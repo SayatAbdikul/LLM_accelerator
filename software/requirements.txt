@@ -1,0 +1,7 @@
+torch
+transformers
+Pillow
+requests
+numpy
+scipy
+datasets

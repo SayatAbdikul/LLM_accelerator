@@ -1,0 +1,45 @@
+# Verilator build artifacts
+verilator/build/
+verilator/obj_dir/
+
+# cocotb simulation artifacts
+cocotb/sim_build/
+cocotb/.pytest_cache/
+cocotb/__pycache__/
+cocotb/results.xml
+cocotb/*.vcd
+cocotb/dump.*
+cocotb/taccel_top.vvp
+cocotb/iverilog_dump.v
+
+# Python cache
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# VCD / waveform dumps
+*.vcd
+*.fst
+*.ghw
+
+# Verilator generated C++ (inside build/)
+**/V*.cpp
+**/V*.h
+**/V*.mk
+**/V*.d
+
+# Simulation logs
+*.log
+sim.log
+
+# Coverage / Python test output
+.coverage
+coverage.xml
+
+# Synthesis artifacts
+synth/*.bit
+synth/*.ltx
+synth/*.dcp
+synth/vivado*.jou
+synth/vivado*.log
+synth/.Xil/

@@ -1,0 +1,142 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1940" viewBox="0 0 1200 1940">
+  <defs>
+    <style>
+      .title { font: 700 28px Arial, sans-serif; fill: #1b1f24; }
+      .subtitle { font: 400 15px Arial, sans-serif; fill: #475467; }
+      .label { font: 700 16px Arial, sans-serif; fill: #1b1f24; }
+      .body { font: 400 14px Arial, sans-serif; fill: #344054; }
+      .small { font: 400 13px Arial, sans-serif; fill: #475467; }
+      .panel { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; rx: 18; ry: 18; }
+      .node-main { fill: #ffffff; stroke: #2563eb; stroke-width: 2; rx: 14; ry: 14; }
+      .node-attn { fill: #eff6ff; stroke: #1d4ed8; stroke-width: 2; rx: 14; ry: 14; }
+      .node-mlp { fill: #f0fdf4; stroke: #15803d; stroke-width: 2; rx: 14; ry: 14; }
+      .node-sfu { fill: #fff7ed; stroke: #c2410c; stroke-width: 2; rx: 14; ry: 14; }
+      .node-note { fill: #fef3c7; stroke: #b45309; stroke-width: 2; rx: 14; ry: 14; }
+      .arrow { stroke: #475467; stroke-width: 2.5; fill: none; marker-end: url(#arrowhead); }
+      .dash { stroke-dasharray: 8 6; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475467" />
+    </marker>
+  </defs>
+
+  <rect x="20" y="20" width="1160" height="1900" class="panel" />
+  <text x="60" y="70" class="title">One DeiT Transformer Block: Exact Default Quantization Flow</text>
+  <text x="60" y="102" class="subtitle">Current default path in TACCEL: INT8 activations with per-node scales, INT32 accumulators for matmuls, SFU ops in FP32.</text>
+
+  <rect x="80" y="140" width="1040" height="850" class="panel" />
+  <text x="100" y="180" class="label">Attention Path</text>
+
+  <rect x="350" y="210" width="500" height="74" class="node-main" />
+  <text x="370" y="238" class="label">Block Input x</text>
+  <text x="370" y="262" class="body">INT8 activation in ABUF/DRAM</text>
+  <text x="370" y="282" class="small">real x ≈ q · block_input_scale</text>
+
+  <rect x="350" y="340" width="500" height="92" class="node-sfu" />
+  <text x="370" y="368" class="label">LayerNorm</text>
+  <text x="370" y="392" class="body">INT8 -&gt; FP32 -&gt; INT8</text>
+  <text x="370" y="416" class="small">output scale = ln1_scale</text>
+
+  <rect x="90" y="500" width="290" height="110" class="node-attn" />
+  <text x="110" y="528" class="label">Q MATMUL</text>
+  <text x="110" y="552" class="body">INT8 × INT8 -&gt; INT32 ACCUM</text>
+  <text x="110" y="576" class="body">REQUANT -&gt; INT8</text>
+  <text x="110" y="600" class="small">output scale = q_scale</text>
+
+  <rect x="455" y="500" width="290" height="110" class="node-attn" />
+  <text x="475" y="528" class="label">K MATMUL</text>
+  <text x="475" y="552" class="body">INT8 × INT8 -&gt; INT32 ACCUM</text>
+  <text x="475" y="576" class="body">REQUANT -&gt; INT8</text>
+  <text x="475" y="600" class="small">output scale = k_scale</text>
+
+  <rect x="820" y="500" width="290" height="110" class="node-attn" />
+  <text x="840" y="528" class="label">V MATMUL</text>
+  <text x="840" y="552" class="body">INT8 × INT8 -&gt; INT32 ACCUM</text>
+  <text x="840" y="576" class="body">REQUANT -&gt; INT8</text>
+  <text x="840" y="600" class="small">output scale = v_scale</text>
+
+  <rect x="350" y="690" width="500" height="110" class="node-attn" />
+  <text x="370" y="718" class="label">QKT MATMUL</text>
+  <text x="370" y="742" class="body">Q × Kᵀ -&gt; INT32 ACCUM</text>
+  <text x="370" y="766" class="small">accum real scale = q_scale × k_scale × 1/sqrt(64)</text>
+  <text x="370" y="786" class="small">that is q_scale × k_scale × 0.125</text>
+
+  <rect x="350" y="850" width="500" height="110" class="node-sfu" />
+  <text x="370" y="878" class="label">Softmax SFU</text>
+  <text x="370" y="902" class="body">INT32 ACCUM -&gt; FP32 -&gt; INT8</text>
+  <text x="370" y="926" class="small">input scale = qkt_scale</text>
+  <text x="370" y="946" class="small">output scale = softmax_scale</text>
+
+  <rect x="80" y="1040" width="1040" height="840" class="panel" />
+  <text x="100" y="1080" class="label">attn@V, Residual, and MLP Path</text>
+
+  <rect x="350" y="1110" width="500" height="110" class="node-attn" />
+  <text x="370" y="1138" class="label">attn @ V MATMUL</text>
+  <text x="370" y="1162" class="body">INT8 softmax × INT8 V -&gt; INT32 ACCUM</text>
+  <text x="370" y="1186" class="body">REQUANT -&gt; INT8</text>
+  <text x="370" y="1206" class="small">output scale = attn_v_scale</text>
+
+  <rect x="350" y="1265" width="500" height="74" class="node-attn" />
+  <text x="370" y="1293" class="label">Concat Heads</text>
+  <text x="370" y="1317" class="small">INT8 copy, scale stays attn_v_scale</text>
+
+  <rect x="350" y="1380" width="500" height="110" class="node-attn" />
+  <text x="370" y="1408" class="label">out_proj MATMUL</text>
+  <text x="370" y="1432" class="body">INT8 × INT8 -&gt; INT32 ACCUM</text>
+  <text x="370" y="1456" class="body">REQUANT -&gt; INT8</text>
+  <text x="370" y="1476" class="small">forced output scale = block_input_scale</text>
+
+  <rect x="350" y="1535" width="500" height="74" class="node-main" />
+  <text x="370" y="1563" class="label">Residual1 VADD</text>
+  <text x="370" y="1587" class="small">INT8 + INT8 -&gt; INT8, both operands must use block_input_scale</text>
+
+  <rect x="350" y="1650" width="500" height="92" class="node-sfu" />
+  <text x="370" y="1678" class="label">LayerNorm</text>
+  <text x="370" y="1702" class="body">INT8 -&gt; FP32 -&gt; INT8</text>
+  <text x="370" y="1726" class="small">output scale = ln2_scale</text>
+
+  <rect x="80" y="1780" width="300" height="110" class="node-mlp" />
+  <text x="100" y="1808" class="label">FC1 MATMUL</text>
+  <text x="100" y="1832" class="body">INT8 × INT8 -&gt; INT32 ACCUM</text>
+  <text x="100" y="1856" class="body">REQUANT -&gt; INT8</text>
+  <text x="100" y="1876" class="small">output scale = fc1_scale</text>
+
+  <rect x="450" y="1780" width="300" height="110" class="node-sfu" />
+  <text x="470" y="1808" class="label">GELU SFU</text>
+  <text x="470" y="1832" class="body">default path: INT8 -&gt; FP32 -&gt; INT8</text>
+  <text x="470" y="1856" class="small">input scale = fc1_scale</text>
+  <text x="470" y="1876" class="small">output scale = gelu_scale</text>
+
+  <rect x="820" y="1780" width="300" height="110" class="node-mlp" />
+  <text x="840" y="1808" class="label">FC2 MATMUL</text>
+  <text x="840" y="1832" class="body">INT8 × INT8 -&gt; INT32 ACCUM</text>
+  <text x="840" y="1856" class="body">REQUANT -&gt; INT8</text>
+  <text x="840" y="1876" class="small">forced output scale = block_input_scale</text>
+
+  <rect x="870" y="1270" width="250" height="210" class="node-note" />
+  <text x="890" y="1300" class="label">Key Default Rule</text>
+  <text x="890" y="1330" class="body">Residual adds stay in INT8.</text>
+  <text x="890" y="1356" class="body">So out_proj and FC2 are</text>
+  <text x="890" y="1382" class="body">forced back to the same</text>
+  <text x="890" y="1408" class="body">block_input_scale before</text>
+  <text x="890" y="1434" class="body">Residual1 / Residual2.</text>
+
+  <line x1="600" y1="284" x2="600" y2="340" class="arrow" />
+  <line x1="600" y1="432" x2="235" y2="500" class="arrow" />
+  <line x1="600" y1="432" x2="600" y2="500" class="arrow" />
+  <line x1="600" y1="432" x2="965" y2="500" class="arrow" />
+  <line x1="235" y1="610" x2="450" y2="690" class="arrow" />
+  <line x1="600" y1="610" x2="600" y2="690" class="arrow" />
+  <line x1="600" y1="800" x2="600" y2="850" class="arrow" />
+  <line x1="600" y1="960" x2="600" y2="1110" class="arrow" />
+  <line x1="965" y1="610" x2="760" y2="1110" class="arrow dash" />
+  <line x1="600" y1="1220" x2="600" y2="1265" class="arrow" />
+  <line x1="600" y1="1339" x2="600" y2="1380" class="arrow" />
+  <line x1="600" y1="1490" x2="600" y2="1535" class="arrow" />
+  <line x1="600" y1="1609" x2="600" y2="1650" class="arrow" />
+  <line x1="600" y1="1742" x2="230" y2="1780" class="arrow" />
+  <line x1="380" y1="1835" x2="450" y2="1835" class="arrow" />
+  <line x1="750" y1="1835" x2="820" y2="1835" class="arrow" />
+
+  <rect x="80" y="1898" width="1040" height="0" fill="none" stroke="none" />
+</svg>

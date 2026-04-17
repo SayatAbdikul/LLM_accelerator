@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Model weights (large binary files)
+pytorch_model.bin
+*.bin
+*.pt
+*.pth
+*.safetensors
+
+# Compiled / generated outputs
+program.bin
+golden_comparison.json
+quantization_comparison.json
+
+# Hugging Face cache
+.cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# storage for dataset
+images/
