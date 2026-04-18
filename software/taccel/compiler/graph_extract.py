@@ -193,3 +193,10 @@ def extract_deit_tiny() -> IRGraph:
     ))
 
     return graph
+
+
+def extract_deit_tiny_with_config():
+    """Return the legacy DeiT IR graph plus its ModelConfig."""
+    from .model_config import deit_tiny_config
+
+    return extract_deit_tiny(), deit_tiny_config()

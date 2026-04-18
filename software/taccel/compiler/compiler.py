@@ -9,8 +9,9 @@ from ..quantizer.quantize import quantize_weights, quantize_tensor
 from ..quantizer.scales import ScalePropagator
 from ..quantizer.calibrate import CalibrationResult, calibrate_model
 from .ir import IRGraph
-from .graph_extract import extract_deit_tiny, EMBED_DIM, SEQ_LEN, NUM_PATCHES, PATCH_DIM, MLP_DIM, HEAD_DIM, NUM_HEADS, NUM_CLASSES
 from .codegen import CodeGenerator
+from .frontend import load_frontend
+from .model_config import deit_tiny_config
 from .tiler import pad_dim
 
 
@@ -220,6 +221,10 @@ class Compiler:
             calibration: pre-computed calibration result, or None to use defaults
             sample_inputs: if calibration is None and sample_inputs provided, calibrate
         """
+        frontend_result = load_frontend("deit_tiny")
+        graph = frontend_result.graph
+        config = frontend_result.config
+
         # Step 1: Quantize weights
         quant_weights = quantize_weights(
             state_dict,
@@ -242,8 +247,12 @@ class Compiler:
         )
 
         if requant_pc_fc1 and gelu_from_accum:
-            active_fc1_blocks = set(range(12)) if requant_pc_fc1_blocks is None else set(requant_pc_fc1_blocks)
-            active_gelu_blocks = set(range(12)) if gelu_from_accum_blocks is None else set(gelu_from_accum_blocks)
+            active_fc1_blocks = (
+                set(range(config.n_layer)) if requant_pc_fc1_blocks is None else set(requant_pc_fc1_blocks)
+            )
+            active_gelu_blocks = (
+                set(range(config.n_layer)) if gelu_from_accum_blocks is None else set(gelu_from_accum_blocks)
+            )
             overlap = sorted(active_fc1_blocks.intersection(active_gelu_blocks))
             if overlap:
                 raise ValueError(
@@ -273,7 +282,7 @@ class Compiler:
         # REQUANT in codegen is exact. Per-channel weights with mean(w_scales) REQUANT
         # introduces a per-channel weighting factor that distorts dot products, causing
         # wrong attention scores (e.g. 100% CLS-self instead of ~21%).
-        for layer_idx in range(12):
+        for layer_idx in range(config.n_layer):
             prefix = f"vit.encoder.layer.{layer_idx}"
             ln1_scale = cal_scales.get(f"block{layer_idx}_ln1", 6.0 / 127.0)
             for proj in ["query", "key", "value"]:
@@ -288,18 +297,18 @@ class Compiler:
                 ) \
                     if bname in state_dict else None
                 q_full_int8, q_full_scales = quant_weights[wname]
-                for h in range(NUM_HEADS):
+                for h in range(config.n_head):
                     head_weight_name = f"{wname}_h{h}"
                     use_requant_pc_qkv = requant_pc_qkv and (
                         requant_pc_qkv_selection is None
                         or (layer_idx, proj, h) in requant_pc_qkv_selection
                     )
                     if use_requant_pc_qkv:
-                        w_h_int8 = q_full_int8[h * HEAD_DIM:(h + 1) * HEAD_DIM, :].astype(np.int8)
-                        s_h = q_full_scales[h * HEAD_DIM:(h + 1) * HEAD_DIM].astype(np.float16)
+                        w_h_int8 = q_full_int8[h * config.d_head:(h + 1) * config.d_head, :].astype(np.int8)
+                        s_h = q_full_scales[h * config.d_head:(h + 1) * config.d_head].astype(np.float16)
                     else:
                         w_h_fp32 = state_dict[wname].numpy().astype(np.float32)[
-                            h * HEAD_DIM:(h + 1) * HEAD_DIM, :
+                            h * config.d_head:(h + 1) * config.d_head, :
                         ]
                         max_abs_h = float(np.max(np.abs(w_h_fp32)))
                         w_scale_h = max(max_abs_h, 1e-8) / 127.0
@@ -318,7 +327,7 @@ class Compiler:
 
                     # Per-head bias uses the same quantized weight scales as the emitted matmul.
                     if bias_fp32_full is not None:
-                        b_h = bias_fp32_full[h * HEAD_DIM:(h + 1) * HEAD_DIM]
+                        b_h = bias_fp32_full[h * config.d_head:(h + 1) * config.d_head]
                         s_h_arr = s_h[:len(b_h)].astype(np.float32)
                         bias_i32 = self.scale_prop.prescale_bias(
                             b_h, np.array([ln1_scale]), s_h_arr)
@@ -343,7 +352,7 @@ class Compiler:
         # Per-tensor quantization makes REQUANT exact (mean(uniform) = the value).
         # Also fix bias prescaling: use calibrated layer-input scale (not hardcoded
         # 6/127) so the bias units match the accumulator units seen by REQUANT.
-        for layer_idx in range(12):
+        for layer_idx in range(config.n_layer):
             prefix = f"vit.encoder.layer.{layer_idx}"
             b = f"block{layer_idx}"
             layer_specs = [
@@ -522,9 +531,6 @@ class Compiler:
                 q = np.pad(q, ((0, row_pad), (0, col_pad)), mode='constant')
             weight_data[k] = (q, None)
 
-        # Step 5: Extract IR
-        graph = extract_deit_tiny()
-
         # Step 6: Generate code
         codegen = CodeGenerator(
             weight_data,
@@ -539,6 +545,7 @@ class Compiler:
             ),
             requant_pc_weight_names=requant_pc_weight_names,
             requant_pc_scale_tables=requant_pc_scale_tables,
+            model_config=config,
         )
         instructions, dram_data = codegen.generate(graph)
 
@@ -586,7 +593,7 @@ class Compiler:
         if pos_emb_dram_start is not None:
             pos_embed_cls_dram_offset = data_base + pos_emb_dram_start
             # Row 0 (192 bytes) = CLS position embedding → skip it
-            pos_embed_patch_dram_offset = data_base + pos_emb_dram_start + EMBED_DIM
+            pos_embed_patch_dram_offset = data_base + pos_emb_dram_start + config.d_model
         else:
             pos_embed_cls_dram_offset = 0
             pos_embed_patch_dram_offset = 0
@@ -667,6 +674,7 @@ class Compiler:
         """Pre-scale biases to INT32."""
         prescaled = {}
         default_act_scale = 6.0 / 127.0
+        config = deit_tiny_config()
 
         for name, tensor in state_dict.items():
             if 'bias' not in name:
@@ -694,7 +702,7 @@ class Compiler:
                     prescaled[name] = bias_int32
 
         # Add per-head bias slices for Q/K/V
-        for layer_idx in range(12):
+        for layer_idx in range(config.n_layer):
             prefix = f"vit.encoder.layer.{layer_idx}"
             ln1_scale = cal_scales.get(f"block{layer_idx}_ln1", default_act_scale)
             for proj in ["query", "key", "value"]:
@@ -710,9 +718,9 @@ class Compiler:
                 _, w_scales_full = quant_weights[wname]
                 if w_scales_full is None:
                     continue
-                for h in range(NUM_HEADS):
-                    b_h = bias_fp32[h * HEAD_DIM:(h + 1) * HEAD_DIM]
-                    s_h = w_scales_full[h * HEAD_DIM:(h + 1) * HEAD_DIM]
+                for h in range(config.n_head):
+                    b_h = bias_fp32[h * config.d_head:(h + 1) * config.d_head]
+                    s_h = w_scales_full[h * config.d_head:(h + 1) * config.d_head]
                     act_scale = np.array([ln1_scale], dtype=np.float32)
                     bias_i32 = self.scale_prop.prescale_bias(b_h, act_scale, s_h)
                     prescaled[f"{bname}_h{h}"] = bias_i32

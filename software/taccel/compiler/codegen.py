@@ -14,7 +14,7 @@ from ..isa.instructions import (
 from .ir import IRNode, IRGraph
 from .tiler import tile_matmul, tile_qkt, tile_strip_mine, pad_dim, TILE
 from .memory_alloc import MemoryAllocator, Allocation
-from .graph_extract import NUM_PATCHES, EMBED_DIM
+from .model_config import ModelConfig, deit_tiny_config
 
 UNIT = 16
 
@@ -48,7 +48,8 @@ class CodeGenerator:
                  fused_softmax_attnv_blocks: Optional[set] = None,
                  fused_softmax_attnv_accum_out_proj_blocks: Optional[set] = None,
                  requant_pc_weight_names: Optional[set] = None,
-                 requant_pc_scale_tables: Optional[Dict[str, np.ndarray]] = None):
+                 requant_pc_scale_tables: Optional[Dict[str, np.ndarray]] = None,
+                 model_config: Optional[ModelConfig] = None):
         """
         Args:
             weight_data: name → (quantized_data, per_channel_scales)
@@ -56,6 +57,7 @@ class CodeGenerator:
             prescaled_biases: name → INT32 pre-scaled bias array
         """
         self.weight_data = weight_data
+        self.config = model_config or deit_tiny_config()
         self.calibration_scales = calibration_scales
         self.prescaled_biases = prescaled_biases
         self.gelu_from_accum = gelu_from_accum
@@ -118,7 +120,7 @@ class CodeGenerator:
                     if alloc is not None:
                         self.mem.abuf.free(inp_name)
                     # Also free per-head sub-allocations (e.g. k_head0, q_head1)
-                    for h in range(3):
+                    for h in range(self.config.n_head):
                         self.mem.abuf.free(f"{inp_name}_head{h}")
 
         self.instructions.append(HaltInsn())
@@ -157,15 +159,20 @@ class CodeGenerator:
         # Padding rows 197-207 are zero in the input but LN(zero_row) = beta (non-zero),
         # which propagates through QKV projections. Zeroing K/V rows 197-207 eliminates
         # the beta-derived attention contribution from padding tokens.
-        # Size: 11 padding rows × 64 bytes (head_dim, which equals K_pad) = 704 bytes.
-        _zero_pad_size = 11 * 64
+        # Size: padding rows × row width. DeiT attention uses d_head; Stage 1
+        # token embeddings use d_model for short fixed-sequence tests.
+        if self.config.embedding_kind == "patch_cls":
+            _zero_pad_size = (pad_dim(self.config.max_seq_len) - self.config.max_seq_len) * self.config.d_head
+        else:
+            _zero_pad_size = (TILE - 1) * self.config.d_model
         self.dram_layout["__zero_pad__"] = offset
         self.dram_blob.extend(bytes(_zero_pad_size))
         offset += _zero_pad_size
 
-        # Input patches placeholder: the host writes 196 × 192 INT8 patch embeddings
-        # here before starting the program.  The program DMAs this region to ABUF.
-        _input_patches_size = NUM_PATCHES * EMBED_DIM  # 196 × 192 = 37,632 bytes
+        # Input patches placeholder for patch+CLS encoders. Token/position
+        # decoders do not use this Stage 1 ViT startup region.
+        num_patches = self.config.max_seq_len - 1 if self.config.embedding_kind == "patch_cls" else 0
+        _input_patches_size = num_patches * self.config.d_model
         self.dram_layout["__input_patches__"] = offset
         self.dram_blob.extend(bytes(_input_patches_size))
         offset += _input_patches_size
@@ -281,7 +288,8 @@ class CodeGenerator:
         if match is None:
             raise ValueError(f"Cannot infer residual1 skip input from '{out_proj_name}'")
         block_idx = int(match.group(1))
-        return "pos_embed_add" if block_idx == 0 else f"block{block_idx - 1}_residual2"
+        first_skip = "pos_embed_add" if self.config.embedding_kind == "patch_cls" else "tok_pos_add"
+        return first_skip if block_idx == 0 else f"block{block_idx - 1}_residual2"
 
     def _emit_node(self, node: IRNode):
         """Emit instructions for a single IR node."""
@@ -302,6 +310,10 @@ class CodeGenerator:
             self._emit_scale_mul(node)
         elif op == "vadd":
             self._emit_vadd(node)
+        elif op == "embed_lookup":
+            self._emit_embedding_lookup(node, default_table="transformer.wte.weight")
+        elif op == "pos_embed_lookup":
+            self._emit_embedding_lookup(node, default_table="transformer.wpe.weight")
         elif op == "cls_prepend":
             self._emit_cls_prepend(node)
         elif op == "pos_embed_add":
@@ -597,7 +609,7 @@ class CodeGenerator:
         K_pad = pad_dim(K)
         strip_rows = TILE
         num_strips = M_pad // strip_rows
-        head_names = [f"block{block_idx}_head{head_idx}_attn_v" for head_idx in range(3)]
+        head_names = [f"block{block_idx}_head{head_idx}_attn_v" for head_idx in range(self.config.n_head)]
         num_heads = len(head_names)
         head_dim = K // max(num_heads, 1)
         head_dim_pad = pad_dim(head_dim)
@@ -1119,7 +1131,7 @@ class CodeGenerator:
         """
         head_idx = node.attrs["head_idx"]
         seq_len = node.output_shape[0]
-        head_dim = 64  # DeiT-tiny
+        head_dim = self.config.d_head
         M_pad = pad_dim(seq_len)
         K_pad = pad_dim(head_dim)
         num_strips = M_pad // TILE  # 13 strips of 16 rows
@@ -1528,7 +1540,7 @@ class CodeGenerator:
         if self._fused_softmax_attnv_accum_out_proj_enabled_for(node.name):
             return
 
-        head_dim = 64
+        head_dim = self.config.d_head
         seq_len = node.output_shape[0]
         M_pad = pad_dim(seq_len)
         N_pad = pad_dim(head_dim)
@@ -1844,29 +1856,89 @@ class CodeGenerator:
             alloc.name = node.name
             self.mem.abuf.allocations[node.name] = alloc
 
+    def _emit_embedding_lookup(self, node: IRNode, *, default_table: str):
+        """Emit fixed-row token/position embedding loads for Stage 1 tests."""
+        table_name = node.attrs.get("table", default_table)
+        if table_name not in self.dram_layout:
+            return
+        seq_len, d_model = node.output_shape
+        d_model_pad = pad_dim(d_model)
+        if d_model_pad != d_model:
+            raise ValueError("Stage 1 embedding lookup requires d_model to be 16-aligned")
+
+        if "row_indices" in node.attrs:
+            row_indices = list(node.attrs["row_indices"])
+        elif "token_ids" in node.attrs:
+            row_indices = list(node.attrs["token_ids"])
+        elif "position_ids" in node.attrs:
+            row_indices = list(node.attrs["position_ids"])
+        else:
+            row_indices = list(range(seq_len)) if node.op == "pos_embed_lookup" else [0] * seq_len
+        if len(row_indices) != seq_len:
+            raise ValueError(f"{node.name} expected {seq_len} row indices, got {len(row_indices)}")
+
+        out_alloc = self.mem.abuf.alloc(node.name, pad_dim(seq_len) * d_model_pad)
+        table_dram = self._dram_offset_required(table_name, f"loading embedding table '{table_name}'")
+        row_units = d_model_pad // UNIT
+        for row_idx, table_row in enumerate(row_indices):
+            self._emit_dma_load(
+                BUF_ABUF,
+                out_alloc.offset_units + row_idx * row_units,
+                d_model_pad,
+                0,
+                table_dram + int(table_row) * d_model_pad,
+            )
+            self._emit(SyncInsn(resource_mask=0b001))
+        pad_rows = pad_dim(seq_len) - seq_len
+        if pad_rows:
+            zero_pad_dram = self._dram_offset_required("__zero_pad__", "zeroing embedding padding rows")
+            self._emit_dma_load(
+                BUF_ABUF,
+                out_alloc.offset_units + seq_len * row_units,
+                pad_rows * d_model_pad,
+                3,
+                zero_pad_dram,
+            )
+            self._emit(SyncInsn(resource_mask=0b001))
+        self._record_trace_event(
+            node.name,
+            BUF_ABUF,
+            out_alloc.offset_units,
+            pad_dim(seq_len),
+            d_model_pad,
+            seq_len,
+            d_model,
+            "int8",
+            self.calibration_scales.get(node.name, 6.0 / 127.0),
+        )
+
     def _emit_cls_prepend(self, node: IRNode):
         """Emit CLS token prepend: load CLS to ABUF[0], then DMA patches to rows 1-196."""
+        if self.config.embedding_kind != "patch_cls":
+            raise ValueError("cls_prepend is only valid for patch_cls embeddings")
         cls_name = node.inputs[1]
         cls_dram = self._dram_offset_required(cls_name, "loading cls token")
-        # Load CLS token [1, 192] = 192 bytes = 12 × 16-byte units to ABUF row 0
-        self._emit_dma_load(BUF_ABUF, 0, 192, 0, cls_dram)
+        # Load CLS token [1, d_model] to ABUF row 0.
+        self._emit_dma_load(BUF_ABUF, 0, self.config.d_model, 0, cls_dram)
         self._emit(SyncInsn(resource_mask=0b001))
         # DMA input patches from DRAM to ABUF rows 1-196.
         # Host writes INT8 patch embeddings [196, 192] to DRAM[input_offset] before run.
-        # Row 1 starts at byte offset 192 = 12 × 16-byte units in ABUF.
+        # Row 1 starts at byte offset d_model in ABUF.
         patches_dram = self.dram_layout["__input_patches__"]
-        patches_bytes = NUM_PATCHES * EMBED_DIM  # 196 × 192 = 37,632 bytes
-        self._emit_dma_load(BUF_ABUF, EMBED_DIM // UNIT, patches_bytes, 1, patches_dram)
+        patches_bytes = (self.config.max_seq_len - 1) * self.config.d_model
+        self._emit_dma_load(BUF_ABUF, self.config.d_model // UNIT, patches_bytes, 1, patches_dram)
         self._emit(SyncInsn(resource_mask=0b001))
         # Mark allocation for the full [208, 192] padded sequence (rows 197-207 stay zero)
-        self.mem.abuf.alloc(node.name, pad_dim(197) * 192, evictable=False)
+        self.mem.abuf.alloc(node.name, pad_dim(self.config.max_seq_len) * self.config.d_model, evictable=False)
 
     def _emit_pos_embed_add(self, node: IRNode):
         """Emit position embedding add."""
+        if self.config.embedding_kind != "patch_cls":
+            raise ValueError("pos_embed_add is only valid for patch_cls embeddings")
         pos_name = node.inputs[1]
         pos_dram = self._dram_offset_required(pos_name, "loading position embeddings")
-        M_pad = pad_dim(197)
-        N = 192
+        M_pad = pad_dim(self.config.max_seq_len)
+        N = self.config.d_model
         N_pad = pad_dim(N)
 
         # Load pos_embed to WBUF [208, 192] (pre-padded at compile time)
@@ -1932,9 +2004,11 @@ class CodeGenerator:
 
     def _emit_cls_extract(self, node: IRNode):
         """Extract CLS token (row 0) via BUF_COPY."""
-        N = 192
+        if self.config.embedding_kind != "patch_cls":
+            raise ValueError("cls_extract is only valid for patch_cls embeddings")
+        N = self.config.d_model
         in_alloc = self.mem.abuf.get(node.inputs[0]) or \
-                   self.mem.abuf.alloc(node.inputs[0], pad_dim(197) * pad_dim(N))
+                   self.mem.abuf.alloc(node.inputs[0], pad_dim(self.config.max_seq_len) * pad_dim(N))
         out_alloc = self.mem.abuf.alloc(node.name, pad_dim(N))
         # Copy 192 bytes = 12 × 16-byte units
         self._emit(BufCopyInsn(
