@@ -15,8 +15,9 @@ execution of independent units (e.g. a LOAD can overlap a MATMUL).
 
 Reserved fields / opcodes
 -------------------------
-- Opcodes 0x14–0x1F are reserved.  Decoding a reserved opcode raises an
+- Opcodes 0x17–0x1F are reserved.  Decoding a reserved opcode raises an
   illegal-instruction fault and the processor halts.
+- CONFIG_ATTN reserved bits [32:0] must be zero.
 - M-TYPE stride_log2 [6:3] is reserved and must be zero.
 - M-TYPE flags [2:0] are reserved and must be zero.
 """
@@ -44,6 +45,9 @@ class Opcode(IntEnum):
     REQUANT_PC = 0x11
     SOFTMAX_ATTNV = 0x12
     DEQUANT_ADD = 0x13
+    CONFIG_ATTN = 0x14
+    MASKED_SOFTMAX = 0x15
+    MASKED_SOFTMAX_ATTNV = 0x16
 
 
 class InsnFormat(IntEnum):
@@ -53,6 +57,7 @@ class InsnFormat(IntEnum):
     A_TYPE = 3
     C_TYPE = 4
     S_TYPE = 5
+    ATTN_TYPE = 6
 
 
 OPCODE_FORMAT = {
@@ -76,6 +81,9 @@ OPCODE_FORMAT = {
     Opcode.REQUANT_PC: InsnFormat.R_TYPE,
     Opcode.SOFTMAX_ATTNV: InsnFormat.R_TYPE,
     Opcode.DEQUANT_ADD: InsnFormat.R_TYPE,
+    Opcode.CONFIG_ATTN: InsnFormat.ATTN_TYPE,
+    Opcode.MASKED_SOFTMAX: InsnFormat.R_TYPE,
+    Opcode.MASKED_SOFTMAX_ATTNV: InsnFormat.R_TYPE,
 }
 
 # Buffer IDs (2-bit, shared across R-type, M-type, B-type)
@@ -148,6 +156,12 @@ C_M_SHIFT = 49
 C_N_SHIFT = 39
 C_K_SHIFT = 29
 
+# ATTN-type CONFIG_ATTN fields
+ATTN_QUERY_ROW_BASE_SHIFT = 47
+ATTN_VALID_KV_LEN_SHIFT = 35
+ATTN_MODE_SHIFT = 33
+ATTN_RESERVED_MASK = (1 << 33) - 1
+
 # S-type SET_SCALE fields
 SS_SREG_SHIFT = 55
 SS_SRC_MODE_SHIFT = 53
@@ -163,5 +177,6 @@ MASK_4BIT = 0xF
 MASK_5BIT = 0x1F
 MASK_6BIT = 0x3F
 MASK_10BIT = 0x3FF
+MASK_12BIT = 0xFFF
 MASK_16BIT = 0xFFFF
 MASK_28BIT = 0xFFFFFFF

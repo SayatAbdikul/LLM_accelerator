@@ -33,6 +33,9 @@ from ..quantizer.twin_uniform import (
 from ..utils.int8_ops import clip_int8
 
 CYCLE_PER_ELEMENT = 2
+ATTN_MODE_PADDED = 0b01
+ATTN_MODE_CAUSAL = 0b10
+ATTN_MODE_CAUSAL_PADDED = 0b11
 
 
 def _erf_poly(x: np.ndarray) -> np.ndarray:
@@ -89,6 +92,58 @@ def _runtime_twin_spec(state, kind: str):
     if not spec or spec.get("kind") != kind or spec.get("mode") != "paper_exact":
         return None
     return spec
+
+
+def _requantize_int8(x: np.ndarray, out_scale: np.float32) -> np.ndarray:
+    """Requantize FP32 to INT8 using the architectural rounding policy."""
+    if out_scale == np.float32(0):
+        return np.zeros_like(x, dtype=np.int8)
+    return np.clip(np.round(x / out_scale), -128, 127).astype(np.int8)
+
+
+def _attention_mask(M: int, N: int, query_row_base: int, valid_kv_len: int, mode: int) -> np.ndarray:
+    """Return a True/False mask where True means a logit is visible."""
+    from .simulator import ConfigError
+    if valid_kv_len <= 0:
+        raise ConfigError("CONFIG_ATTN valid_kv_len must be > 0")
+    rows = np.arange(M, dtype=np.int32).reshape(M, 1)
+    cols = np.arange(N, dtype=np.int32).reshape(1, N)
+    visible = np.ones((M, N), dtype=bool)
+    if mode & ATTN_MODE_CAUSAL:
+        visible &= cols <= (query_row_base + rows)
+    if mode & ATTN_MODE_PADDED:
+        visible &= cols < valid_kv_len
+    fully_masked = ~visible.any(axis=1)
+    if np.any(fully_masked):
+        first = int(np.flatnonzero(fully_masked)[0])
+        raise ConfigError(f"CONFIG_ATTN produced a fully masked row at local row {first}")
+    return visible
+
+
+def _masked_softmax_probs(x: np.ndarray, query_row_base: int, valid_kv_len: int, mode: int) -> np.ndarray:
+    """Apply configured attention mask before stable softmax."""
+    visible = _attention_mask(x.shape[0], x.shape[1], query_row_base, valid_kv_len, mode)
+    masked = np.where(visible, x, np.float32(-np.inf)).astype(np.float32)
+    shifted = masked - masked.max(axis=-1, keepdims=True)
+    exp_x = np.exp(shifted).astype(np.float32)
+    exp_x = np.where(visible, exp_x, np.float32(0.0))
+    denom = exp_x.sum(axis=-1, keepdims=True)
+    if np.any(denom == np.float32(0)):
+        from .simulator import ConfigError
+        raise ConfigError("CONFIG_ATTN produced zero softmax denominator")
+    return (exp_x / denom).astype(np.float32)
+
+
+def _attn_context_values(state):
+    from .simulator import ConfigError
+    ctx = getattr(state, "attn_context", None) or {}
+    if not ctx.get("is_valid", False):
+        raise ConfigError("CONFIG_ATTN not set")
+    return (
+        int(ctx["query_row_base"]),
+        int(ctx["valid_kv_len"]),
+        int(ctx["mode"]),
+    )
 
 
 def execute_layernorm(state, insn):
@@ -177,6 +232,40 @@ def execute_softmax(state, insn):
     else:
         result = np.clip(np.round(x_out / out_scale), -128, 127).astype(np.int8)
 
+    memory.write_int8_tile(state, insn.dst_buf, insn.dst_off, result)
+    state.cycle_count += M * N * CYCLE_PER_ELEMENT
+
+
+def execute_masked_softmax(state, insn):
+    """Masked softmax under the current CONFIG_ATTN context."""
+    from .simulator import ConfigError
+    if state.tile_config is None:
+        raise ConfigError("CONFIG_TILE not set")
+
+    m_tiles = state.tile_config[0] + 1
+    n_tiles = state.tile_config[1] + 1
+    M = m_tiles * 16
+    N = n_tiles * 16
+
+    in_scale, out_scale = _get_dual_scales(state, insn.sreg)
+    query_row_base, valid_kv_len, mode = _attn_context_values(state)
+
+    if insn.src1_buf == BUF_ACCUM:
+        inp_i32 = memory.read_int32_tile(state, BUF_ACCUM, insn.src1_off, M, N)
+        x = inp_i32.astype(np.float32) * in_scale
+    else:
+        inp_i8 = memory.read_int8_tile(state, insn.src1_buf, insn.src1_off, M, N)
+        x = inp_i8.astype(np.float32) * in_scale
+
+    x_out = _masked_softmax_probs(x, query_row_base, valid_kv_len, mode)
+    softmax_spec = _runtime_twin_spec(state, "softmax")
+    if softmax_spec is not None:
+        x_out = quantize_dequant_softmax_twin(
+            x_out,
+            float(softmax_spec.get("range1_max", 1.0)),
+        ).astype(np.float32)
+
+    result = _requantize_int8(x_out, out_scale)
     memory.write_int8_tile(state, insn.dst_buf, insn.dst_off, result)
     state.cycle_count += M * N * CYCLE_PER_ELEMENT
 
@@ -286,6 +375,60 @@ def execute_softmax_attnv(state, insn):
     else:
         softmax_i8 = np.clip(np.round(softmax / softmax_trace_scale), -128, 127).astype(np.int8)
 
+    state.cycle_count += (M * K * CYCLE_PER_ELEMENT) + (m_tiles * n_tiles * k_tiles * 16) + (M * N)
+    return {
+        "softmax": {
+            "raw": softmax_i8,
+            "dtype": "int8",
+            "scale": float(softmax_trace_scale),
+            "sat": int(np.count_nonzero((softmax_i8 == 127) | (softmax_i8 == -128))),
+            "zero": int(np.count_nonzero(softmax_i8 == 0)),
+            "total": int(softmax_i8.size),
+        }
+    }
+
+
+def execute_masked_softmax_attnv(state, insn):
+    """Fused masked softmax + attn@V under CONFIG_ATTN."""
+    from .simulator import ConfigError, IllegalBufferError
+    if state.tile_config is None:
+        raise ConfigError("CONFIG_TILE not set")
+    if insn.src1_buf != BUF_ACCUM:
+        raise IllegalBufferError(insn.src1_buf)
+    if insn.src2_buf == BUF_ACCUM:
+        raise IllegalBufferError(insn.src2_buf)
+    if insn.dst_buf == BUF_ACCUM:
+        raise IllegalBufferError(insn.dst_buf)
+
+    m_tiles = state.tile_config[0] + 1
+    n_tiles = state.tile_config[1] + 1
+    k_tiles = state.tile_config[2] + 1
+    M = m_tiles * 16
+    N = n_tiles * 16
+    K = k_tiles * 16
+
+    query_row_base, valid_kv_len, mode = _attn_context_values(state)
+    qkt_in_scale, v_scale, out_scale, softmax_trace_scale = _get_quad_scales(state, insn.sreg)
+
+    qkt_i32 = memory.read_int32_tile(state, BUF_ACCUM, insn.src1_off, M, K)
+    v_i8 = memory.read_int8_tile(state, insn.src2_buf, insn.src2_off, K, N)
+
+    qkt = qkt_i32.astype(np.float32) * qkt_in_scale
+    v = v_i8.astype(np.float32) * v_scale
+
+    softmax = _masked_softmax_probs(qkt, query_row_base, valid_kv_len, mode)
+    softmax_spec = _runtime_twin_spec(state, "softmax")
+    if softmax_spec is not None:
+        softmax = quantize_dequant_softmax_twin(
+            softmax,
+            float(softmax_spec.get("range1_max", 1.0)),
+        ).astype(np.float32)
+    attn_v = np.matmul(softmax, v).astype(np.float32)
+
+    result = _requantize_int8(attn_v, out_scale)
+    memory.write_int8_tile(state, insn.dst_buf, insn.dst_off, result)
+
+    softmax_i8 = _requantize_int8(softmax, softmax_trace_scale)
     state.cycle_count += (M * K * CYCLE_PER_ELEMENT) + (m_tiles * n_tiles * k_tiles * 16) + (M * N)
     return {
         "softmax": {

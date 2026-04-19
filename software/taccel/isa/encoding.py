@@ -11,15 +11,16 @@ from .opcodes import (
     B_LENGTH_SHIFT, B_SRC_ROWS_SHIFT, B_TRANSPOSE_SHIFT,
     A_ADDR_REG_SHIFT, A_IMM28_SHIFT,
     C_M_SHIFT, C_N_SHIFT, C_K_SHIFT,
+    ATTN_QUERY_ROW_BASE_SHIFT, ATTN_VALID_KV_LEN_SHIFT, ATTN_MODE_SHIFT, ATTN_RESERVED_MASK,
     SS_SREG_SHIFT, SS_SRC_MODE_SHIFT, SS_IMM16_SHIFT,
     SYNC_RESOURCE_MASK_SHIFT,
-    MASK_2BIT, MASK_3BIT, MASK_4BIT, MASK_6BIT, MASK_10BIT, MASK_16BIT, MASK_28BIT,
+    MASK_2BIT, MASK_3BIT, MASK_4BIT, MASK_6BIT, MASK_10BIT, MASK_12BIT, MASK_16BIT, MASK_28BIT,
 )
 from .instructions import (
     Instruction, RTypeInsn, MTypeInsn, BufCopyInsn, ATypeInsn, ConfigTileInsn,
-    SetScaleInsn, SyncInsn, NopInsn, HaltInsn,
+    ConfigAttnInsn, SetScaleInsn, SyncInsn, NopInsn, HaltInsn,
     MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn, SoftmaxInsn, LayernormInsn, GeluInsn,
-    SoftmaxAttnVInsn, DequantAddInsn,
+    SoftmaxAttnVInsn, MaskedSoftmaxInsn, MaskedSoftmaxAttnVInsn, DequantAddInsn,
     LoadInsn, StoreInsn, SetAddrLoInsn, SetAddrHiInsn,
 )
 
@@ -34,6 +35,8 @@ _R_TYPE_CLASSES = {
     Opcode.LAYERNORM: LayernormInsn,
     Opcode.GELU: GeluInsn,
     Opcode.SOFTMAX_ATTNV: SoftmaxAttnVInsn,
+    Opcode.MASKED_SOFTMAX: MaskedSoftmaxInsn,
+    Opcode.MASKED_SOFTMAX_ATTNV: MaskedSoftmaxAttnVInsn,
     Opcode.DEQUANT_ADD: DequantAddInsn,
 }
 
@@ -89,6 +92,11 @@ def encode(insn: Instruction) -> bytes:
         word |= (insn.M & MASK_10BIT) << C_M_SHIFT
         word |= (insn.N & MASK_10BIT) << C_N_SHIFT
         word |= (insn.K & MASK_10BIT) << C_K_SHIFT
+
+    elif fmt == InsnFormat.ATTN_TYPE:
+        word |= (insn.query_row_base & MASK_12BIT) << ATTN_QUERY_ROW_BASE_SHIFT
+        word |= (insn.valid_kv_len & MASK_12BIT) << ATTN_VALID_KV_LEN_SHIFT
+        word |= (insn.mode & MASK_2BIT) << ATTN_MODE_SHIFT
 
     elif fmt == InsnFormat.S_TYPE:
         if insn.opcode == Opcode.SET_SCALE:
@@ -159,6 +167,15 @@ def decode(data: bytes) -> Instruction:
             M=(word >> C_M_SHIFT) & MASK_10BIT,
             N=(word >> C_N_SHIFT) & MASK_10BIT,
             K=(word >> C_K_SHIFT) & MASK_10BIT,
+        )
+
+    elif fmt == InsnFormat.ATTN_TYPE:
+        if word & ATTN_RESERVED_MASK:
+            raise ValueError("CONFIG_ATTN reserved bits [32:0] must be zero")
+        return ConfigAttnInsn(
+            query_row_base=(word >> ATTN_QUERY_ROW_BASE_SHIFT) & MASK_12BIT,
+            valid_kv_len=(word >> ATTN_VALID_KV_LEN_SHIFT) & MASK_12BIT,
+            mode=(word >> ATTN_MODE_SHIFT) & MASK_2BIT,
         )
 
     elif fmt == InsnFormat.S_TYPE:

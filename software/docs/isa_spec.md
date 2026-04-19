@@ -1,4 +1,4 @@
-# TACCEL ISA v1 Specification
+# TACCEL ISA v1.1 Specification
 
 This document tracks the ISA as implemented in the current software stack
 (`taccel/isa`, assembler/disassembler, golden-model simulator, compiler, and
@@ -13,7 +13,7 @@ behind an in-order issue stage:
 |----------|--------------------------------------------|------------------------------|
 | DMA      | LOAD, STORE                                | byte stream                  |
 | Systolic | MATMUL                                     | INT8 in, INT32 out           |
-| SFU      | SOFTMAX, SOFTMAX_ATTNV, LAYERNORM, GELU    | INT8/INT32 in, FP32 internal |
+| SFU      | SOFTMAX, MASKED_SOFTMAX, SOFTMAX_ATTNV, MASKED_SOFTMAX_ATTNV, LAYERNORM, GELU | INT8/INT32 in, FP32 internal |
 
 Additional control/data instructions (`REQUANT`, `REQUANT_PC`, `VADD`,
 `DEQUANT_ADD`, `SCALE_MUL`, `BUF_COPY`, `CONFIG_TILE`, `SET_SCALE`,
@@ -72,7 +72,10 @@ All instructions are 64 bits, big-endian.  Bits [63:59] hold the 5-bit opcode.
 | REQUANT_PC   | 0x11   | R-TYPE | INT32 → INT8 using per-column FP16 scales |
 | SOFTMAX_ATTNV | 0x12   | R-TYPE | Fused softmax(QK^T) @ V             |
 | DEQUANT_ADD  | 0x13   | R-TYPE | FP32 rescale-add of ACCUM and INT8 skip |
-| 0x14–0x1F    | —      | —      | **Reserved** — illegal instruction fault |
+| CONFIG_ATTN  | 0x14   | ATTN-TYPE | Set masked-attention context       |
+| MASKED_SOFTMAX | 0x15 | R-TYPE | Row-wise softmax with attention mask |
+| MASKED_SOFTMAX_ATTNV | 0x16 | R-TYPE | Fused masked softmax(QK^T) @ V |
+| 0x17–0x1F    | —      | —      | **Reserved** — illegal instruction fault |
 
 ### 2.2 R-TYPE (Compute)
 
@@ -158,9 +161,27 @@ Full 56-bit address = `(HI_imm28 << 28) | LO_imm28`.
 Tile dimensions in 16-element units.  Persists until next CONFIG_TILE.
 Must be set before any tiled compute instruction (`MATMUL`, `REQUANT`,
 `REQUANT_PC`, `SCALE_MUL`, `VADD`, `DEQUANT_ADD`, `SOFTMAX`,
-`SOFTMAX_ATTNV`, `LAYERNORM`, `GELU`).
+`MASKED_SOFTMAX`, `SOFTMAX_ATTNV`, `MASKED_SOFTMAX_ATTNV`, `LAYERNORM`,
+`GELU`).
 
-### 2.7 S-TYPE (System)
+### 2.7 ATTN-TYPE (Attention Context)
+
+`CONFIG_ATTN` is an opcode-specific format, not C-TYPE reuse.
+
+```
+[63:59]  Opcode = 0x14
+[58:47]  QUERY_ROW_BASE   (12 bits)
+[46:35]  VALID_KV_LEN     (12 bits)
+[34:33]  MODE             (2 bits: 01=padded, 10=causal, 11=causal+padded)
+[32:0]   Reserved, must be 0
+```
+
+Mode `0b00` is accepted by encode/decode for diagnostic roundtrips but faults
+when executed. `VALID_KV_LEN` must be nonzero. The context persists until the
+next `CONFIG_ATTN` or reset, and masked softmax instructions fault without a
+valid context.
+
+### 2.8 S-TYPE (System)
 
 **SET_SCALE:**
 ```
@@ -315,14 +336,16 @@ widened to FP32.
 Scale-register conventions:
 - `SOFTMAX`, `LAYERNORM`, `GELU`: dual-scale form using `S[sreg]` and
   `S[sreg+1]`.
-- `SOFTMAX_ATTNV`: quad-scale form using `S[sreg]..S[sreg+3]`.
+- `SOFTMAX_ATTNV` and `MASKED_SOFTMAX_ATTNV`: quad-scale form using
+  `S[sreg]..S[sreg+3]`.
 
 Source/destination conventions:
-- `SOFTMAX` and `GELU` may read either INT8 SRAM or raw INT32 `ACCUM`.
+- `SOFTMAX`, `MASKED_SOFTMAX`, and `GELU` may read either INT8 SRAM or raw
+  INT32 `ACCUM`.
 - `LAYERNORM` reads INT8 activations plus FP16 `gamma/beta` parameters from
   `src2`.
-- `SOFTMAX_ATTNV` reads `QK^T` from `ACCUM` and `V` from INT8 SRAM, and writes
-  the quantized `attn @ V` output to INT8 SRAM.
+- `SOFTMAX_ATTNV` and `MASKED_SOFTMAX_ATTNV` read `QK^T` from `ACCUM` and `V`
+  from INT8 SRAM, and write the quantized `attn @ V` output to INT8 SRAM.
 
 ### 5.1 Rounding Convention
 
@@ -343,7 +366,19 @@ output = clip(round(softmax / out_scale), -128, 127)
 
 Row-max subtraction is required for numerical stability.
 
-### 5.3 SOFTMAX_ATTNV
+### 5.3 MASKED_SOFTMAX
+
+`MASKED_SOFTMAX` follows the same datapath as `SOFTMAX`, but applies the active
+`CONFIG_ATTN` mask before row-max and exponentiation:
+
+- Causal mask hides columns `j > query_row_base + local_row_i`.
+- Padded mask hides columns `j >= valid_kv_len`.
+- Hidden logits are treated as `-inf`; their output probability is zero.
+- Fully masked rows fault in the golden model.
+
+For `MASKED_SOFTMAX`, key columns are `(CONFIG_TILE.N + 1) * 16`.
+
+### 5.4 SOFTMAX_ATTNV
 
 Fused attention tail:
 
@@ -360,7 +395,10 @@ software stack can materialize a virtual INT8 softmax tensor for diagnostics.
 That virtual trace payload is not architectural state and does not affect the
 visible destination buffer.
 
-### 5.4 LAYERNORM
+`MASKED_SOFTMAX_ATTNV` applies the same `CONFIG_ATTN` mask to `qkt` before
+softmax. For `MASKED_SOFTMAX_ATTNV`, key columns are `(CONFIG_TILE.K + 1) * 16`.
+
+### 5.5 LAYERNORM
 
 Per-row normalize + affine transform:
 
@@ -373,7 +411,7 @@ output = clip(round(y / out_scale), -128, 127)
 
 Gamma and beta are packed in WBUF at src2: N×2 bytes gamma, then N×2 bytes beta.
 
-### 5.5 GELU
+### 5.6 GELU
 
 ```
 GELU(x) = x × 0.5 × (1 + erf(x / sqrt(2)))
@@ -430,8 +468,8 @@ include `data_base`).
 
 Register usage in the current ISA:
 - Single-register ops: `REQUANT`, `SCALE_MUL`
-- Dual-register ops: `SOFTMAX`, `LAYERNORM`, `GELU`, `DEQUANT_ADD`
-- Quad-register ops: `SOFTMAX_ATTNV`
+- Dual-register ops: `SOFTMAX`, `MASKED_SOFTMAX`, `LAYERNORM`, `GELU`, `DEQUANT_ADD`
+- Quad-register ops: `SOFTMAX_ATTNV`, `MASKED_SOFTMAX_ATTNV`
 - Memory-sourced scales: `REQUANT_PC`
 
 Constraints:
@@ -457,7 +495,9 @@ FP16 → FP32 widening: the exact FP16 value is preserved (no extra precision).
 | VADD          | M × N                                     |
 | DEQUANT_ADD   | M × N                                     |
 | SOFTMAX       | M × N × 2                                |
+| MASKED_SOFTMAX | M × N × 2                               |
 | SOFTMAX_ATTNV | M × K × 2 + m_tiles × n_tiles × k_tiles × 16 + M × N |
+| MASKED_SOFTMAX_ATTNV | M × K × 2 + m_tiles × n_tiles × k_tiles × 16 + M × N |
 | LAYERNORM     | M × N × 2                                |
 | GELU          | M × N × 2                                |
 | Others        | 0 (issue-stage only)                      |

@@ -3,7 +3,7 @@ from ..isa.encoding import decode
 from ..isa.opcodes import Opcode, BUFFER_NAMES, BUF_ABUF, BUF_WBUF, BUF_ACCUM
 from ..isa.instructions import (
     RTypeInsn, MTypeInsn, BufCopyInsn, ATypeInsn, ConfigTileInsn,
-    SetScaleInsn, SyncInsn, NopInsn, HaltInsn,
+    ConfigAttnInsn, SetScaleInsn, SyncInsn, NopInsn, HaltInsn,
 )
 from .assembler import ProgramBinary
 
@@ -41,6 +41,13 @@ class Disassembler:
         elif isinstance(insn, ConfigTileInsn):
             # Display tile counts (add 1 back from encoded value)
             return f"CONFIG_TILE M={insn.M + 1}, N={insn.N + 1}, K={insn.K + 1}"
+        elif isinstance(insn, ConfigAttnInsn):
+            return (
+                "CONFIG_ATTN "
+                f"query_row_base={insn.query_row_base}, "
+                f"valid_kv_len={insn.valid_kv_len}, "
+                f"mode=0b{insn.mode:02b}"
+            )
         elif isinstance(insn, SetScaleInsn):
             if insn.src_mode == 0:
                 return f"SET_SCALE S{insn.sreg}, imm=0x{insn.imm16:04x}"

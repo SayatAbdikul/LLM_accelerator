@@ -225,6 +225,35 @@ class TestDisassembler:
         assert "SOFTMAX_ATTNV" in text
         assert "ABUF[0x0004]" in text
 
+    def test_config_attn_roundtrip(self):
+        prog = Assembler().assemble(
+            "CONFIG_ATTN query_row_base=16, valid_kv_len=31, mode=0b11"
+        )
+        insn = decode(prog.get_instruction_bytes(0))
+        assert insn.opcode.name == "CONFIG_ATTN"
+        assert insn.query_row_base == 16
+        assert insn.valid_kv_len == 31
+        assert insn.mode == 0b11
+        text = Disassembler().disassemble(prog)
+        assert "CONFIG_ATTN" in text
+        assert "query_row_base=16" in text
+        assert "valid_kv_len=31" in text
+        assert "mode=0b11" in text
+
+    def test_masked_softmax_assembly_roundtrip(self):
+        source = "\n".join([
+            "CONFIG_ATTN query_row_base=0, valid_kv_len=16, mode=0b10",
+            "MASKED_SOFTMAX src1=ACCUM[0], src2=ABUF[0], dst=WBUF[16], sreg=2, flags=0",
+            "MASKED_SOFTMAX_ATTNV src1=ACCUM[0], src2=ABUF[4], dst=WBUF[8], sreg=4, flags=0",
+        ])
+        prog1 = Assembler().assemble(source)
+        text = Disassembler().disassemble(prog1)
+        lines = [line.split('] ', 1)[1] for line in text.split('\n')]
+        prog2 = Assembler().assemble('\n'.join(lines))
+        assert prog1.instructions == prog2.instructions
+        assert "MASKED_SOFTMAX" in text
+        assert "MASKED_SOFTMAX_ATTNV" in text
+
     def test_dequant_add_roundtrip(self):
         prog = Assembler().assemble(
             "DEQUANT_ADD src1=ACCUM[0], src2=ABUF[4], dst=ABUF[8], sreg=6, flags=0"

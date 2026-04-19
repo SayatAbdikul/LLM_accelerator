@@ -43,6 +43,11 @@ def test_forward_1token_emits_decoder_config_and_attention_path():
     assert "matmul_qkt" in ops
     assert "softmax" in ops
     assert "matmul_attn_v" in ops
+    assert all(
+        node.attrs.get("masked") is True
+        for node in result.graph.nodes
+        if node.op == "matmul_qkt"
+    )
     assert result.graph.get_node("tok_embed").attrs["token_ids"] == [0]
     assert result.graph.get_node("pos_embed").attrs["position_ids"] == [0]
     assert result.graph.nodes[-1].name == "lm_head"

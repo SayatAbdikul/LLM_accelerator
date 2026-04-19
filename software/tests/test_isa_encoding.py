@@ -8,7 +8,8 @@ from taccel.isa.instructions import (
     NopInsn, HaltInsn, SyncInsn, ConfigTileInsn, SetScaleInsn,
     SetAddrLoInsn, SetAddrHiInsn, LoadInsn, StoreInsn, BufCopyInsn,
     MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn,
-    SoftmaxInsn, LayernormInsn, GeluInsn, SoftmaxAttnVInsn, DequantAddInsn,
+    SoftmaxInsn, LayernormInsn, GeluInsn, SoftmaxAttnVInsn,
+    ConfigAttnInsn, MaskedSoftmaxInsn, MaskedSoftmaxAttnVInsn, DequantAddInsn,
 )
 
 
@@ -72,6 +73,22 @@ class TestConfigInstructions:
     def test_config_tile_zero(self):
         dec = round_trip(ConfigTileInsn(M=0, N=0, K=0))
         assert dec.M == 0 and dec.N == 0 and dec.K == 0
+
+    def test_config_attn_roundtrip_boundaries(self):
+        for mode in range(4):
+            dec = round_trip(ConfigAttnInsn(
+                query_row_base=0xFFF,
+                valid_kv_len=0xFFF,
+                mode=mode,
+            ))
+            assert dec.query_row_base == 0xFFF
+            assert dec.valid_kv_len == 0xFFF
+            assert dec.mode == mode
+
+    def test_config_attn_reserved_bits_fault(self):
+        word = (Opcode.CONFIG_ATTN << 59) | 1
+        with pytest.raises(ValueError, match="reserved bits"):
+            decode(struct.pack(">Q", word))
 
 
 class TestAddressInstructions:
@@ -204,6 +221,13 @@ class TestRTypeInstructions:
                                       dst_buf=BUF_ABUF, dst_off=0, sreg=6))
         assert dec.sreg == 6
 
+    def test_masked_softmax(self):
+        dec = round_trip(MaskedSoftmaxInsn(src1_buf=BUF_ACCUM, src1_off=0,
+                                           dst_buf=BUF_WBUF, dst_off=64, sreg=6))
+        assert dec.src1_buf == BUF_ACCUM
+        assert dec.dst_buf == BUF_WBUF
+        assert dec.sreg == 6
+
     def test_layernorm(self):
         dec = round_trip(LayernormInsn(src1_buf=BUF_ABUF, src1_off=0,
                                         src2_buf=BUF_WBUF, src2_off=0,
@@ -217,6 +241,17 @@ class TestRTypeInstructions:
 
     def test_softmax_attnv(self):
         dec = round_trip(SoftmaxAttnVInsn(
+            src1_buf=BUF_ACCUM, src1_off=0,
+            src2_buf=BUF_ABUF, src2_off=64,
+            dst_buf=BUF_WBUF, dst_off=128, sreg=4,
+        ))
+        assert dec.src1_buf == BUF_ACCUM
+        assert dec.src2_buf == BUF_ABUF
+        assert dec.dst_buf == BUF_WBUF
+        assert dec.sreg == 4
+
+    def test_masked_softmax_attnv(self):
+        dec = round_trip(MaskedSoftmaxAttnVInsn(
             src1_buf=BUF_ACCUM, src1_off=0,
             src2_buf=BUF_ABUF, src2_off=64,
             dst_buf=BUF_WBUF, dst_off=128, sreg=4,

@@ -7,7 +7,7 @@ from ..isa.opcodes import BUF_ABUF, BUF_WBUF, BUF_ACCUM
 from ..isa.instructions import (
     MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn, SoftmaxInsn, LayernormInsn, GeluInsn,
     DequantAddInsn,
-    SoftmaxAttnVInsn,
+    SoftmaxAttnVInsn, ConfigAttnInsn, MaskedSoftmaxInsn, MaskedSoftmaxAttnVInsn,
     LoadInsn, StoreInsn, BufCopyInsn, SetAddrLoInsn, SetAddrHiInsn,
     ConfigTileInsn, SetScaleInsn, SyncInsn, NopInsn, HaltInsn, Instruction,
 )
@@ -282,6 +282,15 @@ class CodeGenerator:
     def _should_trace_ln1_padding_debug(self, node_name: str) -> bool:
         """Return True when a layernorm should emit padded input/output debug views."""
         return node_name == "block0_ln1"
+
+    def _attention_mask_mode_for_qkt(self, node: IRNode, M_pad: int) -> Optional[int]:
+        """Return CONFIG_ATTN mode for a masked QKT node, or None for legacy attention."""
+        if not node.attrs.get("masked", False):
+            return None
+        seq_len = node.output_shape[0]
+        if M_pad == seq_len:
+            return 0b10
+        return 0b11
 
     def _residual1_skip_name(self, out_proj_name: str) -> str:
         match = re.match(r"block(\d+)_out_proj$", out_proj_name)
@@ -1206,6 +1215,7 @@ class CodeGenerator:
         if q_alloc is None:
             q_alloc = self.mem.abuf.alloc(node.inputs[0], M_pad * head_dim)
 
+        attn_mode = self._attention_mask_mode_for_qkt(node, M_pad)
         fused_softmax_attnv = self._block_selected(node.name, self.fused_softmax_attnv_blocks)
         softmax_name = node.name.replace("_qkt", "_softmax")
         attn_v_name = node.name.replace("_qkt", "_attn_v")
@@ -1243,6 +1253,12 @@ class CodeGenerator:
             # CONFIG_TILE: M=1 strip (16 rows), N=full, K=head_dim
             self._emit(ConfigTileInsn(M=0, N=n_tiles - 1, K=k_tiles - 1))
             qkt_config_pc = len(self.instructions) - 1
+            if attn_mode is not None and not fused_softmax_attnv:
+                self._emit(ConfigAttnInsn(
+                    query_row_base=row_start,
+                    valid_kv_len=seq_len,
+                    mode=attn_mode,
+                ))
             if trace_qkt_debug:
                 # Snapshot ACCUM immediately before the QK^T MATMUL. CONFIG_TILE
                 # itself does not mutate SRAM, so tracing at this PC gives us the
@@ -1323,13 +1339,20 @@ class CodeGenerator:
 
             if fused_softmax_attnv:
                 self._emit(ConfigTileInsn(M=0, N=k_tiles - 1, K=n_tiles - 1))
+                if attn_mode is not None:
+                    self._emit(ConfigAttnInsn(
+                        query_row_base=row_start,
+                        valid_kv_len=seq_len,
+                        mode=attn_mode,
+                    ))
                 sreg = self._alloc_sreg_quad()
                 self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(qkt_in_scale)))
                 self._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0, imm16=_fp16_to_uint16(v_scale)))
                 self._emit(SetScaleInsn(sreg=sreg + 2, src_mode=0, imm16=_fp16_to_uint16(target_act_scale)))
                 self._emit(SetScaleInsn(sreg=sreg + 3, src_mode=0, imm16=_fp16_to_uint16(softmax_out_scale)))
                 strip_out_off = attn_v_alloc.offset_units + (s * TILE * K_pad) // UNIT
-                self._emit(SoftmaxAttnVInsn(
+                fused_cls = MaskedSoftmaxAttnVInsn if attn_mode is not None else SoftmaxAttnVInsn
+                self._emit(fused_cls(
                     src1_buf=BUF_ACCUM, src1_off=0,
                     src2_buf=BUF_ABUF, src2_off=v_alloc.offset_units,
                     dst_buf=BUF_WBUF, dst_off=strip_out_off,
@@ -1377,7 +1400,8 @@ class CodeGenerator:
                 self._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0,
                                         imm16=_fp16_to_uint16(softmax_out_scale)))
                 strip_wbuf_off = qkt_wbuf.offset_units + (s * TILE * M_pad) // UNIT
-                self._emit(SoftmaxInsn(
+                softmax_cls = MaskedSoftmaxInsn if attn_mode is not None else SoftmaxInsn
+                self._emit(softmax_cls(
                     src1_buf=BUF_ACCUM, src1_off=0,
                     dst_buf=BUF_WBUF, dst_off=strip_wbuf_off,
                     sreg=sreg,

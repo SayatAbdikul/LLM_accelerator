@@ -48,6 +48,12 @@ class MachineState:
 
         # Tile configuration: (M, N, K) in 16-element units (0-based encoded)
         self.tile_config = None  # Set by CONFIG_TILE
+        self.attn_context = {
+            "is_valid": False,
+            "query_row_base": 0,
+            "valid_kv_len": 0,
+            "mode": 0,
+        }
 
         # Program counter and execution state
         self.pc = 0
@@ -89,6 +95,12 @@ class MachineState:
         self.scale_regs[:] = 0
         self.addr_regs[:] = 0
         self.tile_config = None
+        self.attn_context = {
+            "is_valid": False,
+            "query_row_base": 0,
+            "valid_kv_len": 0,
+            "mode": 0,
+        }
         self.pc = 0
         self.current_pc = 0
         self.halted = False

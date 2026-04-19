@@ -30,12 +30,16 @@ from ..isa.instructions import (
     NopInsn, HaltInsn, SyncInsn, ConfigTileInsn, SetScaleInsn,
     SetAddrLoInsn, SetAddrHiInsn, LoadInsn, StoreInsn, BufCopyInsn,
     MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn,
-    SoftmaxInsn, LayernormInsn, GeluInsn, SoftmaxAttnVInsn, DequantAddInsn,
+    SoftmaxInsn, LayernormInsn, GeluInsn, SoftmaxAttnVInsn,
+    ConfigAttnInsn, MaskedSoftmaxInsn, MaskedSoftmaxAttnVInsn, DequantAddInsn,
 )
 from .state import MachineState
 from . import memory as mem
 from .systolic import execute_matmul
-from .sfu import execute_layernorm, execute_softmax, execute_gelu, execute_softmax_attnv
+from .sfu import (
+    execute_layernorm, execute_softmax, execute_gelu, execute_softmax_attnv,
+    execute_masked_softmax, execute_masked_softmax_attnv,
+)
 from .dma import execute_load, execute_store, execute_buf_copy
 from ..utils.int8_ops import clip_int8, clip_int32
 
@@ -379,6 +383,8 @@ class Simulator:
             self.state.cycle_count += 1
         elif op == Opcode.CONFIG_TILE:
             self.state.tile_config = (insn.M, insn.N, insn.K)
+        elif op == Opcode.CONFIG_ATTN:
+            self._exec_config_attn(insn)
         elif op == Opcode.SET_SCALE:
             self._exec_set_scale(insn)
         elif op == Opcode.SET_ADDR_LO:
@@ -405,8 +411,22 @@ class Simulator:
             self._exec_dequant_add(insn)
         elif op == Opcode.SOFTMAX:
             execute_softmax(self.state, insn)
+        elif op == Opcode.MASKED_SOFTMAX:
+            if self.state.tile_config is None:
+                raise ConfigError("CONFIG_TILE not set")
+            self._validate_attn_context_for_key_cols((self.state.tile_config[1] + 1) * 16)
+            execute_masked_softmax(self.state, insn)
         elif op == Opcode.SOFTMAX_ATTNV:
             virtual_payloads = execute_softmax_attnv(self.state, insn)
+            self._virtual_trace_payloads = {
+                node_name: dict(payload)
+                for node_name, payload in (virtual_payloads or {}).items()
+            }
+        elif op == Opcode.MASKED_SOFTMAX_ATTNV:
+            if self.state.tile_config is None:
+                raise ConfigError("CONFIG_TILE not set")
+            self._validate_attn_context_for_key_cols((self.state.tile_config[2] + 1) * 16)
+            virtual_payloads = execute_masked_softmax_attnv(self.state, insn)
             self._virtual_trace_payloads = {
                 node_name: dict(payload)
                 for node_name, payload in (virtual_payloads or {}).items()
@@ -417,6 +437,44 @@ class Simulator:
             execute_gelu(self.state, insn)
         else:
             raise IllegalOpcodeError(self.state.pc, b'\x00' * 8)
+
+    def _exec_config_attn(self, insn: ConfigAttnInsn):
+        """CONFIG_ATTN: set attention mask context for masked softmax ops."""
+        if self.state.tile_config is None:
+            raise ConfigError("CONFIG_TILE not set")
+        if insn.mode == 0:
+            raise ConfigError("CONFIG_ATTN mode 0b00 is reserved")
+        if insn.valid_kv_len == 0:
+            raise ConfigError("CONFIG_ATTN valid_kv_len must be > 0")
+        self.state.attn_context = {
+            "is_valid": True,
+            "query_row_base": int(insn.query_row_base),
+            "valid_kv_len": int(insn.valid_kv_len),
+            "mode": int(insn.mode),
+        }
+
+    def _validate_attn_context_for_key_cols(self, softmax_key_cols: int):
+        """Validate the active attention context against an opcode's key width."""
+        if self.state.tile_config is None:
+            raise ConfigError("CONFIG_TILE not set")
+        ctx = getattr(self.state, "attn_context", None) or {}
+        if not ctx.get("is_valid", False):
+            raise ConfigError("CONFIG_ATTN not set")
+        mode = int(ctx.get("mode", 0))
+        valid_kv_len = int(ctx.get("valid_kv_len", 0))
+        if mode == 0:
+            raise ConfigError("CONFIG_ATTN mode 0b00 is reserved")
+        if valid_kv_len == 0:
+            raise ConfigError("CONFIG_ATTN valid_kv_len must be > 0")
+        if mode in (0b01, 0b11) and softmax_key_cols < valid_kv_len:
+            raise ConfigError(
+                f"CONFIG_ATTN valid_kv_len={valid_kv_len} exceeds softmax key columns {softmax_key_cols}"
+            )
+        if mode == 0b10 and softmax_key_cols != valid_kv_len:
+            raise ConfigError(
+                f"CONFIG_ATTN pure-causal mode requires softmax key columns {softmax_key_cols} "
+                f"to equal valid_kv_len={valid_kv_len}"
+            )
 
     def _exec_set_scale(self, insn):
         """SET_SCALE: load FP16 into scale register."""

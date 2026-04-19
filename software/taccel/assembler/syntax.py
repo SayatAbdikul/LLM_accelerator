@@ -4,9 +4,9 @@ from typing import Optional, Tuple, List
 from ..isa.opcodes import Opcode, BUF_ABUF, BUF_WBUF, BUF_ACCUM
 from ..isa.instructions import (
     MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn, SoftmaxInsn, LayernormInsn, GeluInsn,
-    SoftmaxAttnVInsn, DequantAddInsn,
+    SoftmaxAttnVInsn, MaskedSoftmaxInsn, MaskedSoftmaxAttnVInsn, DequantAddInsn,
     LoadInsn, StoreInsn, BufCopyInsn, SetAddrLoInsn, SetAddrHiInsn,
-    ConfigTileInsn, SetScaleInsn, SyncInsn, NopInsn, HaltInsn, Instruction,
+    ConfigTileInsn, ConfigAttnInsn, SetScaleInsn, SyncInsn, NopInsn, HaltInsn, Instruction,
 )
 
 BUFFER_NAME_TO_ID = {"ABUF": BUF_ABUF, "WBUF": BUF_WBUF, "ACCUM": BUF_ACCUM}
@@ -36,6 +36,9 @@ MNEMONIC_MAP = {
     "GELU": Opcode.GELU,
     "SOFTMAX_ATTNV": Opcode.SOFTMAX_ATTNV,
     "DEQUANT_ADD": Opcode.DEQUANT_ADD,
+    "CONFIG_ATTN": Opcode.CONFIG_ATTN,
+    "MASKED_SOFTMAX": Opcode.MASKED_SOFTMAX,
+    "MASKED_SOFTMAX_ATTNV": Opcode.MASKED_SOFTMAX_ATTNV,
 }
 
 
@@ -123,6 +126,14 @@ def parse_line(line: str) -> Tuple[Optional[str], Optional[Instruction]]:
             K=params['K'] - 1,
         )
 
+    elif opcode == Opcode.CONFIG_ATTN:
+        params = _parse_kv_args(args_str)
+        return label, ConfigAttnInsn(
+            query_row_base=parse_int(params.get('query_row_base', '0')),
+            valid_kv_len=parse_int(params.get('valid_kv_len', '0')),
+            mode=parse_int(params.get('mode', '0')),
+        )
+
     elif opcode == Opcode.SET_SCALE:
         # SET_SCALE S0, imm=0x3000 or SET_SCALE S0, ABUF[0x100]
         parts = [p.strip() for p in args_str.split(',', 1)]
@@ -166,7 +177,7 @@ def parse_line(line: str) -> Tuple[Optional[str], Optional[Instruction]]:
 
     elif opcode in (Opcode.MATMUL, Opcode.REQUANT, Opcode.REQUANT_PC, Opcode.SCALE_MUL, Opcode.VADD,
                     Opcode.SOFTMAX, Opcode.LAYERNORM, Opcode.GELU, Opcode.SOFTMAX_ATTNV,
-                    Opcode.DEQUANT_ADD):
+                    Opcode.MASKED_SOFTMAX, Opcode.MASKED_SOFTMAX_ATTNV, Opcode.DEQUANT_ADD):
         return label, _parse_r_type(opcode, args_str)
 
     raise SyntaxError(f"Unhandled mnemonic: {mnemonic}")
@@ -209,6 +220,8 @@ def _parse_r_type(opcode: Opcode, args_str: str) -> Instruction:
         Opcode.SCALE_MUL: ScaleMulInsn, Opcode.VADD: VaddInsn,
         Opcode.SOFTMAX: SoftmaxInsn, Opcode.LAYERNORM: LayernormInsn,
         Opcode.GELU: GeluInsn, Opcode.SOFTMAX_ATTNV: SoftmaxAttnVInsn,
+        Opcode.MASKED_SOFTMAX: MaskedSoftmaxInsn,
+        Opcode.MASKED_SOFTMAX_ATTNV: MaskedSoftmaxAttnVInsn,
         Opcode.DEQUANT_ADD: DequantAddInsn,
     }
 

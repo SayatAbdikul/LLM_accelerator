@@ -1,6 +1,5 @@
 """Instruction dataclasses for all ISA instruction types."""
 from dataclasses import dataclass, field
-from typing import Optional
 from .opcodes import (
     Opcode, BUFFER_MAX_OFF, BUF_ABUF, BUF_WBUF, BUF_ACCUM, BUF_RESERVED,
 )
@@ -80,6 +79,11 @@ class SoftmaxInsn(RTypeInsn):
 
 
 @dataclass
+class MaskedSoftmaxInsn(RTypeInsn):
+    opcode: Opcode = field(default=Opcode.MASKED_SOFTMAX, init=False)
+
+
+@dataclass
 class LayernormInsn(RTypeInsn):
     opcode: Opcode = field(default=Opcode.LAYERNORM, init=False)
 
@@ -92,6 +96,11 @@ class GeluInsn(RTypeInsn):
 @dataclass
 class SoftmaxAttnVInsn(RTypeInsn):
     opcode: Opcode = field(default=Opcode.SOFTMAX_ATTNV, init=False)
+
+
+@dataclass
+class MaskedSoftmaxAttnVInsn(RTypeInsn):
+    opcode: Opcode = field(default=Opcode.MASKED_SOFTMAX_ATTNV, init=False)
 
 
 @dataclass
@@ -195,6 +204,23 @@ class ConfigTileInsn(Instruction):
         for name, val in [("M", self.M), ("N", self.N), ("K", self.K)]:
             if not (0 <= val <= 1023):
                 raise ValueError(f"{name} must be 0-1023 (encoded), got {val}")
+
+
+# --- ATTN-type instruction ---
+@dataclass
+class ConfigAttnInsn(Instruction):
+    opcode: Opcode = field(default=Opcode.CONFIG_ATTN, init=False)
+    query_row_base: int = 0
+    valid_kv_len: int = 0
+    mode: int = 0
+
+    def __post_init__(self):
+        if not (0 <= self.query_row_base <= 0xFFF):
+            raise ValueError(f"query_row_base must be 0-4095, got {self.query_row_base}")
+        if not (0 <= self.valid_kv_len <= 0xFFF):
+            raise ValueError(f"valid_kv_len must be 0-4095, got {self.valid_kv_len}")
+        if not (0 <= self.mode <= 0x3):
+            raise ValueError(f"mode must be 0-3, got {self.mode}")
 
 
 # --- S-type instructions ---
