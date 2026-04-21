@@ -1,10 +1,8 @@
 """Top-level compiler: PyTorch model → ProgramBinary."""
-import struct
 import numpy as np
 from typing import Any, Dict, Optional, List, Tuple
-from ..assembler.assembler import ProgramBinary
+from ..assembler.assembler import ProgramBinary, relocate_set_addr_pairs
 from ..isa.encoding import encode
-from ..isa.opcodes import Opcode, OPCODE_SHIFT, OPCODE_MASK, A_IMM28_SHIFT, MASK_28BIT
 from ..quantizer.quantize import quantize_weights, quantize_tensor
 from ..quantizer.scales import ScalePropagator
 from ..quantizer.calibrate import CalibrationResult, calibrate_model
@@ -564,21 +562,10 @@ class Compiler:
         # aligned to 16 bytes so instructions don't bleed into parameter data.
         data_base = (len(insn_bytes) + 15) & ~15
 
-        # Patch SET_ADDR_LO instructions: all DRAM addresses emitted by codegen are
-        # data-relative (offset from start of dram_blob).  Add data_base to make them
-        # DRAM-absolute (offset from start of the unified DRAM image).
-        # SET_ADDR_HI needs no patching because all data fits within 24 bits, so the
-        # high 28-bit half is always zero and adding data_base (<256 KB) still fits in
-        # the low 28 bits with no carry.
-        patched = bytearray(insn_bytes)
-        for i in range(0, len(patched), 8):
-            word = struct.unpack(">Q", patched[i:i + 8])[0]
-            opcode_val = (word >> OPCODE_SHIFT) & OPCODE_MASK
-            if opcode_val == Opcode.SET_ADDR_LO:
-                old_imm28 = (word >> A_IMM28_SHIFT) & MASK_28BIT
-                new_imm28 = (old_imm28 + data_base) & MASK_28BIT
-                word = (word & ~(MASK_28BIT << A_IMM28_SHIFT)) | (new_imm28 << A_IMM28_SHIFT)
-                patched[i:i + 8] = struct.pack(">Q", word)
+        # Patch SET_ADDR_LO/HI pairs: all DRAM addresses emitted by codegen are
+        # data-relative offsets from dram_blob. Add data_base to make them
+        # DRAM-absolute, carrying from the low 28 bits into SET_ADDR_HI.
+        patched = relocate_set_addr_pairs(insn_bytes, data_base)
 
         # input_offset: DRAM-absolute address where the host writes input patches
         input_patches_dram_off = codegen.dram_layout.get("__input_patches__", 0)

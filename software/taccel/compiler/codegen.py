@@ -3,6 +3,7 @@ import re
 import struct
 import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
+from ..assembler.assembler import RelocationSite, RuntimeConfigAttnSite, RuntimePatchSite
 from ..isa.opcodes import BUF_ABUF, BUF_WBUF, BUF_ACCUM
 from ..isa.instructions import (
     MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn, SoftmaxInsn, LayernormInsn, GeluInsn,
@@ -15,6 +16,7 @@ from .ir import IRNode, IRGraph
 from .tiler import tile_matmul, tile_qkt, tile_strip_mine, pad_dim, TILE
 from .memory_alloc import MemoryAllocator, Allocation
 from .model_config import ModelConfig, deit_tiny_config
+from .kv_cache import KVCacheLayout, normalize_kv_kind
 
 UNIT = 16
 
@@ -49,7 +51,9 @@ class CodeGenerator:
                  fused_softmax_attnv_accum_out_proj_blocks: Optional[set] = None,
                  requant_pc_weight_names: Optional[set] = None,
                  requant_pc_scale_tables: Optional[Dict[str, np.ndarray]] = None,
-                 model_config: Optional[ModelConfig] = None):
+                 model_config: Optional[ModelConfig] = None,
+                 stream_name: str = "prefill",
+                 kv_layout: Optional[KVCacheLayout] = None):
         """
         Args:
             weight_data: name → (quantized_data, per_channel_scales)
@@ -58,6 +62,10 @@ class CodeGenerator:
         """
         self.weight_data = weight_data
         self.config = model_config or deit_tiny_config()
+        if stream_name not in ("prefill", "decode"):
+            raise ValueError("stream_name must be 'prefill' or 'decode'")
+        self.stream_name = stream_name
+        self.kv_layout = kv_layout
         self.calibration_scales = calibration_scales
         self.prescaled_biases = prescaled_biases
         self.gelu_from_accum = gelu_from_accum
@@ -87,6 +95,9 @@ class CodeGenerator:
         self.trace_manifest: Dict[int, List[Dict[str, Any]]] = {}
         self.pending_accum_outputs: Dict[str, Dict[str, Any]] = {}
         self.precomputed_nodes: set = set()
+        self.relocation_sites: List[RelocationSite] = []
+        self.runtime_patch_sites: List[RuntimePatchSite] = []
+        self.runtime_config_attn_sites: List[RuntimeConfigAttnSite] = []
 
     def _dram_offset_required(self, name: str, context: str) -> int:
         """Return DRAM offset for a symbol or raise a clear error."""
@@ -215,6 +226,32 @@ class CodeGenerator:
     def _emit(self, insn: Instruction):
         self.instructions.append(insn)
 
+    def _record_addr_site(self, lo_pc: int, hi_pc: int, addr_reg: int, *,
+                          relocation_symbol: Optional[str] = None,
+                          runtime_patch_kind: Optional[str] = None,
+                          runtime_base_symbol: Optional[str] = None):
+        if relocation_symbol is not None:
+            self.relocation_sites.append(RelocationSite(
+                stream=self.stream_name,
+                local_lo_pc=lo_pc,
+                local_hi_pc=hi_pc,
+                addr_reg=addr_reg,
+                symbol=relocation_symbol,
+            ))
+        if runtime_patch_kind is not None:
+            if runtime_base_symbol is None:
+                raise ValueError("runtime_base_symbol is required for runtime patch sites")
+            self.runtime_patch_sites.append(RuntimePatchSite(
+                stream=self.stream_name,
+                kind=runtime_patch_kind,
+                local_lo_pc=lo_pc,
+                local_hi_pc=hi_pc,
+                absolute_lo_pc=0,
+                absolute_hi_pc=0,
+                addr_reg=addr_reg,
+                base_symbol=runtime_base_symbol,
+            ))
+
     def _record_trace_event(self, node_name: str, buf_id: int, offset_units: int,
                             mem_rows: int, mem_cols: int,
                             logical_rows: int, logical_cols: int,
@@ -283,14 +320,34 @@ class CodeGenerator:
         """Return True when a layernorm should emit padded input/output debug views."""
         return node_name == "block0_ln1"
 
-    def _attention_mask_mode_for_qkt(self, node: IRNode, M_pad: int) -> Optional[int]:
+    def _attention_mask_mode_for_qkt(self, node: IRNode, key_pad: int) -> Optional[int]:
         """Return CONFIG_ATTN mode for a masked QKT node, or None for legacy attention."""
         if not node.attrs.get("masked", False):
             return None
-        seq_len = node.output_shape[0]
-        if M_pad == seq_len:
+        if node.attrs.get("runtime_config_attn", False):
+            return 0b11
+        key_len = int(node.attrs.get("key_len", node.output_shape[1] if len(node.output_shape) > 1 else node.output_shape[0]))
+        if key_pad == key_len:
             return 0b10
         return 0b11
+
+    def _emit_config_attn_for_qkt(self, node: IRNode, *, row_start: int,
+                                  valid_kv_len: int, mode: int):
+        pc = len(self.instructions)
+        if node.attrs.get("runtime_config_attn", False):
+            self._emit(ConfigAttnInsn(query_row_base=0, valid_kv_len=1, mode=mode))
+            self.runtime_config_attn_sites.append(RuntimeConfigAttnSite(
+                stream=self.stream_name,
+                local_pc=pc,
+                absolute_pc=0,
+                mode=mode,
+            ))
+        else:
+            self._emit(ConfigAttnInsn(
+                query_row_base=row_start,
+                valid_kv_len=valid_kv_len,
+                mode=mode,
+            ))
 
     def _residual1_skip_name(self, out_proj_name: str) -> str:
         match = re.match(r"block(\d+)_out_proj$", out_proj_name)
@@ -323,6 +380,12 @@ class CodeGenerator:
             self._emit_embedding_lookup(node, default_table="transformer.wte.weight")
         elif op == "pos_embed_lookup":
             self._emit_embedding_lookup(node, default_table="transformer.wpe.weight")
+        elif op == "kv_store":
+            self._emit_kv_store(node)
+        elif op == "kv_load":
+            self._emit_kv_load(node)
+        elif op == "logits_store":
+            self._emit_logits_store(node)
         elif op == "cls_prepend":
             self._emit_cls_prepend(node)
         elif op == "pos_embed_add":
@@ -1139,9 +1202,11 @@ class CodeGenerator:
         After all strips, WBUF holds [208,208] INT8 = 43KB for downstream softmax.
         """
         head_idx = node.attrs["head_idx"]
-        seq_len = node.output_shape[0]
+        query_len = int(node.attrs.get("query_len", node.output_shape[0]))
+        key_len = int(node.attrs.get("key_len", node.output_shape[1] if len(node.output_shape) > 1 else query_len))
         head_dim = self.config.d_head
-        M_pad = pad_dim(seq_len)
+        M_pad = pad_dim(query_len)
+        N_pad = pad_dim(key_len)
         K_pad = pad_dim(head_dim)
         num_strips = M_pad // TILE  # 13 strips of 16 rows
         trace_qkt_debug = re.match(r"block\d+_head\d+_qkt$", node.name) is not None
@@ -1151,23 +1216,23 @@ class CodeGenerator:
         # BUF_COPY K_h → WBUF (transpose) to get K^T [64,208]
         k_alloc = self.mem.abuf.get(node.inputs[1])
         if k_alloc is None:
-            k_alloc = self.mem.abuf.alloc(node.inputs[1], M_pad * head_dim)
+            k_alloc = self.mem.abuf.alloc(node.inputs[1], N_pad * K_pad)
 
         # Zero out K rows for padding positions (197-207).
         # LN(zero_row) = layernorm_beta (non-zero), so K[padding] = W_k @ beta + b_k.
         # Zeroing removes this contribution so padding columns don't steer attention.
-        real_seq = node.output_shape[0]
-        if M_pad > real_seq:
-            pad_rows = M_pad - real_seq
-            k_pad_units = k_alloc.offset_units + (real_seq * K_pad) // UNIT
+        real_key_len = key_len
+        if N_pad > real_key_len:
+            pad_rows = N_pad - real_key_len
+            k_pad_units = k_alloc.offset_units + (real_key_len * K_pad) // UNIT
             zero_pad_dram = self._dram_offset_required("__zero_pad__", "loading K padding mask")
             self._emit_dma_load(BUF_ABUF, k_pad_units, pad_rows * K_pad, 3,
                                 zero_pad_dram)
             self._emit(SyncInsn(resource_mask=0b001))
 
-        src_rows = M_pad // TILE
-        length_units = (M_pad * K_pad) // UNIT
-        kt_wbuf = self.mem.wbuf.alloc(f"kt_head{head_idx}", K_pad * M_pad)
+        src_rows = N_pad // TILE
+        length_units = (N_pad * K_pad) // UNIT
+        kt_wbuf = self.mem.wbuf.alloc(f"kt_head{head_idx}", K_pad * N_pad)
         self._emit(BufCopyInsn(
             src_buf=BUF_ABUF, src_off=k_alloc.offset_units,
             dst_buf=BUF_WBUF, dst_off=kt_wbuf.offset_units,
@@ -1185,13 +1250,13 @@ class CodeGenerator:
                 f"{node.name}__key_padded_input",
                 BUF_ABUF,
                 k_alloc.offset_units,
-                M_pad,
+                N_pad,
                 K_pad,
-                M_pad,
+                N_pad,
                 K_pad,
                 "int8",
                 act_scale_k,
-                full_rows=M_pad,
+                full_rows=N_pad,
                 full_cols=K_pad,
                 pc=key_transpose_pc,
             )
@@ -1200,43 +1265,46 @@ class CodeGenerator:
                 BUF_WBUF,
                 kt_wbuf.offset_units,
                 K_pad,
-                M_pad,
+                N_pad,
                 K_pad,
-                M_pad,
+                N_pad,
                 "int8",
                 act_scale_k,
                 full_rows=K_pad,
-                full_cols=M_pad,
+                full_cols=N_pad,
                 pc=key_transpose_pc,
             )
         self._emit(SyncInsn(resource_mask=0b001))
 
         q_alloc = self.mem.abuf.get(node.inputs[0])
         if q_alloc is None:
-            q_alloc = self.mem.abuf.alloc(node.inputs[0], M_pad * head_dim)
+            q_alloc = self.mem.abuf.alloc(node.inputs[0], M_pad * K_pad)
 
-        attn_mode = self._attention_mask_mode_for_qkt(node, M_pad)
+        attn_mode = self._attention_mask_mode_for_qkt(node, N_pad)
         fused_softmax_attnv = self._block_selected(node.name, self.fused_softmax_attnv_blocks)
         softmax_name = node.name.replace("_qkt", "_softmax")
         attn_v_name = node.name.replace("_qkt", "_attn_v")
         value_name = node.name.replace("_qkt", "_value")
 
-        n_tiles = M_pad // TILE
+        n_tiles = N_pad // TILE
         k_tiles = K_pad // TILE
         # C1: softmax consumes raw ACCUM values with this dequant scale.
         # qkt_in_scale = q_scale * k_scale * (1/sqrt(d_head)).
-        qkt_in_scale = self.calibration_scales.get(
-            node.name, act_scale_q * act_scale_k * node.attrs.get("scale", 0.125)
-        )
+        # Do NOT look up node.name here: _emit_qkt itself writes that key
+        # (calibration_scales[node.name] = softmax_out_scale) so that
+        # _emit_attn_v can recover the softmax output scale.  If prefill
+        # and decode codegens share the same dict, the decode codegen would
+        # read back softmax_out_scale and use it as qkt_in_scale, which is
+        # ~1000x too large and collapses softmax to a degenerate distribution.
+        qkt_in_scale = act_scale_q * act_scale_k * node.attrs.get("scale", 0.125)
         softmax_out_scale = self.calibration_scales.get(softmax_name, 1.0 / 127.0)
         if fused_softmax_attnv:
             v_alloc = self.mem.abuf.get(value_name)
             if v_alloc is None:
-                v_alloc = self.mem.abuf.alloc(value_name, M_pad * K_pad)
-            real_seq = node.output_shape[0]
-            if M_pad > real_seq:
-                pad_rows = M_pad - real_seq
-                v_pad_units = v_alloc.offset_units + (real_seq * K_pad) // UNIT
+                v_alloc = self.mem.abuf.alloc(value_name, N_pad * K_pad)
+            if N_pad > real_key_len:
+                pad_rows = N_pad - real_key_len
+                v_pad_units = v_alloc.offset_units + (real_key_len * K_pad) // UNIT
                 zero_pad_dram = self._dram_offset_required("__zero_pad__", "loading V padding mask")
                 self._emit_dma_load(BUF_ABUF, v_pad_units, pad_rows * K_pad, 3, zero_pad_dram)
                 self._emit(SyncInsn(resource_mask=0b001))
@@ -1245,20 +1313,21 @@ class CodeGenerator:
             v_scale = self.calibration_scales.get(value_name, 6.0 / 127.0)
         else:
             # Output: full [208,208] INT8 softmax probabilities in WBUF
-            qkt_wbuf = self.mem.wbuf.alloc(node.name, M_pad * M_pad)
+            qkt_wbuf = self.mem.wbuf.alloc(node.name, M_pad * N_pad)
 
         for s in range(num_strips):
             row_start = s * TILE
-            logical_rows = max(0, min(TILE, seq_len - row_start))
+            logical_rows = max(0, min(TILE, query_len - row_start))
             # CONFIG_TILE: M=1 strip (16 rows), N=full, K=head_dim
             self._emit(ConfigTileInsn(M=0, N=n_tiles - 1, K=k_tiles - 1))
             qkt_config_pc = len(self.instructions) - 1
             if attn_mode is not None and not fused_softmax_attnv:
-                self._emit(ConfigAttnInsn(
-                    query_row_base=row_start,
-                    valid_kv_len=seq_len,
+                self._emit_config_attn_for_qkt(
+                    node,
+                    row_start=row_start,
+                    valid_kv_len=key_len,
                     mode=attn_mode,
-                ))
+                )
             if trace_qkt_debug:
                 # Snapshot ACCUM immediately before the QK^T MATMUL. CONFIG_TILE
                 # itself does not mutate SRAM, so tracing at this PC gives us the
@@ -1269,14 +1338,14 @@ class CodeGenerator:
                     BUF_ACCUM,
                     0,
                     TILE,
-                    M_pad,
+                    N_pad,
                     logical_rows,
-                    seq_len,
+                    key_len,
                     "int32",
                     qkt_in_scale,
                     row_start=row_start,
-                    full_rows=seq_len,
-                    full_cols=seq_len,
+                    full_rows=query_len,
+                    full_cols=key_len,
                     pc=qkt_config_pc,
                 )
                 self._record_trace_event(
@@ -1284,14 +1353,14 @@ class CodeGenerator:
                     BUF_ACCUM,
                     0,
                     TILE,
-                    M_pad,
+                    N_pad,
                     logical_rows,
-                    seq_len,
+                    key_len,
                     "int32",
                     qkt_in_scale,
                     row_start=row_start,
-                    full_rows=seq_len,
-                    full_cols=seq_len,
+                    full_rows=query_len,
+                    full_cols=key_len,
                     pc=qkt_config_pc,
                     capture_phase="retire_plus_1",
                 )
@@ -1317,7 +1386,7 @@ class CodeGenerator:
                     "int8",
                     act_scale_q,
                     row_start=row_start,
-                    full_rows=seq_len,
+                    full_rows=query_len,
                     full_cols=head_dim,
                     pc=qkt_matmul_pc,
                 )
@@ -1327,24 +1396,25 @@ class CodeGenerator:
                 BUF_ACCUM,
                 0,
                 TILE,
-                M_pad,
+                N_pad,
                 logical_rows,
-                seq_len,
+                key_len,
                 "int32",
                 qkt_in_scale,
                 row_start=row_start,
-                full_rows=seq_len,
-                full_cols=seq_len,
+                full_rows=query_len,
+                full_cols=key_len,
             )
 
             if fused_softmax_attnv:
                 self._emit(ConfigTileInsn(M=0, N=k_tiles - 1, K=n_tiles - 1))
                 if attn_mode is not None:
-                    self._emit(ConfigAttnInsn(
-                        query_row_base=row_start,
-                        valid_kv_len=seq_len,
+                    self._emit_config_attn_for_qkt(
+                        node,
+                        row_start=row_start,
+                        valid_kv_len=key_len,
                         mode=attn_mode,
-                    ))
+                    )
                 sreg = self._alloc_sreg_quad()
                 self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(qkt_in_scale)))
                 self._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0, imm16=_fp16_to_uint16(v_scale)))
@@ -1365,14 +1435,14 @@ class CodeGenerator:
                     BUF_WBUF,
                     0,
                     TILE,
-                    M_pad,
+                    N_pad,
                     logical_rows,
-                    seq_len,
+                    key_len,
                     "int8",
                     softmax_out_scale,
                     row_start=row_start,
-                    full_rows=seq_len,
-                    full_cols=seq_len,
+                    full_rows=query_len,
+                    full_cols=key_len,
                     pc=fused_pc,
                 )
                 self.trace_manifest.setdefault(fused_pc, [])[-1]["source"] = "virtual"
@@ -1387,7 +1457,7 @@ class CodeGenerator:
                     "int8",
                     target_act_scale,
                     row_start=row_start,
-                    full_rows=seq_len,
+                    full_rows=query_len,
                     full_cols=head_dim,
                     pc=fused_pc,
                 )
@@ -1399,7 +1469,7 @@ class CodeGenerator:
                                         imm16=_fp16_to_uint16(qkt_in_scale)))
                 self._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0,
                                         imm16=_fp16_to_uint16(softmax_out_scale)))
-                strip_wbuf_off = qkt_wbuf.offset_units + (s * TILE * M_pad) // UNIT
+                strip_wbuf_off = qkt_wbuf.offset_units + (s * TILE * N_pad) // UNIT
                 softmax_cls = MaskedSoftmaxInsn if attn_mode is not None else SoftmaxInsn
                 self._emit(softmax_cls(
                     src1_buf=BUF_ACCUM, src1_off=0,
@@ -1413,14 +1483,14 @@ class CodeGenerator:
                         BUF_ACCUM,
                         0,
                         TILE,
-                        M_pad,
+                        N_pad,
                         logical_rows,
-                        seq_len,
+                        key_len,
                         "int32",
                         qkt_in_scale,
                         row_start=row_start,
-                        full_rows=seq_len,
-                        full_cols=seq_len,
+                        full_rows=query_len,
+                        full_cols=key_len,
                         pc=softmax_pc,
                     )
                     self._record_trace_event(
@@ -1428,14 +1498,14 @@ class CodeGenerator:
                         BUF_ACCUM,
                         0,
                         TILE,
-                        M_pad,
+                        N_pad,
                         logical_rows,
-                        seq_len,
+                        key_len,
                         "int32",
                         qkt_in_scale,
                         row_start=row_start,
-                        full_rows=seq_len,
-                        full_cols=seq_len,
+                        full_rows=query_len,
+                        full_cols=key_len,
                         pc=softmax_pc,
                         capture_phase="retire_plus_1",
                     )
@@ -1445,14 +1515,14 @@ class CodeGenerator:
                     BUF_WBUF,
                     strip_wbuf_off,
                     TILE,
-                    M_pad,
+                    N_pad,
                     logical_rows,
-                    seq_len,
+                    key_len,
                     "int8",
                     softmax_out_scale,
                     row_start=row_start,
-                    full_rows=seq_len,
-                    full_cols=seq_len,
+                    full_rows=query_len,
+                    full_cols=key_len,
                 )
 
         self.mem.wbuf.free(f"kt_head{head_idx}")
@@ -1470,28 +1540,29 @@ class CodeGenerator:
             return
 
         head_idx = node.attrs["head_idx"]
-        seq_len = node.output_shape[0]
+        query_len = int(node.attrs.get("query_len", node.output_shape[0]))
+        key_len = int(node.attrs.get("key_len", node.attrs.get("attn_key_len", query_len)))
         head_dim = node.output_shape[1]
-        M_pad = pad_dim(seq_len)
+        M_pad = pad_dim(query_len)
+        Kseq_pad = pad_dim(key_len)
         N_pad = pad_dim(head_dim)
 
         # attn scores in WBUF under the softmax node name
         attn_alloc = self.mem.wbuf.get(node.inputs[0])
         if attn_alloc is None:
-            attn_alloc = self.mem.wbuf.alloc(node.inputs[0], M_pad * M_pad)
+            attn_alloc = self.mem.wbuf.alloc(node.inputs[0], M_pad * Kseq_pad)
 
         # V_h is the per-head ABUF allocation
         v_alloc = self.mem.abuf.get(node.inputs[1])
         if v_alloc is None:
-            v_alloc = self.mem.abuf.alloc(node.inputs[1], M_pad * N_pad)
+            v_alloc = self.mem.abuf.alloc(node.inputs[1], Kseq_pad * N_pad)
 
         # Zero out V rows for padding positions (197-207).
         # Same reason as K: LN(zero_row) = beta propagates non-zero values into V.
         # Zeroing V ensures padding positions contribute nothing to attn@V output.
-        real_seq = node.output_shape[0]
-        if M_pad > real_seq:
-            pad_rows = M_pad - real_seq
-            v_pad_units = v_alloc.offset_units + (real_seq * N_pad) // UNIT
+        if Kseq_pad > key_len:
+            pad_rows = Kseq_pad - key_len
+            v_pad_units = v_alloc.offset_units + (key_len * N_pad) // UNIT
             zero_pad_dram = self._dram_offset_required("__zero_pad__", "loading V padding mask")
             self._emit_dma_load(BUF_ABUF, v_pad_units, pad_rows * N_pad, 3,
                                 zero_pad_dram)
@@ -1499,7 +1570,7 @@ class CodeGenerator:
 
         m_tiles = M_pad // TILE
         n_tiles = N_pad // TILE
-        k_tiles = M_pad // TILE
+        k_tiles = Kseq_pad // TILE
         self._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=k_tiles - 1))
 
         # MATMUL: attn(WBUF) @ V(ABUF) → ACCUM
@@ -1539,7 +1610,7 @@ class CodeGenerator:
             out_alloc.offset_units,
             M_pad,
             N_pad,
-            seq_len,
+            query_len,
             head_dim,
             "int8",
             target_act_scale,
@@ -1890,7 +1961,10 @@ class CodeGenerator:
         if d_model_pad != d_model:
             raise ValueError("Stage 1 embedding lookup requires d_model to be 16-aligned")
 
-        if "row_indices" in node.attrs:
+        runtime_patch = bool(node.attrs.get("runtime_patch", False))
+        if runtime_patch:
+            row_indices = [0] * seq_len
+        elif "row_indices" in node.attrs:
             row_indices = list(node.attrs["row_indices"])
         elif "token_ids" in node.attrs:
             row_indices = list(node.attrs["token_ids"])
@@ -1905,12 +1979,21 @@ class CodeGenerator:
         table_dram = self._dram_offset_required(table_name, f"loading embedding table '{table_name}'")
         row_units = d_model_pad // UNIT
         for row_idx, table_row in enumerate(row_indices):
+            runtime_kind = None
+            runtime_base = None
+            dram_addr = table_dram + int(table_row) * d_model_pad
+            if runtime_patch:
+                runtime_kind = "token_embed" if node.op == "embed_lookup" else "pos_embed"
+                runtime_base = table_name
+                dram_addr = 0
             self._emit_dma_load(
                 BUF_ABUF,
                 out_alloc.offset_units + row_idx * row_units,
                 d_model_pad,
                 0,
-                table_dram + int(table_row) * d_model_pad,
+                dram_addr,
+                runtime_patch_kind=runtime_kind,
+                runtime_base_symbol=runtime_base,
             )
             self._emit(SyncInsn(resource_mask=0b001))
         pad_rows = pad_dim(seq_len) - seq_len
@@ -1935,6 +2018,185 @@ class CodeGenerator:
             "int8",
             self.calibration_scales.get(node.name, 6.0 / 127.0),
         )
+
+    def _kv_entry_for_node(self, node: IRNode):
+        if self.kv_layout is None:
+            raise ValueError("kv_layout is required for kv_load/kv_store nodes")
+        return self.kv_layout.entry(
+            int(node.attrs["layer"]),
+            normalize_kv_kind(node.attrs["kind"]),
+            int(node.attrs["head"]),
+        )
+
+    def _kv_transfer_bytes(self, node: IRNode, *, decode_default: bool) -> int:
+        if "xfer_bytes" in node.attrs:
+            return int(node.attrs["xfer_bytes"])
+        tokens = int(node.attrs.get("tokens", 1 if decode_default else node.attrs.get("seq_len", 1)))
+        return tokens * self.config.d_head
+
+    def _kv_source_location(self, node: IRNode) -> Tuple[int, int]:
+        if "src_buf" in node.attrs and "src_off_units" in node.attrs:
+            return int(node.attrs["src_buf"]), int(node.attrs["src_off_units"])
+        if not node.inputs:
+            raise ValueError(f"{node.name} requires an input allocation or src_buf/src_off_units attrs")
+        alloc = self.mem.abuf.get(node.inputs[0])
+        if alloc is None:
+            raise KeyError(f"Missing ABUF allocation '{node.inputs[0]}' for {node.name}")
+        return alloc.buf_id, alloc.offset_units
+
+    def _emit_kv_store(self, node: IRNode):
+        entry = self._kv_entry_for_node(node)
+        src_buf, src_off = self._kv_source_location(node)
+        decode_mode = bool(node.attrs.get("decode", self.stream_name == "decode"))
+        xfer_bytes = self._kv_transfer_bytes(node, decode_default=decode_mode)
+        addr_reg = int(node.attrs.get("addr_reg", 2))
+        if decode_mode:
+            self._emit_dma_store(
+                src_buf,
+                src_off,
+                xfer_bytes,
+                addr_reg,
+                0,
+                dram_off_units=entry.dram_off_units,
+                runtime_patch_kind="kv_base",
+                runtime_base_symbol=entry.base_symbol,
+            )
+        else:
+            self._emit_dma_store(
+                src_buf,
+                src_off,
+                xfer_bytes,
+                addr_reg,
+                0,
+                dram_off_units=entry.dram_off_units,
+                relocation_symbol=entry.base_symbol,
+            )
+        self._emit(SyncInsn(resource_mask=0b001))
+
+    def _emit_kv_load(self, node: IRNode):
+        entry = self._kv_entry_for_node(node)
+        decode_mode = bool(node.attrs.get("decode", self.stream_name == "decode"))
+        xfer_bytes = self._kv_transfer_bytes(node, decode_default=decode_mode)
+        addr_reg = int(node.attrs.get("addr_reg", 2))
+        dst_buf = int(node.attrs.get("dst_buf", BUF_ABUF))
+        if "dst_off_units" in node.attrs:
+            dst_off = int(node.attrs["dst_off_units"])
+        else:
+            alloc_bytes = xfer_bytes
+            if len(node.output_shape) == 2:
+                rows = pad_dim(int(node.output_shape[0]))
+                cols = pad_dim(int(node.output_shape[1]))
+                alloc_bytes = max(alloc_bytes, rows * cols)
+            alloc = self.mem.abuf.alloc(node.name, alloc_bytes)
+            dst_off = alloc.offset_units
+        tokens = int(node.attrs.get("tokens", 1))
+        if decode_mode and tokens > 1:
+            # Full-context kv_load (tokens = seq_len): must always read from
+            # position 0 so the QKT sees K[0..seq_len-1].  kv_store uses
+            # kv_base to write the *current* token at the right position;
+            # kv_load must NOT inherit that offset or it would skip position 0
+            # and feed stale garbage columns to the QKT.
+            self._emit_dma_load(
+                dst_buf,
+                dst_off,
+                xfer_bytes,
+                addr_reg,
+                0,
+                dram_off_units=entry.dram_off_units,
+                relocation_symbol=entry.base_symbol,
+            )
+        elif decode_mode:
+            # Single-token kv_load (tokens = 1): reads one specific token at
+            # the position indicated by kv_base (position-indexed access).
+            self._emit_dma_load(
+                dst_buf,
+                dst_off,
+                xfer_bytes,
+                addr_reg,
+                0,
+                dram_off_units=entry.dram_off_units,
+                runtime_patch_kind="kv_base",
+                runtime_base_symbol=entry.base_symbol,
+            )
+        else:
+            self._emit_dma_load(
+                dst_buf,
+                dst_off,
+                xfer_bytes,
+                addr_reg,
+                0,
+                dram_off_units=entry.dram_off_units,
+                relocation_symbol=entry.base_symbol,
+            )
+        self._emit(SyncInsn(resource_mask=0b001))
+
+    def _emit_logits_store(self, node: IRNode):
+        """Store a one-row INT8 logits tensor to the ProgramBundle logits region."""
+        if not node.inputs:
+            raise ValueError(f"{node.name} requires a source tensor input")
+        source_name = node.inputs[0]
+        source_shape = tuple(node.attrs.get("source_shape", node.output_shape))
+        if len(source_shape) != 2:
+            raise ValueError(f"{node.name} requires a 2D source_shape/output_shape, got {source_shape}")
+
+        logical_rows = int(source_shape[0])
+        logical_cols = int(source_shape[1])
+        if logical_rows <= 0 or logical_cols <= 0:
+            raise ValueError(f"{node.name} source shape must be positive, got {source_shape}")
+        cols_pad = pad_dim(logical_cols)
+        default_row = logical_rows - 1 if self.stream_name == "prefill" else 0
+        row_index = int(node.attrs.get("row_index", default_row))
+        store_rows = int(node.attrs.get("store_rows", 1))
+        if row_index < 0 or row_index + store_rows > logical_rows:
+            raise ValueError(
+                f"{node.name} row range [{row_index}, {row_index + store_rows}) "
+                f"exceeds logical row count {logical_rows}"
+            )
+        if store_rows <= 0:
+            raise ValueError(f"{node.name} store_rows must be positive")
+
+        size_bytes = int(node.attrs.get("xfer_bytes", store_rows * cols_pad))
+        addr_reg = int(node.attrs.get("addr_reg", 3))
+        symbol = str(node.attrs.get("symbol", f"{self.stream_name}_logits_offset"))
+        row_byte_offset = row_index * cols_pad
+
+        staging_name = None
+        if "src_buf" in node.attrs and "src_off_units" in node.attrs:
+            src_buf = int(node.attrs["src_buf"])
+            src_off = int(node.attrs["src_off_units"]) + row_byte_offset // UNIT
+        elif source_name in self.dram_temp_outputs:
+            # Strip-mined producers leave their full output in DRAM temp. Load the
+            # requested row window back into ABUF before storing to the logits region.
+            staging_name = f"{node.name}_staging"
+            staging = self.mem.abuf.alloc(staging_name, size_bytes)
+            self._emit_dma_load(
+                BUF_ABUF,
+                staging.offset_units,
+                size_bytes,
+                addr_reg,
+                self.dram_temp_outputs[source_name] + row_byte_offset,
+            )
+            self._emit(SyncInsn(resource_mask=0b001))
+            src_buf = BUF_ABUF
+            src_off = staging.offset_units
+        else:
+            alloc = self.mem.abuf.get(source_name)
+            if alloc is None:
+                raise KeyError(f"Missing ABUF allocation '{source_name}' for {node.name}")
+            src_buf = alloc.buf_id
+            src_off = alloc.offset_units + row_byte_offset // UNIT
+
+        self._emit_dma_store(
+            src_buf,
+            src_off,
+            size_bytes,
+            addr_reg,
+            0,
+            relocation_symbol=symbol,
+        )
+        self._emit(SyncInsn(resource_mask=0b001))
+        if staging_name is not None:
+            self.mem.abuf.free(staging_name)
 
     def _emit_cls_prepend(self, node: IRNode):
         """Emit CLS token prepend: load CLS to ABUF[0], then DMA patches to rows 1-196."""
@@ -2084,27 +2346,57 @@ class CodeGenerator:
             self.mem.abuf._free = [(new_offset, self.mem.abuf.capacity_units - new_offset)]
 
     def _emit_dma_load(self, buf_id: int, sram_off_units: int, size_bytes: int,
-                       addr_reg: int, dram_byte_offset: int):
+                       addr_reg: int, dram_byte_offset: int, *,
+                       dram_off_units: int = 0,
+                       relocation_symbol: Optional[str] = None,
+                       runtime_patch_kind: Optional[str] = None,
+                       runtime_base_symbol: Optional[str] = None):
         """Emit SET_ADDR + LOAD sequence."""
+        lo_pc = len(self.instructions)
         self.instructions.extend(_set_addr(addr_reg, dram_byte_offset))
+        if relocation_symbol is None and runtime_patch_kind is None:
+            relocation_symbol = "data_base"
+        self._record_addr_site(
+            lo_pc,
+            lo_pc + 1,
+            addr_reg,
+            relocation_symbol=relocation_symbol,
+            runtime_patch_kind=runtime_patch_kind,
+            runtime_base_symbol=runtime_base_symbol,
+        )
         xfer_units = (size_bytes + UNIT - 1) // UNIT
         self._emit(LoadInsn(
             buf_id=buf_id,
             sram_off=sram_off_units,
             xfer_len=min(xfer_units, 0xFFFF),
             addr_reg=addr_reg,
-            dram_off=0,
+            dram_off=dram_off_units,
         ))
 
     def _emit_dma_store(self, buf_id: int, sram_off_units: int, size_bytes: int,
-                        addr_reg: int, dram_byte_offset: int):
+                        addr_reg: int, dram_byte_offset: int, *,
+                        dram_off_units: int = 0,
+                        relocation_symbol: Optional[str] = None,
+                        runtime_patch_kind: Optional[str] = None,
+                        runtime_base_symbol: Optional[str] = None):
         """Emit SET_ADDR + STORE sequence."""
+        lo_pc = len(self.instructions)
         self.instructions.extend(_set_addr(addr_reg, dram_byte_offset))
+        if relocation_symbol is None and runtime_patch_kind is None:
+            relocation_symbol = "data_base"
+        self._record_addr_site(
+            lo_pc,
+            lo_pc + 1,
+            addr_reg,
+            relocation_symbol=relocation_symbol,
+            runtime_patch_kind=runtime_patch_kind,
+            runtime_base_symbol=runtime_base_symbol,
+        )
         xfer_units = (size_bytes + UNIT - 1) // UNIT
         self._emit(StoreInsn(
             buf_id=buf_id,
             sram_off=sram_off_units,
             xfer_len=min(xfer_units, 0xFFFF),
             addr_reg=addr_reg,
-            dram_off=0,
+            dram_off=dram_off_units,
         ))

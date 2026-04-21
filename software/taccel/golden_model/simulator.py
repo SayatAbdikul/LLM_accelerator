@@ -24,6 +24,7 @@ executing HALT) and sets a fault status register.
 """
 import numpy as np
 from typing import Any, Dict, Optional, Set
+from ..assembler.assembler import ProgramBundle
 from ..isa.encoding import decode
 from ..isa.opcodes import Opcode, BUF_ABUF, BUF_WBUF, BUF_ACCUM
 from ..isa.instructions import (
@@ -74,10 +75,12 @@ class Simulator:
         self.trace_meta: Dict[str, Dict[str, object]] = {}
         self.trace_raw_events: list[Dict[str, Any]] = []
         self._virtual_trace_payloads: Dict[str, Dict[str, object]] = {}
+        self.bundle: Optional[ProgramBundle] = None
 
     def load_program(self, program):
         """Load a ProgramBinary into the simulator."""
         self.program = program
+        self.bundle = None
         self.state.pc = program.entry_point
         self.state.halted = False
         self.trace_manifest = getattr(program, "trace_manifest", {}) or {}
@@ -111,6 +114,83 @@ class Simulator:
                 if len(program.data) > len(self.state.dram):
                     self.state.dram = bytearray(len(program.data) + 1024 * 1024)
                 self.state.dram[:len(program.data)] = program.data
+
+    def _ensure_dram_capacity(self, required_bytes: int, *,
+                              strict_dram_size: bool = False,
+                              max_dram_bytes: int = 1 << 30) -> None:
+        if required_bytes <= len(self.state.dram):
+            return
+        if strict_dram_size:
+            raise SimulatorError(
+                f"Program requires {required_bytes} DRAM bytes, "
+                f"but strict DRAM size is {len(self.state.dram)} bytes"
+            )
+        if required_bytes > max_dram_bytes:
+            raise SimulatorError(
+                f"Program requires {required_bytes} DRAM bytes, exceeding cap {max_dram_bytes}"
+            )
+        self.state.dram = bytearray(required_bytes)
+
+    def _reset_trace_state(self) -> None:
+        self.trace_tensors = {}
+        self.trace_raw_tensors = {}
+        self.trace_saturation = {}
+        self.trace_meta = {}
+        self.trace_raw_events = []
+        self._virtual_trace_payloads = {}
+
+    def _reset_volatile_execution_state(self, entry_pc: int) -> None:
+        self.state.pc = int(entry_pc)
+        self.state.current_pc = int(entry_pc)
+        self.state.halted = False
+        self.state.tile_config = None
+        self.state.attn_context = {
+            "is_valid": False,
+            "query_row_base": 0,
+            "valid_kv_len": 0,
+            "mode": 0,
+        }
+        self.state.scale_regs[:] = 0
+        self.state.addr_regs[:] = 0
+        self._virtual_trace_payloads = {}
+
+    def load_bundle(self, bundle: ProgramBundle, *,
+                    strict_dram_size: bool = False,
+                    max_dram_bytes: int = 1 << 30) -> None:
+        """Load a ProgramBundle into DRAM with idempotent fresh-image relocation."""
+        image = bundle.materialize(reset_runtime=True)
+        self._ensure_dram_capacity(
+            bundle.required_dram_bytes,
+            strict_dram_size=strict_dram_size,
+            max_dram_bytes=max_dram_bytes,
+        )
+        self.state.dram[:bundle.required_dram_bytes] = image
+        self.bundle = bundle
+        self.program = bundle
+        self.trace_manifest = {}
+        self.runtime_twin_specs = {}
+        self.state.runtime_twin_specs = {}
+        self._reset_trace_state()
+        self._reset_volatile_execution_state(bundle.prefill_pc)
+
+    def run_program(self, bundle: ProgramBundle, name: str,
+                    max_instructions: int = 10_000_000) -> int:
+        """Run one ProgramBundle stream while preserving persistent memory."""
+        if name not in ("prefill", "decode"):
+            raise ValueError("ProgramBundle stream name must be 'prefill' or 'decode'")
+        if getattr(self, "bundle", None) is not bundle:
+            self.load_bundle(bundle)
+
+        stream = bundle.stream_bytes(name)
+        stream_offset = (
+            bundle.prefill_instrs_offset if name == "prefill"
+            else bundle.decode_instrs_offset
+        )
+        self.state.dram[stream_offset:stream_offset + len(stream)] = stream
+        entry_pc = bundle.prefill_pc if name == "prefill" else bundle.decode_pc
+        self.program = bundle
+        self._reset_volatile_execution_state(entry_pc)
+        return self.run(max_instructions=max_instructions)
 
     def run(self, max_instructions: int = 10_000_000):
         """Run until HALT or max instructions."""

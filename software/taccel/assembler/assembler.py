@@ -1,11 +1,11 @@
 """Two-pass assembler: text assembly → ProgramBinary."""
 import json
 import struct
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field, replace
+from typing import Any, Dict, List, Optional, Union
 from .syntax import parse_line
-from ..isa.encoding import encode
-from ..isa.instructions import Instruction
+from ..isa.encoding import decode, encode
+from ..isa.instructions import ConfigAttnInsn, Instruction, SetAddrHiInsn, SetAddrLoInsn
 
 
 MAGIC = 0x54414343  # "TACC", needed fro checking the binary file format and version compatibility.
@@ -16,6 +16,360 @@ LEGACY_HEADER_FMT = ">IHHIIIIQ"
 HEADER_FMT = ">IHH" + "I" * 14
 LEGACY_HEADER_SIZE = struct.calcsize(LEGACY_HEADER_FMT)
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
+MASK_28BIT = 0x0FFFFFFF
+MASK_56BIT = (1 << 56) - 1
+VALID_RUNTIME_PATCH_KINDS = {"token_embed", "pos_embed", "kv_base"}
+
+
+def _align(value: int, alignment: int) -> int:
+    return (value + alignment - 1) & ~(alignment - 1)
+
+
+def _instruction_at(instructions: Union[bytes, bytearray], pc: int) -> Instruction:
+    offset = pc * 8
+    if pc < 0 or offset + 8 > len(instructions):
+        raise ValueError(f"Instruction PC {pc} is out of range for {len(instructions) // 8} instructions")
+    return decode(bytes(instructions[offset:offset + 8]))
+
+
+def patch_set_addr_pair(instructions: bytearray, local_lo_pc: int, local_hi_pc: int,
+                        addr_reg: int, byte_addr: int) -> None:
+    """Patch a SET_ADDR_LO/SET_ADDR_HI pair to a 56-bit absolute byte address."""
+    if not (0 <= byte_addr <= MASK_56BIT):
+        raise ValueError(f"byte_addr must fit in 56 bits, got {byte_addr:#x}")
+    lo_insn = _instruction_at(instructions, local_lo_pc)
+    hi_insn = _instruction_at(instructions, local_hi_pc)
+    if not isinstance(lo_insn, SetAddrLoInsn):
+        raise ValueError(f"PC {local_lo_pc} is not SET_ADDR_LO")
+    if not isinstance(hi_insn, SetAddrHiInsn):
+        raise ValueError(f"PC {local_hi_pc} is not SET_ADDR_HI")
+    if lo_insn.addr_reg != addr_reg:
+        raise ValueError(f"SET_ADDR_LO at PC {local_lo_pc} uses R{lo_insn.addr_reg}, expected R{addr_reg}")
+    if hi_insn.addr_reg != addr_reg:
+        raise ValueError(f"SET_ADDR_HI at PC {local_hi_pc} uses R{hi_insn.addr_reg}, expected R{addr_reg}")
+
+    lo = byte_addr & MASK_28BIT
+    hi = (byte_addr >> 28) & MASK_28BIT
+    instructions[local_lo_pc * 8:local_lo_pc * 8 + 8] = encode(SetAddrLoInsn(addr_reg=addr_reg, imm28=lo))
+    instructions[local_hi_pc * 8:local_hi_pc * 8 + 8] = encode(SetAddrHiInsn(addr_reg=addr_reg, imm28=hi))
+
+
+def read_set_addr_pair(instructions: Union[bytes, bytearray], local_lo_pc: int, local_hi_pc: int,
+                       addr_reg: int) -> int:
+    """Read and validate a SET_ADDR_LO/HI pair as a 56-bit byte address."""
+    lo_insn = _instruction_at(instructions, local_lo_pc)
+    hi_insn = _instruction_at(instructions, local_hi_pc)
+    if not isinstance(lo_insn, SetAddrLoInsn):
+        raise ValueError(f"PC {local_lo_pc} is not SET_ADDR_LO")
+    if not isinstance(hi_insn, SetAddrHiInsn):
+        raise ValueError(f"PC {local_hi_pc} is not SET_ADDR_HI")
+    if lo_insn.addr_reg != addr_reg:
+        raise ValueError(f"SET_ADDR_LO at PC {local_lo_pc} uses R{lo_insn.addr_reg}, expected R{addr_reg}")
+    if hi_insn.addr_reg != addr_reg:
+        raise ValueError(f"SET_ADDR_HI at PC {local_hi_pc} uses R{hi_insn.addr_reg}, expected R{addr_reg}")
+    return (int(hi_insn.imm28) << 28) | int(lo_insn.imm28)
+
+
+def patch_config_attn(instructions: bytearray, local_pc: int, *,
+                      query_row_base: int, valid_kv_len: int, mode: int) -> None:
+    """Patch a CONFIG_ATTN instruction payload while preserving its opcode."""
+    insn = _instruction_at(instructions, local_pc)
+    if not isinstance(insn, ConfigAttnInsn):
+        raise ValueError(f"PC {local_pc} is not CONFIG_ATTN")
+    patched = ConfigAttnInsn(
+        query_row_base=int(query_row_base),
+        valid_kv_len=int(valid_kv_len),
+        mode=int(mode),
+    )
+    instructions[local_pc * 8:local_pc * 8 + 8] = encode(patched)
+
+
+def relocate_set_addr_pairs(instructions: Union[bytes, bytearray], delta: int) -> bytearray:
+    """Return a copy with every adjacent SET_ADDR_LO/HI pair increased by delta."""
+    patched = bytearray(instructions)
+    pc = 0
+    insn_count = len(patched) // 8
+    while pc < insn_count:
+        insn = _instruction_at(patched, pc)
+        if not isinstance(insn, SetAddrLoInsn):
+            pc += 1
+            continue
+        if pc + 1 >= insn_count:
+            raise ValueError(f"SET_ADDR_LO at PC {pc} is missing paired SET_ADDR_HI")
+        hi_insn = _instruction_at(patched, pc + 1)
+        if not isinstance(hi_insn, SetAddrHiInsn):
+            raise ValueError(f"SET_ADDR_LO at PC {pc} is not followed by SET_ADDR_HI")
+        if hi_insn.addr_reg != insn.addr_reg:
+            raise ValueError(
+                f"SET_ADDR_LO/HI register mismatch at PCs {pc}/{pc + 1}: "
+                f"R{insn.addr_reg} vs R{hi_insn.addr_reg}"
+            )
+        old_addr = (int(hi_insn.imm28) << 28) | int(insn.imm28)
+        patch_set_addr_pair(patched, pc, pc + 1, insn.addr_reg, old_addr + delta)
+        pc += 2
+    return patched
+
+
+@dataclass(frozen=True)
+class RelocationSite:
+    """Static relocation against a symbol in a ProgramBundle layout."""
+    stream: str
+    local_lo_pc: int
+    local_hi_pc: int
+    addr_reg: int
+    symbol: str
+
+    def __post_init__(self):
+        if self.stream not in ("prefill", "decode"):
+            raise ValueError("RelocationSite.stream must be 'prefill' or 'decode'")
+
+
+@dataclass(frozen=True)
+class RuntimePatchSite:
+    """Runtime-patched SET_ADDR pair in a ProgramBundle stream."""
+    stream: str
+    kind: str
+    local_lo_pc: int
+    local_hi_pc: int
+    absolute_lo_pc: int
+    absolute_hi_pc: int
+    addr_reg: int
+    base_symbol: str
+
+    def __post_init__(self):
+        if self.stream not in ("prefill", "decode"):
+            raise ValueError("RuntimePatchSite.stream must be 'prefill' or 'decode'")
+        if self.kind not in VALID_RUNTIME_PATCH_KINDS:
+            raise ValueError(
+                f"RuntimePatchSite.kind must be one of {sorted(VALID_RUNTIME_PATCH_KINDS)}, got {self.kind!r}"
+            )
+
+
+@dataclass(frozen=True)
+class RuntimeConfigAttnSite:
+    """Runtime-patched CONFIG_ATTN in a ProgramBundle stream."""
+    stream: str
+    local_pc: int
+    absolute_pc: int
+    mode: int
+
+    def __post_init__(self):
+        if self.stream not in ("prefill", "decode"):
+            raise ValueError("RuntimeConfigAttnSite.stream must be 'prefill' or 'decode'")
+        if not (0 <= self.mode <= 0x3):
+            raise ValueError(f"RuntimeConfigAttnSite.mode must be 0-3, got {self.mode}")
+
+
+@dataclass
+class ProgramBundle:
+    """Two instruction streams sharing one decoder DRAM image."""
+    prefill_instrs: bytes = b""
+    decode_instrs: bytes = b""
+    shared_data: bytes = b""
+    temp_size: int = 0
+    logits_size: int = 0
+    kv_cache_size: int = 0
+    input_offset: int = 0
+    prefill_logits_offset: int = 0
+    decode_logits_offset: int = 0
+    symbol_offsets: Dict[str, int] = field(default_factory=dict)
+    symbol_regions: Dict[str, str] = field(default_factory=dict)
+    relocation_sites: List[RelocationSite] = field(default_factory=list)
+    runtime_patch_sites: List[RuntimePatchSite] = field(default_factory=list)
+    runtime_config_attn_sites: List[RuntimeConfigAttnSite] = field(default_factory=list)
+    embedding_row_bytes: int = 16
+    kv_step_bytes: int = 16
+
+    prefill_instrs_offset: int = field(init=False)
+    decode_instrs_offset: int = field(init=False)
+    data_base: int = field(init=False)
+    temp_base: int = field(init=False)
+    logits_base: int = field(init=False)
+    kv_cache_base: int = field(init=False)
+    kv_cache_size_bytes: int = field(init=False)
+    required_dram_bytes: int = field(init=False)
+    prefill_pc: int = field(init=False)
+    decode_pc: int = field(init=False)
+    insn_count: int = field(init=False)
+
+    def __post_init__(self):
+        self.prefill_instrs = bytes(self.prefill_instrs)
+        self.decode_instrs = bytes(self.decode_instrs)
+        self.shared_data = bytes(self.shared_data)
+        if len(self.prefill_instrs) % 8 or len(self.decode_instrs) % 8:
+            raise ValueError("ProgramBundle instruction streams must be 8-byte aligned")
+        if min(self.temp_size, self.logits_size, self.kv_cache_size) < 0:
+            raise ValueError("ProgramBundle region sizes must be non-negative")
+        if self.embedding_row_bytes <= 0:
+            raise ValueError("ProgramBundle.embedding_row_bytes must be positive")
+        if self.kv_step_bytes <= 0:
+            raise ValueError("ProgramBundle.kv_step_bytes must be positive")
+
+        self.prefill_instrs_offset = 0
+        self.decode_instrs_offset = _align(len(self.prefill_instrs), 8)
+        decode_end = self.decode_instrs_offset + len(self.decode_instrs)
+        self.data_base = _align(decode_end, 16)
+        self.temp_base = _align(self.data_base + len(self.shared_data), 16)
+        self.logits_base = _align(self.temp_base + self.temp_size, 16)
+        self.kv_cache_base = _align(self.logits_base + self.logits_size, 16)
+        self.kv_cache_size_bytes = self.kv_cache_size
+        self.required_dram_bytes = self.kv_cache_base + self.kv_cache_size
+        self.prefill_pc = self.prefill_instrs_offset // 8
+        self.decode_pc = self.decode_instrs_offset // 8
+        self.insn_count = self.data_base // 8
+        if self.input_offset == 0:
+            self.input_offset = self.data_base
+        if self.prefill_logits_offset == 0:
+            self.prefill_logits_offset = self.logits_base
+        if self.decode_logits_offset == 0:
+            self.decode_logits_offset = self.logits_base
+
+        self.symbol_offsets = dict(self.symbol_offsets)
+        self.symbol_regions = dict(self.symbol_regions)
+        self.relocation_sites = list(self.relocation_sites)
+        self.runtime_patch_sites = [
+            replace(
+                site,
+                absolute_lo_pc=self._stream_base_pc(site.stream) + site.local_lo_pc,
+                absolute_hi_pc=self._stream_base_pc(site.stream) + site.local_hi_pc,
+            )
+            for site in self.runtime_patch_sites
+        ]
+        self.runtime_config_attn_sites = [
+            replace(
+                site,
+                absolute_pc=self._stream_base_pc(site.stream) + site.local_pc,
+            )
+            for site in self.runtime_config_attn_sites
+        ]
+        self._prefill_runtime_instrs: Optional[bytearray] = None
+        self._decode_runtime_instrs: Optional[bytearray] = None
+
+    def _stream_base_pc(self, stream: str) -> int:
+        if stream == "prefill":
+            return self.prefill_pc
+        if stream == "decode":
+            return self.decode_pc
+        raise ValueError("stream must be 'prefill' or 'decode'")
+
+    def _stream_offset(self, stream: str) -> int:
+        if stream == "prefill":
+            return self.prefill_instrs_offset
+        if stream == "decode":
+            return self.decode_instrs_offset
+        raise ValueError("stream must be 'prefill' or 'decode'")
+
+    def _runtime_stream(self, stream: str) -> bytearray:
+        if self._prefill_runtime_instrs is None or self._decode_runtime_instrs is None:
+            self.reset_runtime_images()
+        if stream == "prefill":
+            return self._prefill_runtime_instrs
+        if stream == "decode":
+            return self._decode_runtime_instrs
+        raise ValueError("stream must be 'prefill' or 'decode'")
+
+    def symbol_address(self, symbol: str) -> int:
+        builtins = {
+            "data_base": self.data_base,
+            "shared_data": self.data_base,
+            "temp_base": self.temp_base,
+            "logits_base": self.logits_base,
+            "kv_cache_base": self.kv_cache_base,
+            "input_offset": self.input_offset,
+            "prefill_logits_offset": self.prefill_logits_offset,
+            "decode_logits_offset": self.decode_logits_offset,
+        }
+        if symbol in builtins:
+            return builtins[symbol]
+        if symbol in self.symbol_offsets:
+            region = self.symbol_regions.get(symbol, "data")
+            region_bases = {
+                "data": self.data_base,
+                "shared_data": self.data_base,
+                "temp": self.temp_base,
+                "logits": self.logits_base,
+                "kv_cache": self.kv_cache_base,
+            }
+            if region not in region_bases:
+                raise ValueError(f"Unknown ProgramBundle symbol region {region!r} for {symbol!r}")
+            return region_bases[region] + int(self.symbol_offsets[symbol])
+        raise KeyError(f"Unknown ProgramBundle symbol: {symbol}")
+
+    def reset_runtime_images(self) -> None:
+        streams = {
+            "prefill": bytearray(self.prefill_instrs),
+            "decode": bytearray(self.decode_instrs),
+        }
+        for site in self.relocation_sites:
+            addend = read_set_addr_pair(
+                streams[site.stream],
+                site.local_lo_pc,
+                site.local_hi_pc,
+                site.addr_reg,
+            )
+            patch_set_addr_pair(
+                streams[site.stream],
+                site.local_lo_pc,
+                site.local_hi_pc,
+                site.addr_reg,
+                self.symbol_address(site.symbol) + addend,
+            )
+        self._prefill_runtime_instrs = streams["prefill"]
+        self._decode_runtime_instrs = streams["decode"]
+
+    def patch_runtime_site(self, site_or_kind: Union[RuntimePatchSite, str],
+                           offset: int = 0, *, stream: Optional[str] = None) -> RuntimePatchSite:
+        if isinstance(site_or_kind, RuntimePatchSite):
+            site = site_or_kind
+        else:
+            matches = [
+                candidate for candidate in self.runtime_patch_sites
+                if candidate.kind == site_or_kind and (stream is None or candidate.stream == stream)
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"Expected exactly one runtime patch site for kind={site_or_kind!r}, "
+                    f"stream={stream!r}; found {len(matches)}"
+                )
+            site = matches[0]
+        patch_set_addr_pair(
+            self._runtime_stream(site.stream),
+            site.local_lo_pc,
+            site.local_hi_pc,
+            site.addr_reg,
+            self.symbol_address(site.base_symbol) + int(offset),
+        )
+        return site
+
+    def patch_config_attn_site(self, site: RuntimeConfigAttnSite, *,
+                               query_row_base: int, valid_kv_len: int) -> RuntimeConfigAttnSite:
+        patch_config_attn(
+            self._runtime_stream(site.stream),
+            site.local_pc,
+            query_row_base=query_row_base,
+            valid_kv_len=valid_kv_len,
+            mode=site.mode,
+        )
+        return site
+
+    def stream_bytes(self, stream: str) -> bytes:
+        return bytes(self._runtime_stream(stream))
+
+    def materialize(self, *, reset_runtime: bool = True) -> bytes:
+        if reset_runtime:
+            self.reset_runtime_images()
+        image = bytearray(self.required_dram_bytes)
+        prefill = self._runtime_stream("prefill")
+        decode_stream = self._runtime_stream("decode")
+        image[self.prefill_instrs_offset:self.prefill_instrs_offset + len(prefill)] = prefill
+        image[self.decode_instrs_offset:self.decode_instrs_offset + len(decode_stream)] = decode_stream
+        image[self.data_base:self.data_base + len(self.shared_data)] = self.shared_data
+        return bytes(image)
+
+    def get_instruction_bytes(self, pc: int) -> bytes:
+        image = self.materialize(reset_runtime=False)
+        offset = pc * 8
+        return image[offset:offset + 8]
 
 
 @dataclass

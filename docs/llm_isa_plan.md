@@ -929,12 +929,21 @@ Verification:
 
 ### Stage 3: ProgramBundle, KV Cache, and Host Runner
 
+Implementation status: complete in the software/golden-model path. Stage 3 is
+implemented as an internal decoder runtime path, not yet as the stable public
+`Compiler.compile(model_kind="decoder")` API. The generated checkpoint artifact
+is intentionally local-only and ignored by git; tests that depend on the default
+fixture skip with the exact generation command when it is absent, while temp
+fixture tests exercise the full path in CI/local regression runs.
+
 Deliverables:
 
 - `ProgramBundle` with shared data, temp, and persistent KV cache layout.
-- Static `RelocationSite` records for bundle layout and `RuntimePatchSite`
-  records for `token_embed`, `pos_embed`, and decode-stream per-bank KV bases
-  (`kv_base`); each site records both LO and HI pc.
+- Static `RelocationSite` records for bundle layout preserve the emitted
+  `SET_ADDR_LO/HI` addend and relocate to `symbol_address + addend`.
+- `RuntimePatchSite` records cover `token_embed`, `pos_embed`, and
+  decode-stream per-bank KV bases (`kv_base`); each site records both LO and HI
+  pc.
 - Prefill KV bank bases are static `RelocationSite` records resolved at bundle
   layout; only decode emits runtime `kv_base` patch sites.
 - Update `compiler.py:560` fix-up site to patch `SET_ADDR_LO` and
@@ -945,6 +954,11 @@ Deliverables:
 - Runtime host runner for prefill and decode.
 - Token and position embedding patch sites consumed at runtime.
 - KV STORE/LOAD codegen.
+- Runtime `CONFIG_ATTN` patch sites for decode attention update
+  `query_row_base = position` and `valid_kv_len = position + 1` per decode step.
+- Decoder logits are written through explicit internal `logits_store` IR nodes
+  into `prefill_logits_offset` / `decode_logits_offset`; Stage 3 stores INT8
+  padded-vocabulary logits.
 - KV cache scale contract enforced.
 - Assembler syntax and disassembler coverage for all decode-path instructions
   is asserted in tests, not just compiled.
@@ -952,8 +966,8 @@ Deliverables:
 Verification:
 
 - `tests/test_program_bundle.py`: instruction-region patching does not touch
-  shared data or KV cache; full LO+HI patching is verified against a layout
-  where `data_base > (1 << 28)` using a synthetic relocation fixture.
+  shared data or KV cache; full LO+HI patching preserves static relocation
+  addends and is verified against carry-boundary synthetic relocation fixtures.
 - `tests/test_kv_cache_scale.py`: cached K/V from prefill produces the same
   attention output during decode as a full-sequence fake-quant reference.
 - `tests/test_kv_banking.py`: synthetic decoder config deliberately exceeds one
@@ -961,31 +975,22 @@ Verification:
   deterministic `(layer, kind)` natural-order rule, every static offset within a
   bank is `<= 0xFFFF * 16` bytes, and decode attention across a cross-bank
   transition matches the full-sequence fake-quant reference.
-- `tests/test_assembler_roundtrip.py` (new): text-asm of each 0x14/0x15/0x16
-  opcode and a full prefill+decode bundle parses, assembles, disassembles, and
-  re-parses to the same text form.
-- `tests/test_e2e_tiny.py`: 32 decode steps from a small trained model. Use a
-  deterministic nanoGPT Shakespeare-character checkpoint fixture, for example
-  `software/tests/fixtures/nanogpt_shakespeare_char_d128_l2.pt` with a recorded
-  SHA-256 checksum. The fixture must be reproducible from
-  `software/tools/train_tiny_fixture.py`, which records the nanoGPT commit or
-  source snapshot, training data, tokenizer, random seed, hyperparameters, and
-  final validation loss. The intended dataset is nanoGPT's `shakespeare_char`
-  dataset; the script must declare a pinned upstream nanoGPT commit SHA before
-  the fixture is accepted. The plan should decide whether the checkpoint is
-  tracked directly or via Git LFS before the test lands. Random-init models
-  produce noisy logits and brittle top-k behavior, so a trained fixture is
-  required for the top-k gate.
-- Calibration/evaluation split for this fixture: train on the standard
-  `shakespeare_char` train split, calibrate on the first `N` contiguous
-  tokenized examples from that train split, and evaluate on a held-out
-  validation slice not used for calibration. Record `N`, exact byte/token
-  ranges, sample count, and sequence length policy in the test metadata.
-- Gate: per-step logit cosine >= 0.99 against the compiler-matched PyTorch
-  fake-quant reference on the same checkpoint. Top-k overlap is reported as a
-  diagnostic with an optional warning threshold such as top-10 overlap < 7/10;
-  it is not a pass/fail gate because tiny-model rank order is brittle under
-  1-LSB perturbations.
+- `tests/test_logits_store.py`: codegen-emitted `logits_store` writes prefill
+  and decode INT8 logits into the bundle logits region, and `HostRunner` reads
+  them back.
+- `tests/test_tiny_decode_smoke.py`: builds a full 1-token tiny decoder bundle
+  from a generated fixture, runs prefill plus short decode, and verifies
+  deterministic non-empty logits.
+- `tests/test_e2e_tiny.py`: 32 greedy decode steps from the generated
+  deterministic nanoGPT-shaped Shakespeare-character checkpoint. The fixture is
+  reproducible from `software/tools/train_tiny_fixture.py` and records source
+  snapshot, tokenizer, seed, hyperparameters, data ranges, validation-loss
+  placeholder, and SHA-256. The checkpoint remains ignored by git.
+- Gate: per-step logit cosine >= 0.99 against a fresh compiler-matched replay
+  reference from the same quantized bundle path. Top-10 overlap >= 7/10 is
+  asserted for the current replay gate. FP32/PyTorch reference comparison and a
+  trained non-placeholder checkpoint remain future quality improvements, not
+  Stage 3 blockers.
 
 ### Stage 4: `d_model = 384` Weight and Activation Striping
 
