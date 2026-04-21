@@ -7,6 +7,8 @@ from taccel.compiler.decoder_bundle import (
     mark_runtime_embedding_lookups,
 )
 from taccel.compiler.frontend.nanogpt_adapter import load_nanogpt
+from taccel.compiler.ir import IRGraph, IRNode
+from taccel.compiler.model_config import ModelConfig
 from taccel.isa.instructions import LoadInsn
 
 
@@ -169,3 +171,48 @@ def test_decode_kv_load_allocates_padded_tensor_footprint():
         for insn in (key_load, value_load)
     )
     assert ranges[0][1] <= ranges[1][0]
+
+
+def test_decoder_bundle_reserves_codegen_temp_before_logits_and_kv_cache():
+    graph = IRGraph()
+    graph.add_node(IRNode(
+        op="matmul",
+        name="large_fc1",
+        inputs=["act", "large.weight"],
+        output_shape=(1, 1536),
+    ))
+    config = ModelConfig(
+        name="stage4-temp-layout-test",
+        model_kind="decoder",
+        n_layer=1,
+        n_head=6,
+        d_model=384,
+        d_head=64,
+        mlp_dim=1536,
+        vocab_size=32,
+        max_seq_len=256,
+        embedding_kind="token_pos",
+    )
+
+    build = build_decoder_program_bundle(
+        prefill_graph=graph,
+        decode_graph=graph,
+        weight_data={
+            "large.weight": (
+                np.zeros((384, 1536), dtype=np.int8),
+                np.ones(1536, dtype=np.float16),
+            ),
+        },
+        calibration_scales={"act": 0.125, "large_fc1": 0.25},
+        prescaled_biases={},
+        model_config=config,
+    )
+
+    generated_temp = max(
+        build.prefill_codegen.mem.dram_temp_total,
+        build.decode_codegen.mem.dram_temp_total,
+    )
+    assert generated_temp > 0
+    assert build.bundle.temp_size == generated_temp
+    assert build.bundle.logits_base >= build.bundle.temp_base + build.bundle.temp_size
+    assert build.bundle.kv_cache_base >= build.bundle.logits_base + build.bundle.logits_size

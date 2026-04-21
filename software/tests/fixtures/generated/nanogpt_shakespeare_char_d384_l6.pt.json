@@ -1,0 +1,45 @@
+{
+  "checkpoint_path": "/Users/sayat/Documents/GitHub/LLM_accelerator/software/tests/fixtures/generated/nanogpt_shakespeare_char_d384_l6.pt",
+  "checkpoint_sha256": "2e255986a25f9ebe440f2c6a7d954083397049f140336fa15c51374071628c39",
+  "dataset": "embedded_shakespeare_char_excerpt",
+  "hyperparameters": {
+    "bias": true,
+    "block_size": 256,
+    "d_head": 64,
+    "d_model": 384,
+    "n_head": 6,
+    "n_layer": 6
+  },
+  "ranges": {
+    "calibration_bytes": {
+      "end": 131,
+      "start": 0
+    },
+    "evaluation_bytes": {
+      "end": 146,
+      "start": 131
+    },
+    "train_bytes": {
+      "end": 131,
+      "start": 0
+    }
+  },
+  "sample_count": {
+    "calibration": 131,
+    "evaluation": 15
+  },
+  "schema_version": 1,
+  "seed": 1337,
+  "sequence_length_policy": "contiguous character windows, max block_size tokens",
+  "source_snapshot": "local-stage4-d384-deterministic-export-v1",
+  "stage3c_e2e_ready": true,
+  "stage3e_logits_smoke_ready": true,
+  "stage3f_full_graph_smoke_ready": true,
+  "stage4_d384_ready": true,
+  "tokenizer": {
+    "alphabet": "\n ,.:?ABCFSYacdefhiklmnoprstuvwyz",
+    "kind": "character",
+    "vocab_size": 33
+  },
+  "validation_loss": null
+}

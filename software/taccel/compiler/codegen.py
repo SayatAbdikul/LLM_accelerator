@@ -4,7 +4,14 @@ import struct
 import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
 from ..assembler.assembler import RelocationSite, RuntimeConfigAttnSite, RuntimePatchSite
-from ..isa.opcodes import BUF_ABUF, BUF_WBUF, BUF_ACCUM
+from ..isa.opcodes import (
+    ABUF_SIZE,
+    ACCUM_SIZE,
+    BUF_ABUF,
+    BUF_WBUF,
+    BUF_ACCUM,
+    WBUF_SIZE,
+)
 from ..isa.instructions import (
     MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn, SoftmaxInsn, LayernormInsn, GeluInsn,
     DequantAddInsn,
@@ -19,6 +26,8 @@ from .model_config import ModelConfig, deit_tiny_config
 from .kv_cache import KVCacheLayout, normalize_kv_kind
 
 UNIT = 16
+STAGE4_M_TILE = TILE
+STAGE4_MAX_N_TILE = 512
 
 
 def _fp16_to_uint16(val: float) -> int:
@@ -139,6 +148,11 @@ class CodeGenerator:
 
     def _layout_weights(self, graph: IRGraph):
         """Pack all weights into DRAM data blob."""
+        forced_stage4_weights = {
+            node.inputs[1]
+            for node in graph.nodes
+            if node.op == "matmul" and len(node.inputs) > 1 and node.attrs.get("stage4_weight_tiled", False)
+        }
         offset = 0
         for name, (data, scales) in self.weight_data.items():
             blob = data.tobytes()
@@ -158,6 +172,26 @@ class CodeGenerator:
                 pc_scale_blob = self.requant_pc_scale_tables[name].astype(np.float16).tobytes()
                 self.dram_blob.extend(pc_scale_blob)
                 offset += len(pc_scale_blob)
+
+        # Stage 4 large-weight matmuls need output-column tiles, but the
+        # canonical weight layout is row-major [K, N], so those tiles are
+        # strided in the base blob. Pack deterministic contiguous tile blobs
+        # before the temp region so runtime DMA can still use ordinary LOADs.
+        for name, (data, _scales) in self.weight_data.items():
+            if not (
+                isinstance(data, np.ndarray)
+                and data.ndim == 2
+                and (data.size > WBUF_SIZE or name in forced_stage4_weights)
+            ):
+                continue
+            K_pad, N_pad = int(data.shape[0]), int(data.shape[1])
+            for k_start, k_len, n_start, n_len in self._large_weight_tile_plan(K_pad, N_pad):
+                tile_name = self._large_weight_tile_symbol(name, k_start, k_len, n_start, n_len)
+                self.dram_layout[tile_name] = offset
+                tile = np.ascontiguousarray(data[k_start:k_start + k_len, n_start:n_start + n_len])
+                blob = tile.astype(np.int8, copy=False).tobytes()
+                self.dram_blob.extend(blob)
+                offset += len(blob)
 
         # Pre-scaled biases
         for name, bias_i32 in self.prescaled_biases.items():
@@ -397,6 +431,55 @@ class CodeGenerator:
         elif op == "concat_heads":
             self._emit_concat_heads(node)
 
+    @staticmethod
+    def _large_weight_tile_symbol(weight_name: str, k_start: int, k_len: int,
+                                  n_start: int, n_len: int) -> str:
+        return f"{weight_name}__stage4_tile_k{k_start}_{k_len}_n{n_start}_{n_len}"
+
+    @staticmethod
+    def _large_weight_tile_plan(K_pad: int, N_pad: int) -> List[Tuple[int, int, int, int]]:
+        """Return deterministic (k_start, k_len, n_start, n_len) tiles.
+
+        Tiles are sized for a 16-row activation strip.  `N_tile` is capped at
+        512 so the `d=384` FC1 case uses the intended 384x512 WBUF tile.  If the
+        full K dimension still does not fit, split K and use MATMUL accumulate.
+        """
+        if K_pad <= 0 or N_pad <= 0:
+            raise ValueError("large weight tile dimensions must be positive")
+
+        max_n_by_accum = ACCUM_SIZE // (STAGE4_M_TILE * 4)
+        max_n_by_abuf = ABUF_SIZE // STAGE4_M_TILE
+        n_tile = min(N_pad, STAGE4_MAX_N_TILE, max_n_by_accum, max_n_by_abuf)
+        n_tile = max(TILE, (n_tile // TILE) * TILE)
+
+        while n_tile >= TILE:
+            k_tile = (WBUF_SIZE // n_tile) // TILE * TILE
+            if k_tile >= TILE:
+                break
+            n_tile //= 2
+            n_tile = (n_tile // TILE) * TILE
+        if n_tile < TILE:
+            raise MemoryError("Unable to choose a Stage 4 N tile that fits WBUF")
+
+        k_tile = max(TILE, (WBUF_SIZE // n_tile) // TILE * TILE)
+        k_tile = min(K_pad, k_tile)
+        k_tile = max(TILE, (k_tile // TILE) * TILE)
+
+        tiles: List[Tuple[int, int, int, int]] = []
+        for n_start in range(0, N_pad, n_tile):
+            n_len = min(n_tile, N_pad - n_start)
+            for k_start in range(0, K_pad, k_tile):
+                k_len = min(k_tile, K_pad - k_start)
+                tiles.append((k_start, k_len, n_start, n_len))
+        return tiles
+
+    def _large_weight_tiles_for_n(self, K_pad: int, N_pad: int,
+                                  n_start: int, n_len: int) -> List[Tuple[int, int, int, int]]:
+        return [
+            tile for tile in self._large_weight_tile_plan(K_pad, N_pad)
+            if tile[2] == n_start and tile[3] == n_len
+        ]
+
     def _emit_matmul(self, node: IRNode):
         """Emit a standard linear matmul with optional bias."""
         M, N = node.output_shape
@@ -411,12 +494,18 @@ class CodeGenerator:
 
         # Check if strip-mining is needed:
         # - INT8 output exceeds ABUF (128 KB), OR
-        # - INT32 intermediate exceeds ACCUM (64 KB)
+        # - INT32 intermediate exceeds ACCUM (64 KB), OR
+        # - full weight matrix exceeds WBUF (Stage 4 d=384 FC1/FC2)
         strip_mine = node.attrs.get("strip_mine", False)
         output_bytes = pad_dim(M) * pad_dim(N)
         accum_bytes = pad_dim(M) * pad_dim(N) * 4  # INT32 intermediate
-        if output_bytes > 128 * 1024 or accum_bytes > 64 * 1024:
+        weight_bytes = int(w_q.size)
+        if output_bytes > ABUF_SIZE or accum_bytes > ACCUM_SIZE:
             strip_mine = True
+
+        if weight_bytes > WBUF_SIZE or bool(node.attrs.get("stage4_weight_tiled", False)):
+            self._emit_matmul_large_weight_tiled(node, M, N, K, w_q, w_scales)
+            return
 
         if strip_mine:
             if (
@@ -881,6 +970,242 @@ class CodeGenerator:
         self.dram_temp_outputs[node.name] = dram_temp_off
         out_alloc = self.mem.abuf.alloc(node.name, strip_rows * N_pad)
         out_alloc.size_bytes = M_pad * N_pad
+
+    def _emit_matmul_large_weight_tiled(self, node: IRNode, M: int, N: int, K: int,
+                                        w_q: np.ndarray, w_scales: Optional[np.ndarray]):
+        """Emit a matmul whose full weight matrix is too large for WBUF.
+
+        The canonical weight blob is [K, N] row-major.  Stage 4 pre-packs
+        contiguous [K_tile, N_tile] blobs in DRAM, then accumulates K chunks
+        into ACCUM for each 16-row activation strip and output-column tile.
+        Outputs are always spilled to DRAM temp in full row-major [M_pad, N_pad]
+        layout so downstream ops can consume them through the existing spill
+        mechanism.
+        """
+        weight_name = node.inputs[1]
+        if weight_name in self.requant_pc_weight_names:
+            raise ValueError(f"Stage 4 large-weight striping does not support REQUANT_PC for {weight_name!r}")
+        if self._dequant_add_residual1_enabled_for_output(node.name):
+            raise ValueError(f"Stage 4 large-weight striping does not support fused residual1 for {node.name!r}")
+        if node.attrs.get("inline_gelu"):
+            raise ValueError(
+                f"Stage 4 large-weight striping expects standalone GELU for {node.name!r}; "
+                "remove inline_gelu or handle GELU from DRAM temp"
+            )
+
+        M_pad = pad_dim(M)
+        N_pad = pad_dim(N)
+        K_pad = pad_dim(K)
+        strip_rows = STAGE4_M_TILE
+        input_name = node.inputs[0]
+        input_dram_off = self.dram_temp_outputs.get(input_name)
+        input_from_dram = input_dram_off is not None
+        act_alloc = None
+        if not input_from_dram:
+            act_alloc = self.mem.abuf.get(input_name) or self.mem.abuf.alloc(input_name, M_pad * K_pad)
+        else:
+            self.mem.abuf.free(input_name)
+
+        mean_w_scale = float(np.mean(w_scales.astype(np.float32))) if w_scales is not None else 1.0
+        input_act_scale = self.calibration_scales.get(input_name, 6.0 / 127.0)
+        target_act_scale = self.calibration_scales.get(node.name, 6.0 / 127.0)
+        requant_scale_f = input_act_scale * mean_w_scale / max(target_act_scale, 1e-12)
+        dram_temp_off = self.dram_temp_start + self.mem.alloc_dram_temp(
+            f"{node.name}_temp", M_pad * N_pad
+        )
+
+        n_tiles_seen = []
+        for _k_start, _k_len, n_start, n_len in self._large_weight_tile_plan(K_pad, N_pad):
+            if not n_tiles_seen or n_tiles_seen[-1] != (n_start, n_len):
+                n_tiles_seen.append((n_start, n_len))
+
+        for row_start in range(0, M_pad, strip_rows):
+            logical_rows = max(0, min(strip_rows, M - row_start))
+            for n_start, n_len in n_tiles_seen:
+                tile_alloc = self.mem.abuf.alloc(
+                    f"{node.name}_tile_r{row_start}_n{n_start}", strip_rows * n_len
+                )
+                first_k = True
+                for k_start, k_len, _, _ in self._large_weight_tiles_for_n(K_pad, N_pad, n_start, n_len):
+                    act_off, staging_name = self._materialize_activation_k_tile(
+                        input_name=input_name,
+                        input_from_dram=input_from_dram,
+                        input_dram_off=input_dram_off,
+                        act_alloc=act_alloc,
+                        row_start=row_start,
+                        k_start=k_start,
+                        k_len=k_len,
+                        K_pad=K_pad,
+                        strip_rows=strip_rows,
+                    )
+                    weight_tile_name = self._large_weight_tile_symbol(
+                        weight_name, k_start, k_len, n_start, n_len
+                    )
+                    weight_dram = self._dram_offset_required(
+                        weight_tile_name,
+                        f"loading Stage 4 packed weight tile for '{weight_name}'",
+                    )
+                    w_alloc = self.mem.wbuf.alloc(
+                        f"_w_{node.name}_k{k_start}_n{n_start}", k_len * n_len
+                    )
+                    self._emit_dma_load(BUF_WBUF, w_alloc.offset_units, k_len * n_len, 0, weight_dram)
+                    self._emit(SyncInsn(resource_mask=0b001))
+
+                    self._emit(ConfigTileInsn(
+                        M=strip_rows // TILE - 1,
+                        N=n_len // TILE - 1,
+                        K=k_len // TILE - 1,
+                    ))
+                    self._emit(MatmulInsn(
+                        src1_buf=BUF_ABUF,
+                        src1_off=act_off,
+                        src2_buf=BUF_WBUF,
+                        src2_off=w_alloc.offset_units,
+                        dst_buf=BUF_ACCUM,
+                        dst_off=0,
+                        flags=0 if first_k else 1,
+                    ))
+                    self._emit(SyncInsn(resource_mask=0b010))
+                    first_k = False
+                    self.mem.wbuf.free(w_alloc.name)
+                    if staging_name is not None:
+                        self.mem.abuf.free(staging_name)
+
+                bias_name = node.attrs.get("bias")
+                if bias_name:
+                    if bias_name not in self.prescaled_biases:
+                        raise KeyError(f"Missing prescaled bias '{bias_name}' for node '{node.name}'")
+                    self._emit_bias_add_tile(bias_name, n_start, n_len)
+
+                self._emit(ConfigTileInsn(M=0, N=n_len // TILE - 1, K=0))
+                sreg = self._alloc_sreg()
+                self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(requant_scale_f)))
+                self._emit(RequantInsn(
+                    src1_buf=BUF_ACCUM,
+                    src1_off=0,
+                    dst_buf=BUF_ABUF,
+                    dst_off=tile_alloc.offset_units,
+                    sreg=sreg,
+                ))
+                if n_len == N_pad:
+                    self._record_trace_event(
+                        node.name,
+                        BUF_ABUF,
+                        tile_alloc.offset_units,
+                        strip_rows,
+                        N_pad,
+                        logical_rows,
+                        N,
+                        "int8",
+                        target_act_scale,
+                        row_start=row_start,
+                        full_rows=M,
+                        full_cols=N,
+                    )
+                self._spill_abuf_tile_rows_to_dram(
+                    tile_alloc.offset_units,
+                    dram_temp_off,
+                    row_start=row_start,
+                    n_start=n_start,
+                    rows=strip_rows,
+                    cols=n_len,
+                    full_cols=N_pad,
+                    addr_reg=2,
+                )
+                self.mem.abuf.free(tile_alloc.name)
+
+        self.dram_temp_outputs[node.name] = dram_temp_off
+        out_alloc = self.mem.abuf.alloc(node.name, strip_rows * N_pad)
+        out_alloc.size_bytes = M_pad * N_pad
+
+    def _materialize_activation_k_tile(
+        self,
+        *,
+        input_name: str,
+        input_from_dram: bool,
+        input_dram_off: Optional[int],
+        act_alloc: Optional[Allocation],
+        row_start: int,
+        k_start: int,
+        k_len: int,
+        K_pad: int,
+        strip_rows: int,
+    ) -> Tuple[int, Optional[str]]:
+        """Return ABUF offset for a contiguous [strip_rows, k_len] activation tile."""
+        if not input_from_dram and act_alloc is None:
+            raise ValueError("act_alloc is required for ABUF-resident activation tiles")
+
+        if not input_from_dram and k_start == 0 and k_len == K_pad:
+            return act_alloc.offset_units + (row_start * K_pad) // UNIT, None
+
+        staging_name = f"{input_name}_stage4_k{k_start}_r{row_start}"
+        staging = self.mem.abuf.alloc(staging_name, strip_rows * k_len)
+        row_units = k_len // UNIT
+        if input_from_dram:
+            if input_dram_off is None:
+                raise ValueError("input_dram_off is required for DRAM-resident activation tiles")
+            if k_start == 0 and k_len == K_pad:
+                self._emit_dma_load(
+                    BUF_ABUF,
+                    staging.offset_units,
+                    strip_rows * K_pad,
+                    1,
+                    input_dram_off + row_start * K_pad,
+                )
+                self._emit(SyncInsn(resource_mask=0b001))
+            else:
+                for r in range(strip_rows):
+                    self._emit_dma_load(
+                        BUF_ABUF,
+                        staging.offset_units + r * row_units,
+                        k_len,
+                        1,
+                        input_dram_off + (row_start + r) * K_pad + k_start,
+                    )
+                    self._emit(SyncInsn(resource_mask=0b001))
+        else:
+            src_row_units = K_pad // UNIT
+            for r in range(strip_rows):
+                self._emit(BufCopyInsn(
+                    src_buf=BUF_ABUF,
+                    src_off=act_alloc.offset_units + (row_start + r) * src_row_units + k_start // UNIT,
+                    dst_buf=BUF_ABUF,
+                    dst_off=staging.offset_units + r * row_units,
+                    length=row_units,
+                ))
+                self._emit(SyncInsn(resource_mask=0b001))
+        return staging.offset_units, staging_name
+
+    def _emit_bias_add_tile(self, bias_name: str, n_start: int, n_len: int):
+        bias_dram_off = self._dram_offset_required(bias_name, f"loading bias '{bias_name}'") + n_start * 4
+        bias_bytes = n_len * 4
+        bias_alloc = self.mem.wbuf.alloc(f"bias_{bias_name}_n{n_start}", bias_bytes)
+        self._emit_dma_load(BUF_WBUF, bias_alloc.offset_units, bias_bytes, 1, bias_dram_off)
+        self._emit(SyncInsn(resource_mask=0b001))
+        self._emit(ConfigTileInsn(M=0, N=n_len // TILE - 1, K=0))
+        self._emit(VaddInsn(
+            src1_buf=BUF_ACCUM,
+            src1_off=0,
+            src2_buf=BUF_WBUF,
+            src2_off=bias_alloc.offset_units,
+            dst_buf=BUF_ACCUM,
+            dst_off=0,
+        ))
+        self.mem.wbuf.free(bias_alloc.name)
+
+    def _spill_abuf_tile_rows_to_dram(self, src_off_units: int, dram_base: int, *,
+                                      row_start: int, n_start: int, rows: int,
+                                      cols: int, full_cols: int, addr_reg: int):
+        row_units = cols // UNIT
+        for r in range(rows):
+            self._emit_dma_store(
+                BUF_ABUF,
+                src_off_units + r * row_units,
+                cols,
+                addr_reg,
+                dram_base + (row_start + r) * full_cols + n_start,
+            )
+            self._emit(SyncInsn(resource_mask=0b001))
 
     def _emit_matmul_strip_mined(self, node: IRNode, M: int, N: int, K: int,
                                   w_q: np.ndarray, w_scales: np.ndarray):
@@ -1714,6 +2039,9 @@ class CodeGenerator:
                 fc1_alloc.name = node.name
                 self.mem.abuf.allocations[node.name] = fc1_alloc
             return
+        if node.inputs[0] in self.dram_temp_outputs:
+            self._emit_gelu_from_dram_temp(node)
+            return
         M_pad = pad_dim(node.output_shape[0])
         N_pad = pad_dim(node.output_shape[1])
         m_tiles = M_pad // TILE
@@ -1746,6 +2074,73 @@ class CodeGenerator:
             "int8",
             out_scale,
         )
+
+    def _emit_gelu_from_dram_temp(self, node: IRNode):
+        """Apply GELU strip-by-strip to a DRAM-temp-resident tensor."""
+        input_name = node.inputs[0]
+        input_dram = self.dram_temp_outputs[input_name]
+        M = int(node.output_shape[0])
+        N = int(node.output_shape[1])
+        M_pad = pad_dim(M)
+        N_pad = pad_dim(N)
+        strip_rows = TILE
+        out_dram = self.dram_temp_start + self.mem.alloc_dram_temp(
+            f"{node.name}_temp", M_pad * N_pad
+        )
+        in_scale = self.calibration_scales.get(input_name, 1.0 / 127.0)
+        out_scale = self.calibration_scales.get(node.name, 1.0 / 127.0)
+        self.mem.abuf.free(input_name)
+
+        for row_start in range(0, M_pad, strip_rows):
+            logical_rows = max(0, min(strip_rows, M - row_start))
+            strip_alloc = self.mem.abuf.alloc(f"{node.name}_strip{row_start}", strip_rows * N_pad)
+            self._emit_dma_load(
+                BUF_ABUF,
+                strip_alloc.offset_units,
+                strip_rows * N_pad,
+                1,
+                input_dram + row_start * N_pad,
+            )
+            self._emit(SyncInsn(resource_mask=0b001))
+            self._emit(ConfigTileInsn(M=0, N=N_pad // TILE - 1, K=0))
+            sreg = self._alloc_sreg_pair()
+            self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(in_scale)))
+            self._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0, imm16=_fp16_to_uint16(out_scale)))
+            self._emit(GeluInsn(
+                src1_buf=BUF_ABUF,
+                src1_off=strip_alloc.offset_units,
+                dst_buf=BUF_ABUF,
+                dst_off=strip_alloc.offset_units,
+                sreg=sreg,
+            ))
+            self._emit(SyncInsn(resource_mask=0b100))
+            self._record_trace_event(
+                node.name,
+                BUF_ABUF,
+                strip_alloc.offset_units,
+                strip_rows,
+                N_pad,
+                logical_rows,
+                N,
+                "int8",
+                out_scale,
+                row_start=row_start,
+                full_rows=M,
+                full_cols=N,
+            )
+            self._emit_dma_store(
+                BUF_ABUF,
+                strip_alloc.offset_units,
+                strip_rows * N_pad,
+                2,
+                out_dram + row_start * N_pad,
+            )
+            self._emit(SyncInsn(resource_mask=0b001))
+            self.mem.abuf.free(strip_alloc.name)
+
+        self.dram_temp_outputs[node.name] = out_dram
+        placeholder = self.mem.abuf.alloc(node.name, strip_rows * N_pad)
+        placeholder.size_bytes = M_pad * N_pad
 
     def _emit_layernorm(self, node: IRNode):
         """Emit LAYERNORM SFU instruction."""

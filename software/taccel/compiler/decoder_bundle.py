@@ -216,6 +216,11 @@ def build_decoder_program_bundle(
     decode_instructions, decode_data = decode_codegen.generate(decode_graph)
     if prefill_data != decode_data:
         raise ValueError("prefill and decode graphs produced different shared data layouts")
+    if temp_size == 0:
+        temp_size = max(
+            int(prefill_codegen.mem.dram_temp_total),
+            int(decode_codegen.mem.dram_temp_total),
+        )
 
     symbol_offsets = dict(prefill_codegen.dram_layout)
     symbol_regions = {}

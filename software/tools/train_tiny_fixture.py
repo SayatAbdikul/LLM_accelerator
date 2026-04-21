@@ -23,7 +23,17 @@ DEFAULT_FIXTURE = (
     / "nanogpt_shakespeare_char_d128_l2.pt"
 )
 DEFAULT_METADATA = DEFAULT_FIXTURE.with_suffix(DEFAULT_FIXTURE.suffix + ".json")
+DEFAULT_STAGE4_FIXTURE = (
+    REPO_ROOT
+    / "software"
+    / "tests"
+    / "fixtures"
+    / "generated"
+    / "nanogpt_shakespeare_char_d384_l6.pt"
+)
+DEFAULT_STAGE4_METADATA = DEFAULT_STAGE4_FIXTURE.with_suffix(DEFAULT_STAGE4_FIXTURE.suffix + ".json")
 SOURCE_SNAPSHOT = "local-stage3-deterministic-export-v1"
+STAGE4_SOURCE_SNAPSHOT = "local-stage4-d384-deterministic-export-v1"
 SHAKESPEARE_EXCERPT = (
     "First Citizen: Before we proceed any further, hear me speak.\n"
     "All: Speak, speak.\n"
@@ -52,14 +62,25 @@ def split_ranges(text: str) -> Dict[str, Tuple[int, int]]:
     }
 
 
-def build_metadata(checkpoint_path: Path, checkpoint_sha256: str) -> Dict[str, object]:
+def build_metadata(
+    checkpoint_path: Path,
+    checkpoint_sha256: str,
+    *,
+    source_snapshot: str = SOURCE_SNAPSHOT,
+    n_layer: int = 2,
+    n_head: int = 4,
+    d_model: int = 128,
+    block_size: int = 128,
+    stage4_ready: bool = False,
+) -> Dict[str, object]:
     alphabet = "".join(sorted(set(SHAKESPEARE_EXCERPT)))
     ranges = split_ranges(SHAKESPEARE_EXCERPT)
+    d_head = d_model // n_head
     return {
         "schema_version": 1,
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_sha256": checkpoint_sha256,
-        "source_snapshot": SOURCE_SNAPSHOT,
+        "source_snapshot": source_snapshot,
         "dataset": "embedded_shakespeare_char_excerpt",
         "tokenizer": {
             "kind": "character",
@@ -68,11 +89,11 @@ def build_metadata(checkpoint_path: Path, checkpoint_sha256: str) -> Dict[str, o
         },
         "seed": 1337,
         "hyperparameters": {
-            "n_layer": 2,
-            "n_head": 4,
-            "d_model": 128,
-            "d_head": 32,
-            "block_size": 128,
+            "n_layer": n_layer,
+            "n_head": n_head,
+            "d_model": d_model,
+            "d_head": d_head,
+            "block_size": block_size,
             "bias": True,
         },
         "ranges": {
@@ -88,6 +109,7 @@ def build_metadata(checkpoint_path: Path, checkpoint_sha256: str) -> Dict[str, o
         "stage3e_logits_smoke_ready": True,
         "stage3f_full_graph_smoke_ready": True,
         "stage3c_e2e_ready": True,
+        "stage4_d384_ready": bool(stage4_ready),
     }
 
 
@@ -95,7 +117,14 @@ def _randn_torch(torch, generator, *shape, scale=0.02):
     return torch.randn(*shape, generator=generator, dtype=torch.float32) * float(scale)
 
 
-def _make_checkpoint_payload():
+def _make_checkpoint_payload(
+    *,
+    n_layer: int = 2,
+    n_head: int = 4,
+    d_model: int = 128,
+    block_size: int = 128,
+    source_snapshot: str = SOURCE_SNAPSHOT,
+):
     """Build a deterministic nanoGPT-compatible checkpoint payload."""
     import torch
 
@@ -103,10 +132,10 @@ def _make_checkpoint_payload():
     stoi = {ch: i for i, ch in enumerate(vocab)}
     itos = {i: ch for ch, i in stoi.items()}
     cfg = {
-        "n_layer": 2,
-        "n_head": 4,
-        "n_embd": 128,
-        "block_size": 128,
+        "n_layer": int(n_layer),
+        "n_head": int(n_head),
+        "n_embd": int(d_model),
+        "block_size": int(block_size),
         "vocab_size": len(vocab),
         "bias": True,
         "layer_norm_epsilon": 1e-5,
@@ -151,7 +180,7 @@ def _make_checkpoint_payload():
         state[f"transformer.h.{layer}.mlp.c_proj.bias"] = torch.zeros(d_model, dtype=torch.float32)
 
     return {
-        "source_snapshot": SOURCE_SNAPSHOT,
+        "source_snapshot": source_snapshot,
         "seed": 1337,
         "model_args": cfg,
         "stoi": stoi,
@@ -168,6 +197,33 @@ def write_fixture(checkpoint_path: Path = DEFAULT_FIXTURE,
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(_make_checkpoint_payload(), checkpoint_path)
     metadata = build_metadata(checkpoint_path, sha256_file(checkpoint_path))
+    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return metadata
+
+
+def write_stage4_fixture(checkpoint_path: Path = DEFAULT_STAGE4_FIXTURE,
+                         metadata_path: Path = DEFAULT_STAGE4_METADATA) -> Dict[str, object]:
+    import torch
+
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _make_checkpoint_payload(
+        n_layer=6,
+        n_head=6,
+        d_model=384,
+        block_size=256,
+        source_snapshot=STAGE4_SOURCE_SNAPSHOT,
+    )
+    torch.save(payload, checkpoint_path)
+    metadata = build_metadata(
+        checkpoint_path,
+        sha256_file(checkpoint_path),
+        source_snapshot=STAGE4_SOURCE_SNAPSHOT,
+        n_layer=6,
+        n_head=6,
+        d_model=384,
+        block_size=256,
+        stage4_ready=True,
+    )
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return metadata
 
@@ -204,16 +260,24 @@ def main(argv=None) -> int:
     parser.add_argument("--output", type=Path, default=DEFAULT_FIXTURE)
     parser.add_argument("--metadata", type=Path, default=None)
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("--stage4-d384", action="store_true")
     args = parser.parse_args(argv)
 
-    metadata_path = args.metadata or args.output.with_suffix(args.output.suffix + ".json")
+    output_path = args.output
+    if args.stage4_d384 and output_path == DEFAULT_FIXTURE and args.metadata is None:
+        output_path = DEFAULT_STAGE4_FIXTURE
+    metadata_path = args.metadata or output_path.with_suffix(output_path.suffix + ".json")
     if args.validate_only:
-        validate_fixture_metadata(args.output, metadata_path)
-        print(f"fixture metadata valid: {args.output}")
+        validate_fixture_metadata(output_path, metadata_path)
+        print(f"fixture metadata valid: {output_path}")
         return 0
 
-    metadata = write_fixture(args.output, metadata_path)
-    print(f"wrote fixture: {args.output}")
+    metadata = (
+        write_stage4_fixture(output_path, metadata_path)
+        if args.stage4_d384 else
+        write_fixture(output_path, metadata_path)
+    )
+    print(f"wrote fixture: {output_path}")
     print(f"wrote metadata: {metadata_path}")
     print(f"sha256: {metadata['checkpoint_sha256']}")
     return 0
