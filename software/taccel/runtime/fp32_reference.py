@@ -147,6 +147,26 @@ class NanoGPTFP32Reference:
             for tok, pos in zip(tids, pids)
         ]
 
+    def incremental_node_trace(
+        self,
+        token_ids: Sequence[int],
+        position_ids: Optional[Sequence[int]] = None,
+    ) -> List[dict[str, dict[str, np.ndarray]]]:
+        """Process tokens with explicit K/V caches and return per-node FP32 traces."""
+        tids = [int(tok) for tok in token_ids]
+        if not tids:
+            return []
+        pids = list(position_ids) if position_ids is not None else list(range(len(tids)))
+        if len(pids) != len(tids):
+            raise ValueError("position_ids length must match token_ids length")
+        caches = self._empty_caches()
+        traces = []
+        for tok, pos in zip(tids, pids):
+            step_trace: dict[str, dict[str, np.ndarray]] = {}
+            self._decode_incremental_step(tok, pos, caches, trace=step_trace)
+            traces.append(step_trace)
+        return traces
+
     def forward_incremental(
         self,
         token_ids: Sequence[int],
@@ -196,32 +216,64 @@ class NanoGPTFP32Reference:
             for _ in range(self.n_layer)
         ]
 
-    def _decode_incremental_step(self, token_id: int, position_id: int, caches) -> np.ndarray:
+    def _decode_incremental_step(self, token_id: int, position_id: int, caches,
+                                 trace: Optional[dict[str, dict[str, np.ndarray]]] = None) -> np.ndarray:
         with self.torch.no_grad():
+            def record(name: str, value) -> None:
+                if trace is None:
+                    return
+                trace[name] = {
+                    "value": value.detach().cpu().numpy().astype(np.float32).copy()
+                    if hasattr(value, "detach")
+                    else np.asarray(value, dtype=np.float32).copy()
+                }
+
             tok = self.torch.tensor([int(token_id)], dtype=self.torch.long)
             pos = self.torch.tensor([int(position_id)], dtype=self.torch.long)
             x = self.wte[tok] + self.wpe[pos]
+            record("tok_pos_add", x)
 
             for layer_idx, layer in enumerate(self.layers):
                 ln1 = self._layer_norm(x, layer["ln1_w"], layer["ln1_b"])
+                record(f"block{layer_idx}_ln1", ln1)
                 head_outs = []
                 for head_idx, (q_w, k_w, v_w) in enumerate(layer["heads"]):
                     q = ln1 @ q_w.T
                     k = ln1 @ k_w.T
                     v = ln1 @ v_w.T
+                    record(f"block{layer_idx}_head{head_idx}_query", q)
+                    record(f"block{layer_idx}_head{head_idx}_key", k)
+                    record(f"block{layer_idx}_head{head_idx}_value", v)
                     caches[layer_idx][head_idx]["k"].append(k[0].clone())
                     caches[layer_idx][head_idx]["v"].append(v[0].clone())
                     k_cache = self.torch.stack(caches[layer_idx][head_idx]["k"], dim=0)
                     v_cache = self.torch.stack(caches[layer_idx][head_idx]["v"], dim=0)
                     attn = (q @ k_cache.T) * self.attn_scale
                     probs = self.F.softmax(attn, dim=-1)
-                    head_outs.append(probs @ v_cache)
+                    record(f"block{layer_idx}_head{head_idx}_softmax", probs)
+                    head_out = probs @ v_cache
+                    record(f"block{layer_idx}_head{head_idx}_attn_v", head_out)
+                    head_outs.append(head_out)
                 concat = self.torch.cat(head_outs, dim=-1)
-                x = x + concat @ layer["c_proj_w"].T + layer["c_proj_b"]
+                record(f"block{layer_idx}_concat", concat)
+                out_proj = concat @ layer["c_proj_w"].T + layer["c_proj_b"]
+                record(f"block{layer_idx}_out_proj", out_proj)
+                x = x + out_proj
+                record(f"block{layer_idx}_residual1", x)
 
                 ln2 = self._layer_norm(x, layer["ln2_w"], layer["ln2_b"])
+                record(f"block{layer_idx}_ln2", ln2)
                 fc1 = ln2 @ layer["fc_w"].T + layer["fc_b"]
+                record(f"block{layer_idx}_fc1", fc1)
                 gelu = self.F.gelu(fc1)
-                x = x + gelu @ layer["proj_w"].T + layer["proj_b"]
+                record(f"block{layer_idx}_gelu", gelu)
+                fc2 = gelu @ layer["proj_w"].T + layer["proj_b"]
+                record(f"block{layer_idx}_fc2", fc2)
+                x = x + fc2
+                record(f"block{layer_idx}_residual2", x)
 
-            return self._logits(x)[0].cpu().numpy().astype(np.float32)
+            ln_f = self._layer_norm(x, self.ln_f_w, self.ln_f_b)
+            record("ln_f", ln_f)
+            logits = ln_f[-1:] @ self.lm_head_w.T
+            record("lm_head", logits)
+            return logits[0].cpu().numpy().astype(np.float32)

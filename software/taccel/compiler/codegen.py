@@ -56,6 +56,7 @@ class CodeGenerator:
                  gelu_from_accum: bool = False,
                  gelu_from_accum_blocks: Optional[set] = None,
                  dequant_add_residual1_blocks: Optional[set] = None,
+                 dequant_add_residual2_blocks: Optional[set] = None,
                  fused_softmax_attnv_blocks: Optional[set] = None,
                  fused_softmax_attnv_accum_out_proj_blocks: Optional[set] = None,
                  requant_pc_weight_names: Optional[set] = None,
@@ -81,6 +82,9 @@ class CodeGenerator:
         self.gelu_from_accum_blocks = None if gelu_from_accum_blocks is None else set(gelu_from_accum_blocks)
         self.dequant_add_residual1_blocks = (
             None if dequant_add_residual1_blocks is None else set(dequant_add_residual1_blocks)
+        )
+        self.dequant_add_residual2_blocks = (
+            None if dequant_add_residual2_blocks is None else set(dequant_add_residual2_blocks)
         )
         self.fused_softmax_attnv_blocks = None if fused_softmax_attnv_blocks is None else set(fused_softmax_attnv_blocks)
         self.fused_softmax_attnv_accum_out_proj_blocks = (
@@ -342,6 +346,24 @@ class CodeGenerator:
 
     def _dequant_add_residual1_enabled_for_residual(self, node_name: str) -> bool:
         return node_name.endswith("_residual1") and self._block_selected(node_name, self.dequant_add_residual1_blocks)
+
+    def _dequant_add_residual2_enabled_for_output(self, node_name: str) -> bool:
+        return node_name.endswith("_fc2") and self._block_selected(node_name, self.dequant_add_residual2_blocks)
+
+    def _dequant_add_residual2_enabled_for_residual(self, node_name: str) -> bool:
+        return node_name.endswith("_residual2") and self._block_selected(node_name, self.dequant_add_residual2_blocks)
+
+    def _dequant_add_enabled_for_output(self, node_name: str) -> bool:
+        return (
+            self._dequant_add_residual1_enabled_for_output(node_name)
+            or self._dequant_add_residual2_enabled_for_output(node_name)
+        )
+
+    def _dequant_add_enabled_for_residual(self, node_name: str) -> bool:
+        return (
+            self._dequant_add_residual1_enabled_for_residual(node_name)
+            or self._dequant_add_residual2_enabled_for_residual(node_name)
+        )
 
     def _fused_softmax_attnv_accum_out_proj_enabled_for(self, node_name: str) -> bool:
         return self._block_selected(node_name, self.fused_softmax_attnv_accum_out_proj_blocks)
@@ -666,10 +688,10 @@ class CodeGenerator:
                 accum_real_scale,
             )
 
-        if self._dequant_add_residual1_enabled_for_output(node.name):
+        if self._dequant_add_enabled_for_output(node.name):
             if weight_name in self.requant_pc_weight_names:
                 raise ValueError(
-                    f"DEQUANT_ADD residual1 path currently requires scalar out_proj scale, got REQUANT_PC weight '{weight_name}'"
+                    f"DEQUANT_ADD residual path currently requires scalar output scale, got REQUANT_PC weight '{weight_name}'"
                 )
             self.pending_accum_outputs[node.name] = {
                 "accum_real_scale": accum_real_scale,
@@ -2257,15 +2279,27 @@ class CodeGenerator:
         if node.name in self.precomputed_nodes:
             return
 
-        if self._dequant_add_residual1_enabled_for_residual(node.name) and node.inputs[0] in self.pending_accum_outputs:
-            skip_name = node.inputs[1]
+        pending_name = None
+        skip_name = None
+        if self._dequant_add_enabled_for_residual(node.name):
+            for input_name in node.inputs:
+                if input_name in self.pending_accum_outputs:
+                    pending_name = input_name
+                    break
+            if pending_name is not None:
+                skip_candidates = [name for name in node.inputs if name != pending_name]
+                if len(skip_candidates) != 1:
+                    raise ValueError(f"{node.name} expected one skip input, got {node.inputs}")
+                skip_name = skip_candidates[0]
+
+        if pending_name is not None and skip_name is not None:
             if skip_name in self.dram_temp_outputs:
                 skip_alloc = self._load_dram_to_abuf(skip_name, M_pad, N_pad)
             else:
                 skip_alloc = self.mem.abuf.get(skip_name) or \
                             self.mem.abuf.alloc(skip_name, M_pad * N_pad)
 
-            pending = self.pending_accum_outputs.pop(node.inputs[0])
+            pending = self.pending_accum_outputs.pop(pending_name)
             output_scale = self.calibration_scales.get(node.name, 6.0 / 127.0)
             skip_scale = self.calibration_scales.get(skip_name, 6.0 / 127.0)
             accum_rescale = pending["accum_real_scale"] / max(output_scale, 1e-12)

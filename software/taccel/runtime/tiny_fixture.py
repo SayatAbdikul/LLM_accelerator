@@ -91,9 +91,14 @@ def _to_numpy(tensor) -> np.ndarray:
     return np.asarray(tensor)
 
 
-def _quantize_embedding(tensor) -> np.ndarray:
-    q, _ = quantize_tensor(_to_numpy(tensor).astype(np.float32), per_channel=False)
-    return q.astype(np.int8)
+def _quantize_embedding(tensor, scale: Optional[float] = None) -> np.ndarray:
+    arr = _to_numpy(tensor).astype(np.float32)
+    if scale is None:
+        q, _ = quantize_tensor(arr, per_channel=False)
+        return q.astype(np.int8)
+    if scale <= 0.0:
+        raise ValueError("embedding scale must be positive")
+    return np.clip(np.round(arr / np.float32(scale)), -128, 127).astype(np.int8)
 
 
 def _quantize_linear_weight(tensor) -> Tuple[np.ndarray, np.ndarray]:
@@ -159,9 +164,14 @@ def quantize_fixture_payload(
         calibration_scales = build_calibration_scales(payload)
     state_dict = payload["state_dict"]
     config = model_config_from_fixture_payload(payload)
+    # Token and position embeddings are added by a raw INT8 VADD in the
+    # generated program.  Both tables therefore must share the output scale used
+    # for tok_pos_add; otherwise q_token + q_pos is not a representation of
+    # token + position in any single real scale.
+    embedding_add_scale = float(calibration_scales.get("tok_pos_add", 6.0 / 127.0))
     weight_data = {
-        "transformer.wte.weight": (_quantize_embedding(state_dict["transformer.wte.weight"]), None),
-        "transformer.wpe.weight": (_quantize_embedding(state_dict["transformer.wpe.weight"]), None),
+        "transformer.wte.weight": (_quantize_embedding(state_dict["transformer.wte.weight"], embedding_add_scale), None),
+        "transformer.wpe.weight": (_quantize_embedding(state_dict["transformer.wpe.weight"], embedding_add_scale), None),
         "transformer.ln_f.weight": (_fp16_vector(state_dict["transformer.ln_f.weight"]), None),
         "transformer.ln_f.bias": (_fp16_vector(state_dict["transformer.ln_f.bias"]), None),
     }
@@ -369,10 +379,16 @@ def run_nanogpt_fp32_e2e(payload: Dict[str, object], *,
         calibration_scales=calibration_scales,
     )
     actual = run_tiny_decode_trace(tiny, prompt_ids, max_new_tokens=max_new_tokens)
-    fp32 = NanoGPTFP32Reference(payload["state_dict"], payload["model_args"]).greedy_decode_trace(
+    fp32_ref = NanoGPTFP32Reference(payload["state_dict"], payload["model_args"])
+    fp32 = fp32_ref.greedy_decode_trace(
         prompt_ids,
         max_new_tokens=max_new_tokens,
     )
+    # Rank-quality gates must compare both models on the same prefix.  The
+    # independently free-running FP32 text is still returned as a diagnostic,
+    # but the logits below are evaluated on the golden-generated prefix so an
+    # early greedy-token split does not poison every later rank comparison.
+    fp32_logits_on_golden_prefix = fp32_ref.incremental_logits_trace(actual.generated)
 
     vocab = tiny.config.vocab_size
     lm_head_scale = float(calibration_scales.get("lm_head", 1.0))
@@ -381,7 +397,7 @@ def run_nanogpt_fp32_e2e(payload: Dict[str, object], *,
     golden_in_fp32 = []
     top1_match = []
     cosine = []
-    for got, ref in zip(actual.logits, fp32.logits):
+    for got, ref in zip(actual.logits, fp32_logits_on_golden_prefix):
         got_active = np.asarray(got)[:vocab]
         ref_active = np.asarray(ref)[:vocab]
         got_top5 = _topk_set(got_active, vocab_size=vocab, k=5)
@@ -399,7 +415,7 @@ def run_nanogpt_fp32_e2e(payload: Dict[str, object], *,
         generated=actual.generated,
         fp32_generated=fp32.generated,
         logits=actual.logits,
-        fp32_logits=fp32.logits,
+        fp32_logits=fp32_logits_on_golden_prefix,
         top5_overlap_per_step=top5,
         fp32_top1_in_golden_top5_per_step=fp32_in_golden,
         golden_top1_in_fp32_top5_per_step=golden_in_fp32,

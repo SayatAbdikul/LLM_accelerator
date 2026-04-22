@@ -196,6 +196,7 @@ def build_decoder_program_bundle(
     decode_graph = _copy_graph_with_logits_store(decode_graph, stream_name="decode")
     if logits_size == 0:
         logits_size = _infer_logits_size(prefill_graph, decode_graph)
+    residual_dequant_blocks = set(range(int(model_config.n_layer)))
     prefill_codegen = CodeGenerator(
         weight_data,
         calibration_scales,
@@ -203,6 +204,8 @@ def build_decoder_program_bundle(
         model_config=model_config,
         stream_name="prefill",
         kv_layout=kv_layout,
+        dequant_add_residual1_blocks=residual_dequant_blocks,
+        dequant_add_residual2_blocks=residual_dequant_blocks,
     )
     decode_codegen = CodeGenerator(
         weight_data,
@@ -211,6 +214,8 @@ def build_decoder_program_bundle(
         model_config=model_config,
         stream_name="decode",
         kv_layout=kv_layout,
+        dequant_add_residual1_blocks=residual_dequant_blocks,
+        dequant_add_residual2_blocks=residual_dequant_blocks,
     )
     prefill_instructions, prefill_data = prefill_codegen.generate(prefill_graph)
     decode_instructions, decode_data = decode_codegen.generate(decode_graph)

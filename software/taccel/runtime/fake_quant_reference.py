@@ -101,18 +101,29 @@ def _causal_softmax(x: np.ndarray) -> np.ndarray:
 # Weight fake-quantisation at build time
 # ---------------------------------------------------------------------------
 
-def _fq_linear(tensor) -> np.ndarray:
-    """Per-channel INT8 quantisation dequantised with the MEAN channel scale.
+def _linear_components(tensor) -> tuple[np.ndarray, np.float32, np.ndarray]:
+    """Return compiler-matched linear weight components.
 
     The codegen REQUANT uses a single scalar scale = mean(per_channel_scales),
-    not per-channel dequant.  Using mean_scale here makes fake-quant arithmetic
-    match the golden-model REQUANT output exactly (up to rounding).
+    not per-channel dequant.  The compiler also pads output-channel scales to a
+    16-wide boundary before taking that mean, so the reference mirrors that
+    padding even when the logical vocab/output size is not a multiple of 16.
     """
     from ..quantizer.quantize import quantize_tensor
     arr = _to_f32(tensor)  # [out, in]
     q, scales = quantize_tensor(arr, per_channel=True)
-    mean_scale = np.float32(np.mean(scales.astype(np.float32)))
-    return q.astype(np.float32) * mean_scale  # scalar dequant to match REQUANT
+    padded_out = q.shape[0] + ((16 - q.shape[0] % 16) % 16)
+    scales_f = scales.astype(np.float32)
+    if scales_f.size < padded_out:
+        scales_f = np.pad(scales_f, (0, padded_out - scales_f.size), constant_values=scales_f[-1])
+    mean_scale = np.float32(np.mean(scales_f))
+    q_i8 = q.astype(np.int8)
+    return q_i8, mean_scale, q_i8.astype(np.float32) * mean_scale
+
+
+def _fq_linear(tensor) -> np.ndarray:
+    """Per-channel INT8 quantisation dequantised with compiler scalar scale."""
+    return _linear_components(tensor)[2]
 
 
 def _fq_embedding(tensor) -> np.ndarray:
@@ -139,6 +150,33 @@ def _fp32_to_int8(x: np.ndarray, scale: float) -> np.ndarray:
     Dividing by scale recovers the stored integers.
     """
     return np.clip(np.round(x.astype(np.float32) / np.float32(scale)), -128, 127).astype(np.int8)
+
+
+def _requant_accum_int8(accum: np.ndarray, accum_scale: float, out_scale: float) -> np.ndarray:
+    """Requantize INT32 accumulators through the architectural FP16 scale reg."""
+    if out_scale <= 0.0:
+        return np.zeros_like(accum, dtype=np.int8)
+    requant = np.float32(np.float16(np.float32(accum_scale) / np.float32(out_scale)))
+    return np.clip(np.round(accum.astype(np.float32) * requant), -128, 127).astype(np.int8)
+
+
+def _dequant_add_accum_int8(
+    accum: np.ndarray,
+    accum_scale: float,
+    skip_i8: np.ndarray,
+    skip_scale: float,
+    out_scale: float,
+) -> np.ndarray:
+    """Mirror DEQUANT_ADD: ACCUM and INT8 skip are rescaled via FP16 regs."""
+    if out_scale <= 0.0:
+        return np.zeros_like(skip_i8, dtype=np.int8)
+    accum_rescale = np.float32(np.float16(np.float32(accum_scale) / np.float32(out_scale)))
+    skip_rescale = np.float32(np.float16(np.float32(skip_scale) / np.float32(out_scale)))
+    return np.clip(
+        np.round(accum.astype(np.float32) * accum_rescale + skip_i8.astype(np.float32) * skip_rescale),
+        -128,
+        127,
+    ).astype(np.int8)
 
 
 class NanoGPTFQReference:
@@ -176,38 +214,67 @@ class NanoGPTFQReference:
         self.eps = np.float32(1e-6)
         self.scales = dict(scales)
 
-        from ..quantizer.quantize import quantize_tensor
         sd = state_dict
-        # INT8 per-tensor embeddings (matching _quantize_embedding in tiny_fixture.py)
-        wte_q, _ = quantize_tensor(_to_f32(sd["transformer.wte.weight"]), per_channel=False)
-        wpe_q, _ = quantize_tensor(_to_f32(sd["transformer.wpe.weight"]), per_channel=False)
+        # INT8 embeddings are stored at the tok_pos_add scale because the
+        # compiled program uses a raw INT8 VADD for token + position.  Separate
+        # table scales would make q_token + q_pos numerically meaningless.
+        self.wte_fp32 = _to_f32(sd["transformer.wte.weight"])
+        self.wpe_fp32 = _to_f32(sd["transformer.wpe.weight"])
+        embed_add_scale = _scale(self.scales, "tok_pos_add")
+        wte_q = np.clip(np.round(self.wte_fp32 / np.float32(embed_add_scale)), -128, 127).astype(np.int8)
+        wpe_q = np.clip(np.round(self.wpe_fp32 / np.float32(embed_add_scale)), -128, 127).astype(np.int8)
         self.wte_int8 = wte_q  # [V, d], INT8
         self.wpe_int8 = wpe_q  # [T, d], INT8
 
         self.ln_f_w = _to_f32(sd["transformer.ln_f.weight"])
         self.ln_f_b = _to_f32(sd["transformer.ln_f.bias"])
-        self.lm_head_w = _fq_linear(sd["lm_head.weight"])        # [V, d]
+        self.lm_head_w_q, self.lm_head_w_scale, self.lm_head_w = _linear_components(sd["lm_head.weight"])
+        self.lm_head_w_fp32 = _to_f32(sd["lm_head.weight"])
 
         self.layers = []
         for L in range(self.n_layer):
             heads = []
             for H in range(self.n_head):
+                q_q, q_scale_w, q_w = _linear_components(sd[f"transformer.h.{L}.attn.c_attn.weight_h{H}_query"])
+                k_q, k_scale_w, k_w = _linear_components(sd[f"transformer.h.{L}.attn.c_attn.weight_h{H}_key"])
+                v_q, v_scale_w, v_w = _linear_components(sd[f"transformer.h.{L}.attn.c_attn.weight_h{H}_value"])
                 heads.append((
-                    _fq_linear(sd[f"transformer.h.{L}.attn.c_attn.weight_h{H}_query"]),
-                    _fq_linear(sd[f"transformer.h.{L}.attn.c_attn.weight_h{H}_key"]),
-                    _fq_linear(sd[f"transformer.h.{L}.attn.c_attn.weight_h{H}_value"]),
+                    q_w,
+                    k_w,
+                    v_w,
+                    _to_f32(sd[f"transformer.h.{L}.attn.c_attn.weight_h{H}_query"]),
+                    _to_f32(sd[f"transformer.h.{L}.attn.c_attn.weight_h{H}_key"]),
+                    _to_f32(sd[f"transformer.h.{L}.attn.c_attn.weight_h{H}_value"]),
+                    q_q,
+                    k_q,
+                    v_q,
+                    q_scale_w,
+                    k_scale_w,
+                    v_scale_w,
                 ))
+            c_proj_q, c_proj_scale_w, c_proj_w = _linear_components(sd[f"transformer.h.{L}.attn.c_proj.weight"])
+            fc_q, fc_scale_w, fc_w = _linear_components(sd[f"transformer.h.{L}.mlp.c_fc.weight"])
+            proj_q, proj_scale_w, proj_w = _linear_components(sd[f"transformer.h.{L}.mlp.c_proj.weight"])
             self.layers.append({
                 "ln1_w": _to_f32(sd[f"transformer.h.{L}.ln_1.weight"]),
                 "ln1_b": _to_f32(sd[f"transformer.h.{L}.ln_1.bias"]),
                 "ln2_w": _to_f32(sd[f"transformer.h.{L}.ln_2.weight"]),
                 "ln2_b": _to_f32(sd[f"transformer.h.{L}.ln_2.bias"]),
                 "heads": heads,
-                "c_proj_w": _fq_linear(sd[f"transformer.h.{L}.attn.c_proj.weight"]),
+                "c_proj_w": c_proj_w,
+                "c_proj_w_q": c_proj_q,
+                "c_proj_w_scale": c_proj_scale_w,
+                "c_proj_w_fp32": _to_f32(sd[f"transformer.h.{L}.attn.c_proj.weight"]),
                 "c_proj_b": _to_f32(sd[f"transformer.h.{L}.attn.c_proj.bias"]),
-                "fc_w": _fq_linear(sd[f"transformer.h.{L}.mlp.c_fc.weight"]),
+                "fc_w": fc_w,
+                "fc_w_q": fc_q,
+                "fc_w_scale": fc_scale_w,
+                "fc_w_fp32": _to_f32(sd[f"transformer.h.{L}.mlp.c_fc.weight"]),
                 "fc_b": _to_f32(sd[f"transformer.h.{L}.mlp.c_fc.bias"]),
-                "proj_w": _fq_linear(sd[f"transformer.h.{L}.mlp.c_proj.weight"]),
+                "proj_w": proj_w,
+                "proj_w_q": proj_q,
+                "proj_w_scale": proj_scale_w,
+                "proj_w_fp32": _to_f32(sd[f"transformer.h.{L}.mlp.c_proj.weight"]),
                 "proj_b": _to_f32(sd[f"transformer.h.{L}.mlp.c_proj.bias"]),
             })
 
@@ -235,7 +302,8 @@ class NanoGPTFQReference:
                 _scale(s, f"block{L}_ln1"),
             )
             head_outs_int8 = []
-            for H, (q_w, k_w, v_w) in enumerate(layer["heads"]):
+            for H, head_weights in enumerate(layer["heads"]):
+                q_w, k_w, v_w = head_weights[:3]
                 q = _qdq(ln1 @ q_w.T, _scale(s, f"block{L}_head{H}_query"))
                 k = _qdq(ln1 @ k_w.T, _scale(s, f"block{L}_head{H}_key"))
                 v = _qdq(ln1 @ v_w.T, _scale(s, f"block{L}_head{H}_value"))
@@ -255,14 +323,18 @@ class NanoGPTFQReference:
             concat_scale = _scale(s, f"block{L}_concat")
             concat = concat_int8.astype(np.float32) * np.float32(concat_scale)
 
-            out_proj = _qdq(
-                concat @ layer["c_proj_w"].T + layer["c_proj_b"],
-                _scale(s, f"block{L}_out_proj"),
-            )
-            # Residual 1: INT8 saturating VADD matching the compiled VADD instruction.
+            concat_scale = _scale(s, f"block{L}_concat")
             out_proj_scale = _scale(s, f"block{L}_out_proj")
-            x_int8 = _int8_saturating_add(x_int8, _fp32_to_int8(out_proj, out_proj_scale))
+            out_accum = concat_int8.astype(np.int32) @ layer["c_proj_w_q"].astype(np.int32).T
+            out_accum_scale = np.float32(concat_scale) * np.float32(layer["c_proj_w_scale"])
+            out_proj_i8 = _requant_accum_int8(out_accum, out_accum_scale, out_proj_scale)
+            out_proj = out_proj_i8.astype(np.float32) * np.float32(out_proj_scale)
+            # Residual 1: decoder bundles use DEQUANT_ADD, which consumes the
+            # branch accumulator directly through FP16 rescale registers.
+            prev_x_int8 = x_int8
+            prev_x_scale = x_scale
             x_scale = _scale(s, f"block{L}_residual1")
+            x_int8 = _dequant_add_accum_int8(out_accum, out_accum_scale, prev_x_int8, prev_x_scale, x_scale)
             x = x_int8.astype(np.float32) * np.float32(x_scale)
 
             # --- MLP ---
@@ -272,14 +344,17 @@ class NanoGPTFQReference:
             )
             fc1 = _qdq(ln2 @ layer["fc_w"].T + layer["fc_b"], _scale(s, f"block{L}_fc1"))
             gelu = _qdq(_gelu_np(fc1), _scale(s, f"block{L}_gelu", 1.0 / 127.0))
-            fc2 = _qdq(
-                gelu @ layer["proj_w"].T + layer["proj_b"],
-                _scale(s, f"block{L}_fc2"),
-            )
-            # Residual 2: INT8 saturating VADD.
+            gelu_scale = _scale(s, f"block{L}_gelu", 1.0 / 127.0)
+            gelu_i8 = _fp32_to_int8(gelu, gelu_scale)
             fc2_scale = _scale(s, f"block{L}_fc2")
-            x_int8 = _int8_saturating_add(x_int8, _fp32_to_int8(fc2, fc2_scale))
+            fc2_accum = gelu_i8.astype(np.int32) @ layer["proj_w_q"].astype(np.int32).T
+            fc2_accum_scale = np.float32(gelu_scale) * np.float32(layer["proj_w_scale"])
+            fc2_i8 = _requant_accum_int8(fc2_accum, fc2_accum_scale, fc2_scale)
+            fc2 = fc2_i8.astype(np.float32) * np.float32(fc2_scale)
+            prev_x_int8 = x_int8
+            prev_x_scale = x_scale
             x_scale = _scale(s, f"block{L}_residual2")
+            x_int8 = _dequant_add_accum_int8(fc2_accum, fc2_accum_scale, prev_x_int8, prev_x_scale, x_scale)
             x = x_int8.astype(np.float32) * np.float32(x_scale)
 
         ln_f = _qdq(_layernorm_np(x, self.ln_f_w, self.ln_f_b, self.eps), _scale(s, "ln_f"))
@@ -301,6 +376,7 @@ class NanoGPTFQReference:
         self,
         token_ids: Sequence[int],
         position_ids: Optional[Sequence[int]] = None,
+        fp32_groups: Optional[set[str]] = None,
     ) -> list[np.ndarray]:
         """Run a cache-style decode and return logits after each token."""
         tids = [int(tok) for tok in token_ids]
@@ -318,36 +394,104 @@ class NanoGPTFQReference:
             for _ in range(self.n_layer)
         ]
         return [
-            self._decode_incremental_step(tok, pos, caches)
+            self._decode_incremental_step(tok, pos, caches, fp32_groups=fp32_groups)
             for tok, pos in zip(tids, pids)
         ]
 
-    def _decode_incremental_step(self, token_id: int, position_id: int, caches) -> np.ndarray:
+    def incremental_node_trace(
+        self,
+        token_ids: Sequence[int],
+        position_ids: Optional[Sequence[int]] = None,
+        fp32_groups: Optional[set[str]] = None,
+    ) -> list[dict[str, dict[str, np.ndarray | float | None]]]:
+        """Run incremental decode and return per-node fake-quant trace entries."""
+        tids = [int(tok) for tok in token_ids]
+        if not tids:
+            return []
+        pids = list(position_ids) if position_ids is not None else list(range(len(tids)))
+        if len(pids) != len(tids):
+            raise ValueError("position_ids length must match token_ids length")
+        caches = [
+            [
+                {"k": [], "v": []}
+                for _ in range(self.n_head)
+            ]
+            for _ in range(self.n_layer)
+        ]
+        traces = []
+        for tok, pos in zip(tids, pids):
+            step_trace: dict[str, dict[str, np.ndarray | float | None]] = {}
+            self._decode_incremental_step(
+                tok,
+                pos,
+                caches,
+                trace=step_trace,
+                fp32_groups=fp32_groups,
+            )
+            traces.append(step_trace)
+        return traces
+
+    def _decode_incremental_step(
+        self,
+        token_id: int,
+        position_id: int,
+        caches,
+        trace: Optional[dict[str, dict[str, np.ndarray | float | None]]] = None,
+        fp32_groups: Optional[set[str]] = None,
+    ) -> np.ndarray:
         s = self.scales
-        x_int8 = _int8_saturating_add(
-            self.wte_int8[[token_id]],
-            self.wpe_int8[[position_id]],
-        )
+        groups = set(fp32_groups or ())
+
+        def record(name: str, value: np.ndarray, *, scale: Optional[float] = None,
+                   int8: Optional[np.ndarray] = None) -> None:
+            if trace is None:
+                return
+            trace[name] = {
+                "value": np.asarray(value, dtype=np.float32).copy(),
+                "scale": None if scale is None else float(scale),
+                "int8": None if int8 is None else np.asarray(int8, dtype=np.int8).copy(),
+            }
+
         x_scale = _scale(s, "tok_pos_add")
-        x = x_int8.astype(np.float32) * np.float32(x_scale)
+        if "embeddings" in groups:
+            x = self.wte_fp32[[token_id]] + self.wpe_fp32[[position_id]]
+            x_int8 = _fp32_to_int8(_qdq(x, x_scale), x_scale)
+        else:
+            x_int8 = _int8_saturating_add(
+                self.wte_int8[[token_id]],
+                self.wpe_int8[[position_id]],
+            )
+            x = x_int8.astype(np.float32) * np.float32(x_scale)
+        record("tok_pos_add", x, scale=x_scale, int8=x_int8)
 
         for L, layer in enumerate(self.layers):
+            ln1_scale = _scale(s, f"block{L}_ln1")
             ln1 = _qdq(
                 _layernorm_np(x, layer["ln1_w"], layer["ln1_b"], self.eps),
-                _scale(s, f"block{L}_ln1"),
+                ln1_scale,
             )
+            record(f"block{L}_ln1", ln1, scale=ln1_scale, int8=_fp32_to_int8(ln1, ln1_scale))
             head_outs_int8 = []
-            for H, (q_w, k_w, v_w) in enumerate(layer["heads"]):
+            for H, head_weights in enumerate(layer["heads"]):
+                q_w, k_w, v_w, q_w_fp32, k_w_fp32, v_w_fp32 = head_weights[:6]
                 q_scale = _scale(s, f"block{L}_head{H}_query")
                 k_scale = _scale(s, f"block{L}_head{H}_key")
                 v_scale = _scale(s, f"block{L}_head{H}_value")
                 attn_v_scale = _scale(s, f"block{L}_head{H}_attn_v")
 
-                q = _qdq(ln1 @ q_w.T, q_scale)
-                k = _qdq(ln1 @ k_w.T, k_scale)
-                v = _qdq(ln1 @ v_w.T, v_scale)
+                if "qkv" in groups:
+                    q = ln1 @ q_w_fp32.T
+                    k = ln1 @ k_w_fp32.T
+                    v = ln1 @ v_w_fp32.T
+                else:
+                    q = _qdq(ln1 @ q_w.T, q_scale)
+                    k = _qdq(ln1 @ k_w.T, k_scale)
+                    v = _qdq(ln1 @ v_w.T, v_scale)
                 k_i8 = _fp32_to_int8(k, k_scale)
                 v_i8 = _fp32_to_int8(v, v_scale)
+                record(f"block{L}_head{H}_query", q, scale=q_scale, int8=_fp32_to_int8(q, q_scale))
+                record(f"block{L}_head{H}_key", k, scale=k_scale, int8=k_i8)
+                record(f"block{L}_head{H}_value", v, scale=v_scale, int8=v_i8)
                 caches[L][H]["k"].append(k_i8[0].copy())
                 caches[L][H]["v"].append(v_i8[0].copy())
 
@@ -358,41 +502,106 @@ class NanoGPTFQReference:
                 row_max = float(row.max())
                 exp_row = np.exp(row - row_max)
                 probs = (exp_row / float(exp_row.sum()))[None, :]
-                probs = _qdq(probs, _scale(s, f"block{L}_head{H}_softmax", 1.0 / 127.0))
-                head_out = _qdq(probs @ v_cache, attn_v_scale)
+                softmax_scale = _scale(s, f"block{L}_head{H}_softmax", 1.0 / 127.0)
+                if "softmax" not in groups:
+                    probs = _qdq(probs, softmax_scale)
+                record(
+                    f"block{L}_head{H}_softmax",
+                    probs,
+                    scale=softmax_scale,
+                    int8=_fp32_to_int8(probs, softmax_scale),
+                )
+                head_out = probs @ v_cache
+                if "attn_v" not in groups:
+                    head_out = _qdq(head_out, attn_v_scale)
+                record(
+                    f"block{L}_head{H}_attn_v",
+                    head_out,
+                    scale=attn_v_scale,
+                    int8=_fp32_to_int8(head_out, attn_v_scale),
+                )
                 head_outs_int8.append(_fp32_to_int8(head_out, attn_v_scale))
 
             concat_int8 = np.concatenate(head_outs_int8, axis=-1)
             concat_scale = _scale(s, f"block{L}_concat")
             concat = concat_int8.astype(np.float32) * np.float32(concat_scale)
+            record(f"block{L}_concat", concat, scale=concat_scale, int8=concat_int8)
 
-            out_proj = _qdq(
-                concat @ layer["c_proj_w"].T + layer["c_proj_b"],
-                _scale(s, f"block{L}_out_proj"),
-            )
             out_proj_scale = _scale(s, f"block{L}_out_proj")
-            x_int8 = _int8_saturating_add(x_int8, _fp32_to_int8(out_proj, out_proj_scale))
+            if "out_proj" in groups:
+                out_proj = concat @ layer["c_proj_w_fp32"].T + layer["c_proj_b"]
+                out_proj_i8 = _fp32_to_int8(_qdq(out_proj, out_proj_scale), out_proj_scale)
+                out_accum = None
+                out_accum_scale = None
+            else:
+                out_accum = concat_int8.astype(np.int32) @ layer["c_proj_w_q"].astype(np.int32).T
+                out_accum_scale = np.float32(concat_scale) * np.float32(layer["c_proj_w_scale"])
+                out_proj_i8 = _requant_accum_int8(out_accum, out_accum_scale, out_proj_scale)
+                out_proj = out_proj_i8.astype(np.float32) * np.float32(out_proj_scale)
+            record(f"block{L}_out_proj", out_proj, scale=out_proj_scale, int8=out_proj_i8)
             x_scale = _scale(s, f"block{L}_residual1")
-            x = x_int8.astype(np.float32) * np.float32(x_scale)
+            if "residual_vadd" in groups or out_accum is None:
+                x = _qdq(x + out_proj, x_scale)
+                x_int8 = _fp32_to_int8(x, x_scale)
+            else:
+                x_int8 = _dequant_add_accum_int8(out_accum, out_accum_scale, x_int8, _scale(s, "tok_pos_add") if L == 0 else _scale(s, f"block{L - 1}_residual2"), x_scale)
+                x = x_int8.astype(np.float32) * np.float32(x_scale)
+            record(f"block{L}_residual1", x, scale=x_scale, int8=x_int8)
 
+            ln2_scale = _scale(s, f"block{L}_ln2")
             ln2 = _qdq(
                 _layernorm_np(x, layer["ln2_w"], layer["ln2_b"], self.eps),
-                _scale(s, f"block{L}_ln2"),
+                ln2_scale,
             )
-            fc1 = _qdq(ln2 @ layer["fc_w"].T + layer["fc_b"], _scale(s, f"block{L}_fc1"))
-            gelu = _qdq(_gelu_np(fc1), _scale(s, f"block{L}_gelu", 1.0 / 127.0))
-            fc2 = _qdq(
-                gelu @ layer["proj_w"].T + layer["proj_b"],
-                _scale(s, f"block{L}_fc2"),
-            )
+            record(f"block{L}_ln2", ln2, scale=ln2_scale, int8=_fp32_to_int8(ln2, ln2_scale))
+            fc1_scale = _scale(s, f"block{L}_fc1")
+            gelu_scale = _scale(s, f"block{L}_gelu", 1.0 / 127.0)
             fc2_scale = _scale(s, f"block{L}_fc2")
-            x_int8 = _int8_saturating_add(x_int8, _fp32_to_int8(fc2, fc2_scale))
+            if "mlp" in groups:
+                fc1 = ln2 @ layer["fc_w_fp32"].T + layer["fc_b"]
+                gelu = _gelu_np(fc1)
+                fc2 = gelu @ layer["proj_w_fp32"].T + layer["proj_b"]
+                fc2_i8 = _fp32_to_int8(_qdq(fc2, fc2_scale), fc2_scale)
+                fc2_accum = None
+                fc2_accum_scale = None
+            else:
+                fc1 = _qdq(ln2 @ layer["fc_w"].T + layer["fc_b"], fc1_scale)
+                gelu = _qdq(_gelu_np(fc1), gelu_scale)
+                gelu_i8 = _fp32_to_int8(gelu, gelu_scale)
+                fc2_accum = gelu_i8.astype(np.int32) @ layer["proj_w_q"].astype(np.int32).T
+                fc2_accum_scale = np.float32(gelu_scale) * np.float32(layer["proj_w_scale"])
+                fc2_i8 = _requant_accum_int8(fc2_accum, fc2_accum_scale, fc2_scale)
+                fc2 = fc2_i8.astype(np.float32) * np.float32(fc2_scale)
+            record(f"block{L}_fc1", fc1, scale=fc1_scale, int8=_fp32_to_int8(fc1, fc1_scale))
+            record(f"block{L}_gelu", gelu, scale=gelu_scale, int8=_fp32_to_int8(gelu, gelu_scale))
+            record(f"block{L}_fc2", fc2, scale=fc2_scale, int8=fc2_i8)
+            residual1_int8 = x_int8
+            residual1_scale = x_scale
             x_scale = _scale(s, f"block{L}_residual2")
-            x = x_int8.astype(np.float32) * np.float32(x_scale)
+            if "residual_vadd" in groups or fc2_accum is None:
+                x = _qdq(x + fc2, x_scale)
+                x_int8 = _fp32_to_int8(x, x_scale)
+            else:
+                x_int8 = _dequant_add_accum_int8(fc2_accum, fc2_accum_scale, residual1_int8, residual1_scale, x_scale)
+                x = x_int8.astype(np.float32) * np.float32(x_scale)
+            record(f"block{L}_residual2", x, scale=x_scale, int8=x_int8)
 
-        ln_f = _qdq(_layernorm_np(x, self.ln_f_w, self.ln_f_b, self.eps), _scale(s, "ln_f"))
-        logits = ln_f @ self.lm_head_w.T
-        return _to_int8_logits(logits[0], _scale(s, "lm_head"))
+        ln_f_scale = _scale(s, "ln_f")
+        ln_f_raw = _layernorm_np(x, self.ln_f_w, self.ln_f_b, self.eps)
+        ln_f = ln_f_raw if "ln_f" in groups else _qdq(ln_f_raw, ln_f_scale)
+        record("ln_f", ln_f, scale=ln_f_scale, int8=_fp32_to_int8(ln_f, ln_f_scale))
+        logits = ln_f @ (self.lm_head_w_fp32.T if "lm_head" in groups else self.lm_head_w.T)
+        if "lm_head" in groups:
+            record("lm_head", logits, scale=None, int8=None)
+            return logits[0].astype(np.float32)
+        logits_i8 = _to_int8_logits(logits[0], _scale(s, "lm_head"))
+        record(
+            "lm_head",
+            logits_i8.astype(np.float32) * np.float32(_scale(s, "lm_head")),
+            scale=_scale(s, "lm_head"),
+            int8=logits_i8,
+        )
+        return logits_i8
 
 
 # ---------------------------------------------------------------------------
