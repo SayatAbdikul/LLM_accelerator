@@ -9,7 +9,7 @@ from typing import List
 
 import torch
 
-from taccel.runtime.tiny_fixture import run_stage3_tiny_e2e
+from taccel.runtime.tiny_fixture import run_nanogpt_fp32_e2e, run_stage3_tiny_e2e
 
 
 def _parse_prompt_ids(raw: str) -> List[int]:
@@ -42,6 +42,7 @@ def main(argv=None) -> int:
     parser.add_argument("--prompt", default=None, help="Character prompt using the checkpoint tokenizer")
     parser.add_argument("--max-new-tokens", type=int, default=2)
     parser.add_argument("--max-seq-len", type=int, default=None, help="Accepted for CLI compatibility; Stage 4 uses checkpoint block_size")
+    parser.add_argument("--compare-fp32", action="store_true", help="Add rank-based comparison against true PyTorch FP32 nanoGPT")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     args = parser.parse_args(argv)
 
@@ -75,6 +76,22 @@ def main(argv=None) -> int:
         "mean_cosine": float(sum(result.cosine_per_step) / len(result.cosine_per_step)),
         "min_top5_overlap": min(result.top5_overlap_per_step),
     }
+    if args.compare_fp32:
+        fp32 = run_nanogpt_fp32_e2e(
+            payload,
+            prompt_ids=prompt_ids,
+            max_new_tokens=args.max_new_tokens,
+        )
+        summary.update({
+            "fp32_generated_ids": fp32.fp32_generated,
+            "fp32_generated_text": _decode_chars(fp32.fp32_generated, itos),
+            "fp32_min_top5_overlap": fp32.min_top5_overlap,
+            "fp32_top1_in_golden_top5_all": fp32.fp32_top1_in_golden_top5_all,
+            "golden_top1_in_fp32_top5_all": fp32.golden_top1_in_fp32_top5_all,
+            "fp32_top1_match_rate": fp32.top1_match_rate,
+            "fp32_min_cosine": fp32.min_fp32_cosine,
+            "fp32_mean_cosine": float(sum(fp32.fp32_cosine_per_step) / len(fp32.fp32_cosine_per_step)),
+        })
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))
     else:
@@ -83,6 +100,21 @@ def main(argv=None) -> int:
         print(f"min_cosine: {summary['min_cosine']:.9f}")
         print(f"mean_cosine: {summary['mean_cosine']:.9f}")
         print(f"min_top5_overlap: {summary['min_top5_overlap']}")
+        if args.compare_fp32:
+            print(f"fp32_generated_ids: {summary['fp32_generated_ids']}")
+            print(f"fp32_generated_text: {summary['fp32_generated_text']!r}")
+            print(f"fp32_min_top5_overlap: {summary['fp32_min_top5_overlap']}")
+            print(
+                "fp32_top1_in_golden_top5_all: "
+                f"{summary['fp32_top1_in_golden_top5_all']}"
+            )
+            print(
+                "golden_top1_in_fp32_top5_all: "
+                f"{summary['golden_top1_in_fp32_top5_all']}"
+            )
+            print(f"fp32_top1_match_rate: {summary['fp32_top1_match_rate']:.6f}")
+            print(f"fp32_min_cosine: {summary['fp32_min_cosine']:.9f}")
+            print(f"fp32_mean_cosine: {summary['fp32_mean_cosine']:.9f}")
     return 0
 
 

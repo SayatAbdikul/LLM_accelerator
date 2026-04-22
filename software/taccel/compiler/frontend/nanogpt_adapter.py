@@ -207,6 +207,7 @@ def _emit_attention_block(graph: IRGraph, prev: str, block_idx: int, seq_len: in
             block_idx=block_idx,
             head_idx=head_idx,
             masked=True,
+            scale=shape.d_head ** -0.5,
         )
         scaled = _add(
             graph,

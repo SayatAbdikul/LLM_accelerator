@@ -19,6 +19,7 @@ from ..quantizer.quantize import quantize_tensor
 from .calibration import build_calibration_scales
 from .fake_quant import cosine_similarity
 from .fake_quant_reference import NanoGPTFQReference
+from .fp32_reference import NanoGPTFP32Reference
 from .host_runner import HostRunner
 
 
@@ -47,6 +48,41 @@ class TinyE2EResult:
     @property
     def min_cosine(self) -> float:
         return min(self.cosine_per_step) if self.cosine_per_step else 1.0
+
+
+@dataclass
+class TinyFP32E2EResult:
+    generated: List[int]
+    fp32_generated: List[int]
+    logits: List[np.ndarray]
+    fp32_logits: List[np.ndarray]
+    top5_overlap_per_step: List[int]
+    fp32_top1_in_golden_top5_per_step: List[bool]
+    golden_top1_in_fp32_top5_per_step: List[bool]
+    top1_match_per_step: List[bool]
+    fp32_cosine_per_step: List[float]
+
+    @property
+    def min_top5_overlap(self) -> int:
+        return min(self.top5_overlap_per_step) if self.top5_overlap_per_step else 5
+
+    @property
+    def fp32_top1_in_golden_top5_all(self) -> bool:
+        return all(self.fp32_top1_in_golden_top5_per_step)
+
+    @property
+    def golden_top1_in_fp32_top5_all(self) -> bool:
+        return all(self.golden_top1_in_fp32_top5_per_step)
+
+    @property
+    def top1_match_rate(self) -> float:
+        if not self.top1_match_per_step:
+            return 1.0
+        return float(sum(bool(v) for v in self.top1_match_per_step) / len(self.top1_match_per_step))
+
+    @property
+    def min_fp32_cosine(self) -> float:
+        return min(self.fp32_cosine_per_step) if self.fp32_cosine_per_step else 1.0
 
 
 def _to_numpy(tensor) -> np.ndarray:
@@ -228,10 +264,18 @@ def run_tiny_decode_trace(tiny: TinyFixtureBundle, prompt_ids: Sequence[int], *,
 
 
 def _topk_overlap(a: np.ndarray, b: np.ndarray, *, vocab_size: int, k: int = 5) -> int:
-    k = min(int(k), int(vocab_size))
-    lhs = set(np.argsort(np.asarray(a)[:vocab_size])[-k:].tolist())
-    rhs = set(np.argsort(np.asarray(b)[:vocab_size])[-k:].tolist())
+    lhs = _topk_set(a, vocab_size=vocab_size, k=k)
+    rhs = _topk_set(b, vocab_size=vocab_size, k=k)
     return len(lhs.intersection(rhs))
+
+
+def _topk_set(logits: np.ndarray, *, vocab_size: int, k: int = 5) -> set[int]:
+    k = min(int(k), int(vocab_size))
+    active = np.asarray(logits)[:vocab_size]
+    if k <= 0 or active.size == 0:
+        return set()
+    threshold = np.sort(active)[-k]
+    return set(np.where(active >= threshold)[0].tolist())
 
 
 def _run_reference_trace(
@@ -307,3 +351,58 @@ def run_stage3_tiny_e2e(payload: Dict[str, object], *,
 
 
 run_stage3g_tiny_e2e = run_stage3_tiny_e2e
+
+
+def run_nanogpt_fp32_e2e(payload: Dict[str, object], *,
+                         prompt_ids: Sequence[int] = (0,),
+                         max_new_tokens: int = 32) -> TinyFP32E2EResult:
+    """Compare golden-model INT8 generation against true PyTorch FP32 nanoGPT.
+
+    The fake-quant gate remains the primary INT8 correctness test.  This helper
+    is intentionally rank-based: golden logits are INT8, while the reference is
+    true FP32, so top-k agreement is a more stable signal than raw magnitudes.
+    """
+    calibration_scales = build_calibration_scales(payload)
+    tiny = build_stage3_tiny_decoder_bundle(
+        payload,
+        smoke_decode_steps=max_new_tokens,
+        calibration_scales=calibration_scales,
+    )
+    actual = run_tiny_decode_trace(tiny, prompt_ids, max_new_tokens=max_new_tokens)
+    fp32 = NanoGPTFP32Reference(payload["state_dict"], payload["model_args"]).greedy_decode_trace(
+        prompt_ids,
+        max_new_tokens=max_new_tokens,
+    )
+
+    vocab = tiny.config.vocab_size
+    lm_head_scale = float(calibration_scales.get("lm_head", 1.0))
+    top5 = []
+    fp32_in_golden = []
+    golden_in_fp32 = []
+    top1_match = []
+    cosine = []
+    for got, ref in zip(actual.logits, fp32.logits):
+        got_active = np.asarray(got)[:vocab]
+        ref_active = np.asarray(ref)[:vocab]
+        got_top5 = _topk_set(got_active, vocab_size=vocab, k=5)
+        ref_top5 = _topk_set(ref_active, vocab_size=vocab, k=5)
+        got_argmax_set = set(np.where(got_active == np.max(got_active))[0].tolist())
+        ref_argmax_set = set(np.where(ref_active == np.max(ref_active))[0].tolist())
+        top5.append(len(got_top5.intersection(ref_top5)))
+        fp32_in_golden.append(bool(ref_argmax_set.intersection(got_top5)))
+        golden_in_fp32.append(bool(got_argmax_set.intersection(ref_top5)))
+        top1_match.append(bool(got_argmax_set.intersection(ref_argmax_set)))
+        got_dequant = got_active.astype(np.float32) * np.float32(lm_head_scale)
+        cosine.append(cosine_similarity(got_dequant, ref_active.astype(np.float32)))
+
+    return TinyFP32E2EResult(
+        generated=actual.generated,
+        fp32_generated=fp32.generated,
+        logits=actual.logits,
+        fp32_logits=fp32.logits,
+        top5_overlap_per_step=top5,
+        fp32_top1_in_golden_top5_per_step=fp32_in_golden,
+        golden_top1_in_fp32_top5_per_step=golden_in_fp32,
+        top1_match_per_step=top1_match,
+        fp32_cosine_per_step=cosine,
+    )

@@ -33,6 +33,7 @@ def test_run_nanogpt_stage4_fixture_smoke(tmp_path):
             "0",
             "--max-new-tokens",
             "2",
+            "--compare-fp32",
             "--json",
         ],
         cwd=Path(__file__).resolve().parents[2],
@@ -44,3 +45,5 @@ def test_run_nanogpt_stage4_fixture_smoke(tmp_path):
 
     assert "generated_ids" in result.stdout
     assert "min_cosine" in result.stdout
+    assert "fp32_generated_ids" in result.stdout
+    assert "fp32_min_top5_overlap" in result.stdout

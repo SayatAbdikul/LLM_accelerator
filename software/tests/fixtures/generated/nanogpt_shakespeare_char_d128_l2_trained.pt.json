@@ -1,0 +1,82 @@
+{
+  "checkpoint_path": "/Users/sayat/Documents/GitHub/LLM_accelerator/software/tests/fixtures/generated/nanogpt_shakespeare_char_d128_l2_trained.pt",
+  "checkpoint_sha256": "fba6d21411bcc775150b582b5f231d4e4007cd72aee60ddb2a406c4e5e7a9f93",
+  "dataset": "embedded_shakespeare_char_excerpt",
+  "final_train_loss": 0.03663109615445137,
+  "hyperparameters": {
+    "bias": true,
+    "block_size": 128,
+    "d_head": 32,
+    "d_model": 128,
+    "n_head": 4,
+    "n_layer": 2
+  },
+  "initial_train_loss": 8.25173568725586,
+  "learning_rate": 0.0003,
+  "ranges": {
+    "calibration_bytes": {
+      "end": 2048,
+      "start": 0
+    },
+    "evaluation_bytes": {
+      "end": 37376,
+      "start": 33638
+    },
+    "train_bytes": {
+      "end": 33638,
+      "start": 0
+    }
+  },
+  "real_trained_d128_ready": true,
+  "sample_count": {
+    "calibration": 2048,
+    "evaluation": 3738
+  },
+  "schema_version": 1,
+  "seed": 1337,
+  "sequence_length_policy": "contiguous character windows, max block_size tokens",
+  "source_snapshot": "local-stage45-trained-d128-v2-lr3e4-attn-quality",
+  "stage3c_e2e_ready": true,
+  "stage3e_logits_smoke_ready": true,
+  "stage3f_full_graph_smoke_ready": true,
+  "stage4_d384_ready": false,
+  "tokenizer": {
+    "alphabet": "\n ,.:?ABCFSYacdefhiklmnoprstuvwyz",
+    "kind": "character",
+    "vocab_size": 33
+  },
+  "training": {
+    "batch_size": 32,
+    "embedding_learning_rate": 9.999999999999999e-06,
+    "embedding_learning_rate_multiplier": 0.03333333333333333,
+    "final_train_loss": 0.03663109615445137,
+    "initial_train_loss": 8.25173568725586,
+    "learning_rate": 0.0003,
+    "steps": 600,
+    "train_eval_loss": 0.043521586805582047,
+    "train_loss": 0.03663109615445137,
+    "train_seq_len": 64,
+    "training_quality": {
+      "best_entropy_drop": 0.28213125467300415,
+      "best_entropy_ratio": 0.7178687453269958,
+      "best_head": 3,
+      "best_layer": 1,
+      "best_qkt_p95_abs": 6.227034091949463,
+      "entropy_drop_threshold": 0.05,
+      "qkt_p95_abs_threshold": 0.001,
+      "sequence_length": 64
+    },
+    "validation_loss": 0.028443994000554085
+  },
+  "training_quality": {
+    "best_entropy_drop": 0.28213125467300415,
+    "best_entropy_ratio": 0.7178687453269958,
+    "best_head": 3,
+    "best_layer": 1,
+    "best_qkt_p95_abs": 6.227034091949463,
+    "entropy_drop_threshold": 0.05,
+    "qkt_p95_abs_threshold": 0.001,
+    "sequence_length": 64
+  },
+  "validation_loss": 0.028443994000554085
+}

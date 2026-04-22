@@ -171,6 +171,7 @@ class NanoGPTFQReference:
         self.d_model = int(model_args["n_embd"])
         self.d_head = self.d_model // self.n_head
         self.vocab_size = int(model_args["vocab_size"])
+        self.attn_scale = np.float32(self.d_head ** -0.5)
         # sfu.py uses 1e-6 hardcoded — not from model_args
         self.eps = np.float32(1e-6)
         self.scales = dict(scales)
@@ -239,9 +240,7 @@ class NanoGPTFQReference:
                 k = _qdq(ln1 @ k_w.T, _scale(s, f"block{L}_head{H}_key"))
                 v = _qdq(ln1 @ v_w.T, _scale(s, f"block{L}_head{H}_value"))
 
-                # Codegen uses hardcoded 0.125 (= 1/sqrt(64)) as the QKT scale
-                # default, regardless of d_head.
-                attn = (q @ k.T) * np.float32(0.125)
+                attn = (q @ k.T) * self.attn_scale
                 probs = np.ones((1, 1), dtype=np.float32) if seq == 1 else _causal_softmax(attn)
                 probs = _qdq(probs, _scale(s, f"block{L}_head{H}_softmax", 1.0 / 127.0))
                 head_out = _qdq(probs @ v, _scale(s, f"block{L}_head{H}_attn_v"))
@@ -354,7 +353,7 @@ class NanoGPTFQReference:
 
                 k_cache = np.stack(caches[L][H]["k"], axis=0).astype(np.float32) * np.float32(k_scale)
                 v_cache = np.stack(caches[L][H]["v"], axis=0).astype(np.float32) * np.float32(v_scale)
-                attn = (q @ k_cache.T) * np.float32(0.125)
+                attn = (q @ k_cache.T) * self.attn_scale
                 row = attn[0].astype(np.float32)
                 row_max = float(row.max())
                 exp_row = np.exp(row - row_max)
