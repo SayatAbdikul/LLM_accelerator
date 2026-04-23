@@ -6,7 +6,7 @@ compiler (via calibration_scales) and the NanoGPTFQReference consume.
 """
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 import numpy as np
 
@@ -36,6 +36,28 @@ def build_calibration_seqs(
     if len(tokens) < seq_len:
         tokens = tokens * ((seq_len // max(len(tokens), 1)) + 2)
     seqs = []
+    step = max(1, (len(tokens) - seq_len) // max(n_seqs, 1))
+    for i in range(n_seqs):
+        start = (i * step) % (len(tokens) - seq_len + 1)
+        seqs.append(tokens[start: start + seq_len])
+    return seqs
+
+
+def build_calibration_seqs_from_token_ids(
+    token_ids: Sequence[int],
+    *,
+    n_seqs: int = 8,
+    seq_len: int = 16,
+) -> List[List[int]]:
+    """Extract deterministic calibration windows from already-tokenized text."""
+    if seq_len <= 0:
+        raise ValueError("seq_len must be positive")
+    tokens = [int(tok) for tok in token_ids]
+    if not tokens:
+        return [[0] * seq_len]
+    if len(tokens) < seq_len:
+        tokens = tokens * ((seq_len // max(len(tokens), 1)) + 2)
+    seqs: List[List[int]] = []
     step = max(1, (len(tokens) - seq_len) // max(n_seqs, 1))
     for i in range(n_seqs):
         start = (i * step) % (len(tokens) - seq_len + 1)
@@ -82,6 +104,46 @@ def build_calibration_scales(
         scales[name] = max(max_abs, 1e-8) / 127.0
 
     # Nodes that calibration didn't observe → keep the compiler's defaults
+    _fill_defaults(scales, model_args)
+    return scales
+
+
+def build_calibration_scales_from_token_ids(
+    payload: dict,
+    token_ids: Sequence[int],
+    *,
+    n_seqs: int = 8,
+    seq_len: int = 16,
+    percentile: float = 99.9,
+) -> Dict[str, float]:
+    """Return per-node INT8 scales from tokenized calibration text."""
+    model_args = payload["model_args"]
+    state_dict = payload["state_dict"]
+    seqs = build_calibration_seqs_from_token_ids(
+        token_ids,
+        n_seqs=n_seqs,
+        seq_len=seq_len,
+    )
+
+    accum: Dict[str, List[float]] = {}
+    for tids in seqs:
+        node_outputs = _fp32_forward(state_dict, model_args, tids)
+        for name, arr in node_outputs.items():
+            arr_f = np.asarray(arr, dtype=np.float32).ravel()
+            if arr_f.size == 0:
+                continue
+            p = float(
+                np.percentile(np.abs(arr_f), percentile)
+                if percentile < 100.0
+                else float(np.abs(arr_f).max())
+            )
+            accum.setdefault(name, []).append(p)
+
+    scales: Dict[str, float] = {}
+    for name, vals in accum.items():
+        max_abs = float(np.max(vals))
+        scales[name] = max(max_abs, 1e-8) / 127.0
+
     _fill_defaults(scales, model_args)
     return scales
 

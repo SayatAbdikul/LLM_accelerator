@@ -16,6 +16,7 @@ from ..compiler.frontend.nanogpt_adapter import load_nanogpt
 from ..compiler.model_config import ModelConfig
 from ..compiler.tiler import pad_dim
 from ..quantizer.quantize import quantize_tensor
+from ..quantizer.scales import ScalePropagator
 from .calibration import build_calibration_scales
 from .fake_quant import cosine_similarity
 from .fake_quant_reference import NanoGPTFQReference
@@ -119,16 +120,30 @@ def _fp16_vector(tensor) -> np.ndarray:
     return np.pad(arr, (0, (16 - len(arr) % 16) % 16), mode="constant")
 
 
-def _zero_prescaled_bias(state_dict: Dict[str, object], name: str) -> np.ndarray:
+def _prescale_bias(
+    state_dict: Dict[str, object],
+    name: str,
+    *,
+    output_dim: int,
+    act_scale: float,
+    weight_scales: np.ndarray,
+) -> np.ndarray:
+    """Return compiler-domain INT32 bias, padded to the matmul output width."""
+    output_pad = pad_dim(int(output_dim))
     if name not in state_dict:
-        return np.zeros(0, dtype=np.int32)
+        return np.zeros(output_pad, dtype=np.int32)
     arr = _to_numpy(state_dict[name]).astype(np.float32)
-    if not np.allclose(arr, 0.0):
-        raise ValueError(
-            f"Stage 3 tiny fixture helper only supports zero matmul biases; "
-            f"{name!r} is non-zero"
-        )
-    return np.zeros(pad_dim(arr.size), dtype=np.int32)
+    if arr.size != int(output_dim):
+        raise ValueError(f"{name!r} has {arr.size} values, expected {output_dim}")
+    scales = np.asarray(weight_scales, dtype=np.float32)
+    if scales.size < output_pad:
+        scales = np.pad(scales, (0, output_pad - scales.size), constant_values=scales[-1])
+    bias_i32 = ScalePropagator().prescale_bias(
+        arr,
+        np.asarray([float(act_scale)], dtype=np.float32),
+        scales[:arr.size],
+    )
+    return np.pad(bias_i32, (0, output_pad - bias_i32.size), constant_values=0).astype(np.int32)
 
 
 def model_config_from_fixture_payload(payload: Dict[str, object]) -> ModelConfig:
@@ -191,18 +206,49 @@ def quantize_fixture_payload(
             for proj in ("query", "key", "value"):
                 name = f"transformer.h.{layer}.attn.c_attn.weight_h{head}_{proj}"
                 weight_data[name] = _quantize_linear_weight(state_dict[name])
+                bias_name = f"transformer.h.{layer}.attn.c_attn.bias_h{head}_{proj}"
+                if bias_name in state_dict:
+                    prescaled_biases[bias_name] = _prescale_bias(
+                        state_dict,
+                        bias_name,
+                        output_dim=config.d_head,
+                        act_scale=calibration_scales.get(f"block{layer}_ln1", 6.0 / 127.0),
+                        weight_scales=weight_data[name][1],
+                    )
         for name in (
             f"transformer.h.{layer}.attn.c_proj.weight",
             f"transformer.h.{layer}.mlp.c_fc.weight",
             f"transformer.h.{layer}.mlp.c_proj.weight",
         ):
             weight_data[name] = _quantize_linear_weight(state_dict[name])
-        for name in (
-            f"transformer.h.{layer}.attn.c_proj.bias",
-            f"transformer.h.{layer}.mlp.c_fc.bias",
-            f"transformer.h.{layer}.mlp.c_proj.bias",
-        ):
-            prescaled_biases[name] = _zero_prescaled_bias(state_dict, name)
+        bias_specs = (
+            (
+                f"transformer.h.{layer}.attn.c_proj.bias",
+                f"transformer.h.{layer}.attn.c_proj.weight",
+                config.d_model,
+                f"block{layer}_concat",
+            ),
+            (
+                f"transformer.h.{layer}.mlp.c_fc.bias",
+                f"transformer.h.{layer}.mlp.c_fc.weight",
+                config.mlp_dim,
+                f"block{layer}_ln2",
+            ),
+            (
+                f"transformer.h.{layer}.mlp.c_proj.bias",
+                f"transformer.h.{layer}.mlp.c_proj.weight",
+                config.d_model,
+                f"block{layer}_gelu",
+            ),
+        )
+        for bias_name, weight_name, output_dim, act_name in bias_specs:
+            prescaled_biases[bias_name] = _prescale_bias(
+                state_dict,
+                bias_name,
+                output_dim=output_dim,
+                act_scale=calibration_scales.get(act_name, 6.0 / 127.0),
+                weight_scales=weight_data[weight_name][1],
+            )
 
     weight_data["lm_head.weight"] = _quantize_linear_weight(state_dict["lm_head.weight"])
     return weight_data, prescaled_biases, calibration_scales, config, pad_dim(config.vocab_size)

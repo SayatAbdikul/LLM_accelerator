@@ -4,7 +4,8 @@ from .host_runner import HostRunner
 from .tiny_fixture import run_nanogpt_fp32_e2e, run_stage3_tiny_e2e, run_stage3g_tiny_e2e
 from .fake_quant_reference import NanoGPTFQReference
 from .fp32_reference import NanoGPTFP32Reference
-from .calibration import build_calibration_scales
+from .calibration import build_calibration_scales, build_calibration_scales_from_token_ids
+from .gpt2_perplexity import evaluate_gpt2_perplexity
 
 __all__ = [
     "HostRunner",
@@ -14,4 +15,6 @@ __all__ = [
     "NanoGPTFQReference",
     "NanoGPTFP32Reference",
     "build_calibration_scales",
+    "build_calibration_scales_from_token_ids",
+    "evaluate_gpt2_perplexity",
 ]

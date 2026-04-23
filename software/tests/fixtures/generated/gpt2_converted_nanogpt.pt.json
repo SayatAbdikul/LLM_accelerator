@@ -1,0 +1,18 @@
+{
+  "checkpoint": "software/tests/fixtures/generated/gpt2_converted_nanogpt.pt",
+  "checkpoint_sha256": "f0ac7200c680cba02d5ff8c5a9fb9151152485295b2da2fc3323665efd10bf9d",
+  "format": "nanogpt_split_qkv",
+  "model_args": {
+    "bias": true,
+    "block_size": 1024,
+    "layer_norm_epsilon": 1e-05,
+    "n_embd": 768,
+    "n_head": 12,
+    "n_layer": 12,
+    "split_qkv_bias": true,
+    "vocab_size": 50257
+  },
+  "source": "software/tests/fixtures/generated/hf_gpt2",
+  "stage5_gpt2_converted": true,
+  "weight_tying": "lm_head.weight aliases transformer.wte.weight in payload"
+}

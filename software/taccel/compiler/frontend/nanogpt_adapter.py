@@ -18,6 +18,7 @@ class NanoGPTShape:
     max_seq_len: int
     norm_epsilon: float
     bias: bool
+    split_qkv_bias: bool
 
 
 def _config_value(config: Any, *names: str, default: Any = None) -> Any:
@@ -48,6 +49,7 @@ def _coerce_shape(config: Any) -> NanoGPTShape:
         max_seq_len=int(_config_value(config, "block_size", "max_seq_len")),
         norm_epsilon=float(_config_value(config, "layer_norm_epsilon", "norm_epsilon", default=1e-5)),
         bias=bool(_config_value(config, "bias", default=True)),
+        split_qkv_bias=bool(_config_value(config, "split_qkv_bias", default=False)),
     )
 
 
@@ -175,6 +177,8 @@ def _emit_attention_block(graph: IRGraph, prev: str, block_idx: int, seq_len: in
             head_idx=head_idx,
             projection="query",
             weight_name=q_weight,
+            bias=f"transformer.h.{block_idx}.attn.c_attn.bias_h{head_idx}_query"
+            if shape.split_qkv_bias else None,
         )
         k = _add(
             graph,
@@ -186,6 +190,8 @@ def _emit_attention_block(graph: IRGraph, prev: str, block_idx: int, seq_len: in
             head_idx=head_idx,
             projection="key",
             weight_name=k_weight,
+            bias=f"transformer.h.{block_idx}.attn.c_attn.bias_h{head_idx}_key"
+            if shape.split_qkv_bias else None,
         )
         v = _add(
             graph,
@@ -197,6 +203,8 @@ def _emit_attention_block(graph: IRGraph, prev: str, block_idx: int, seq_len: in
             head_idx=head_idx,
             projection="value",
             weight_name=v_weight,
+            bias=f"transformer.h.{block_idx}.attn.c_attn.bias_h{head_idx}_value"
+            if shape.split_qkv_bias else None,
         )
         qkt = _add(
             graph,

@@ -101,7 +101,7 @@ def _causal_softmax(x: np.ndarray) -> np.ndarray:
 # Weight fake-quantisation at build time
 # ---------------------------------------------------------------------------
 
-def _linear_components(tensor) -> tuple[np.ndarray, np.float32, np.ndarray]:
+def _linear_components(tensor) -> tuple[np.ndarray, np.float32, np.ndarray, np.ndarray]:
     """Return compiler-matched linear weight components.
 
     The codegen REQUANT uses a single scalar scale = mean(per_channel_scales),
@@ -118,7 +118,7 @@ def _linear_components(tensor) -> tuple[np.ndarray, np.float32, np.ndarray]:
         scales_f = np.pad(scales_f, (0, padded_out - scales_f.size), constant_values=scales_f[-1])
     mean_scale = np.float32(np.mean(scales_f))
     q_i8 = q.astype(np.int8)
-    return q_i8, mean_scale, q_i8.astype(np.float32) * mean_scale
+    return q_i8, mean_scale, q_i8.astype(np.float32) * mean_scale, scales_f
 
 
 def _fq_linear(tensor) -> np.ndarray:
@@ -179,6 +179,18 @@ def _dequant_add_accum_int8(
     ).astype(np.int8)
 
 
+def _bias_i32(state_dict: dict, name: str, act_scale: float, weight_scales: np.ndarray,
+              output_dim: int) -> np.ndarray:
+    if name not in state_dict:
+        return np.zeros(int(output_dim), dtype=np.int32)
+    bias = _to_f32(state_dict[name]).reshape(-1)
+    if bias.size != int(output_dim):
+        raise ValueError(f"{name!r} has {bias.size} values, expected {output_dim}")
+    scales = np.asarray(weight_scales, dtype=np.float32)[:bias.size]
+    denom = np.maximum(np.abs(np.float32(act_scale) * scales), 1e-10)
+    return np.round(bias / denom).astype(np.int32)
+
+
 class NanoGPTFQReference:
     """NumPy fake-quantised nanoGPT forward pass sharing scales with the compiler.
 
@@ -213,8 +225,13 @@ class NanoGPTFQReference:
         # sfu.py uses 1e-6 hardcoded — not from model_args
         self.eps = np.float32(1e-6)
         self.scales = dict(scales)
-
         sd = state_dict
+        self._has_nonzero_linear_bias = any(
+            ("bias" in name and ("c_attn" in name or "c_proj" in name or "c_fc" in name))
+            and np.any(np.abs(_to_f32(value)) > 0.0)
+            for name, value in sd.items()
+        )
+
         # INT8 embeddings are stored at the tok_pos_add scale because the
         # compiled program uses a raw INT8 VADD for token + position.  Separate
         # table scales would make q_token + q_pos numerically meaningless.
@@ -228,16 +245,23 @@ class NanoGPTFQReference:
 
         self.ln_f_w = _to_f32(sd["transformer.ln_f.weight"])
         self.ln_f_b = _to_f32(sd["transformer.ln_f.bias"])
-        self.lm_head_w_q, self.lm_head_w_scale, self.lm_head_w = _linear_components(sd["lm_head.weight"])
+        self.lm_head_w_q, self.lm_head_w_scale, self.lm_head_w, self.lm_head_w_scales = _linear_components(sd["lm_head.weight"])
         self.lm_head_w_fp32 = _to_f32(sd["lm_head.weight"])
 
         self.layers = []
         for L in range(self.n_layer):
             heads = []
             for H in range(self.n_head):
-                q_q, q_scale_w, q_w = _linear_components(sd[f"transformer.h.{L}.attn.c_attn.weight_h{H}_query"])
-                k_q, k_scale_w, k_w = _linear_components(sd[f"transformer.h.{L}.attn.c_attn.weight_h{H}_key"])
-                v_q, v_scale_w, v_w = _linear_components(sd[f"transformer.h.{L}.attn.c_attn.weight_h{H}_value"])
+                q_name = f"transformer.h.{L}.attn.c_attn.weight_h{H}_query"
+                k_name = f"transformer.h.{L}.attn.c_attn.weight_h{H}_key"
+                v_name = f"transformer.h.{L}.attn.c_attn.weight_h{H}_value"
+                q_q, q_scale_w, q_w, q_scales = _linear_components(sd[q_name])
+                k_q, k_scale_w, k_w, k_scales = _linear_components(sd[k_name])
+                v_q, v_scale_w, v_w, v_scales = _linear_components(sd[v_name])
+                ln1_scale = _scale(self.scales, f"block{L}_ln1")
+                q_b_name = f"transformer.h.{L}.attn.c_attn.bias_h{H}_query"
+                k_b_name = f"transformer.h.{L}.attn.c_attn.bias_h{H}_key"
+                v_b_name = f"transformer.h.{L}.attn.c_attn.bias_h{H}_value"
                 heads.append((
                     q_w,
                     k_w,
@@ -251,10 +275,19 @@ class NanoGPTFQReference:
                     q_scale_w,
                     k_scale_w,
                     v_scale_w,
+                    q_scales,
+                    k_scales,
+                    v_scales,
+                    _bias_i32(sd, q_b_name, ln1_scale, q_scales, self.d_head),
+                    _bias_i32(sd, k_b_name, ln1_scale, k_scales, self.d_head),
+                    _bias_i32(sd, v_b_name, ln1_scale, v_scales, self.d_head),
+                    _to_f32(sd[q_b_name]) if q_b_name in sd else np.zeros(self.d_head, dtype=np.float32),
+                    _to_f32(sd[k_b_name]) if k_b_name in sd else np.zeros(self.d_head, dtype=np.float32),
+                    _to_f32(sd[v_b_name]) if v_b_name in sd else np.zeros(self.d_head, dtype=np.float32),
                 ))
-            c_proj_q, c_proj_scale_w, c_proj_w = _linear_components(sd[f"transformer.h.{L}.attn.c_proj.weight"])
-            fc_q, fc_scale_w, fc_w = _linear_components(sd[f"transformer.h.{L}.mlp.c_fc.weight"])
-            proj_q, proj_scale_w, proj_w = _linear_components(sd[f"transformer.h.{L}.mlp.c_proj.weight"])
+            c_proj_q, c_proj_scale_w, c_proj_w, c_proj_scales = _linear_components(sd[f"transformer.h.{L}.attn.c_proj.weight"])
+            fc_q, fc_scale_w, fc_w, fc_scales = _linear_components(sd[f"transformer.h.{L}.mlp.c_fc.weight"])
+            proj_q, proj_scale_w, proj_w, proj_scales = _linear_components(sd[f"transformer.h.{L}.mlp.c_proj.weight"])
             self.layers.append({
                 "ln1_w": _to_f32(sd[f"transformer.h.{L}.ln_1.weight"]),
                 "ln1_b": _to_f32(sd[f"transformer.h.{L}.ln_1.bias"]),
@@ -264,19 +297,51 @@ class NanoGPTFQReference:
                 "c_proj_w": c_proj_w,
                 "c_proj_w_q": c_proj_q,
                 "c_proj_w_scale": c_proj_scale_w,
+                "c_proj_w_scales": c_proj_scales,
                 "c_proj_w_fp32": _to_f32(sd[f"transformer.h.{L}.attn.c_proj.weight"]),
                 "c_proj_b": _to_f32(sd[f"transformer.h.{L}.attn.c_proj.bias"]),
+                "c_proj_b_i32": _bias_i32(
+                    sd,
+                    f"transformer.h.{L}.attn.c_proj.bias",
+                    _scale(self.scales, f"block{L}_concat"),
+                    c_proj_scales,
+                    self.d_model,
+                ),
                 "fc_w": fc_w,
                 "fc_w_q": fc_q,
                 "fc_w_scale": fc_scale_w,
+                "fc_w_scales": fc_scales,
                 "fc_w_fp32": _to_f32(sd[f"transformer.h.{L}.mlp.c_fc.weight"]),
                 "fc_b": _to_f32(sd[f"transformer.h.{L}.mlp.c_fc.bias"]),
+                "fc_b_i32": _bias_i32(
+                    sd,
+                    f"transformer.h.{L}.mlp.c_fc.bias",
+                    _scale(self.scales, f"block{L}_ln2"),
+                    fc_scales,
+                    4 * self.d_model,
+                ),
                 "proj_w": proj_w,
                 "proj_w_q": proj_q,
                 "proj_w_scale": proj_scale_w,
+                "proj_w_scales": proj_scales,
                 "proj_w_fp32": _to_f32(sd[f"transformer.h.{L}.mlp.c_proj.weight"]),
                 "proj_b": _to_f32(sd[f"transformer.h.{L}.mlp.c_proj.bias"]),
+                "proj_b_i32": _bias_i32(
+                    sd,
+                    f"transformer.h.{L}.mlp.c_proj.bias",
+                    _scale(self.scales, f"block{L}_gelu", 1.0 / 127.0),
+                    proj_scales,
+                    self.d_model,
+                ),
             })
+
+    def _large_vocab_lm_head_reference(self) -> bool:
+        """Use integer lm_head reference when codegen must tile the weight."""
+        return int(self.lm_head_w_q.size) > 256 * 1024
+
+    def _integer_linear_reference(self) -> bool:
+        """Use bias-aware integer linear math for GPT-2-class converted models."""
+        return self._large_vocab_lm_head_reference() or self._has_nonzero_linear_bias
 
     def forward(
         self,
@@ -297,16 +362,35 @@ class NanoGPTFQReference:
 
         for L, layer in enumerate(self.layers):
             # --- Attention ---
+            ln1_scale = _scale(s, f"block{L}_ln1")
             ln1 = _qdq(
                 _layernorm_np(x, layer["ln1_w"], layer["ln1_b"], self.eps),
-                _scale(s, f"block{L}_ln1"),
+                ln1_scale,
             )
+            ln1_i8 = _fp32_to_int8(ln1, ln1_scale)
             head_outs_int8 = []
             for H, head_weights in enumerate(layer["heads"]):
-                q_w, k_w, v_w = head_weights[:3]
-                q = _qdq(ln1 @ q_w.T, _scale(s, f"block{L}_head{H}_query"))
-                k = _qdq(ln1 @ k_w.T, _scale(s, f"block{L}_head{H}_key"))
-                v = _qdq(ln1 @ v_w.T, _scale(s, f"block{L}_head{H}_value"))
+                q_scale = _scale(s, f"block{L}_head{H}_query")
+                k_scale = _scale(s, f"block{L}_head{H}_key")
+                v_scale = _scale(s, f"block{L}_head{H}_value")
+                if self._integer_linear_reference():
+                    q_q, k_q, v_q = head_weights[6:9]
+                    q_scale_w, k_scale_w, v_scale_w = head_weights[9:12]
+                    q_b_i32, k_b_i32, v_b_i32 = head_weights[15:18]
+                    q_accum = ln1_i8.astype(np.int32) @ q_q.astype(np.int32).T + q_b_i32
+                    k_accum = ln1_i8.astype(np.int32) @ k_q.astype(np.int32).T + k_b_i32
+                    v_accum = ln1_i8.astype(np.int32) @ v_q.astype(np.int32).T + v_b_i32
+                    q_i8 = _requant_accum_int8(q_accum, np.float32(ln1_scale) * np.float32(q_scale_w), q_scale)
+                    k_i8 = _requant_accum_int8(k_accum, np.float32(ln1_scale) * np.float32(k_scale_w), k_scale)
+                    v_i8 = _requant_accum_int8(v_accum, np.float32(ln1_scale) * np.float32(v_scale_w), v_scale)
+                    q = q_i8.astype(np.float32) * np.float32(q_scale)
+                    k = k_i8.astype(np.float32) * np.float32(k_scale)
+                    v = v_i8.astype(np.float32) * np.float32(v_scale)
+                else:
+                    q_w, k_w, v_w = head_weights[:3]
+                    q = _qdq(ln1 @ q_w.T, q_scale)
+                    k = _qdq(ln1 @ k_w.T, k_scale)
+                    v = _qdq(ln1 @ v_w.T, v_scale)
 
                 attn = (q @ k.T) * self.attn_scale
                 probs = np.ones((1, 1), dtype=np.float32) if seq == 1 else _causal_softmax(attn)
@@ -325,7 +409,10 @@ class NanoGPTFQReference:
 
             concat_scale = _scale(s, f"block{L}_concat")
             out_proj_scale = _scale(s, f"block{L}_out_proj")
-            out_accum = concat_int8.astype(np.int32) @ layer["c_proj_w_q"].astype(np.int32).T
+            out_accum = (
+                concat_int8.astype(np.int32) @ layer["c_proj_w_q"].astype(np.int32).T
+                + layer["c_proj_b_i32"]
+            )
             out_accum_scale = np.float32(concat_scale) * np.float32(layer["c_proj_w_scale"])
             out_proj_i8 = _requant_accum_int8(out_accum, out_accum_scale, out_proj_scale)
             out_proj = out_proj_i8.astype(np.float32) * np.float32(out_proj_scale)
@@ -342,12 +429,30 @@ class NanoGPTFQReference:
                 _layernorm_np(x, layer["ln2_w"], layer["ln2_b"], self.eps),
                 _scale(s, f"block{L}_ln2"),
             )
-            fc1 = _qdq(ln2 @ layer["fc_w"].T + layer["fc_b"], _scale(s, f"block{L}_fc1"))
+            fc1_scale = _scale(s, f"block{L}_fc1")
+            ln2_scale = _scale(s, f"block{L}_ln2")
+            ln2_i8 = _fp32_to_int8(ln2, ln2_scale)
+            if self._integer_linear_reference():
+                fc1_accum = (
+                    ln2_i8.astype(np.int32) @ layer["fc_w_q"].astype(np.int32).T
+                    + layer["fc_b_i32"]
+                )
+                fc1_i8 = _requant_accum_int8(
+                    fc1_accum,
+                    np.float32(ln2_scale) * np.float32(layer["fc_w_scale"]),
+                    fc1_scale,
+                )
+                fc1 = fc1_i8.astype(np.float32) * np.float32(fc1_scale)
+            else:
+                fc1 = _qdq(ln2 @ layer["fc_w"].T + layer["fc_b"], fc1_scale)
             gelu = _qdq(_gelu_np(fc1), _scale(s, f"block{L}_gelu", 1.0 / 127.0))
             gelu_scale = _scale(s, f"block{L}_gelu", 1.0 / 127.0)
             gelu_i8 = _fp32_to_int8(gelu, gelu_scale)
             fc2_scale = _scale(s, f"block{L}_fc2")
-            fc2_accum = gelu_i8.astype(np.int32) @ layer["proj_w_q"].astype(np.int32).T
+            fc2_accum = (
+                gelu_i8.astype(np.int32) @ layer["proj_w_q"].astype(np.int32).T
+                + layer["proj_b_i32"]
+            )
             fc2_accum_scale = np.float32(gelu_scale) * np.float32(layer["proj_w_scale"])
             fc2_i8 = _requant_accum_int8(fc2_accum, fc2_accum_scale, fc2_scale)
             fc2 = fc2_i8.astype(np.float32) * np.float32(fc2_scale)
@@ -357,9 +462,19 @@ class NanoGPTFQReference:
             x_int8 = _dequant_add_accum_int8(fc2_accum, fc2_accum_scale, prev_x_int8, prev_x_scale, x_scale)
             x = x_int8.astype(np.float32) * np.float32(x_scale)
 
-        ln_f = _qdq(_layernorm_np(x, self.ln_f_w, self.ln_f_b, self.eps), _scale(s, "ln_f"))
-        logits = ln_f[-1:] @ self.lm_head_w.T  # [1, vocab_size]
-        return _to_int8_logits(logits[0], _scale(s, "lm_head"))
+        ln_f_scale = _scale(s, "ln_f")
+        ln_f = _qdq(_layernorm_np(x, self.ln_f_w, self.ln_f_b, self.eps), ln_f_scale)
+        if not self._large_vocab_lm_head_reference():
+            logits = ln_f[-1:] @ self.lm_head_w.T
+            return _to_int8_logits(logits[0], _scale(s, "lm_head"))
+        ln_f_i8 = _fp32_to_int8(ln_f[-1:], ln_f_scale)
+        logits_accum = ln_f_i8.astype(np.int32) @ self.lm_head_w_q.astype(np.int32).T
+        logits_i8 = _requant_accum_int8(
+            logits_accum,
+            np.float32(ln_f_scale) * np.float32(self.lm_head_w_scale),
+            _scale(s, "lm_head"),
+        )
+        return logits_i8[0]
 
     def forward_incremental(
         self,
@@ -471,18 +586,33 @@ class NanoGPTFQReference:
                 ln1_scale,
             )
             record(f"block{L}_ln1", ln1, scale=ln1_scale, int8=_fp32_to_int8(ln1, ln1_scale))
+            ln1_i8 = _fp32_to_int8(ln1, ln1_scale)
             head_outs_int8 = []
             for H, head_weights in enumerate(layer["heads"]):
                 q_w, k_w, v_w, q_w_fp32, k_w_fp32, v_w_fp32 = head_weights[:6]
+                q_q, k_q, v_q = head_weights[6:9]
+                q_scale_w, k_scale_w, v_scale_w = head_weights[9:12]
+                q_b_i32, k_b_i32, v_b_i32 = head_weights[15:18]
+                q_b_fp32, k_b_fp32, v_b_fp32 = head_weights[18:21]
                 q_scale = _scale(s, f"block{L}_head{H}_query")
                 k_scale = _scale(s, f"block{L}_head{H}_key")
                 v_scale = _scale(s, f"block{L}_head{H}_value")
                 attn_v_scale = _scale(s, f"block{L}_head{H}_attn_v")
 
                 if "qkv" in groups:
-                    q = ln1 @ q_w_fp32.T
-                    k = ln1 @ k_w_fp32.T
-                    v = ln1 @ v_w_fp32.T
+                    q = ln1 @ q_w_fp32.T + q_b_fp32
+                    k = ln1 @ k_w_fp32.T + k_b_fp32
+                    v = ln1 @ v_w_fp32.T + v_b_fp32
+                elif self._integer_linear_reference():
+                    q_accum = ln1_i8.astype(np.int32) @ q_q.astype(np.int32).T + q_b_i32
+                    k_accum = ln1_i8.astype(np.int32) @ k_q.astype(np.int32).T + k_b_i32
+                    v_accum = ln1_i8.astype(np.int32) @ v_q.astype(np.int32).T + v_b_i32
+                    q_i8 = _requant_accum_int8(q_accum, np.float32(ln1_scale) * np.float32(q_scale_w), q_scale)
+                    k_i8 = _requant_accum_int8(k_accum, np.float32(ln1_scale) * np.float32(k_scale_w), k_scale)
+                    v_i8 = _requant_accum_int8(v_accum, np.float32(ln1_scale) * np.float32(v_scale_w), v_scale)
+                    q = q_i8.astype(np.float32) * np.float32(q_scale)
+                    k = k_i8.astype(np.float32) * np.float32(k_scale)
+                    v = v_i8.astype(np.float32) * np.float32(v_scale)
                 else:
                     q = _qdq(ln1 @ q_w.T, q_scale)
                     k = _qdq(ln1 @ k_w.T, k_scale)
@@ -534,7 +664,10 @@ class NanoGPTFQReference:
                 out_accum = None
                 out_accum_scale = None
             else:
-                out_accum = concat_int8.astype(np.int32) @ layer["c_proj_w_q"].astype(np.int32).T
+                out_accum = (
+                    concat_int8.astype(np.int32) @ layer["c_proj_w_q"].astype(np.int32).T
+                    + layer["c_proj_b_i32"]
+                )
                 out_accum_scale = np.float32(concat_scale) * np.float32(layer["c_proj_w_scale"])
                 out_proj_i8 = _requant_accum_int8(out_accum, out_accum_scale, out_proj_scale)
                 out_proj = out_proj_i8.astype(np.float32) * np.float32(out_proj_scale)
@@ -564,6 +697,27 @@ class NanoGPTFQReference:
                 fc2_i8 = _fp32_to_int8(_qdq(fc2, fc2_scale), fc2_scale)
                 fc2_accum = None
                 fc2_accum_scale = None
+            elif self._integer_linear_reference():
+                ln2_i8 = _fp32_to_int8(ln2, ln2_scale)
+                fc1_accum = (
+                    ln2_i8.astype(np.int32) @ layer["fc_w_q"].astype(np.int32).T
+                    + layer["fc_b_i32"]
+                )
+                fc1_i8 = _requant_accum_int8(
+                    fc1_accum,
+                    np.float32(ln2_scale) * np.float32(layer["fc_w_scale"]),
+                    fc1_scale,
+                )
+                fc1 = fc1_i8.astype(np.float32) * np.float32(fc1_scale)
+                gelu = _qdq(_gelu_np(fc1), gelu_scale)
+                gelu_i8 = _fp32_to_int8(gelu, gelu_scale)
+                fc2_accum = (
+                    gelu_i8.astype(np.int32) @ layer["proj_w_q"].astype(np.int32).T
+                    + layer["proj_b_i32"]
+                )
+                fc2_accum_scale = np.float32(gelu_scale) * np.float32(layer["proj_w_scale"])
+                fc2_i8 = _requant_accum_int8(fc2_accum, fc2_accum_scale, fc2_scale)
+                fc2 = fc2_i8.astype(np.float32) * np.float32(fc2_scale)
             else:
                 fc1 = _qdq(ln2 @ layer["fc_w"].T + layer["fc_b"], fc1_scale)
                 gelu = _qdq(_gelu_np(fc1), gelu_scale)
@@ -590,18 +744,35 @@ class NanoGPTFQReference:
         ln_f_raw = _layernorm_np(x, self.ln_f_w, self.ln_f_b, self.eps)
         ln_f = ln_f_raw if "ln_f" in groups else _qdq(ln_f_raw, ln_f_scale)
         record("ln_f", ln_f, scale=ln_f_scale, int8=_fp32_to_int8(ln_f, ln_f_scale))
-        logits = ln_f @ (self.lm_head_w_fp32.T if "lm_head" in groups else self.lm_head_w.T)
         if "lm_head" in groups:
+            logits = ln_f @ self.lm_head_w_fp32.T
             record("lm_head", logits, scale=None, int8=None)
             return logits[0].astype(np.float32)
-        logits_i8 = _to_int8_logits(logits[0], _scale(s, "lm_head"))
+        if not self._large_vocab_lm_head_reference():
+            logits = ln_f @ self.lm_head_w.T
+            logits_i8 = _to_int8_logits(logits[0], _scale(s, "lm_head"))
+            record(
+                "lm_head",
+                logits_i8.astype(np.float32) * np.float32(_scale(s, "lm_head")),
+                scale=_scale(s, "lm_head"),
+                int8=logits_i8,
+            )
+            return logits_i8
+        ln_f_i8 = _fp32_to_int8(ln_f, ln_f_scale)
+        logits_accum = ln_f_i8.astype(np.int32) @ self.lm_head_w_q.astype(np.int32).T
+        logits_i8 = _requant_accum_int8(
+            logits_accum,
+            np.float32(ln_f_scale) * np.float32(self.lm_head_w_scale),
+            _scale(s, "lm_head"),
+        )
+        logits = logits_i8.astype(np.float32) * np.float32(_scale(s, "lm_head"))
         record(
             "lm_head",
-            logits_i8.astype(np.float32) * np.float32(_scale(s, "lm_head")),
+            logits,
             scale=_scale(s, "lm_head"),
             int8=logits_i8,
         )
-        return logits_i8
+        return logits_i8[0]
 
 
 # ---------------------------------------------------------------------------
@@ -646,9 +817,21 @@ def _fp32_forward(
             q_w = _to_f32(sd[f"transformer.h.{L}.attn.c_attn.weight_h{H}_query"])
             k_w = _to_f32(sd[f"transformer.h.{L}.attn.c_attn.weight_h{H}_key"])
             v_w = _to_f32(sd[f"transformer.h.{L}.attn.c_attn.weight_h{H}_value"])
-            q = out[f"block{L}_head{H}_query"] = ln1 @ q_w.T
-            k = out[f"block{L}_head{H}_key"] = ln1 @ k_w.T
-            v = out[f"block{L}_head{H}_value"] = ln1 @ v_w.T
+            q_b = _to_f32(sd.get(
+                f"transformer.h.{L}.attn.c_attn.bias_h{H}_query",
+                np.zeros(d_head, dtype=np.float32),
+            ))
+            k_b = _to_f32(sd.get(
+                f"transformer.h.{L}.attn.c_attn.bias_h{H}_key",
+                np.zeros(d_head, dtype=np.float32),
+            ))
+            v_b = _to_f32(sd.get(
+                f"transformer.h.{L}.attn.c_attn.bias_h{H}_value",
+                np.zeros(d_head, dtype=np.float32),
+            ))
+            q = out[f"block{L}_head{H}_query"] = ln1 @ q_w.T + q_b
+            k = out[f"block{L}_head{H}_key"] = ln1 @ k_w.T + k_b
+            v = out[f"block{L}_head{H}_value"] = ln1 @ v_w.T + v_b
             attn = (q @ k.T) * (d_head ** -0.5)
             probs = np.ones((1, 1), dtype=np.float32) if seq == 1 else _causal_softmax(attn)
             out[f"block{L}_head{H}_softmax"] = probs

@@ -413,6 +413,12 @@ class CodeGenerator:
         first_skip = "pos_embed_add" if self.config.embedding_kind == "patch_cls" else "tok_pos_add"
         return first_skip if block_idx == 0 else f"block{block_idx - 1}_residual2"
 
+    def _residual2_skip_name(self, fc2_name: str) -> str:
+        match = re.match(r"block(\d+)_fc2$", fc2_name)
+        if match is None:
+            raise ValueError(f"Cannot infer residual2 skip input from '{fc2_name}'")
+        return f"block{int(match.group(1))}_residual1"
+
     def _emit_node(self, node: IRNode):
         """Emit instructions for a single IR node."""
         op = node.op
@@ -990,8 +996,14 @@ class CodeGenerator:
             return
 
         self.dram_temp_outputs[node.name] = dram_temp_off
-        out_alloc = self.mem.abuf.alloc(node.name, strip_rows * N_pad)
-        out_alloc.size_bytes = M_pad * N_pad
+        placeholder_bytes = min(strip_rows * N_pad, ABUF_SIZE)
+        try:
+            out_alloc = self.mem.abuf.alloc(node.name, placeholder_bytes)
+            out_alloc.size_bytes = M_pad * N_pad
+        except MemoryError:
+            # The real tensor is DRAM-resident; downstream nodes must consult
+            # dram_temp_outputs first.  Large-vocab lm_head rows can exceed ABUF.
+            pass
 
     def _emit_matmul_large_weight_tiled(self, node: IRNode, M: int, N: int, K: int,
                                         w_q: np.ndarray, w_scales: Optional[np.ndarray]):
@@ -1007,8 +1019,6 @@ class CodeGenerator:
         weight_name = node.inputs[1]
         if weight_name in self.requant_pc_weight_names:
             raise ValueError(f"Stage 4 large-weight striping does not support REQUANT_PC for {weight_name!r}")
-        if self._dequant_add_residual1_enabled_for_output(node.name):
-            raise ValueError(f"Stage 4 large-weight striping does not support fused residual1 for {node.name!r}")
         if node.attrs.get("inline_gelu"):
             raise ValueError(
                 f"Stage 4 large-weight striping expects standalone GELU for {node.name!r}; "
@@ -1032,6 +1042,30 @@ class CodeGenerator:
         input_act_scale = self.calibration_scales.get(input_name, 6.0 / 127.0)
         target_act_scale = self.calibration_scales.get(node.name, 6.0 / 127.0)
         requant_scale_f = input_act_scale * mean_w_scale / max(target_act_scale, 1e-12)
+        fuse_residual = self._dequant_add_enabled_for_output(node.name)
+        residual_name = None
+        skip_name = None
+        skip_alloc = None
+        residual_output_scale = None
+        skip_rescale = None
+        accum_rescale = None
+        if fuse_residual:
+            if self._dequant_add_residual1_enabled_for_output(node.name):
+                residual_name = node.name.replace("_out_proj", "_residual1")
+                skip_name = self._residual1_skip_name(node.name)
+            elif self._dequant_add_residual2_enabled_for_output(node.name):
+                residual_name = node.name.replace("_fc2", "_residual2")
+                skip_name = self._residual2_skip_name(node.name)
+            else:
+                raise ValueError(f"Cannot infer fused residual output for {node.name!r}")
+            if skip_name in self.dram_temp_outputs:
+                skip_alloc = self._load_dram_to_abuf(skip_name, M_pad, N_pad)
+            else:
+                skip_alloc = self.mem.abuf.get(skip_name) or self.mem.abuf.alloc(skip_name, M_pad * N_pad)
+            residual_output_scale = self.calibration_scales.get(residual_name, 6.0 / 127.0)
+            skip_scale = self.calibration_scales.get(skip_name, 6.0 / 127.0)
+            accum_rescale = input_act_scale * mean_w_scale / max(residual_output_scale, 1e-12)
+            skip_rescale = skip_scale / max(residual_output_scale, 1e-12)
         dram_temp_off = self.dram_temp_start + self.mem.alloc_dram_temp(
             f"{node.name}_temp", M_pad * N_pad
         )
@@ -1100,45 +1134,106 @@ class CodeGenerator:
                     self._emit_bias_add_tile(bias_name, n_start, n_len)
 
                 self._emit(ConfigTileInsn(M=0, N=n_len // TILE - 1, K=0))
-                sreg = self._alloc_sreg()
-                self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(requant_scale_f)))
-                self._emit(RequantInsn(
-                    src1_buf=BUF_ACCUM,
-                    src1_off=0,
-                    dst_buf=BUF_ABUF,
-                    dst_off=tile_alloc.offset_units,
-                    sreg=sreg,
-                ))
-                if n_len == N_pad:
-                    self._record_trace_event(
-                        node.name,
-                        BUF_ABUF,
-                        tile_alloc.offset_units,
-                        strip_rows,
-                        N_pad,
-                        logical_rows,
-                        N,
-                        "int8",
-                        target_act_scale,
-                        row_start=row_start,
-                        full_rows=M,
-                        full_cols=N,
+                if fuse_residual:
+                    skip_stage = self.mem.abuf.alloc(
+                        f"{node.name}_skip_stage_r{row_start}_n{n_start}",
+                        strip_rows * n_len,
                     )
-                self._spill_abuf_tile_rows_to_dram(
-                    tile_alloc.offset_units,
-                    dram_temp_off,
-                    row_start=row_start,
-                    n_start=n_start,
-                    rows=strip_rows,
-                    cols=n_len,
-                    full_cols=N_pad,
-                    addr_reg=2,
-                )
+                    row_units = n_len // UNIT
+                    for r in range(strip_rows):
+                        self._emit(BufCopyInsn(
+                            src_buf=BUF_ABUF,
+                            src_off=skip_alloc.offset_units + ((row_start + r) * N_pad + n_start) // UNIT,
+                            dst_buf=BUF_ABUF,
+                            dst_off=skip_stage.offset_units + r * row_units,
+                            length=row_units,
+                        ))
+                        self._emit(SyncInsn(resource_mask=0b001))
+                    dequant_sreg = self._alloc_sreg_pair()
+                    self._emit(SetScaleInsn(
+                        sreg=dequant_sreg,
+                        src_mode=0,
+                        imm16=_fp16_to_uint16(accum_rescale),
+                    ))
+                    self._emit(SetScaleInsn(
+                        sreg=dequant_sreg + 1,
+                        src_mode=0,
+                        imm16=_fp16_to_uint16(skip_rescale),
+                    ))
+                    skip_tile_off = skip_alloc.offset_units + (row_start * N_pad + n_start) // UNIT
+                    self._emit(DequantAddInsn(
+                        src1_buf=BUF_ACCUM,
+                        src1_off=0,
+                        src2_buf=BUF_ABUF,
+                        src2_off=skip_stage.offset_units,
+                        dst_buf=BUF_ABUF,
+                        dst_off=tile_alloc.offset_units,
+                        sreg=dequant_sreg,
+                    ))
+                    for r in range(strip_rows):
+                        self._emit(BufCopyInsn(
+                            src_buf=BUF_ABUF,
+                            src_off=tile_alloc.offset_units + r * row_units,
+                            dst_buf=BUF_ABUF,
+                            dst_off=skip_alloc.offset_units + ((row_start + r) * N_pad + n_start) // UNIT,
+                            length=row_units,
+                        ))
+                        self._emit(SyncInsn(resource_mask=0b001))
+                    self.mem.abuf.free(skip_stage.name)
+                else:
+                    sreg = self._alloc_sreg()
+                    self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(requant_scale_f)))
+                    self._emit(RequantInsn(
+                        src1_buf=BUF_ACCUM,
+                        src1_off=0,
+                        dst_buf=BUF_ABUF,
+                        dst_off=tile_alloc.offset_units,
+                        sreg=sreg,
+                    ))
+                    if n_len == N_pad:
+                        self._record_trace_event(
+                            node.name,
+                            BUF_ABUF,
+                            tile_alloc.offset_units,
+                            strip_rows,
+                            N_pad,
+                            logical_rows,
+                            N,
+                            "int8",
+                            target_act_scale,
+                            row_start=row_start,
+                            full_rows=M,
+                            full_cols=N,
+                        )
+                    self._spill_abuf_tile_rows_to_dram(
+                        tile_alloc.offset_units,
+                        dram_temp_off,
+                        row_start=row_start,
+                        n_start=n_start,
+                        rows=strip_rows,
+                        cols=n_len,
+                        full_cols=N_pad,
+                        addr_reg=2,
+                    )
                 self.mem.abuf.free(tile_alloc.name)
 
+        if fuse_residual:
+            self.precomputed_nodes.add(residual_name)
+            alloc = self.mem.abuf.allocations.pop(skip_name, None)
+            if alloc is not None:
+                alloc.name = residual_name
+                self.mem.abuf.allocations[residual_name] = alloc
+            return
+
         self.dram_temp_outputs[node.name] = dram_temp_off
-        out_alloc = self.mem.abuf.alloc(node.name, strip_rows * N_pad)
-        out_alloc.size_bytes = M_pad * N_pad
+        placeholder_bytes = min(strip_rows * N_pad, ABUF_SIZE)
+        try:
+            out_alloc = self.mem.abuf.alloc(node.name, placeholder_bytes)
+            out_alloc.size_bytes = M_pad * N_pad
+        except MemoryError:
+            # The real tensor is DRAM-resident; large-vocab lm_head rows can
+            # exceed ABUF and are consumed through dram_temp_outputs.
+            pass
 
     def _materialize_activation_k_tile(
         self,
@@ -1503,8 +1598,14 @@ class CodeGenerator:
         self.dram_temp_outputs[node.name] = dram_temp_off
 
         # Record placeholder allocation for downstream nodes
-        out_alloc = self.mem.abuf.alloc(node.name, strip_rows * N_pad)
-        out_alloc.size_bytes = M_pad * N_pad  # real size is in DRAM
+        placeholder_bytes = min(strip_rows * N_pad, ABUF_SIZE)
+        try:
+            out_alloc = self.mem.abuf.alloc(node.name, placeholder_bytes)
+            out_alloc.size_bytes = M_pad * N_pad  # real size is in DRAM
+        except MemoryError:
+            # The real tensor is DRAM-resident; this placeholder is only a
+            # compatibility hint for legacy downstream code.
+            pass
 
     def _emit_bias_add(self, bias_name: str, N_pad: int, m_tiles: int,
                        trace_node_name: Optional[str] = None,
