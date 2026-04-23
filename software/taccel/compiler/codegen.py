@@ -1017,8 +1017,7 @@ class CodeGenerator:
         mechanism.
         """
         weight_name = node.inputs[1]
-        if weight_name in self.requant_pc_weight_names:
-            raise ValueError(f"Stage 4 large-weight striping does not support REQUANT_PC for {weight_name!r}")
+        use_requant_pc = weight_name in self.requant_pc_weight_names
         if node.attrs.get("inline_gelu"):
             raise ValueError(
                 f"Stage 4 large-weight striping expects standalone GELU for {node.name!r}; "
@@ -1043,6 +1042,16 @@ class CodeGenerator:
         target_act_scale = self.calibration_scales.get(node.name, 6.0 / 127.0)
         requant_scale_f = input_act_scale * mean_w_scale / max(target_act_scale, 1e-12)
         fuse_residual = self._dequant_add_enabled_for_output(node.name)
+        if use_requant_pc and fuse_residual:
+            raise ValueError(
+                f"DEQUANT_ADD residual path currently requires scalar output scale, got REQUANT_PC weight '{weight_name}'"
+            )
+        pc_scale_dram = None
+        if use_requant_pc:
+            pc_scale_dram = self._dram_offset_required(
+                f"{weight_name}__requant_pc",
+                f"loading REQUANT_PC scales for '{weight_name}'",
+            )
         residual_name = None
         skip_name = None
         skip_alloc = None
@@ -1181,15 +1190,38 @@ class CodeGenerator:
                         self._emit(SyncInsn(resource_mask=0b001))
                     self.mem.abuf.free(skip_stage.name)
                 else:
-                    sreg = self._alloc_sreg()
-                    self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(requant_scale_f)))
-                    self._emit(RequantInsn(
-                        src1_buf=BUF_ACCUM,
-                        src1_off=0,
-                        dst_buf=BUF_ABUF,
-                        dst_off=tile_alloc.offset_units,
-                        sreg=sreg,
-                    ))
+                    if use_requant_pc:
+                        pc_scale_alloc = self.mem.wbuf.alloc(
+                            f"_rqpc_{node.name}_n{n_start}",
+                            n_len * 2,
+                        )
+                        self._emit_dma_load(
+                            BUF_WBUF,
+                            pc_scale_alloc.offset_units,
+                            n_len * 2,
+                            0,
+                            pc_scale_dram + n_start * 2,
+                        )
+                        self._emit(SyncInsn(resource_mask=0b001))
+                        self._emit(RequantPcInsn(
+                            src1_buf=BUF_ACCUM,
+                            src1_off=0,
+                            src2_buf=BUF_WBUF,
+                            src2_off=pc_scale_alloc.offset_units,
+                            dst_buf=BUF_ABUF,
+                            dst_off=tile_alloc.offset_units,
+                        ))
+                        self.mem.wbuf.free(pc_scale_alloc.name)
+                    else:
+                        sreg = self._alloc_sreg()
+                        self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(requant_scale_f)))
+                        self._emit(RequantInsn(
+                            src1_buf=BUF_ACCUM,
+                            src1_off=0,
+                            dst_buf=BUF_ABUF,
+                            dst_off=tile_alloc.offset_units,
+                            sreg=sreg,
+                        ))
                     if n_len == N_pad:
                         self._record_trace_event(
                             node.name,

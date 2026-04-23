@@ -6,7 +6,7 @@ from taccel.compiler.ir import IRGraph, IRNode
 from taccel.compiler.model_config import ModelConfig
 from taccel.compiler.tiler import pad_dim
 from taccel.isa.encoding import decode
-from taccel.isa.instructions import LoadInsn, MatmulInsn
+from taccel.isa.instructions import LoadInsn, MatmulInsn, RequantPcInsn
 from taccel.isa.opcodes import BUF_WBUF, WBUF_SIZE
 from taccel.runtime.host_runner import HostRunner
 
@@ -49,14 +49,15 @@ def _weights(vocab_size: int, d_model: int = 16):
     vocab_pad = pad_dim(vocab_size)
     token = ((np.arange(4 * d_model).reshape(4, d_model) % 31) - 15).astype(np.int8)
     weight = (((np.arange(d_model * vocab_pad).reshape(d_model, vocab_pad) * 3) % 23) - 11).astype(np.int8)
+    scales = np.linspace(0.03125, 0.09375, vocab_pad, dtype=np.float16)
     return {
         "transformer.wte.weight": (token, None),
-        "lm_head.weight": (weight, np.full(vocab_pad, 0.0625, dtype=np.float16)),
-    }, token, weight
+        "lm_head.weight": (weight, scales),
+    }, token, weight, scales
 
 
 def _build(vocab_size: int, d_model: int = 16):
-    weights, token, weight = _weights(vocab_size, d_model)
+    weights, token, weight, scales = _weights(vocab_size, d_model)
     build = build_decoder_program_bundle(
         prefill_graph=_graph(vocab_size, d_model),
         decode_graph=_graph(vocab_size, d_model),
@@ -66,30 +67,32 @@ def _build(vocab_size: int, d_model: int = 16):
         model_config=_config(vocab_size, d_model),
         logits_size=pad_dim(vocab_size),
     )
-    return build, token, weight
+    return build, token, weight, scales
 
 
 def test_large_vocab_lm_head_strips_cover_vocab_and_fit_sram():
     vocab_size = 20_000
-    build, _token, _weight = _build(vocab_size)
+    build, _token, _weight, _scales = _build(vocab_size)
     insns = [decode(build.bundle.prefill_instrs[i:i + 8]) for i in range(0, len(build.bundle.prefill_instrs), 8)]
 
     wbuf_loads = [insn for insn in insns if isinstance(insn, LoadInsn) and insn.buf_id == BUF_WBUF]
     assert wbuf_loads
     assert max(insn.xfer_len * 16 for insn in wbuf_loads) <= WBUF_SIZE
     assert any(isinstance(insn, MatmulInsn) and insn.flags == 0 for insn in insns)
+    assert any(isinstance(insn, RequantPcInsn) for insn in insns)
+    assert "lm_head.weight__requant_pc" in build.prefill_codegen.dram_layout
     assert "lm_head" in build.prefill_codegen.dram_temp_outputs
     assert build.bundle.logits_size == pad_dim(vocab_size)
 
 
 def test_host_runner_reads_assembled_large_vocab_logits():
     vocab_size = 20_000
-    build, token, weight = _build(vocab_size)
+    build, token, weight, scales = _build(vocab_size)
     runner = HostRunner(build.bundle, logits_dtype=np.int8)
 
     logits = runner.run_prefill([2])
     accum = token[2].astype(np.int32) @ weight.astype(np.int32)
-    requant = np.float32(np.float16(0.125 * 0.0625 / 0.25))
+    requant = np.float32(np.float16(0.125 * scales.astype(np.float32) / 0.25))
     expected = np.clip(np.round(accum.astype(np.float32) * requant), -128, 127).astype(np.int8)
 
     assert logits.shape == (pad_dim(vocab_size),)

@@ -19,6 +19,12 @@ def _as_f32_tensor(torch, tensor):
     return torch.tensor(tensor, dtype=torch.float32)
 
 
+def _optional_f32_tensor(torch, state_dict: dict, name: str, size: int):
+    if name in state_dict:
+        return _as_f32_tensor(torch, state_dict[name])
+    return torch.zeros(int(size), dtype=torch.float32)
+
+
 class NanoGPTFP32Reference:
     """PyTorch FP32 nanoGPT reference for the repo's split-head checkpoint layout."""
 
@@ -36,6 +42,12 @@ class NanoGPTFP32Reference:
         self.block_size = int(model_args.get("block_size", 0))
         self.eps = float(model_args.get("layer_norm_epsilon", 1e-5))
         self.attn_scale = float(self.d_head ** -0.5)
+        self.activation_function = str(
+            model_args.get(
+                "activation_function",
+                "gelu_new" if bool(model_args.get("split_qkv_bias", False)) else "gelu",
+            )
+        )
 
         sd = state_dict
         self.wte = _as_f32_tensor(torch, sd["transformer.wte.weight"])
@@ -63,6 +75,24 @@ class NanoGPTFP32Reference:
                         torch,
                         sd[f"transformer.h.{layer_idx}.attn.c_attn.weight_h{head_idx}_value"],
                     ),
+                    _optional_f32_tensor(
+                        torch,
+                        sd,
+                        f"transformer.h.{layer_idx}.attn.c_attn.bias_h{head_idx}_query",
+                        self.d_head,
+                    ),
+                    _optional_f32_tensor(
+                        torch,
+                        sd,
+                        f"transformer.h.{layer_idx}.attn.c_attn.bias_h{head_idx}_key",
+                        self.d_head,
+                    ),
+                    _optional_f32_tensor(
+                        torch,
+                        sd,
+                        f"transformer.h.{layer_idx}.attn.c_attn.bias_h{head_idx}_value",
+                        self.d_head,
+                    ),
                 ))
             self.layers.append({
                 "ln1_w": _as_f32_tensor(torch, sd[f"transformer.h.{layer_idx}.ln_1.weight"]),
@@ -80,6 +110,14 @@ class NanoGPTFP32Reference:
 
     def _layer_norm(self, x, w, b):
         return self.F.layer_norm(x, (self.d_model,), weight=w, bias=b, eps=self.eps)
+
+    def _gelu(self, x):
+        if self.activation_function in {"gelu_new", "gelu_fast"}:
+            return self.F.gelu(x, approximate="tanh")
+        if self.activation_function in {"gelu", "gelu_pytorch_tanh"}:
+            approximate = "tanh" if self.activation_function == "gelu_pytorch_tanh" else "none"
+            return self.F.gelu(x, approximate=approximate)
+        raise ValueError(f"Unsupported activation_function={self.activation_function!r}")
 
     def _logits(self, x):
         ln_f = self._layer_norm(x, self.ln_f_w, self.ln_f_b)
@@ -107,10 +145,10 @@ class NanoGPTFP32Reference:
             for layer in self.layers:
                 ln1 = self._layer_norm(x, layer["ln1_w"], layer["ln1_b"])
                 head_outs = []
-                for q_w, k_w, v_w in layer["heads"]:
-                    q = ln1 @ q_w.T
-                    k = ln1 @ k_w.T
-                    v = ln1 @ v_w.T
+                for q_w, k_w, v_w, q_b, k_b, v_b in layer["heads"]:
+                    q = ln1 @ q_w.T + q_b
+                    k = ln1 @ k_w.T + k_b
+                    v = ln1 @ v_w.T + v_b
                     attn = (q @ k.T) * self.attn_scale
                     mask = self.torch.triu(
                         self.torch.ones(seq, seq, dtype=self.torch.bool),
@@ -124,7 +162,7 @@ class NanoGPTFP32Reference:
 
                 ln2 = self._layer_norm(x, layer["ln2_w"], layer["ln2_b"])
                 fc1 = ln2 @ layer["fc_w"].T + layer["fc_b"]
-                gelu = self.F.gelu(fc1)
+                gelu = self._gelu(fc1)
                 x = x + gelu @ layer["proj_w"].T + layer["proj_b"]
 
             return self._logits(x)[0].cpu().numpy().astype(np.float32)
@@ -237,10 +275,10 @@ class NanoGPTFP32Reference:
                 ln1 = self._layer_norm(x, layer["ln1_w"], layer["ln1_b"])
                 record(f"block{layer_idx}_ln1", ln1)
                 head_outs = []
-                for head_idx, (q_w, k_w, v_w) in enumerate(layer["heads"]):
-                    q = ln1 @ q_w.T
-                    k = ln1 @ k_w.T
-                    v = ln1 @ v_w.T
+                for head_idx, (q_w, k_w, v_w, q_b, k_b, v_b) in enumerate(layer["heads"]):
+                    q = ln1 @ q_w.T + q_b
+                    k = ln1 @ k_w.T + k_b
+                    v = ln1 @ v_w.T + v_b
                     record(f"block{layer_idx}_head{head_idx}_query", q)
                     record(f"block{layer_idx}_head{head_idx}_key", k)
                     record(f"block{layer_idx}_head{head_idx}_value", v)
@@ -265,7 +303,7 @@ class NanoGPTFP32Reference:
                 record(f"block{layer_idx}_ln2", ln2)
                 fc1 = ln2 @ layer["fc_w"].T + layer["fc_b"]
                 record(f"block{layer_idx}_fc1", fc1)
-                gelu = self.F.gelu(fc1)
+                gelu = self._gelu(fc1)
                 record(f"block{layer_idx}_gelu", gelu)
                 fc2 = gelu @ layer["proj_w"].T + layer["proj_b"]
                 record(f"block{layer_idx}_fc2", fc2)

@@ -117,6 +117,7 @@ def convert_hf_state_dict_to_nanogpt(
         "bias": True,
         "split_qkv_bias": True,
         "layer_norm_epsilon": norm_eps,
+        "activation_function": str(_cfg(config, "activation_function", "gelu_new")),
     }
     return {
         "state_dict": sd,

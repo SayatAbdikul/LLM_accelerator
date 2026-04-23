@@ -10,7 +10,7 @@ from typing import Dict, List, Sequence
 
 import numpy as np
 
-from .fake_quant_reference import _fp32_forward
+from .fake_quant_reference import _fp32_forward, _to_f32
 
 
 _DEFAULT_SCALES = 6.0 / 127.0
@@ -103,6 +103,8 @@ def build_calibration_scales(
         max_abs = float(np.max(vals))
         scales[name] = max(max_abs, 1e-8) / 127.0
 
+    _apply_raw_vadd_safe_tok_pos_scale(scales, state_dict, seqs, percentile=percentile)
+
     # Nodes that calibration didn't observe → keep the compiler's defaults
     _fill_defaults(scales, model_args)
     return scales
@@ -144,8 +146,50 @@ def build_calibration_scales_from_token_ids(
         max_abs = float(np.max(vals))
         scales[name] = max(max_abs, 1e-8) / 127.0
 
+    _apply_raw_vadd_safe_tok_pos_scale(scales, state_dict, seqs, percentile=percentile)
+
     _fill_defaults(scales, model_args)
     return scales
+
+
+def _apply_raw_vadd_safe_tok_pos_scale(
+    scales: Dict[str, float],
+    state_dict: dict,
+    seqs: Sequence[Sequence[int]],
+    *,
+    percentile: float,
+) -> None:
+    """Ensure token+position embeddings fit the raw INT8 VADD contract.
+
+    The compiled decoder adds token and position tables with a plain INT8 VADD,
+    so each table is quantized at the shared ``tok_pos_add`` scale.  Calibrating
+    only ``abs(token + position)`` can under-cover cases where the two operands
+    have opposite signs.  This bound uses ``abs(token) + abs(position)`` over the
+    same calibration windows so raw integer addition does not clip before the
+    downstream layers see the sum.
+    """
+    if "transformer.wte.weight" not in state_dict or "transformer.wpe.weight" not in state_dict:
+        return
+    wte = _to_f32(state_dict["transformer.wte.weight"])
+    wpe = _to_f32(state_dict["transformer.wpe.weight"])
+    vals: List[float] = []
+    for tids in seqs:
+        token_ids = [int(tok) for tok in tids]
+        if not token_ids:
+            continue
+        pos_ids = list(range(len(token_ids)))
+        if max(token_ids) >= wte.shape[0] or len(pos_ids) > wpe.shape[0]:
+            continue
+        conservative = np.abs(wte[token_ids]) + np.abs(wpe[pos_ids])
+        vals.append(float(
+            np.percentile(conservative.ravel(), percentile)
+            if percentile < 100.0
+            else np.max(conservative)
+        ))
+    if not vals:
+        return
+    raw_vadd_scale = max(float(np.max(vals)), 1e-8) / 127.0
+    scales["tok_pos_add"] = max(float(scales.get("tok_pos_add", 0.0)), raw_vadd_scale)
 
 
 def _fill_defaults(scales: Dict[str, float], model_args: dict) -> None:
