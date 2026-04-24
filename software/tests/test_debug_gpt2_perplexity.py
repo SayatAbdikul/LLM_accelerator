@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -51,6 +52,33 @@ def _base_report():
     }
 
 
+def _subprocess_env():
+    env = os.environ.copy()
+    env.setdefault("PYTHONPATH", "software")
+    env.setdefault("OMP_NUM_THREADS", "1")
+    env.setdefault("MKL_NUM_THREADS", "1")
+    env.setdefault("OPENBLAS_NUM_THREADS", "1")
+    env.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+    env.setdefault("TOKENIZERS_PARALLELISM", "false")
+    env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    env.setdefault("KMP_INIT_AT_FORK", "FALSE")
+    return env
+
+
+def _run_debug_cli(args):
+    proc = subprocess.run(
+        [sys.executable, str(TOOL), *args],
+        cwd=Path(__file__).resolve().parents[2],
+        env=_subprocess_env(),
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode and "OMP: Error #179" in proc.stderr:
+        pytest.skip(f"local OpenMP shared-memory blocker while running debug CLI: {proc.stderr.strip()}")
+    proc.check_returncode()
+    return proc
+
+
 def test_primary_suspect_rules_are_deterministic():
     dbg = _debug_module()
     report = _base_report()
@@ -78,10 +106,8 @@ def test_debug_gpt2_perplexity_outputs_json_sections():
     if missing:
         pytest.skip(f"local GPT-2 debug inputs missing: {missing}")
 
-    proc = subprocess.run(
+    proc = _run_debug_cli(
         [
-            sys.executable,
-            str(TOOL),
             str(FIXTURE),
             "--tokenizer-dir",
             str(TOKENIZER_DIR),
@@ -98,14 +124,11 @@ def test_debug_gpt2_perplexity_outputs_json_sections():
             "--calibration-seq-len",
             "2",
             "--json",
-        ],
-        cwd=Path(__file__).resolve().parents[2],
-        text=True,
-        capture_output=True,
-        check=True,
+        ]
     )
     data = json.loads(proc.stdout)
     assert "primary_suspect" in data
+    assert data["ptq_preset"] == "control"
     assert {"fp32_baseline", "lm_head_quantization", "calibration_sensitivity", "shared_decode_semantics", "converter_bias_layout"}.issubset(data["suspects"])
     assert len(data["suspects"]["calibration_sensitivity"]) == 4
     assert len(data["per_step"]) == 1
@@ -114,6 +137,43 @@ def test_debug_gpt2_perplexity_outputs_json_sections():
     assert "target_nll" in step
     assert "unique_count" in step["int8"]["direct_quant_fp32"]
     assert "saturation_rate" in step["int8"]["direct_quant_fp32"]
+
+
+def test_debug_gpt2_perplexity_preset_sweep_json_sections():
+    missing = [
+        str(path)
+        for path in (FIXTURE, TOKENIZER_DIR, CALIB_TEXT, EVAL_TEXT)
+        if not path.exists()
+    ]
+    if missing:
+        pytest.skip(f"local GPT-2 debug inputs missing: {missing}")
+
+    proc = _run_debug_cli(
+        [
+            str(FIXTURE),
+            "--tokenizer-dir",
+            str(TOKENIZER_DIR),
+            "--calibration-text",
+            str(CALIB_TEXT),
+            "--eval-text",
+            str(EVAL_TEXT),
+            "--max-eval-tokens",
+            "2",
+            "--context-len",
+            "1",
+            "--calibration-n-seqs",
+            "1",
+            "--calibration-seq-len",
+            "2",
+            "--preset-sweep",
+            "--json",
+        ]
+    )
+    data = json.loads(proc.stdout)
+    assert data["preset_sweep"]["promoted_default"] == "control"
+    assert len(data["preset_sweep"]["rows"]) == 9
+    assert data["preset_sweep"]["rows"][0]["name"]
+    assert data["preset_sweep"]["winner"]["name"]
 
 
 def test_gpt2_node_trace_reports_first_divergence():

@@ -27,6 +27,7 @@ def main(argv=None) -> int:
     parser.add_argument("--calibration-seq-len", type=int, default=32)
     parser.add_argument("--calibration-n-seqs", type=int, default=8)
     parser.add_argument("--calibration-percentile", type=float, default=99.9)
+    parser.add_argument("--ptq-preset", default=None)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
@@ -54,6 +55,7 @@ def main(argv=None) -> int:
         calibration_seq_len=args.calibration_seq_len,
         calibration_n_seqs=args.calibration_n_seqs,
         calibration_percentile=args.calibration_percentile,
+        ptq_preset=args.ptq_preset,
     )
     out = asdict(result)
     if args.json:

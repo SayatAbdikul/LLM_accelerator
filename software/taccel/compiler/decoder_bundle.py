@@ -191,6 +191,8 @@ def build_decoder_program_bundle(
     logits_size: int = 0,
     requant_pc_weight_names: Optional[set[str]] = None,
     requant_pc_scale_tables: Optional[Dict[str, np.ndarray]] = None,
+    dequant_add_residual1_blocks: Optional[set[int]] = None,
+    dequant_add_residual2_blocks: Optional[set[int]] = None,
 ) -> DecoderBundleBuild:
     """Build a ProgramBundle from already-formed decoder IR graphs."""
     kv_layout = build_kv_cache_layout(model_config, max_seq_len=max_seq_len)
@@ -207,7 +209,16 @@ def build_decoder_program_bundle(
         explicit_names=requant_pc_weight_names,
         explicit_tables=requant_pc_scale_tables,
     )
-    residual_dequant_blocks = set(range(int(model_config.n_layer)))
+    residual1_dequant_blocks = (
+        set(range(int(model_config.n_layer)))
+        if dequant_add_residual1_blocks is None
+        else set(int(v) for v in dequant_add_residual1_blocks)
+    )
+    residual2_dequant_blocks = (
+        set(range(int(model_config.n_layer)))
+        if dequant_add_residual2_blocks is None
+        else set(int(v) for v in dequant_add_residual2_blocks)
+    )
     prefill_codegen = CodeGenerator(
         weight_data,
         calibration_scales,
@@ -215,8 +226,8 @@ def build_decoder_program_bundle(
         model_config=model_config,
         stream_name="prefill",
         kv_layout=kv_layout,
-        dequant_add_residual1_blocks=residual_dequant_blocks,
-        dequant_add_residual2_blocks=residual_dequant_blocks,
+        dequant_add_residual1_blocks=residual1_dequant_blocks,
+        dequant_add_residual2_blocks=residual2_dequant_blocks,
         requant_pc_weight_names=requant_pc_weight_names,
         requant_pc_scale_tables=requant_pc_scale_tables,
     )
@@ -227,8 +238,8 @@ def build_decoder_program_bundle(
         model_config=model_config,
         stream_name="decode",
         kv_layout=kv_layout,
-        dequant_add_residual1_blocks=residual_dequant_blocks,
-        dequant_add_residual2_blocks=residual_dequant_blocks,
+        dequant_add_residual1_blocks=residual1_dequant_blocks,
+        dequant_add_residual2_blocks=residual2_dequant_blocks,
         requant_pc_weight_names=requant_pc_weight_names,
         requant_pc_scale_tables=requant_pc_scale_tables,
     )
@@ -283,37 +294,42 @@ def _decoder_requant_pc_tables(
     explicit_names: Optional[set[str]],
     explicit_tables: Optional[Dict[str, np.ndarray]],
 ) -> Tuple[set[str], Dict[str, np.ndarray]]:
-    """Enable per-channel requant for GPT-2-class tied lm_head weights."""
+    """Enable per-channel requant tables for selected decoder linear weights."""
     names = set(explicit_names or set())
     tables = dict(explicit_tables or {})
-    weight_name = "lm_head.weight"
-    if weight_name not in weight_data:
-        return names, tables
 
-    q_weight, weight_scales = weight_data[weight_name]
-    if (
-        isinstance(q_weight, np.ndarray)
-        and q_weight.ndim == 2
-        and q_weight.size > 256 * 1024
-        and int(model_config.vocab_size) > 4096
-    ):
+    weight_name = "lm_head.weight"
+    if weight_name in weight_data:
+        q_weight, weight_scales = weight_data[weight_name]
+        if (
+            isinstance(q_weight, np.ndarray)
+            and q_weight.ndim == 2
+            and q_weight.size > 256 * 1024
+            and int(model_config.vocab_size) > 4096
+        ):
+            names.add(weight_name)
+
+    for selected_name in sorted(names):
+        if selected_name in tables:
+            continue
+        if selected_name not in weight_data:
+            raise KeyError(f"missing weight data for REQUANT_PC weight {selected_name!r}")
+        _q_weight, weight_scales = weight_data[selected_name]
         if weight_scales is None:
-            raise KeyError("large-vocab lm_head.weight requires per-channel scales for REQUANT_PC")
-        names.add(weight_name)
-        if weight_name not in tables:
-            scales = np.asarray(weight_scales, dtype=np.float32)
-            input_scale_name = _matmul_input_for_weight((prefill_graph, decode_graph), weight_name)
-            tables[weight_name] = (
-                np.float32(calibration_scales.get(input_scale_name, 6.0 / 127.0))
-                * scales
-                / max(float(calibration_scales.get("lm_head", 6.0 / 127.0)), 1e-12)
-            ).astype(np.float16)
+            raise KeyError(f"missing per-channel scales for REQUANT_PC weight {selected_name!r}")
+        input_name, output_name = _matmul_binding_for_weight((prefill_graph, decode_graph), selected_name)
+        scales = np.asarray(weight_scales, dtype=np.float32)
+        tables[selected_name] = (
+            np.float32(calibration_scales.get(input_name, 6.0 / 127.0))
+            * scales
+            / max(float(calibration_scales.get(output_name, 6.0 / 127.0)), 1e-12)
+        ).astype(np.float16)
     return names, tables
 
 
-def _matmul_input_for_weight(graphs, weight_name: str) -> str:
+def _matmul_binding_for_weight(graphs, weight_name: str) -> tuple[str, str]:
     for graph in graphs:
         for node in graph.nodes:
             if node.op == "matmul" and len(node.inputs) > 1 and node.inputs[1] == weight_name:
-                return str(node.inputs[0])
-    return "ln_f"
+                return str(node.inputs[0]), str(node.name)
+    return "ln_f", "lm_head"

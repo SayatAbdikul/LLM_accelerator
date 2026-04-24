@@ -30,6 +30,17 @@ from taccel.runtime.gpt2_perplexity import (
     teacher_forced_inputs_and_targets,
     tokenize_text_file,
 )
+from taccel.runtime.stage5_ptq import (
+    choose_stage5_ptq_promotion,
+    choose_stage5_ptq_winner,
+    rank_stage5_ptq_rows,
+    resolve_stage5_ptq_preset,
+    stage5_default_ptq_preset_name,
+    stage5_raw_residual1_blocks,
+    stage5_requant_pc_weight_names,
+    STAGE5_PTQ_PRESETS,
+    apply_stage5_ptq_scale_policy,
+)
 
 
 SWEEP_CONFIGS = (
@@ -177,8 +188,24 @@ def _logit_pair_summary(lhs: Sequence[np.ndarray], rhs: Sequence[np.ndarray], *,
         "min_cosine": float(min(cosines)),
         "mean_cosine": float(np.mean(cosines)),
         "min_top10_overlap": int(min(top10)),
+        "mean_top10_overlap": float(np.mean(top10)),
         "max_p99_abs_error": float(max(p99)),
     }
+
+
+def _build_scales_for_preset(payload: dict, calibration_ids: Sequence[int], args, preset_name: str) -> Dict[str, float]:
+    preset = resolve_stage5_ptq_preset(preset_name)
+    scales = build_calibration_scales_from_token_ids(
+        payload,
+        calibration_ids,
+        n_seqs=args.calibration_n_seqs,
+        seq_len=args.calibration_seq_len,
+        percentile=args.calibration_percentile,
+        activation_percentile_overrides=(
+            preset.activation_percentile_nodes or None
+        ),
+    )
+    return apply_stage5_ptq_scale_policy(scales, payload["model_args"], preset)
 
 
 def _centered_cosine(a: np.ndarray, b: np.ndarray) -> float:
@@ -489,6 +516,75 @@ def _best_ablation(ablation_rows: Sequence[Dict[str, object]]) -> Dict[str, obje
     )
 
 
+def _preset_sweep(
+    *,
+    payload: dict,
+    calibration_ids: Sequence[int],
+    eval_tokens: Sequence[int],
+    inputs: Sequence[int],
+    targets: Sequence[int],
+    fp32_logits: Sequence[np.ndarray],
+    vocab_size: int,
+    args,
+) -> Dict[str, object]:
+    rows: list[dict[str, object]] = []
+    for preset_name in STAGE5_PTQ_PRESETS:
+        preset = resolve_stage5_ptq_preset(preset_name)
+        scales = _build_scales_for_preset(payload, calibration_ids, args, preset.name)
+        lm_scale = float(scales.get("lm_head", 1.0))
+        golden_i8 = run_golden_teacher_forced_logits(
+            payload,
+            eval_tokens,
+            scales,
+            ptq_preset=preset,
+        )
+        fake_i8 = run_fake_quant_teacher_forced_logits(
+            payload,
+            eval_tokens,
+            scales,
+            ptq_preset=preset,
+        )
+        golden_deq = [np.asarray(row, dtype=np.float32)[:vocab_size] * np.float32(lm_scale) for row in golden_i8]
+        fake_deq = [np.asarray(row, dtype=np.float32)[:vocab_size] * np.float32(lm_scale) for row in fake_i8]
+        golden_ppl = _ppl_from_logits(golden_deq, targets, vocab_size=vocab_size)
+        fake_ppl = _ppl_from_logits(fake_deq, targets, vocab_size=vocab_size)
+        pair_fake_fp32 = _logit_pair_summary(fake_deq, fp32_logits, vocab_size=vocab_size)
+        pair_golden_fake = _logit_pair_summary(golden_i8, fake_i8, vocab_size=vocab_size)
+        expected_top10 = min(10, int(vocab_size))
+        rows.append({
+            "name": preset.name,
+            "fake_quant_perplexity": float(fake_ppl["perplexity"]),
+            "golden_perplexity": float(golden_ppl["perplexity"]),
+            "relative_delta": abs(golden_ppl["perplexity"] - fake_ppl["perplexity"]) / max(abs(fake_ppl["perplexity"]), 1e-12),
+            "mean_target_nll": float(fake_ppl["mean_nll"]),
+            "min_top10_overlap_vs_fp32": int(pair_fake_fp32["min_top10_overlap"]),
+            "mean_top10_overlap_vs_fp32": float(pair_fake_fp32["mean_top10_overlap"]),
+            "min_cosine_vs_fp32": float(pair_fake_fp32["min_cosine"]),
+            "mean_cosine_vs_fp32": float(pair_fake_fp32["mean_cosine"]),
+            "golden_vs_fake_min_cosine": float(pair_golden_fake["min_cosine"]),
+            "golden_vs_fake_min_top10_overlap": int(pair_golden_fake["min_top10_overlap"]),
+            "logits_gate_passed": bool(
+                pair_golden_fake["min_cosine"] >= 0.995
+                and pair_golden_fake["min_top10_overlap"] >= expected_top10
+            ),
+        })
+
+    ranked = rank_stage5_ptq_rows(rows)
+    winner = choose_stage5_ptq_winner(rows)
+    proposed = choose_stage5_ptq_promotion(
+        rows,
+        gate_passed=bool(winner and winner.get("logits_gate_passed")),
+    )
+    promoted_default = stage5_default_ptq_preset_name()
+    return {
+        "rows": ranked,
+        "winner": winner,
+        "proposed_promotion": proposed,
+        "promoted_default": promoted_default,
+        "winner_promoted": bool(winner and winner["name"] == promoted_default),
+    }
+
+
 def _load_hf_logits(tokenizer_dir: Path, inputs: Sequence[int]) -> tuple[List[np.ndarray] | None, Dict[str, object]]:
     try:
         from transformers import GPT2LMHeadModel
@@ -511,20 +607,27 @@ def _calibration_sweep(
     eval_tokens: Sequence[int],
     vocab_size: int,
     tokenizer_dir: Path,
+    args,
+    ptq_preset: str,
 ) -> List[Dict[str, object]]:
     rows = []
     _, targets = teacher_forced_inputs_and_targets(eval_tokens)
     for n_seqs, seq_len, percentile in SWEEP_CONFIGS:
+        preset = resolve_stage5_ptq_preset(ptq_preset)
         scales = build_calibration_scales_from_token_ids(
             payload,
             calibration_ids,
             n_seqs=n_seqs,
             seq_len=seq_len,
             percentile=percentile,
+            activation_percentile_overrides=(
+                preset.activation_percentile_nodes or None
+            ),
         )
+        scales = apply_stage5_ptq_scale_policy(scales, payload["model_args"], preset)
         lm_scale = float(scales.get("lm_head", 1.0))
-        golden = run_golden_teacher_forced_logits(payload, eval_tokens, scales)
-        fake = run_fake_quant_teacher_forced_logits(payload, eval_tokens, scales)
+        golden = run_golden_teacher_forced_logits(payload, eval_tokens, scales, ptq_preset=preset)
+        fake = run_fake_quant_teacher_forced_logits(payload, eval_tokens, scales, ptq_preset=preset)
         golden_deq = [np.asarray(row, dtype=np.float32)[:vocab_size] * np.float32(lm_scale) for row in golden]
         fake_deq = [np.asarray(row, dtype=np.float32)[:vocab_size] * np.float32(lm_scale) for row in fake]
         golden_ppl = _ppl_from_logits(golden_deq, targets, vocab_size=vocab_size)
@@ -534,6 +637,7 @@ def _calibration_sweep(
             "n_seqs": int(n_seqs),
             "seq_len": int(seq_len),
             "percentile": float(percentile),
+            "ptq_preset": preset.name,
             "lm_head_scale": lm_scale,
             "golden_perplexity": golden_ppl["perplexity"],
             "fake_quant_perplexity": fake_ppl["perplexity"],
@@ -608,21 +712,23 @@ def run_report(args) -> Dict[str, object]:
     eval_tokens = [int(tok) for tok in eval_ids[:token_budget]]
     inputs, targets = teacher_forced_inputs_and_targets(eval_tokens)
     vocab_size = int(payload["model_args"]["vocab_size"])
+    ptq_preset = stage5_default_ptq_preset_name() if args.ptq_preset is None else args.ptq_preset
+    resolved_preset = resolve_stage5_ptq_preset(ptq_preset)
 
-    scales = build_calibration_scales_from_token_ids(
-        payload,
-        calibration_ids,
-        n_seqs=args.calibration_n_seqs,
-        seq_len=args.calibration_seq_len,
-        percentile=args.calibration_percentile,
-    )
+    scales = _build_scales_for_preset(payload, calibration_ids, args, resolved_preset.name)
     lm_scale = float(scales.get("lm_head", 1.0))
 
     fp32_ref = NanoGPTFP32Reference(payload["state_dict"], payload["model_args"])
     fp32_incr, fp32_full = _fp32_incremental_and_full(fp32_ref, eval_tokens)
-    fake_ref = NanoGPTFQReference(payload["state_dict"], payload["model_args"], scales)
+    fake_ref = NanoGPTFQReference(
+        payload["state_dict"],
+        payload["model_args"],
+        scales,
+        requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset),
+        raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
+    )
     fake_incr, fake_full = _fake_incremental_and_full(fake_ref, eval_tokens)
-    golden_i8 = run_golden_teacher_forced_logits(payload, eval_tokens, scales)
+    golden_i8 = run_golden_teacher_forced_logits(payload, eval_tokens, scales, ptq_preset=resolved_preset)
     direct_q = [_quantize_logits(row, lm_scale) for row in fp32_incr]
 
     fp32_ppl = _ppl_from_logits(fp32_incr, targets, vocab_size=vocab_size)
@@ -650,6 +756,7 @@ def run_report(args) -> Dict[str, object]:
         "eval_text": str(args.eval_text),
         "calibration_sha256": file_sha256(args.calibration_text),
         "eval_sha256": file_sha256(args.eval_text),
+        "ptq_preset": resolved_preset.name,
         "vocab_size": vocab_size,
         "lm_head_scale": lm_scale,
         "token_count": len(eval_tokens),
@@ -709,6 +816,8 @@ def run_report(args) -> Dict[str, object]:
                 eval_tokens=eval_tokens,
                 vocab_size=vocab_size,
                 tokenizer_dir=tokenizer_dir,
+                args=args,
+                ptq_preset=resolved_preset.name,
             ),
             "shared_decode_semantics": {
                 "fp32_full_vs_incremental": _logit_pair_summary(fp32_full, fp32_incr, vocab_size=vocab_size),
@@ -733,6 +842,8 @@ def run_report(args) -> Dict[str, object]:
             payload["state_dict"],
             payload["model_args"],
             scales,
+            requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset),
+            raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
         ).incremental_node_trace(prefix)[-1]
         fp32_trace = NanoGPTFP32Reference(
             payload["state_dict"],
@@ -765,6 +876,17 @@ def run_report(args) -> Dict[str, object]:
             vocab_size=vocab_size,
             lm_scale=lm_scale,
         )
+    if bool(getattr(args, "preset_sweep", False)):
+        report["preset_sweep"] = _preset_sweep(
+            payload=payload,
+            calibration_ids=calibration_ids,
+            eval_tokens=eval_tokens,
+            inputs=inputs,
+            targets=targets,
+            fp32_logits=fp32_incr,
+            vocab_size=vocab_size,
+            args=args,
+        )
     if "node_trace" in report or "ablation_sweep" in report:
         report["dominant_loss_point"] = _dominant_loss_point(report)
     return report
@@ -781,10 +903,12 @@ def main(argv=None) -> int:
     parser.add_argument("--calibration-seq-len", type=int, default=32)
     parser.add_argument("--calibration-n-seqs", type=int, default=8)
     parser.add_argument("--calibration-percentile", type=float, default=99.9)
+    parser.add_argument("--ptq-preset", default=None)
     parser.add_argument("--trace-step", type=int)
     parser.add_argument("--trace-node", default="all")
     parser.add_argument("--first-divergence", action="store_true")
     parser.add_argument("--ablation-sweep", action="store_true")
+    parser.add_argument("--preset-sweep", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     report = run_report(args)
@@ -797,6 +921,8 @@ def main(argv=None) -> int:
             "fp32_baseline": report["suspects"]["fp32_baseline"],
             "lm_head_quantization": report["suspects"]["lm_head_quantization"],
             "converter_bias_layout": report["suspects"]["converter_bias_layout"],
+            "ptq_preset": report["ptq_preset"],
+            "preset_sweep": report.get("preset_sweep"),
             "dominant_loss_point": report.get("dominant_loss_point"),
             "ablation_sweep": report.get("ablation_sweep"),
             "node_trace": report.get("node_trace"),

@@ -14,6 +14,7 @@ from taccel.runtime.gpt2_perplexity import (
     file_sha256,
     tokenize_text_file,
 )
+from taccel.runtime.stage5_ptq import stage5_default_ptq_preset_name
 from taccel.runtime.tiny_fixture import run_nanogpt_fp32_e2e, run_stage3_tiny_e2e
 
 
@@ -46,6 +47,7 @@ def main(argv=None) -> int:
     parser.add_argument("--prompt-ids", default=None, help="Comma-separated token ids")
     parser.add_argument("--prompt", default=None, help="Text prompt when tokenizer metadata is available")
     parser.add_argument("--max-new-tokens", type=int, default=2)
+    parser.add_argument("--ptq-preset", default=None)
     parser.add_argument("--compare-fp32", action="store_true")
     parser.add_argument("--perplexity-text", type=Path, default=None)
     parser.add_argument("--calibration-text", type=Path, default=None)
@@ -71,11 +73,18 @@ def main(argv=None) -> int:
         prompt_ids = _prompt_to_ids(args.prompt, payload)
     else:
         prompt_ids = [0]
+    ptq_preset = stage5_default_ptq_preset_name() if args.ptq_preset is None else args.ptq_preset
 
-    result = run_stage3_tiny_e2e(payload, prompt_ids=prompt_ids, max_new_tokens=args.max_new_tokens)
+    result = run_stage3_tiny_e2e(
+        payload,
+        prompt_ids=prompt_ids,
+        max_new_tokens=args.max_new_tokens,
+        ptq_preset=ptq_preset,
+    )
     summary = {
         "checkpoint": str(args.checkpoint),
         "prompt_ids": prompt_ids,
+        "ptq_preset": ptq_preset,
         "generated_ids": result.generated,
         "generated_text": _decode_ids(result.generated, payload),
         "max_new_tokens": args.max_new_tokens,
@@ -111,6 +120,7 @@ def main(argv=None) -> int:
             eval_sha256=file_sha256(args.perplexity_text),
             max_eval_tokens=args.max_eval_tokens,
             context_len=args.context_len,
+            ptq_preset=ptq_preset,
         )
         summary.update({
             "perplexity_golden": ppl.golden_perplexity,
@@ -121,6 +131,7 @@ def main(argv=None) -> int:
             "perplexity_calibration_sha256": ppl.calibration_sha256,
             "perplexity_eval_sha256": ppl.eval_sha256,
             "perplexity_tokenizer_dir": ppl.tokenizer_dir,
+            "perplexity_ptq_preset": ppl.ptq_preset,
         })
 
     if args.json:

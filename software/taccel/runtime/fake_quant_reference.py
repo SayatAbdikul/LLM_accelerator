@@ -236,6 +236,8 @@ class NanoGPTFQReference:
         state_dict: dict,
         model_args: dict,
         scales: Dict[str, float],
+        requant_pc_weight_names: Sequence[str] | None = None,
+        raw_residual1_blocks: Sequence[int] | None = None,
     ) -> None:
         self.n_layer = int(model_args["n_layer"])
         self.n_head = int(model_args["n_head"])
@@ -246,6 +248,8 @@ class NanoGPTFQReference:
         # sfu.py uses 1e-6 hardcoded — not from model_args
         self.eps = np.float32(1e-6)
         self.scales = dict(scales)
+        self.requant_pc_weight_names = set(str(v) for v in (requant_pc_weight_names or ()))
+        self.raw_residual1_blocks = set(int(v) for v in (raw_residual1_blocks or ()))
         sd = state_dict
         self._has_nonzero_linear_bias = any(
             ("bias" in name and ("c_attn" in name or "c_proj" in name or "c_fc" in name))
@@ -314,6 +318,9 @@ class NanoGPTFQReference:
             c_proj_q, c_proj_scale_w, c_proj_w, c_proj_scales = _linear_components(sd[f"transformer.h.{L}.attn.c_proj.weight"])
             fc_q, fc_scale_w, fc_w, fc_scales = _linear_components(sd[f"transformer.h.{L}.mlp.c_fc.weight"])
             proj_q, proj_scale_w, proj_w, proj_scales = _linear_components(sd[f"transformer.h.{L}.mlp.c_proj.weight"])
+            c_proj_name = f"transformer.h.{L}.attn.c_proj.weight"
+            fc_name = f"transformer.h.{L}.mlp.c_fc.weight"
+            proj_name = f"transformer.h.{L}.mlp.c_proj.weight"
             self.layers.append({
                 "ln1_w": _to_fp16_widened_f32(sd[f"transformer.h.{L}.ln_1.weight"]),
                 "ln1_b": _to_fp16_widened_f32(sd[f"transformer.h.{L}.ln_1.bias"]),
@@ -324,6 +331,15 @@ class NanoGPTFQReference:
                 "c_proj_w_q": c_proj_q,
                 "c_proj_w_scale": c_proj_scale_w,
                 "c_proj_w_scales": c_proj_scales,
+                "c_proj_requant_pc": (
+                    (
+                        np.float32(_scale(self.scales, f"block{L}_concat"))
+                        * c_proj_scales.astype(np.float32)
+                        / max(_scale(self.scales, f"block{L}_out_proj"), 1e-12)
+                    ).astype(np.float16)
+                    if c_proj_name in self.requant_pc_weight_names
+                    else None
+                ),
                 "c_proj_w_fp32": _to_f32(sd[f"transformer.h.{L}.attn.c_proj.weight"]),
                 "c_proj_b": _to_f32(sd[f"transformer.h.{L}.attn.c_proj.bias"]),
                 "c_proj_b_i32": _bias_i32(
@@ -337,6 +353,15 @@ class NanoGPTFQReference:
                 "fc_w_q": fc_q,
                 "fc_w_scale": fc_scale_w,
                 "fc_w_scales": fc_scales,
+                "fc_requant_pc": (
+                    (
+                        np.float32(_scale(self.scales, f"block{L}_ln2"))
+                        * fc_scales.astype(np.float32)
+                        / max(_scale(self.scales, f"block{L}_fc1"), 1e-12)
+                    ).astype(np.float16)
+                    if fc_name in self.requant_pc_weight_names
+                    else None
+                ),
                 "fc_w_fp32": _to_f32(sd[f"transformer.h.{L}.mlp.c_fc.weight"]),
                 "fc_b": _to_f32(sd[f"transformer.h.{L}.mlp.c_fc.bias"]),
                 "fc_b_i32": _bias_i32(
@@ -350,6 +375,15 @@ class NanoGPTFQReference:
                 "proj_w_q": proj_q,
                 "proj_w_scale": proj_scale_w,
                 "proj_w_scales": proj_scales,
+                "proj_requant_pc": (
+                    (
+                        np.float32(_scale(self.scales, f"block{L}_gelu", 1.0 / 127.0))
+                        * proj_scales.astype(np.float32)
+                        / max(_scale(self.scales, f"block{L}_fc2"), 1e-12)
+                    ).astype(np.float16)
+                    if proj_name in self.requant_pc_weight_names
+                    else None
+                ),
                 "proj_w_fp32": _to_f32(sd[f"transformer.h.{L}.mlp.c_proj.weight"]),
                 "proj_b": _to_f32(sd[f"transformer.h.{L}.mlp.c_proj.bias"]),
                 "proj_b_i32": _bias_i32(
@@ -368,6 +402,9 @@ class NanoGPTFQReference:
     def _integer_linear_reference(self) -> bool:
         """Use bias-aware integer linear math for GPT-2-class converted models."""
         return self._large_vocab_lm_head_reference() or self._has_nonzero_linear_bias
+
+    def _use_integer_linear(self, requant_pc: np.ndarray | None = None) -> bool:
+        return self._integer_linear_reference() or requant_pc is not None
 
     def forward(
         self,
@@ -460,14 +497,20 @@ class NanoGPTFQReference:
                 + layer["c_proj_b_i32"]
             )
             out_accum_scale = np.float32(concat_scale) * np.float32(layer["c_proj_w_scale"])
-            out_proj_i8 = _requant_accum_int8(out_accum, out_accum_scale, out_proj_scale)
+            if layer["c_proj_requant_pc"] is not None:
+                out_proj_i8 = _requant_accum_pc_int8(out_accum, layer["c_proj_requant_pc"])
+            else:
+                out_proj_i8 = _requant_accum_int8(out_accum, out_accum_scale, out_proj_scale)
             out_proj = out_proj_i8.astype(np.float32) * _arch_scale(out_proj_scale)
             # Residual 1: decoder bundles use DEQUANT_ADD, which consumes the
             # branch accumulator directly through FP16 rescale registers.
             prev_x_int8 = x_int8
             prev_x_scale = x_scale
             x_scale = _scale(s, f"block{L}_residual1")
-            x_int8 = _dequant_add_accum_int8(out_accum, out_accum_scale, prev_x_int8, prev_x_scale, x_scale)
+            if L in self.raw_residual1_blocks:
+                x_int8 = _int8_saturating_add(prev_x_int8, out_proj_i8)
+            else:
+                x_int8 = _dequant_add_accum_int8(out_accum, out_accum_scale, prev_x_int8, prev_x_scale, x_scale)
             x = x_int8.astype(np.float32) * _arch_scale(x_scale)
 
             # --- MLP ---
@@ -478,16 +521,19 @@ class NanoGPTFQReference:
             fc1_scale = _scale(s, f"block{L}_fc1")
             ln2_scale = _scale(s, f"block{L}_ln2")
             ln2_i8 = _fp32_to_int8(ln2, ln2_scale)
-            if self._integer_linear_reference():
+            if self._use_integer_linear(layer["fc_requant_pc"]):
                 fc1_accum = (
                     ln2_i8.astype(np.int32) @ layer["fc_w_q"].astype(np.int32).T
                     + layer["fc_b_i32"]
                 )
-                fc1_i8 = _requant_accum_int8(
-                    fc1_accum,
-                    np.float32(ln2_scale) * np.float32(layer["fc_w_scale"]),
-                    fc1_scale,
-                )
+                if layer["fc_requant_pc"] is not None:
+                    fc1_i8 = _requant_accum_pc_int8(fc1_accum, layer["fc_requant_pc"])
+                else:
+                    fc1_i8 = _requant_accum_int8(
+                        fc1_accum,
+                        np.float32(ln2_scale) * np.float32(layer["fc_w_scale"]),
+                        fc1_scale,
+                    )
                 fc1 = fc1_i8.astype(np.float32) * _arch_scale(fc1_scale)
             else:
                 fc1 = _qdq(ln2 @ layer["fc_w"].T + layer["fc_b"], fc1_scale)
@@ -500,7 +546,10 @@ class NanoGPTFQReference:
                 + layer["proj_b_i32"]
             )
             fc2_accum_scale = np.float32(gelu_scale) * np.float32(layer["proj_w_scale"])
-            fc2_i8 = _requant_accum_int8(fc2_accum, fc2_accum_scale, fc2_scale)
+            if layer["proj_requant_pc"] is not None:
+                fc2_i8 = _requant_accum_pc_int8(fc2_accum, layer["proj_requant_pc"])
+            else:
+                fc2_i8 = _requant_accum_int8(fc2_accum, fc2_accum_scale, fc2_scale)
             fc2 = fc2_i8.astype(np.float32) * _arch_scale(fc2_scale)
             prev_x_int8 = x_int8
             prev_x_scale = x_scale
@@ -734,11 +783,17 @@ class NanoGPTFQReference:
                     + layer["c_proj_b_i32"]
                 )
                 out_accum_scale = np.float32(concat_scale) * np.float32(layer["c_proj_w_scale"])
-                out_proj_i8 = _requant_accum_int8(out_accum, out_accum_scale, out_proj_scale)
+                if layer["c_proj_requant_pc"] is not None:
+                    out_proj_i8 = _requant_accum_pc_int8(out_accum, layer["c_proj_requant_pc"])
+                else:
+                    out_proj_i8 = _requant_accum_int8(out_accum, out_accum_scale, out_proj_scale)
                 out_proj = out_proj_i8.astype(np.float32) * _arch_scale(out_proj_scale)
             record(f"block{L}_out_proj", out_proj, scale=out_proj_scale, int8=out_proj_i8)
             x_scale = _scale(s, f"block{L}_residual1")
-            if "residual_vadd" in groups or out_accum is None:
+            if L in self.raw_residual1_blocks and "residual_vadd" not in groups:
+                x_int8 = _int8_saturating_add(x_int8, out_proj_i8)
+                x = x_int8.astype(np.float32) * _arch_scale(x_scale)
+            elif "residual_vadd" in groups or out_accum is None:
                 x = _qdq(x + out_proj, x_scale)
                 x_int8 = _fp32_to_int8(x, x_scale)
             else:
@@ -762,17 +817,20 @@ class NanoGPTFQReference:
                 fc2_i8 = _fp32_to_int8(_qdq(fc2, fc2_scale), fc2_scale)
                 fc2_accum = None
                 fc2_accum_scale = None
-            elif self._integer_linear_reference():
+            elif self._use_integer_linear(layer["fc_requant_pc"]):
                 ln2_i8 = _fp32_to_int8(ln2, ln2_scale)
                 fc1_accum = (
                     ln2_i8.astype(np.int32) @ layer["fc_w_q"].astype(np.int32).T
                     + layer["fc_b_i32"]
                 )
-                fc1_i8 = _requant_accum_int8(
-                    fc1_accum,
-                    np.float32(ln2_scale) * np.float32(layer["fc_w_scale"]),
-                    fc1_scale,
-                )
+                if layer["fc_requant_pc"] is not None:
+                    fc1_i8 = _requant_accum_pc_int8(fc1_accum, layer["fc_requant_pc"])
+                else:
+                    fc1_i8 = _requant_accum_int8(
+                        fc1_accum,
+                        np.float32(ln2_scale) * np.float32(layer["fc_w_scale"]),
+                        fc1_scale,
+                    )
                 fc1 = fc1_i8.astype(np.float32) * _arch_scale(fc1_scale)
                 gelu = _qdq(_gelu_np(fc1), gelu_scale)
                 gelu_i8 = _fp32_to_int8(gelu, gelu_scale)
@@ -781,7 +839,10 @@ class NanoGPTFQReference:
                     + layer["proj_b_i32"]
                 )
                 fc2_accum_scale = np.float32(gelu_scale) * np.float32(layer["proj_w_scale"])
-                fc2_i8 = _requant_accum_int8(fc2_accum, fc2_accum_scale, fc2_scale)
+                if layer["proj_requant_pc"] is not None:
+                    fc2_i8 = _requant_accum_pc_int8(fc2_accum, layer["proj_requant_pc"])
+                else:
+                    fc2_i8 = _requant_accum_int8(fc2_accum, fc2_accum_scale, fc2_scale)
                 fc2 = fc2_i8.astype(np.float32) * _arch_scale(fc2_scale)
             else:
                 fc1 = _qdq(ln2 @ layer["fc_w"].T + layer["fc_b"], fc1_scale)

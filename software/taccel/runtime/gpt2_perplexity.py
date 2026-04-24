@@ -12,6 +12,14 @@ import numpy as np
 from .calibration import build_calibration_scales_from_token_ids
 from .fake_quant_reference import NanoGPTFQReference
 from .host_runner import HostRunner
+from .stage5_ptq import (
+    Stage5PTQPreset,
+    apply_stage5_ptq_scale_policy,
+    resolve_stage5_ptq_preset,
+    stage5_default_ptq_preset_name,
+    stage5_raw_residual1_blocks,
+    stage5_requant_pc_weight_names,
+)
 from .tiny_fixture import build_stage3_tiny_decoder_bundle
 
 
@@ -27,6 +35,7 @@ class GPT2PerplexityResult:
     tokenizer_dir: str
     calibration_sha256: str
     eval_sha256: str
+    ptq_preset: str
 
 
 def file_sha256(path: Path) -> str:
@@ -88,12 +97,15 @@ def run_golden_teacher_forced_logits(
     payload: Dict[str, object],
     context_tokens: Sequence[int],
     calibration_scales: Dict[str, float],
+    *,
+    ptq_preset: str | Stage5PTQPreset | None = None,
 ) -> List[np.ndarray]:
     inputs, _ = teacher_forced_inputs_and_targets(context_tokens)
     tiny = build_stage3_tiny_decoder_bundle(
         payload,
         smoke_decode_steps=max(0, len(inputs) - 1),
         calibration_scales=calibration_scales,
+        ptq_preset=ptq_preset,
     )
     runner = HostRunner(tiny.build.bundle, logits_dtype=np.int8)
     logits: List[np.ndarray] = [runner.run_prefill([inputs[0]])]
@@ -106,12 +118,17 @@ def run_fake_quant_teacher_forced_logits(
     payload: Dict[str, object],
     context_tokens: Sequence[int],
     calibration_scales: Dict[str, float],
+    *,
+    ptq_preset: str | Stage5PTQPreset | None = None,
 ) -> List[np.ndarray]:
     inputs, _ = teacher_forced_inputs_and_targets(context_tokens)
+    resolved_preset = resolve_stage5_ptq_preset(ptq_preset)
     ref = NanoGPTFQReference(
         payload["state_dict"],
         payload["model_args"],
         calibration_scales,
+        requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset),
+        raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
     )
     return ref.incremental_logits_trace(inputs)
 
@@ -129,6 +146,7 @@ def evaluate_gpt2_perplexity(
     calibration_seq_len: int = 32,
     calibration_n_seqs: int = 8,
     calibration_percentile: float = 99.9,
+    ptq_preset: str | Stage5PTQPreset | None = None,
 ) -> GPT2PerplexityResult:
     if context_len < 1:
         raise ValueError("context_len must be positive")
@@ -139,19 +157,40 @@ def evaluate_gpt2_perplexity(
     if len(eval_tokens) < 2:
         raise ValueError("evaluation text produced fewer than two tokens")
 
+    resolved_preset = resolve_stage5_ptq_preset(
+        stage5_default_ptq_preset_name() if ptq_preset is None else ptq_preset
+    )
     calibration_scales = build_calibration_scales_from_token_ids(
         payload,
         calibration_token_ids,
         n_seqs=calibration_n_seqs,
         seq_len=calibration_seq_len,
         percentile=calibration_percentile,
+        activation_percentile_overrides=(
+            resolved_preset.activation_percentile_nodes or None
+        ),
+    )
+    calibration_scales = apply_stage5_ptq_scale_policy(
+        calibration_scales,
+        payload["model_args"],
+        resolved_preset,
     )
     _, targets = teacher_forced_inputs_and_targets(eval_tokens)
     vocab_size = int(payload["model_args"]["vocab_size"])
     lm_head_scale = float(calibration_scales.get("lm_head", 1.0))
 
-    golden_logits = run_golden_teacher_forced_logits(payload, eval_tokens, calibration_scales)
-    fake_logits = run_fake_quant_teacher_forced_logits(payload, eval_tokens, calibration_scales)
+    golden_logits = run_golden_teacher_forced_logits(
+        payload,
+        eval_tokens,
+        calibration_scales,
+        ptq_preset=resolved_preset,
+    )
+    fake_logits = run_fake_quant_teacher_forced_logits(
+        payload,
+        eval_tokens,
+        calibration_scales,
+        ptq_preset=resolved_preset,
+    )
     if len(golden_logits) != len(targets) or len(fake_logits) != len(targets):
         raise RuntimeError("teacher-forced logits/targets length mismatch")
 
@@ -177,4 +216,5 @@ def evaluate_gpt2_perplexity(
         tokenizer_dir=str(tokenizer_dir),
         calibration_sha256=calibration_sha256,
         eval_sha256=eval_sha256,
+        ptq_preset=resolved_preset.name,
     )

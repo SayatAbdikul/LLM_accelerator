@@ -79,6 +79,7 @@ def test_gpt2_perplexity_gate_against_fake_quant_reference():
     )
 
     assert result.target_count == 32
+    assert result.ptq_preset == "control"
     assert result.relative_delta <= 0.02, (
         f"golden_ppl={result.golden_perplexity:.6f}, "
         f"fake_quant_ppl={result.fake_quant_perplexity:.6f}, "

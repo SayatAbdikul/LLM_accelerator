@@ -71,6 +71,7 @@ def build_calibration_scales(
     n_seqs: int = 8,
     seq_len: int = 16,
     percentile: float = 99.9,
+    activation_percentile_overrides: Dict[str, float] | None = None,
 ) -> Dict[str, float]:
     """Return per-node INT8 scales derived from FP32 calibration runs.
 
@@ -82,6 +83,7 @@ def build_calibration_scales(
     state_dict = payload["state_dict"]
     seqs = build_calibration_seqs(payload, n_seqs=n_seqs, seq_len=seq_len)
 
+    node_percentiles = dict(activation_percentile_overrides or {})
     # per-node max-abs accumulator
     accum: Dict[str, List[float]] = {}
 
@@ -91,9 +93,10 @@ def build_calibration_scales(
             arr_f = np.asarray(arr, dtype=np.float32).ravel()
             if arr_f.size == 0:
                 continue
+            node_pct = float(node_percentiles.get(name, percentile))
             p = float(
-                np.percentile(np.abs(arr_f), percentile)
-                if percentile < 100.0
+                np.percentile(np.abs(arr_f), node_pct)
+                if node_pct < 100.0
                 else float(np.abs(arr_f).max())
             )
             accum.setdefault(name, []).append(p)
@@ -103,7 +106,16 @@ def build_calibration_scales(
         max_abs = float(np.max(vals))
         scales[name] = max(max_abs, 1e-8) / 127.0
 
-    _apply_raw_vadd_safe_tok_pos_scale(scales, state_dict, seqs, percentile=percentile)
+    missing = sorted(set(node_percentiles) - set(accum))
+    if missing:
+        raise ValueError(f"unknown activation percentile override nodes: {missing}")
+
+    _apply_raw_vadd_safe_tok_pos_scale(
+        scales,
+        state_dict,
+        seqs,
+        percentile=float(node_percentiles.get("tok_pos_add", percentile)),
+    )
 
     # Nodes that calibration didn't observe → keep the compiler's defaults
     _fill_defaults(scales, model_args)
@@ -117,6 +129,7 @@ def build_calibration_scales_from_token_ids(
     n_seqs: int = 8,
     seq_len: int = 16,
     percentile: float = 99.9,
+    activation_percentile_overrides: Dict[str, float] | None = None,
 ) -> Dict[str, float]:
     """Return per-node INT8 scales from tokenized calibration text."""
     model_args = payload["model_args"]
@@ -127,6 +140,7 @@ def build_calibration_scales_from_token_ids(
         seq_len=seq_len,
     )
 
+    node_percentiles = dict(activation_percentile_overrides or {})
     accum: Dict[str, List[float]] = {}
     for tids in seqs:
         node_outputs = _fp32_forward(state_dict, model_args, tids)
@@ -134,9 +148,10 @@ def build_calibration_scales_from_token_ids(
             arr_f = np.asarray(arr, dtype=np.float32).ravel()
             if arr_f.size == 0:
                 continue
+            node_pct = float(node_percentiles.get(name, percentile))
             p = float(
-                np.percentile(np.abs(arr_f), percentile)
-                if percentile < 100.0
+                np.percentile(np.abs(arr_f), node_pct)
+                if node_pct < 100.0
                 else float(np.abs(arr_f).max())
             )
             accum.setdefault(name, []).append(p)
@@ -146,7 +161,16 @@ def build_calibration_scales_from_token_ids(
         max_abs = float(np.max(vals))
         scales[name] = max(max_abs, 1e-8) / 127.0
 
-    _apply_raw_vadd_safe_tok_pos_scale(scales, state_dict, seqs, percentile=percentile)
+    missing = sorted(set(node_percentiles) - set(accum))
+    if missing:
+        raise ValueError(f"unknown activation percentile override nodes: {missing}")
+
+    _apply_raw_vadd_safe_tok_pos_scale(
+        scales,
+        state_dict,
+        seqs,
+        percentile=float(node_percentiles.get("tok_pos_add", percentile)),
+    )
 
     _fill_defaults(scales, model_args)
     return scales

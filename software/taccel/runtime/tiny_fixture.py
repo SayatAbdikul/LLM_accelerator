@@ -22,6 +22,15 @@ from .fake_quant import cosine_similarity
 from .fake_quant_reference import NanoGPTFQReference
 from .fp32_reference import NanoGPTFP32Reference
 from .host_runner import HostRunner
+from .stage5_ptq import (
+    Stage5PTQPreset,
+    apply_stage5_ptq_scale_policy,
+    resolve_stage5_ptq_preset,
+    stage5_dequant_add_residual1_blocks,
+    stage5_raw_residual1_blocks,
+    stage5_requant_pc_weight_names,
+    validate_stage5_ptq_preset_for_model,
+)
 
 
 @dataclass
@@ -259,11 +268,23 @@ def build_stage3_tiny_decoder_bundle(
     *,
     smoke_decode_steps: int = 2,
     calibration_scales: Optional[Dict[str, float]] = None,
+    ptq_preset: str | Stage5PTQPreset | None = None,
 ) -> TinyFixtureBundle:
     """Build the full 1-token tiny decoder ProgramBundle used by Stage 3 tests."""
+    resolved_preset = resolve_stage5_ptq_preset(ptq_preset)
+    activation_percentile_nodes = dict(resolved_preset.activation_percentile_nodes)
+    if calibration_scales is None:
+        calibration_scales = build_calibration_scales(
+            payload,
+            activation_percentile_overrides=activation_percentile_nodes or None,
+        )
+    else:
+        calibration_scales = dict(calibration_scales)
     weight_data, prescaled_biases, calibration_scales, config, logits_size = quantize_fixture_payload(
         payload, calibration_scales=calibration_scales
     )
+    validate_stage5_ptq_preset_for_model(config, resolved_preset)
+    calibration_scales = apply_stage5_ptq_scale_policy(calibration_scales, config, resolved_preset)
     frontend = load_nanogpt(config=payload["model_args"], variant="forward_1token")
     graph = mark_runtime_embedding_lookups(frontend.graph)
     decode_key_len = 1 + int(smoke_decode_steps)
@@ -278,6 +299,8 @@ def build_stage3_tiny_decoder_bundle(
         model_config=config,
         max_seq_len=config.max_seq_len,
         logits_size=logits_size,
+        requant_pc_weight_names=stage5_requant_pc_weight_names(config, resolved_preset),
+        dequant_add_residual1_blocks=stage5_dequant_add_residual1_blocks(config, resolved_preset),
     )
     return TinyFixtureBundle(build=build, config=config, logits_size=logits_size)
 
@@ -360,7 +383,8 @@ def _run_reference_trace(
 
 def run_stage3_tiny_e2e(payload: Dict[str, object], *,
                         prompt_ids: Sequence[int] = (0,),
-                        max_new_tokens: int = 32) -> TinyE2EResult:
+                        max_new_tokens: int = 32,
+                        ptq_preset: str | Stage5PTQPreset | None = None) -> TinyE2EResult:
     """Run the Stage 3 32-step gate comparing the golden model against a
     PyTorch fake-quant numpy reference that shares calibration scales.
 
@@ -369,12 +393,24 @@ def run_stage3_tiny_e2e(payload: Dict[str, object], *,
     correctness rather than calibration drift.
     """
     # Single calibration pass — shared by compiler and reference
-    calibration_scales = build_calibration_scales(payload)
+    resolved_preset = resolve_stage5_ptq_preset(ptq_preset)
+    calibration_scales = build_calibration_scales(
+        payload,
+        activation_percentile_overrides=(
+            resolved_preset.activation_percentile_nodes or None
+        ),
+    )
+    calibration_scales = apply_stage5_ptq_scale_policy(
+        calibration_scales,
+        payload["model_args"],
+        resolved_preset,
+    )
 
     tiny = build_stage3_tiny_decoder_bundle(
         payload,
         smoke_decode_steps=max_new_tokens,
         calibration_scales=calibration_scales,
+        ptq_preset=resolved_preset,
     )
     actual = run_tiny_decode_trace(tiny, prompt_ids, max_new_tokens=max_new_tokens)
 
@@ -382,6 +418,8 @@ def run_stage3_tiny_e2e(payload: Dict[str, object], *,
         state_dict=payload["state_dict"],
         model_args=payload["model_args"],
         scales=calibration_scales,
+        requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset),
+        raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
     )
     reference = _run_reference_trace(
         ref, prompt_ids, max_new_tokens=max_new_tokens, vocab_size=tiny.config.vocab_size
