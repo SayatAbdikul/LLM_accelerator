@@ -66,3 +66,8 @@ def test_decoder_requires_token_pos_embeddings():
 def test_per_head_kv_policy_is_deferred():
     with pytest.raises(NotImplementedError, match="per_head_kv"):
         _valid_decoder_config(activation_scale_policy="per_head_kv")
+
+
+def test_separate_prefill_decode_policy_is_deferred():
+    with pytest.raises(NotImplementedError, match="separate_prefill_decode"):
+        _valid_decoder_config(activation_scale_policy="separate_prefill_decode")

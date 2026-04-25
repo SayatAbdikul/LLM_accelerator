@@ -55,6 +55,10 @@ class ModelConfig:
             )
         if self.activation_scale_policy == "per_head_kv":
             raise NotImplementedError("per_head_kv activation scales are deferred")
+        if self.activation_scale_policy == "separate_prefill_decode":
+            raise NotImplementedError(
+                "separate_prefill_decode activation scales are not implemented; use single_set_unified"
+            )
 
         positive_fields = {
             "n_layer": self.n_layer,

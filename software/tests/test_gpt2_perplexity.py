@@ -76,6 +76,8 @@ def test_gpt2_perplexity_gate_against_fake_quant_reference():
         eval_sha256=file_sha256(EVAL_TEXT),
         max_eval_tokens=33,
         context_len=32,
+        calibration_n_seqs=8,
+        calibration_seq_len=32,
     )
 
     assert result.target_count == 32

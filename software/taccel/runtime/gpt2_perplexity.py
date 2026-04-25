@@ -143,8 +143,8 @@ def evaluate_gpt2_perplexity(
     eval_sha256: str = "",
     max_eval_tokens: int = 33,
     context_len: int = 32,
-    calibration_seq_len: int = 32,
-    calibration_n_seqs: int = 8,
+    calibration_seq_len: int = 128,
+    calibration_n_seqs: int = 64,
     calibration_percentile: float = 99.9,
     ptq_preset: str | Stage5PTQPreset | None = None,
 ) -> GPT2PerplexityResult:

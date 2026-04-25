@@ -782,9 +782,12 @@ def run_report(args) -> Dict[str, object]:
         ),
         "suspects": {
             "perplexity": {
+                "fp32_perplexity": fp32_ppl["perplexity"],
+                "fp32_nll": fp32_ppl["mean_nll"],
                 "golden_perplexity": golden_ppl["perplexity"],
                 "fake_quant_perplexity": fake_ppl["perplexity"],
                 "relative_delta": abs(golden_ppl["perplexity"] - fake_ppl["perplexity"]) / max(abs(fake_ppl["perplexity"]), 1e-12),
+                "golden_vs_fp32_gap": (golden_ppl["perplexity"] / max(fp32_ppl["perplexity"], 1e-12)) - 1.0,
                 "golden_nll": golden_ppl["mean_nll"],
                 "fake_quant_nll": fake_ppl["mean_nll"],
             },
@@ -915,9 +918,17 @@ def main(argv=None) -> int:
     if args.json:
         print(json.dumps(_jsonify(report), indent=2, sort_keys=True))
     else:
+        ppl = report["suspects"]["perplexity"]
+        fp32_gap = ppl.get("golden_vs_fp32_gap")
         print(json.dumps(_jsonify({
             "primary_suspect": report["primary_suspect"],
-            "perplexity": report["suspects"]["perplexity"],
+            "perplexity": ppl,
+            "fp32_gap_diagnostic": {
+                "fp32_perplexity": ppl.get("fp32_perplexity"),
+                "golden_perplexity": ppl.get("golden_perplexity"),
+                "golden_vs_fp32_gap": fp32_gap,
+                "golden_vs_fp32_gap_pct": None if fp32_gap is None else round(float(fp32_gap) * 100.0, 2),
+            },
             "fp32_baseline": report["suspects"]["fp32_baseline"],
             "lm_head_quantization": report["suspects"]["lm_head_quantization"],
             "converter_bias_layout": report["suspects"]["converter_bias_layout"],
