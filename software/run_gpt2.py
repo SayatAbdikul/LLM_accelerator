@@ -10,6 +10,9 @@ from typing import List
 import torch
 
 from taccel.runtime.gpt2_perplexity import (
+    CALIBRATION_N_SEQS_LARGE,
+    CALIBRATION_PERCENTILE_DEFAULT,
+    CALIBRATION_SEQ_LEN_LARGE,
     evaluate_gpt2_perplexity,
     file_sha256,
     tokenize_text_file,
@@ -58,6 +61,9 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--max-eval-tokens", type=int, default=33)
     parser.add_argument("--context-len", type=int, default=32)
+    parser.add_argument("--calibration-seq-len", type=int, default=CALIBRATION_SEQ_LEN_LARGE)
+    parser.add_argument("--calibration-n-seqs", type=int, default=CALIBRATION_N_SEQS_LARGE)
+    parser.add_argument("--calibration-percentile", type=float, default=CALIBRATION_PERCENTILE_DEFAULT)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
@@ -120,6 +126,9 @@ def main(argv=None) -> int:
             eval_sha256=file_sha256(args.perplexity_text),
             max_eval_tokens=args.max_eval_tokens,
             context_len=args.context_len,
+            calibration_n_seqs=args.calibration_n_seqs,
+            calibration_seq_len=args.calibration_seq_len,
+            calibration_percentile=args.calibration_percentile,
             ptq_preset=ptq_preset,
         )
         summary.update({

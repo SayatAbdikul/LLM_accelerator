@@ -10,6 +10,13 @@ from typing import Dict, List, Sequence
 import numpy as np
 
 from .calibration import build_calibration_scales_from_token_ids
+
+# Calibration budget constants — all production callers use LARGE; tests pin FAST.
+CALIBRATION_N_SEQS_LARGE = 64
+CALIBRATION_SEQ_LEN_LARGE = 128
+CALIBRATION_N_SEQS_FAST = 8
+CALIBRATION_SEQ_LEN_FAST = 32
+CALIBRATION_PERCENTILE_DEFAULT = 99.9
 from .fake_quant_reference import NanoGPTFQReference
 from .host_runner import HostRunner
 from .stage5_ptq import (
