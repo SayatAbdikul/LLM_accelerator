@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from taccel.runtime.stage5_ptq import STAGE5_PTQ_PRESETS
 
 
 TOOL = Path(__file__).resolve().parents[1] / "tools" / "debug_gpt2_perplexity.py"
@@ -171,10 +172,13 @@ def test_debug_gpt2_perplexity_preset_sweep_json_sections():
     )
     data = json.loads(proc.stdout)
     assert data["preset_sweep"]["promoted_default"] == "fc2_11_raw_vadd"
-    # 23 presets, 0 SKIPPED (fc2 REQUANT_PC now uses raw VADD for residual2).
-    assert len(data["preset_sweep"]["rows"]) == 23
+    assert len(data["preset_sweep"]["rows"]) == len(STAGE5_PTQ_PRESETS)
     assert data["preset_sweep"]["rows"][0]["name"]
     assert data["preset_sweep"]["winner"]["name"]
+    assert data["preset_sweep"]["default_replacement_candidate"]["baseline"] == "fc2_11_raw_vadd"
+    by_name = {row["name"]: row for row in data["preset_sweep"]["rows"]}
+    assert "fc2_11_fc2aware_gelu" in by_name
+    assert "fc2_aware_gelu" in by_name["fc2_11_fc2aware_gelu"]
 
 
 def test_gpt2_node_trace_reports_first_divergence():

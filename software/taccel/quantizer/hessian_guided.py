@@ -5,6 +5,45 @@ from __future__ import annotations
 import numpy as np
 
 
+def find_hessian_gelu_scale(
+    gelu_all: np.ndarray,
+    fc2_weight: np.ndarray,
+    *,
+    n_steps: int = 200,
+) -> float:
+    """Return the INT8 scale for GELU that minimises H-weighted quantisation error.
+
+    Searches clipping thresholds from the 50th to 100th percentile of
+    abs(gelu_all) and picks the scale s (FP16-rounded, matching hardware)
+    that minimises mean(H * (qdq(gelu, s) - gelu)^2) where H is the
+    diagonal Hessian proxy for the GELU -> FC2 output path.
+    """
+    g = np.asarray(gelu_all, dtype=np.float32)
+    H = gelu_fc2_hessian_diag(g, fc2_weight)
+    abs_flat = np.abs(g).ravel()
+    lo = float(np.percentile(abs_flat, 50.0))
+    hi = float(abs_flat.max())
+    if hi <= 0.0:
+        return 1.0 / 127.0
+
+    best_scale = float(np.float16(hi / 127.0))
+    best_error = float("inf")
+
+    for clip_val in np.linspace(lo, hi, n_steps):
+        if clip_val <= 0.0:
+            continue
+        s = float(np.float16(np.float32(clip_val) / np.float32(127.0)))
+        if s <= 0.0:
+            continue
+        q = np.clip(np.round(g / s), -128.0, 127.0).astype(np.float32) * s
+        err = weighted_quant_error_score(g, q, H)
+        if err < best_error:
+            best_error = err
+            best_scale = s
+
+    return best_scale
+
+
 def weighted_quant_error_score(
     reference: np.ndarray,
     candidate: np.ndarray,

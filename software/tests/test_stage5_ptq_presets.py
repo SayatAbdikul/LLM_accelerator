@@ -10,6 +10,7 @@ import pytest
 
 from taccel.runtime.stage5_ptq import (
     STAGE5_PTQ_PRESETS,
+    Stage5PTQPreset,
     apply_stage5_ptq_scale_policy,
     choose_stage5_ptq_promotion,
     choose_stage5_ptq_winner,
@@ -44,6 +45,7 @@ def test_stage5_preset_registry_contains_core_presets_and_promoted_default():
         "out_proj_11_ln_f_99_8", "gpt2_all_pc", "gpt2_all_pc_with_fc1",
         "out_proj_10_11", "out_proj_11_fc1_11", "out_proj_11_block10_ln2_99_0",
         "fc2_11_raw_vadd", "out_proj_11_fc2_11_raw_vadd", "out_proj_11_fc2_10_11_raw_vadd",
+        "hessian_gelu_11", "fc2_11_fc2aware_gelu", "out_proj_11_fc2_11_fc2aware_gelu",
     }
     assert core.issubset(set(STAGE5_PTQ_PRESETS))
     assert stage5_default_ptq_preset_name() == "fc2_11_raw_vadd"
@@ -77,6 +79,19 @@ def test_stage5_preset_weight_names_and_residual_policy():
 def test_stage5_preset_rejects_unsupported_block_indices():
     with pytest.raises(ValueError, match="outside range"):
         validate_stage5_ptq_preset_for_model({"n_layer": 6}, "fc1_8_9")
+    with pytest.raises(ValueError, match="outside range"):
+        validate_stage5_ptq_preset_for_model({"n_layer": 6}, "fc2_11_fc2aware_gelu")
+    invalid = Stage5PTQPreset(
+        name="bad_fc2aware",
+        activation_percentile_nodes={},
+        requant_pc_out_proj_blocks=(),
+        requant_pc_fc1_blocks=(),
+        requant_pc_fc2_blocks=(),
+        hessian_gelu_blocks=(),
+        fc2_aware_gelu_blocks=(0,),
+    )
+    with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
+        validate_stage5_ptq_preset_for_model({"n_layer": 1}, invalid)
 
 
 def test_stage5_scale_policy_ties_out_proj_and_residual_for_raw_vadd_block():
@@ -103,23 +118,34 @@ def test_stage5_scale_policy_ties_fc2_and_residual2_for_raw_vadd_block():
     assert scales["block11_fc2"] == 0.5
 
 
-def test_stage5_scale_policy_residual2_applied_before_residual1_for_combined_preset():
-    # For out_proj_11_fc2_11_raw_vadd: residual2 forcing runs first so block11_residual2
-    # captures block11_residual1 before residual1 forcing reads block11_residual2 as
-    # the skip source for block12 (which doesn't exist for n_layer=12, but the ordering
-    # matters for presets where residual1 skip == a forced residual2).
+def test_stage5_scale_policy_applies_before_fc2_aware_gelu_search():
     scales = {
+        "block11_residual1": 0.03125,
+        "block11_fc2": 0.5,
+        "block11_residual2": 0.75,
+        "block11_gelu": 0.0078125,
+    }
+    updated = apply_stage5_ptq_scale_policy(scales, {"n_layer": 12}, "fc2_11_fc2aware_gelu")
+    assert updated["block11_fc2"] == pytest.approx(scales["block11_residual1"])
+    assert updated["block11_residual2"] == pytest.approx(scales["block11_residual1"])
+    assert updated["block11_gelu"] == pytest.approx(scales["block11_gelu"])
+
+
+def test_stage5_scale_policy_combined_preset_keeps_one_raw_vadd_scale():
+    # Same-block out_proj+fc2 raw VADD needs residual1 forcing first, then
+    # residual2 forcing, so residual1/fc2/residual2 all share one scale.
+    scales = {
+        "block10_residual2": 0.0625,
         "block11_residual1": 0.03125,
         "block11_fc2": 0.9,
         "block11_residual2": 0.8,
         "block11_out_proj": 0.7,
     }
     updated = apply_stage5_ptq_scale_policy(scales, {"n_layer": 12}, "out_proj_11_fc2_11_raw_vadd")
-    # Residual2 forcing: fc2 = residual2 = residual1 = 0.03125
-    assert updated["block11_fc2"] == pytest.approx(0.03125)
-    assert updated["block11_residual2"] == pytest.approx(0.03125)
-    # Residual1 forcing: out_proj = residual1 = block10_residual2 (not in scales → default)
-    assert updated["block11_out_proj"] == updated["block11_residual1"]
+    assert updated["block11_out_proj"] == pytest.approx(0.0625)
+    assert updated["block11_residual1"] == pytest.approx(0.0625)
+    assert updated["block11_fc2"] == pytest.approx(0.0625)
+    assert updated["block11_residual2"] == pytest.approx(0.0625)
 
 
 def test_stage5_ranking_and_promotion_rules():
@@ -164,7 +190,10 @@ def test_debug_preset_sweep_reports_all_presets_and_deterministic_winner(monkeyp
     quality["late_ln_combo"] = 99.0  # ensure it wins
 
     def fake_scales(payload, calibration_ids, args, preset_name):
-        return {"lm_head": 1.0}
+        diagnostics = {}
+        if "fc2aware" in preset_name:
+            diagnostics = {"block11": {"multiplier": 1.25, "objective_mse": 0.0}}
+        return {"lm_head": 1.0}, diagnostics
 
     def fake_fake(payload, eval_tokens, scales, *, ptq_preset=None):
         score = quality.get(ptq_preset.name, 0.5)
@@ -173,7 +202,7 @@ def test_debug_preset_sweep_reports_all_presets_and_deterministic_winner(monkeyp
     def fake_golden(payload, eval_tokens, scales, *, ptq_preset=None):
         return fake_fake(payload, eval_tokens, scales, ptq_preset=ptq_preset)
 
-    monkeypatch.setattr(dbg, "_build_scales_for_preset", fake_scales)
+    monkeypatch.setattr(dbg, "_build_scales_and_diagnostics_for_preset", fake_scales)
     monkeypatch.setattr(dbg, "run_golden_teacher_forced_logits", fake_golden)
     monkeypatch.setattr(dbg, "run_fake_quant_teacher_forced_logits", fake_fake)
 
@@ -193,3 +222,6 @@ def test_debug_preset_sweep_reports_all_presets_and_deterministic_winner(monkeyp
     assert report["winner"]["name"] == "late_ln_combo"
     assert report["proposed_promotion"] == "late_ln_combo"
     assert report["promoted_default"] == "fc2_11_raw_vadd"
+    assert report["default_replacement_candidate"]["baseline"] == "fc2_11_raw_vadd"
+    fc2aware_rows = [row for row in report["rows"] if row["name"] == "fc2_11_fc2aware_gelu"]
+    assert fc2aware_rows and "fc2_aware_gelu" in fc2aware_rows[0]

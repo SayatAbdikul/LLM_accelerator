@@ -17,7 +17,10 @@ from typing import Dict, Iterable, List, Sequence
 import numpy as np
 import torch
 
-from taccel.runtime.calibration import build_calibration_scales_from_token_ids
+from taccel.runtime.calibration import (
+    apply_fc2_aware_gelu_scale_search_from_token_ids,
+    build_calibration_scales_from_token_ids,
+)
 from taccel.runtime.fake_quant import cosine_similarity
 from taccel.runtime.fake_quant_reference import NanoGPTFQReference
 from taccel.runtime.fp32_reference import NanoGPTFP32Reference
@@ -198,7 +201,12 @@ def _logit_pair_summary(lhs: Sequence[np.ndarray], rhs: Sequence[np.ndarray], *,
     }
 
 
-def _build_scales_for_preset(payload: dict, calibration_ids: Sequence[int], args, preset_name: str) -> Dict[str, float]:
+def _build_scales_and_diagnostics_for_preset(
+    payload: dict,
+    calibration_ids: Sequence[int],
+    args,
+    preset_name: str,
+) -> tuple[Dict[str, float], Dict[str, object]]:
     preset = resolve_stage5_ptq_preset(preset_name)
     scales = build_calibration_scales_from_token_ids(
         payload,
@@ -209,8 +217,25 @@ def _build_scales_for_preset(payload: dict, calibration_ids: Sequence[int], args
         activation_percentile_overrides=(
             preset.activation_percentile_nodes or None
         ),
+        hessian_gelu_blocks=preset.hessian_gelu_blocks,
     )
-    return apply_stage5_ptq_scale_policy(scales, payload["model_args"], preset)
+    scales = apply_stage5_ptq_scale_policy(scales, payload["model_args"], preset)
+    diagnostics: Dict[str, object] = {}
+    if preset.fc2_aware_gelu_blocks:
+        scales, diagnostics = apply_fc2_aware_gelu_scale_search_from_token_ids(
+            payload,
+            calibration_ids,
+            scales,
+            blocks=preset.fc2_aware_gelu_blocks,
+            n_seqs=args.calibration_n_seqs,
+            seq_len=args.calibration_seq_len,
+        )
+    return scales, diagnostics
+
+
+def _build_scales_for_preset(payload: dict, calibration_ids: Sequence[int], args, preset_name: str) -> Dict[str, float]:
+    scales, _ = _build_scales_and_diagnostics_for_preset(payload, calibration_ids, args, preset_name)
+    return scales
 
 
 def _centered_cosine(a: np.ndarray, b: np.ndarray) -> float:
@@ -547,7 +572,12 @@ def _preset_sweep(
         print(f"[{idx}/{total}] preset: {preset_name} ...", file=sys.stderr, flush=True)
         preset = resolve_stage5_ptq_preset(preset_name)
         try:
-            scales = _build_scales_for_preset(payload, calibration_ids, args, preset.name)
+            scales, scale_diagnostics = _build_scales_and_diagnostics_for_preset(
+                payload,
+                calibration_ids,
+                args,
+                preset.name,
+            )
             lm_scale = float(scales.get("lm_head", 1.0))
             golden_i8 = run_golden_teacher_forced_logits(
                 payload,
@@ -588,6 +618,8 @@ def _preset_sweep(
                 and pair_golden_fake["min_top10_overlap"] >= expected_top10
             ),
         }
+        if scale_diagnostics:
+            row["fc2_aware_gelu"] = scale_diagnostics
         rows.append(row)
         print(
             f"[{idx}/{total}] {preset.name}: golden={row['golden_perplexity']:.1f}  fq={row['fake_quant_perplexity']:.1f}  rel_delta={row['relative_delta']:.4%}",
@@ -602,12 +634,32 @@ def _preset_sweep(
         gate_passed=bool(winner and winner.get("logits_gate_passed")),
     )
     promoted_default = stage5_default_ptq_preset_name()
+    default_row = next((row for row in rows if str(row["name"]) == promoted_default), None)
+    replacement: dict[str, object] = {"baseline": promoted_default, "candidate": promoted_default, "passes_5pct_rule": False}
+    if default_row is not None:
+        eligible = [row for row in ranked if bool(row.get("logits_gate_passed"))]
+        best = eligible[0] if eligible else None
+        if best is not None:
+            golden_improvement = 1.0 - float(best["golden_perplexity"]) / max(float(default_row["golden_perplexity"]), 1e-12)
+            fake_improvement = 1.0 - float(best["fake_quant_perplexity"]) / max(float(default_row["fake_quant_perplexity"]), 1e-12)
+            replacement = {
+                "baseline": promoted_default,
+                "candidate": str(best["name"]),
+                "golden_improvement_vs_default": float(golden_improvement),
+                "fake_quant_improvement_vs_default": float(fake_improvement),
+                "passes_5pct_rule": bool(
+                    str(best["name"]) != promoted_default
+                    and golden_improvement >= 0.05
+                    and fake_improvement >= 0.05
+                ),
+            }
     return {
         "rows": ranked,
         "winner": winner,
         "proposed_promotion": proposed,
         "promoted_default": promoted_default,
         "winner_promoted": bool(winner and winner["name"] == promoted_default),
+        "default_replacement_candidate": replacement,
     }
 
 
@@ -651,6 +703,15 @@ def _calibration_sweep(
             ),
         )
         scales = apply_stage5_ptq_scale_policy(scales, payload["model_args"], preset)
+        if preset.fc2_aware_gelu_blocks:
+            scales, _ = apply_fc2_aware_gelu_scale_search_from_token_ids(
+                payload,
+                calibration_ids,
+                scales,
+                blocks=preset.fc2_aware_gelu_blocks,
+                n_seqs=n_seqs,
+                seq_len=seq_len,
+            )
         lm_scale = float(scales.get("lm_head", 1.0))
         golden = run_golden_teacher_forced_logits(payload, eval_tokens, scales, ptq_preset=preset)
         fake = run_fake_quant_teacher_forced_logits(payload, eval_tokens, scales, ptq_preset=preset)

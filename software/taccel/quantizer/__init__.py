@@ -17,6 +17,7 @@ from .twin_uniform import (
     quantize_dequant_softmax_twin,
 )
 from .hessian_guided import (
+    find_hessian_gelu_scale,
     gelu_fc2_hessian_diag,
     softmax_attn_v_hessian_diag,
     weighted_quant_error_score,
@@ -47,6 +48,7 @@ __all__ = [
     "apply_smooth_quant",
     "quantize_dequant_gelu_twin",
     "quantize_dequant_softmax_twin",
+    "find_hessian_gelu_scale",
     "gelu_fc2_hessian_diag",
     "softmax_attn_v_hessian_diag",
     "weighted_quant_error_score",

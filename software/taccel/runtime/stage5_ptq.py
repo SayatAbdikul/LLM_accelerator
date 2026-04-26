@@ -17,6 +17,8 @@ class Stage5PTQPreset:
     requant_pc_out_proj_blocks: tuple[int, ...]
     requant_pc_fc1_blocks: tuple[int, ...]
     requant_pc_fc2_blocks: tuple[int, ...]
+    hessian_gelu_blocks: tuple[int, ...]
+    fc2_aware_gelu_blocks: tuple[int, ...]
 
 
 def _preset(
@@ -26,6 +28,8 @@ def _preset(
     requant_pc_out_proj_blocks: Sequence[int] = (),
     requant_pc_fc1_blocks: Sequence[int] = (),
     requant_pc_fc2_blocks: Sequence[int] = (),
+    hessian_gelu_blocks: Sequence[int] = (),
+    fc2_aware_gelu_blocks: Sequence[int] = (),
 ) -> Stage5PTQPreset:
     return Stage5PTQPreset(
         name=name,
@@ -33,6 +37,8 @@ def _preset(
         requant_pc_out_proj_blocks=tuple(int(v) for v in requant_pc_out_proj_blocks),
         requant_pc_fc1_blocks=tuple(int(v) for v in requant_pc_fc1_blocks),
         requant_pc_fc2_blocks=tuple(int(v) for v in requant_pc_fc2_blocks),
+        hessian_gelu_blocks=tuple(int(v) for v in hessian_gelu_blocks),
+        fc2_aware_gelu_blocks=tuple(int(v) for v in fc2_aware_gelu_blocks),
     )
 
 
@@ -130,6 +136,26 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         "gpt2_fc2_all_raw_vadd",
         requant_pc_fc2_blocks=tuple(range(12)),
     ),
+    # Hessian-guided GELU scale: replaces percentile calibration for block 11 GELU
+    # with the scale that minimises mean(H * (qdq(gelu, s) - gelu)^2).
+    "hessian_gelu_11": _preset(
+        "hessian_gelu_11",
+        requant_pc_fc2_blocks=(11,),
+        hessian_gelu_blocks=(11,),
+    ),
+    # FC2-aware GELU scale search: choose block11 GELU scale by minimising the
+    # actual integer FC2→raw-residual2 error, not local GELU QDQ error.
+    "fc2_11_fc2aware_gelu": _preset(
+        "fc2_11_fc2aware_gelu",
+        requant_pc_fc2_blocks=(11,),
+        fc2_aware_gelu_blocks=(11,),
+    ),
+    "out_proj_11_fc2_11_fc2aware_gelu": _preset(
+        "out_proj_11_fc2_11_fc2aware_gelu",
+        requant_pc_out_proj_blocks=(11,),
+        requant_pc_fc2_blocks=(11,),
+        fc2_aware_gelu_blocks=(11,),
+    ),
     # out_proj extension combined with wide fc2 coverage.
     "out_proj_11_fc2_9_10_11_raw_vadd": _preset(
         "out_proj_11_fc2_9_10_11_raw_vadd",
@@ -187,6 +213,8 @@ def validate_stage5_ptq_preset_for_model(
                 resolved.requant_pc_out_proj_blocks
                 + resolved.requant_pc_fc1_blocks
                 + resolved.requant_pc_fc2_blocks
+                + resolved.hessian_gelu_blocks
+                + resolved.fc2_aware_gelu_blocks
             )
             if idx < 0 or idx >= n_layer
         }
@@ -194,6 +222,11 @@ def validate_stage5_ptq_preset_for_model(
     if invalid:
         raise ValueError(
             f"Stage 5 PTQ preset {resolved.name!r} has block indices outside range for n_layer={n_layer}: {invalid}"
+        )
+    fc2_aware_without_pc = sorted(set(resolved.fc2_aware_gelu_blocks) - set(resolved.requant_pc_fc2_blocks))
+    if fc2_aware_without_pc:
+        raise ValueError(
+            f"Stage 5 PTQ preset {resolved.name!r} uses FC2-aware GELU blocks without matching fc2 REQUANT_PC/raw VADD blocks: {fc2_aware_without_pc}"
         )
     return resolved
 
@@ -258,18 +291,27 @@ def apply_stage5_ptq_scale_policy(
 ) -> Dict[str, float]:
     resolved = validate_stage5_ptq_preset_for_model(model_args_or_config, preset)
     scales = dict(calibration_scales)
-    # Residual2 forcing first: block{L}_fc2 = block{L}_residual2 = block{L}_residual1.
-    # Must run before residual1 forcing so block{L}_residual1 captures the updated residual2.
-    for block in stage5_raw_residual2_blocks(resolved):
-        shared_scale = float(scales.get(f"block{block}_residual1", 6.0 / 127.0))
-        scales[f"block{block}_fc2"] = shared_scale
-        scales[f"block{block}_residual2"] = shared_scale
-    # Residual1 forcing: block{L}_out_proj = block{L}_residual1 = block{L-1}_residual2.
-    for block in stage5_raw_residual1_blocks(resolved):
-        skip_name = "tok_pos_add" if block == 0 else f"block{block - 1}_residual2"
-        shared_scale = float(scales.get(skip_name, 6.0 / 127.0))
-        scales[f"block{block}_out_proj"] = shared_scale
-        scales[f"block{block}_residual1"] = shared_scale
+    n_layer = int(
+        getattr(model_args_or_config, "n_layer", None)
+        if hasattr(model_args_or_config, "n_layer")
+        else model_args_or_config["n_layer"]
+    )
+    raw_residual1 = stage5_raw_residual1_blocks(resolved)
+    raw_residual2 = stage5_raw_residual2_blocks(resolved)
+    for block in range(n_layer):
+        # Residual1 forcing: block{L}_out_proj = block{L}_residual1 = block{L-1}_residual2.
+        # Run in forward order so block{L-1}_residual2 already reflects any raw-residual2 forcing.
+        if block in raw_residual1:
+            skip_name = "tok_pos_add" if block == 0 else f"block{block - 1}_residual2"
+            shared_scale = float(scales.get(skip_name, 6.0 / 127.0))
+            scales[f"block{block}_out_proj"] = shared_scale
+            scales[f"block{block}_residual1"] = shared_scale
+        # Residual2 forcing: block{L}_fc2 = block{L}_residual2 = block{L}_residual1.
+        # Run after same-block residual1 forcing so combined out_proj+fc2 presets keep one raw VADD scale.
+        if block in raw_residual2:
+            shared_scale = float(scales.get(f"block{block}_residual1", 6.0 / 127.0))
+            scales[f"block{block}_fc2"] = shared_scale
+            scales[f"block{block}_residual2"] = shared_scale
     return scales
 
 

@@ -9,7 +9,10 @@ from typing import Dict, List, Sequence
 
 import numpy as np
 
-from .calibration import build_calibration_scales_from_token_ids
+from .calibration import (
+    apply_fc2_aware_gelu_scale_search_from_token_ids,
+    build_calibration_scales_from_token_ids,
+)
 
 # Calibration budget constants — all production callers use LARGE; tests pin FAST.
 CALIBRATION_N_SEQS_LARGE = 64
@@ -181,12 +184,22 @@ def evaluate_gpt2_perplexity(
         activation_percentile_overrides=(
             resolved_preset.activation_percentile_nodes or None
         ),
+        hessian_gelu_blocks=resolved_preset.hessian_gelu_blocks,
     )
     calibration_scales = apply_stage5_ptq_scale_policy(
         calibration_scales,
         payload["model_args"],
         resolved_preset,
     )
+    if resolved_preset.fc2_aware_gelu_blocks:
+        calibration_scales, _ = apply_fc2_aware_gelu_scale_search_from_token_ids(
+            payload,
+            calibration_token_ids,
+            calibration_scales,
+            blocks=resolved_preset.fc2_aware_gelu_blocks,
+            n_seqs=calibration_n_seqs,
+            seq_len=calibration_seq_len,
+        )
     _, targets = teacher_forced_inputs_and_targets(eval_tokens)
     vocab_size = int(payload["model_args"]["vocab_size"])
     lm_head_scale = float(calibration_scales.get("lm_head", 1.0))

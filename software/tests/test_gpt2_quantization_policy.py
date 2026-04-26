@@ -1,9 +1,13 @@
 """Focused tests for Stage 5 GPT-2 quantization policy fixes."""
 
+import pytest
 import numpy as np
 
-from taccel.runtime.calibration import build_calibration_scales_from_token_ids
-from taccel.runtime.fake_quant_reference import _requant_accum_pc_int8
+from taccel.runtime.calibration import (
+    choose_fc2_aware_gelu_scale,
+    build_calibration_scales_from_token_ids,
+)
+from taccel.runtime.fake_quant_reference import _fp32_to_int8, _requant_accum_pc_int8
 
 
 def _zero_layer_payload():
@@ -65,3 +69,36 @@ def test_requant_accum_pc_int8_uses_one_scale_per_output_column():
     ).astype(np.int8)
 
     np.testing.assert_array_equal(got, expected)
+
+
+def test_fc2_aware_gelu_scale_search_selects_known_best_multiplier():
+    base_scale = 0.1
+    true_scale = base_scale * 1.25
+    out_scale = 0.1
+    gelu = np.array([[0.22, -0.31], [0.47, 0.09]], dtype=np.float32)
+    residual1 = np.zeros_like(gelu, dtype=np.float32)
+    proj_w_q = np.eye(2, dtype=np.int8)
+    proj_w_scales = np.ones(2, dtype=np.float32)
+    gelu_i8 = _fp32_to_int8(gelu, true_scale)
+    accum = gelu_i8.astype(np.int32) @ proj_w_q.astype(np.int32).T
+    requant_pc = np.asarray([true_scale / out_scale, true_scale / out_scale], dtype=np.float32)
+    fc2_i8 = _requant_accum_pc_int8(accum, requant_pc)
+    residual2 = fc2_i8.astype(np.float32) * np.float32(out_scale)
+    multipliers = (0.75, 1.0, 1.25, 1.5)
+
+    result = choose_fc2_aware_gelu_scale(
+        gelu=gelu,
+        residual1=residual1,
+        residual2=residual2,
+        proj_w_q=proj_w_q,
+        proj_w_scales=proj_w_scales,
+        proj_b_i32_by_scale={base_scale * m: np.zeros(2, dtype=np.int32) for m in multipliers},
+        base_scale=base_scale,
+        fc2_scale=out_scale,
+        residual1_scale=out_scale,
+        residual2_scale=out_scale,
+        multipliers=multipliers,
+    )
+
+    assert result["multiplier"] == pytest.approx(1.25)
+    assert result["objective_mse"] == pytest.approx(0.0)
