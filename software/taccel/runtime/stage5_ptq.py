@@ -113,6 +113,29 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         requant_pc_out_proj_blocks=(11,),
         requant_pc_fc2_blocks=(10, 11),
     ),
+    # fc2 REQUANT_PC ladder: extend raw VADD to earlier blocks.
+    "fc2_10_11_raw_vadd": _preset(
+        "fc2_10_11_raw_vadd",
+        requant_pc_fc2_blocks=(10, 11),
+    ),
+    "fc2_9_10_11_raw_vadd": _preset(
+        "fc2_9_10_11_raw_vadd",
+        requant_pc_fc2_blocks=(9, 10, 11),
+    ),
+    "fc2_8_to_11_raw_vadd": _preset(
+        "fc2_8_to_11_raw_vadd",
+        requant_pc_fc2_blocks=(8, 9, 10, 11),
+    ),
+    "gpt2_fc2_all_raw_vadd": _preset(
+        "gpt2_fc2_all_raw_vadd",
+        requant_pc_fc2_blocks=tuple(range(12)),
+    ),
+    # out_proj extension combined with wide fc2 coverage.
+    "out_proj_11_fc2_9_10_11_raw_vadd": _preset(
+        "out_proj_11_fc2_9_10_11_raw_vadd",
+        requant_pc_out_proj_blocks=(11,),
+        requant_pc_fc2_blocks=(9, 10, 11),
+    ),
     # GPT-2 124M specific (n_layer=12). Do not promote globally.
     "gpt2_all_pc": _preset(
         "gpt2_all_pc",

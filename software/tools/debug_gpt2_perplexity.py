@@ -41,6 +41,7 @@ from taccel.runtime.stage5_ptq import (
     resolve_stage5_ptq_preset,
     stage5_default_ptq_preset_name,
     stage5_raw_residual1_blocks,
+    stage5_raw_residual2_blocks,
     stage5_requant_pc_weight_names,
     STAGE5_PTQ_PRESETS,
     apply_stage5_ptq_scale_policy,
@@ -472,6 +473,7 @@ def _ablation_sweep(
     fake_i8: Sequence[np.ndarray],
     vocab_size: int,
     lm_scale: float,
+    resolved_preset=None,
 ) -> List[Dict[str, object]]:
     baseline_fake_deq = [
         _dequantize_fake_logits(row, lm_scale)[:vocab_size]
@@ -485,7 +487,14 @@ def _ablation_sweep(
     )
     rows = []
     for group in ABLATION_GROUPS:
-        ref = NanoGPTFQReference(payload["state_dict"], payload["model_args"], scales)
+        ref = NanoGPTFQReference(
+            payload["state_dict"],
+            payload["model_args"],
+            scales,
+            requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset) if resolved_preset else set(),
+            raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset) if resolved_preset else set(),
+            raw_residual2_blocks=stage5_raw_residual2_blocks(resolved_preset) if resolved_preset else set(),
+        )
         logits = ref.incremental_logits_trace(inputs, fp32_groups={group})
         deq = [
             _dequantize_fake_logits(row, lm_scale, group=group)[:vocab_size]
@@ -743,6 +752,7 @@ def run_report(args) -> Dict[str, object]:
         scales,
         requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset),
         raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
+        raw_residual2_blocks=stage5_raw_residual2_blocks(resolved_preset),
     )
     fake_incr, fake_full = _fake_incremental_and_full(fake_ref, eval_tokens)
     golden_i8 = run_golden_teacher_forced_logits(payload, eval_tokens, scales, ptq_preset=resolved_preset)
@@ -864,6 +874,7 @@ def run_report(args) -> Dict[str, object]:
             scales,
             requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset),
             raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
+            raw_residual2_blocks=stage5_raw_residual2_blocks(resolved_preset),
         ).incremental_node_trace(prefix)[-1]
         fp32_trace = NanoGPTFP32Reference(
             payload["state_dict"],
@@ -895,6 +906,7 @@ def run_report(args) -> Dict[str, object]:
             fake_i8=fake_incr,
             vocab_size=vocab_size,
             lm_scale=lm_scale,
+            resolved_preset=resolved_preset,
         )
     if bool(getattr(args, "preset_sweep", False)):
         report["preset_sweep"] = _preset_sweep(

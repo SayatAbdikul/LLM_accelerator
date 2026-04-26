@@ -171,8 +171,8 @@ def test_debug_gpt2_perplexity_preset_sweep_json_sections():
     )
     data = json.loads(proc.stdout)
     assert data["preset_sweep"]["promoted_default"] == "fc2_11_raw_vadd"
-    # 18 presets, 0 SKIPPED (fc2 REQUANT_PC now uses raw VADD for residual2).
-    assert len(data["preset_sweep"]["rows"]) == 18
+    # 23 presets, 0 SKIPPED (fc2 REQUANT_PC now uses raw VADD for residual2).
+    assert len(data["preset_sweep"]["rows"]) == 23
     assert data["preset_sweep"]["rows"][0]["name"]
     assert data["preset_sweep"]["winner"]["name"]
 
