@@ -75,11 +75,44 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         requant_pc_fc2_blocks=(10,),
         requant_pc_out_proj_blocks=(11,),
     ),
+    "out_proj_11_ln_f_99_8": _preset(
+        "out_proj_11_ln_f_99_8",
+        activation_percentile_nodes={"ln_f": 99.8},
+        requant_pc_out_proj_blocks=(11,),
+    ),
+    # Two-block extension: test if block 10 + 11 is better or worse than just 11.
+    "out_proj_10_11": _preset(
+        "out_proj_10_11",
+        requant_pc_out_proj_blocks=(10, 11),
+    ),
+    # Out_proj_11 + fc1 per-channel for block 11 (fc1 feeds same activation path).
+    "out_proj_11_fc1_11": _preset(
+        "out_proj_11_fc1_11",
+        requant_pc_out_proj_blocks=(11,),
+        requant_pc_fc1_blocks=(11,),
+    ),
+    # Out_proj_11 + block 10 ln2 percentile override.
+    "out_proj_11_block10_ln2_99_0": _preset(
+        "out_proj_11_block10_ln2_99_0",
+        activation_percentile_nodes={"block10_ln2": 99.0},
+        requant_pc_out_proj_blocks=(11,),
+    ),
+    # GPT-2 124M specific (n_layer=12). Do not promote globally.
+    # requant_pc_fc2_blocks is omitted: fc2→residual2 uses DEQUANT_ADD which requires scalar scale.
+    "gpt2_all_pc": _preset(
+        "gpt2_all_pc",
+        requant_pc_out_proj_blocks=tuple(range(12)),
+    ),
+    "gpt2_all_pc_with_fc1": _preset(
+        "gpt2_all_pc_with_fc1",
+        requant_pc_out_proj_blocks=tuple(range(12)),
+        requant_pc_fc1_blocks=tuple(range(12)),
+    ),
 }
 
 # Updated only after a preset wins on the real local GPT-2 checkpoint and still
 # keeps the existing golden-vs-fake gates green.
-PROMOTED_STAGE5_PTQ_PRESET = "control"
+PROMOTED_STAGE5_PTQ_PRESET = "out_proj_11"
 
 
 def stage5_default_ptq_preset_name() -> str:
@@ -195,6 +228,9 @@ def choose_stage5_ptq_winner(rows: Sequence[Mapping[str, object]]) -> dict[str, 
     return ranked[0] if ranked else None
 
 
+_PPL_PROMOTION_THRESHOLD = 0.10  # both golden and fake-quant must improve by at least 10%
+
+
 def choose_stage5_ptq_promotion(
     rows: Sequence[Mapping[str, object]],
     *,
@@ -208,10 +244,12 @@ def choose_stage5_ptq_promotion(
         return control_name
     best = ranked[0]
     control = next((row for row in ranked if str(row["name"]) == control_name), None)
-    if control is None:
+    if control is None or str(best["name"]) == control_name:
         return control_name
-    if str(best["name"]) == control_name:
-        return control_name
-    if float(best["fake_quant_perplexity"]) >= float(control["fake_quant_perplexity"]):
+    fq_improvement = 1.0 - float(best["fake_quant_perplexity"]) / max(float(control["fake_quant_perplexity"]), 1e-12)
+    g_improvement = 1.0 - float(best.get("golden_perplexity", best["fake_quant_perplexity"])) / max(
+        float(control.get("golden_perplexity", control["fake_quant_perplexity"])), 1e-12
+    )
+    if fq_improvement < _PPL_PROMOTION_THRESHOLD or g_improvement < _PPL_PROMOTION_THRESHOLD:
         return control_name
     return str(best["name"])

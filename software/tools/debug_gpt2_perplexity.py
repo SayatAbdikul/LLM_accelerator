@@ -11,6 +11,7 @@ import argparse
 import json
 import math
 from pathlib import Path
+import sys
 from typing import Dict, Iterable, List, Sequence
 
 import numpy as np
@@ -531,16 +532,23 @@ def _preset_sweep(
     args,
 ) -> Dict[str, object]:
     rows: list[dict[str, object]] = []
-    for preset_name in STAGE5_PTQ_PRESETS:
+    preset_names = list(STAGE5_PTQ_PRESETS)
+    total = len(preset_names)
+    for idx, preset_name in enumerate(preset_names, start=1):
+        print(f"[{idx}/{total}] preset: {preset_name} ...", file=sys.stderr, flush=True)
         preset = resolve_stage5_ptq_preset(preset_name)
-        scales = _build_scales_for_preset(payload, calibration_ids, args, preset.name)
-        lm_scale = float(scales.get("lm_head", 1.0))
-        golden_i8 = run_golden_teacher_forced_logits(
-            payload,
-            eval_tokens,
-            scales,
-            ptq_preset=preset,
-        )
+        try:
+            scales = _build_scales_for_preset(payload, calibration_ids, args, preset.name)
+            lm_scale = float(scales.get("lm_head", 1.0))
+            golden_i8 = run_golden_teacher_forced_logits(
+                payload,
+                eval_tokens,
+                scales,
+                ptq_preset=preset,
+            )
+        except ValueError as exc:
+            print(f"[{idx}/{total}] {preset_name}: SKIPPED — {exc}", file=sys.stderr, flush=True)
+            continue
         fake_i8 = run_fake_quant_teacher_forced_logits(
             payload,
             eval_tokens,
@@ -554,7 +562,7 @@ def _preset_sweep(
         pair_fake_fp32 = _logit_pair_summary(fake_deq, fp32_logits, vocab_size=vocab_size)
         pair_golden_fake = _logit_pair_summary(golden_i8, fake_i8, vocab_size=vocab_size)
         expected_top10 = min(10, int(vocab_size))
-        rows.append({
+        row = {
             "name": preset.name,
             "fake_quant_perplexity": float(fake_ppl["perplexity"]),
             "golden_perplexity": float(golden_ppl["perplexity"]),
@@ -570,7 +578,13 @@ def _preset_sweep(
                 pair_golden_fake["min_cosine"] >= 0.995
                 and pair_golden_fake["min_top10_overlap"] >= expected_top10
             ),
-        })
+        }
+        rows.append(row)
+        print(
+            f"[{idx}/{total}] {preset.name}: golden={row['golden_perplexity']:.1f}  fq={row['fake_quant_perplexity']:.1f}  rel_delta={row['relative_delta']:.4%}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     ranked = rank_stage5_ptq_rows(rows)
     winner = choose_stage5_ptq_winner(rows)

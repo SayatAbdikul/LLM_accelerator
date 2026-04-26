@@ -17,6 +17,9 @@ CALIBRATION_SEQ_LEN_LARGE = 128
 CALIBRATION_N_SEQS_FAST = 8
 CALIBRATION_SEQ_LEN_FAST = 32
 CALIBRATION_PERCENTILE_DEFAULT = 99.9
+
+# GPT-2-specific PTQ default — won the preset sweep on the real GPT-2 124M checkpoint.
+GPT2_DEFAULT_PTQ_PRESET = "out_proj_11"
 from .fake_quant_reference import NanoGPTFQReference
 from .host_runner import HostRunner
 from .stage5_ptq import (
@@ -165,7 +168,7 @@ def evaluate_gpt2_perplexity(
         raise ValueError("evaluation text produced fewer than two tokens")
 
     resolved_preset = resolve_stage5_ptq_preset(
-        stage5_default_ptq_preset_name() if ptq_preset is None else ptq_preset
+        GPT2_DEFAULT_PTQ_PRESET if ptq_preset is None else ptq_preset
     )
     calibration_scales = build_calibration_scales_from_token_ids(
         payload,

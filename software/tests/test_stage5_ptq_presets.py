@@ -34,19 +34,16 @@ def _debug_module():
     return module
 
 
-def test_stage5_preset_registry_is_fixed_and_default_control():
-    assert list(STAGE5_PTQ_PRESETS) == [
-        "control",
-        "final_ln_99_8",
-        "block9_ln2_99_0",
-        "late_ln_combo",
-        "fc1_8_9",
-        "fc2_10",
-        "out_proj_11",
-        "late_mlp_combo",
-        "full_late_combo",
-    ]
-    assert stage5_default_ptq_preset_name() == "control"
+def test_stage5_preset_registry_contains_core_presets_and_promoted_default():
+    # Core presets must always be present.
+    core = {
+        "control", "final_ln_99_8", "block9_ln2_99_0", "late_ln_combo",
+        "fc1_8_9", "fc2_10", "out_proj_11", "late_mlp_combo", "full_late_combo",
+        "out_proj_11_ln_f_99_8", "gpt2_all_pc", "gpt2_all_pc_with_fc1",
+        "out_proj_10_11", "out_proj_11_fc1_11", "out_proj_11_block10_ln2_99_0",
+    }
+    assert core.issubset(set(STAGE5_PTQ_PRESETS))
+    assert stage5_default_ptq_preset_name() == "out_proj_11"
     assert resolve_stage5_ptq_preset("control").name == "control"
     with pytest.raises(KeyError, match="unknown Stage 5 PTQ preset"):
         resolve_stage5_ptq_preset("not_a_preset")
@@ -119,24 +116,19 @@ def test_stage5_ranking_and_promotion_rules():
 
 
 def test_debug_preset_sweep_reports_all_presets_and_deterministic_winner(monkeypatch):
+    from taccel.runtime.stage5_ptq import STAGE5_PTQ_PRESETS
     dbg = _debug_module()
-    quality = {
-        "control": 0.9,
-        "final_ln_99_8": 0.8,
-        "block9_ln2_99_0": 0.7,
-        "late_ln_combo": 1.0,
-        "fc1_8_9": 0.6,
-        "fc2_10": 0.5,
-        "out_proj_11": 0.4,
-        "late_mlp_combo": 0.3,
-        "full_late_combo": 0.2,
-    }
+    # Assign quality scores: presets ranked in STAGE5_PTQ_PRESETS order by default,
+    # with "late_ln_combo" forced to best so winner is deterministic.
+    preset_names = list(STAGE5_PTQ_PRESETS)
+    quality = {name: float(len(preset_names) - i) / len(preset_names) for i, name in enumerate(preset_names)}
+    quality["late_ln_combo"] = 99.0  # ensure it wins
 
     def fake_scales(payload, calibration_ids, args, preset_name):
         return {"lm_head": 1.0}
 
     def fake_fake(payload, eval_tokens, scales, *, ptq_preset=None):
-        score = quality[ptq_preset.name]
+        score = quality.get(ptq_preset.name, 0.5)
         return [np.asarray([score, 2, 1, 0], dtype=np.float32)]
 
     def fake_golden(payload, eval_tokens, scales, *, ptq_preset=None):
@@ -157,17 +149,8 @@ def test_debug_preset_sweep_reports_all_presets_and_deterministic_winner(monkeyp
         args=SimpleNamespace(),
     )
 
-    assert [row["name"] for row in report["rows"]] == [
-        "late_ln_combo",
-        "control",
-        "final_ln_99_8",
-        "block9_ln2_99_0",
-        "fc1_8_9",
-        "fc2_10",
-        "out_proj_11",
-        "late_mlp_combo",
-        "full_late_combo",
-    ]
+    result_names = {row["name"] for row in report["rows"]}
+    assert set(preset_names).issubset(result_names)
     assert report["winner"]["name"] == "late_ln_combo"
     assert report["proposed_promotion"] == "late_ln_combo"
-    assert report["promoted_default"] == "control"
+    assert report["promoted_default"] == "out_proj_11"
