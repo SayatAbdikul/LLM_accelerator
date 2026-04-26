@@ -16,8 +16,10 @@ from taccel.runtime.stage5_ptq import (
     rank_stage5_ptq_rows,
     resolve_stage5_ptq_preset,
     stage5_dequant_add_residual1_blocks,
+    stage5_dequant_add_residual2_blocks,
     stage5_default_ptq_preset_name,
     stage5_raw_residual1_blocks,
+    stage5_raw_residual2_blocks,
     stage5_requant_pc_weight_names,
     validate_stage5_ptq_preset_for_model,
 )
@@ -41,9 +43,10 @@ def test_stage5_preset_registry_contains_core_presets_and_promoted_default():
         "fc1_8_9", "fc2_10", "out_proj_11", "late_mlp_combo", "full_late_combo",
         "out_proj_11_ln_f_99_8", "gpt2_all_pc", "gpt2_all_pc_with_fc1",
         "out_proj_10_11", "out_proj_11_fc1_11", "out_proj_11_block10_ln2_99_0",
+        "fc2_11_raw_vadd", "out_proj_11_fc2_11_raw_vadd", "out_proj_11_fc2_10_11_raw_vadd",
     }
     assert core.issubset(set(STAGE5_PTQ_PRESETS))
-    assert stage5_default_ptq_preset_name() == "out_proj_11"
+    assert stage5_default_ptq_preset_name() == "fc2_11_raw_vadd"
     assert resolve_stage5_ptq_preset("control").name == "control"
     with pytest.raises(KeyError, match="unknown Stage 5 PTQ preset"):
         resolve_stage5_ptq_preset("not_a_preset")
@@ -64,6 +67,11 @@ def test_stage5_preset_weight_names_and_residual_policy():
     assert stage5_raw_residual1_blocks("out_proj_11") == {11}
     assert 11 not in stage5_dequant_add_residual1_blocks(model_args, "out_proj_11")
     assert len(stage5_dequant_add_residual1_blocks(model_args, "out_proj_11")) == 11
+    assert stage5_raw_residual2_blocks("fc2_11_raw_vadd") == {11}
+    assert 11 not in stage5_dequant_add_residual2_blocks(model_args, "fc2_11_raw_vadd")
+    assert len(stage5_dequant_add_residual2_blocks(model_args, "fc2_11_raw_vadd")) == 11
+    assert stage5_raw_residual2_blocks("out_proj_11") == set()
+    assert len(stage5_dequant_add_residual2_blocks(model_args, "out_proj_11")) == 12
 
 
 def test_stage5_preset_rejects_unsupported_block_indices():
@@ -81,6 +89,37 @@ def test_stage5_scale_policy_ties_out_proj_and_residual_for_raw_vadd_block():
     assert updated["block11_out_proj"] == pytest.approx(scales["block10_residual2"])
     assert updated["block11_residual1"] == pytest.approx(scales["block10_residual2"])
     assert scales["block11_out_proj"] == 0.5
+
+
+def test_stage5_scale_policy_ties_fc2_and_residual2_for_raw_vadd_block():
+    scales = {
+        "block11_residual1": 0.03125,
+        "block11_fc2": 0.5,
+        "block11_residual2": 0.75,
+    }
+    updated = apply_stage5_ptq_scale_policy(scales, {"n_layer": 12}, "fc2_11_raw_vadd")
+    assert updated["block11_fc2"] == pytest.approx(scales["block11_residual1"])
+    assert updated["block11_residual2"] == pytest.approx(scales["block11_residual1"])
+    assert scales["block11_fc2"] == 0.5
+
+
+def test_stage5_scale_policy_residual2_applied_before_residual1_for_combined_preset():
+    # For out_proj_11_fc2_11_raw_vadd: residual2 forcing runs first so block11_residual2
+    # captures block11_residual1 before residual1 forcing reads block11_residual2 as
+    # the skip source for block12 (which doesn't exist for n_layer=12, but the ordering
+    # matters for presets where residual1 skip == a forced residual2).
+    scales = {
+        "block11_residual1": 0.03125,
+        "block11_fc2": 0.9,
+        "block11_residual2": 0.8,
+        "block11_out_proj": 0.7,
+    }
+    updated = apply_stage5_ptq_scale_policy(scales, {"n_layer": 12}, "out_proj_11_fc2_11_raw_vadd")
+    # Residual2 forcing: fc2 = residual2 = residual1 = 0.03125
+    assert updated["block11_fc2"] == pytest.approx(0.03125)
+    assert updated["block11_residual2"] == pytest.approx(0.03125)
+    # Residual1 forcing: out_proj = residual1 = block10_residual2 (not in scales → default)
+    assert updated["block11_out_proj"] == updated["block11_residual1"]
 
 
 def test_stage5_ranking_and_promotion_rules():
@@ -153,4 +192,4 @@ def test_debug_preset_sweep_reports_all_presets_and_deterministic_winner(monkeyp
     assert set(preset_names).issubset(result_names)
     assert report["winner"]["name"] == "late_ln_combo"
     assert report["proposed_promotion"] == "late_ln_combo"
-    assert report["promoted_default"] == "out_proj_11"
+    assert report["promoted_default"] == "fc2_11_raw_vadd"

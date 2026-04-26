@@ -19,7 +19,7 @@ CALIBRATION_SEQ_LEN_FAST = 32
 CALIBRATION_PERCENTILE_DEFAULT = 99.9
 
 # GPT-2-specific PTQ default — won the preset sweep on the real GPT-2 124M checkpoint.
-GPT2_DEFAULT_PTQ_PRESET = "out_proj_11"
+GPT2_DEFAULT_PTQ_PRESET = "fc2_11_raw_vadd"
 from .fake_quant_reference import NanoGPTFQReference
 from .host_runner import HostRunner
 from .stage5_ptq import (
@@ -28,6 +28,7 @@ from .stage5_ptq import (
     resolve_stage5_ptq_preset,
     stage5_default_ptq_preset_name,
     stage5_raw_residual1_blocks,
+    stage5_raw_residual2_blocks,
     stage5_requant_pc_weight_names,
 )
 from .tiny_fixture import build_stage3_tiny_decoder_bundle
@@ -139,6 +140,7 @@ def run_fake_quant_teacher_forced_logits(
         calibration_scales,
         requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset),
         raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
+        raw_residual2_blocks=stage5_raw_residual2_blocks(resolved_preset),
     )
     return ref.incremental_logits_trace(inputs)
 

@@ -27,7 +27,9 @@ from .stage5_ptq import (
     apply_stage5_ptq_scale_policy,
     resolve_stage5_ptq_preset,
     stage5_dequant_add_residual1_blocks,
+    stage5_dequant_add_residual2_blocks,
     stage5_raw_residual1_blocks,
+    stage5_raw_residual2_blocks,
     stage5_requant_pc_weight_names,
     validate_stage5_ptq_preset_for_model,
 )
@@ -301,6 +303,7 @@ def build_stage3_tiny_decoder_bundle(
         logits_size=logits_size,
         requant_pc_weight_names=stage5_requant_pc_weight_names(config, resolved_preset),
         dequant_add_residual1_blocks=stage5_dequant_add_residual1_blocks(config, resolved_preset),
+        dequant_add_residual2_blocks=stage5_dequant_add_residual2_blocks(config, resolved_preset),
     )
     return TinyFixtureBundle(build=build, config=config, logits_size=logits_size)
 
@@ -420,6 +423,7 @@ def run_stage3_tiny_e2e(payload: Dict[str, object], *,
         scales=calibration_scales,
         requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset),
         raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
+        raw_residual2_blocks=stage5_raw_residual2_blocks(resolved_preset),
     )
     reference = _run_reference_trace(
         ref, prompt_ids, max_new_tokens=max_new_tokens, vocab_size=tiny.config.vocab_size

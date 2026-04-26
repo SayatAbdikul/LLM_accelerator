@@ -128,7 +128,7 @@ def test_debug_gpt2_perplexity_outputs_json_sections():
     )
     data = json.loads(proc.stdout)
     assert "primary_suspect" in data
-    assert data["ptq_preset"] == "out_proj_11"
+    assert data["ptq_preset"] == "fc2_11_raw_vadd"
     assert {"fp32_baseline", "lm_head_quantization", "calibration_sensitivity", "shared_decode_semantics", "converter_bias_layout"}.issubset(data["suspects"])
     assert len(data["suspects"]["calibration_sensitivity"]) == 4
     assert len(data["per_step"]) == 1
@@ -170,9 +170,9 @@ def test_debug_gpt2_perplexity_preset_sweep_json_sections():
         ]
     )
     data = json.loads(proc.stdout)
-    assert data["preset_sweep"]["promoted_default"] == "out_proj_11"
-    # 15 presets - 3 SKIPPED (fc2_10, late_mlp_combo, full_late_combo) = 12 rows.
-    assert len(data["preset_sweep"]["rows"]) == 12
+    assert data["preset_sweep"]["promoted_default"] == "fc2_11_raw_vadd"
+    # 18 presets, 0 SKIPPED (fc2 REQUANT_PC now uses raw VADD for residual2).
+    assert len(data["preset_sweep"]["rows"]) == 18
     assert data["preset_sweep"]["rows"][0]["name"]
     assert data["preset_sweep"]["winner"]["name"]
 

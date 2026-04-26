@@ -97,8 +97,23 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         activation_percentile_nodes={"block10_ln2": 99.0},
         requant_pc_out_proj_blocks=(11,),
     ),
+    # Non-fused fc2 REQUANT_PC: fc2 uses per-channel scales; residual2 uses raw INT8 VADD.
+    # Scale-forcing: block{L}_fc2 = block{L}_residual2 = block{L}_residual1.
+    "fc2_11_raw_vadd": _preset(
+        "fc2_11_raw_vadd",
+        requant_pc_fc2_blocks=(11,),
+    ),
+    "out_proj_11_fc2_11_raw_vadd": _preset(
+        "out_proj_11_fc2_11_raw_vadd",
+        requant_pc_out_proj_blocks=(11,),
+        requant_pc_fc2_blocks=(11,),
+    ),
+    "out_proj_11_fc2_10_11_raw_vadd": _preset(
+        "out_proj_11_fc2_10_11_raw_vadd",
+        requant_pc_out_proj_blocks=(11,),
+        requant_pc_fc2_blocks=(10, 11),
+    ),
     # GPT-2 124M specific (n_layer=12). Do not promote globally.
-    # requant_pc_fc2_blocks is omitted: fc2→residual2 uses DEQUANT_ADD which requires scalar scale.
     "gpt2_all_pc": _preset(
         "gpt2_all_pc",
         requant_pc_out_proj_blocks=tuple(range(12)),
@@ -112,7 +127,7 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
 
 # Updated only after a preset wins on the real local GPT-2 checkpoint and still
 # keeps the existing golden-vs-fake gates green.
-PROMOTED_STAGE5_PTQ_PRESET = "out_proj_11"
+PROMOTED_STAGE5_PTQ_PRESET = "fc2_11_raw_vadd"
 
 
 def stage5_default_ptq_preset_name() -> str:
@@ -194,6 +209,25 @@ def stage5_dequant_add_residual1_blocks(
     return {idx for idx in range(n_layer) if idx not in raw_blocks}
 
 
+def stage5_raw_residual2_blocks(preset: str | Stage5PTQPreset | None) -> set[int]:
+    resolved = resolve_stage5_ptq_preset(preset)
+    return set(int(idx) for idx in resolved.requant_pc_fc2_blocks)
+
+
+def stage5_dequant_add_residual2_blocks(
+    model_args_or_config,
+    preset: str | Stage5PTQPreset | None,
+) -> set[int]:
+    resolved = validate_stage5_ptq_preset_for_model(model_args_or_config, preset)
+    n_layer = int(
+        getattr(model_args_or_config, "n_layer", None)
+        if hasattr(model_args_or_config, "n_layer")
+        else model_args_or_config["n_layer"]
+    )
+    raw_blocks = stage5_raw_residual2_blocks(resolved)
+    return {idx for idx in range(n_layer) if idx not in raw_blocks}
+
+
 def apply_stage5_ptq_scale_policy(
     calibration_scales: Mapping[str, float],
     model_args_or_config,
@@ -201,6 +235,13 @@ def apply_stage5_ptq_scale_policy(
 ) -> Dict[str, float]:
     resolved = validate_stage5_ptq_preset_for_model(model_args_or_config, preset)
     scales = dict(calibration_scales)
+    # Residual2 forcing first: block{L}_fc2 = block{L}_residual2 = block{L}_residual1.
+    # Must run before residual1 forcing so block{L}_residual1 captures the updated residual2.
+    for block in stage5_raw_residual2_blocks(resolved):
+        shared_scale = float(scales.get(f"block{block}_residual1", 6.0 / 127.0))
+        scales[f"block{block}_fc2"] = shared_scale
+        scales[f"block{block}_residual2"] = shared_scale
+    # Residual1 forcing: block{L}_out_proj = block{L}_residual1 = block{L-1}_residual2.
     for block in stage5_raw_residual1_blocks(resolved):
         skip_name = "tok_pos_add" if block == 0 else f"block{block - 1}_residual2"
         shared_scale = float(scales.get(skip_name, 6.0 / 127.0))

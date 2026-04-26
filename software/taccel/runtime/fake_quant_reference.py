@@ -238,6 +238,7 @@ class NanoGPTFQReference:
         scales: Dict[str, float],
         requant_pc_weight_names: Sequence[str] | None = None,
         raw_residual1_blocks: Sequence[int] | None = None,
+        raw_residual2_blocks: Sequence[int] | None = None,
     ) -> None:
         self.n_layer = int(model_args["n_layer"])
         self.n_head = int(model_args["n_head"])
@@ -250,6 +251,7 @@ class NanoGPTFQReference:
         self.scales = dict(scales)
         self.requant_pc_weight_names = set(str(v) for v in (requant_pc_weight_names or ()))
         self.raw_residual1_blocks = set(int(v) for v in (raw_residual1_blocks or ()))
+        self.raw_residual2_blocks = set(int(v) for v in (raw_residual2_blocks or ()))
         sd = state_dict
         self._has_nonzero_linear_bias = any(
             ("bias" in name and ("c_attn" in name or "c_proj" in name or "c_fc" in name))
@@ -554,7 +556,10 @@ class NanoGPTFQReference:
             prev_x_int8 = x_int8
             prev_x_scale = x_scale
             x_scale = _scale(s, f"block{L}_residual2")
-            x_int8 = _dequant_add_accum_int8(fc2_accum, fc2_accum_scale, prev_x_int8, prev_x_scale, x_scale)
+            if L in self.raw_residual2_blocks:
+                x_int8 = _int8_saturating_add(prev_x_int8, fc2_i8)
+            else:
+                x_int8 = _dequant_add_accum_int8(fc2_accum, fc2_accum_scale, prev_x_int8, prev_x_scale, x_scale)
             x = x_int8.astype(np.float32) * _arch_scale(x_scale)
 
         ln_f_scale = _scale(s, "ln_f")
@@ -858,7 +863,10 @@ class NanoGPTFQReference:
             residual1_int8 = x_int8
             residual1_scale = x_scale
             x_scale = _scale(s, f"block{L}_residual2")
-            if "residual_vadd" in groups or fc2_accum is None:
+            if L in self.raw_residual2_blocks and "residual_vadd" not in groups:
+                x_int8 = _int8_saturating_add(residual1_int8, fc2_i8)
+                x = x_int8.astype(np.float32) * _arch_scale(x_scale)
+            elif "residual_vadd" in groups or fc2_accum is None:
                 x = _qdq(x + fc2, x_scale)
                 x_int8 = _fp32_to_int8(x, x_scale)
             else:
