@@ -129,7 +129,7 @@ def test_debug_gpt2_perplexity_outputs_json_sections():
     )
     data = json.loads(proc.stdout)
     assert "primary_suspect" in data
-    assert data["ptq_preset"] == "fc2_11_raw_vadd"
+    assert data["ptq_preset"] == "fc2_8_to_11_raw_vadd"
     assert {"fp32_baseline", "lm_head_quantization", "calibration_sensitivity", "shared_decode_semantics", "converter_bias_layout"}.issubset(data["suspects"])
     assert len(data["suspects"]["calibration_sensitivity"]) == 4
     assert len(data["per_step"]) == 1
@@ -171,11 +171,11 @@ def test_debug_gpt2_perplexity_preset_sweep_json_sections():
         ]
     )
     data = json.loads(proc.stdout)
-    assert data["preset_sweep"]["promoted_default"] == "fc2_11_raw_vadd"
+    assert data["preset_sweep"]["promoted_default"] == "fc2_8_to_11_raw_vadd"
     assert len(data["preset_sweep"]["rows"]) == len(STAGE5_PTQ_PRESETS)
     assert data["preset_sweep"]["rows"][0]["name"]
     assert data["preset_sweep"]["winner"]["name"]
-    assert data["preset_sweep"]["default_replacement_candidate"]["baseline"] == "fc2_11_raw_vadd"
+    assert data["preset_sweep"]["default_replacement_candidate"]["baseline"] == "fc2_8_to_11_raw_vadd"
     by_name = {row["name"]: row for row in data["preset_sweep"]["rows"]}
     assert "fc2_11_fc2aware_gelu" in by_name
     assert "fc2_aware_gelu" in by_name["fc2_11_fc2aware_gelu"]

@@ -48,7 +48,7 @@ def test_stage5_preset_registry_contains_core_presets_and_promoted_default():
         "hessian_gelu_11", "fc2_11_fc2aware_gelu", "out_proj_11_fc2_11_fc2aware_gelu",
     }
     assert core.issubset(set(STAGE5_PTQ_PRESETS))
-    assert stage5_default_ptq_preset_name() == "fc2_11_raw_vadd"
+    assert stage5_default_ptq_preset_name() == "fc2_8_to_11_raw_vadd"
     assert resolve_stage5_ptq_preset("control").name == "control"
     with pytest.raises(KeyError, match="unknown Stage 5 PTQ preset"):
         resolve_stage5_ptq_preset("not_a_preset")
@@ -221,7 +221,7 @@ def test_debug_preset_sweep_reports_all_presets_and_deterministic_winner(monkeyp
     assert set(preset_names).issubset(result_names)
     assert report["winner"]["name"] == "late_ln_combo"
     assert report["proposed_promotion"] == "late_ln_combo"
-    assert report["promoted_default"] == "fc2_11_raw_vadd"
-    assert report["default_replacement_candidate"]["baseline"] == "fc2_11_raw_vadd"
+    assert report["promoted_default"] == "fc2_8_to_11_raw_vadd"
+    assert report["default_replacement_candidate"]["baseline"] == "fc2_8_to_11_raw_vadd"
     fc2aware_rows = [row for row in report["rows"] if row["name"] == "fc2_11_fc2aware_gelu"]
     assert fc2aware_rows and "fc2_aware_gelu" in fc2aware_rows[0]

@@ -176,7 +176,7 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
 
 # Updated only after a preset wins on the real local GPT-2 checkpoint and still
 # keeps the existing golden-vs-fake gates green.
-PROMOTED_STAGE5_PTQ_PRESET = "fc2_11_raw_vadd"
+PROMOTED_STAGE5_PTQ_PRESET = "fc2_8_to_11_raw_vadd"
 
 
 def stage5_default_ptq_preset_name() -> str:

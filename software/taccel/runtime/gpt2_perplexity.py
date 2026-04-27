@@ -22,7 +22,7 @@ CALIBRATION_SEQ_LEN_FAST = 32
 CALIBRATION_PERCENTILE_DEFAULT = 99.9
 
 # GPT-2-specific PTQ default — won the preset sweep on the real GPT-2 124M checkpoint.
-GPT2_DEFAULT_PTQ_PRESET = "fc2_11_raw_vadd"
+GPT2_DEFAULT_PTQ_PRESET = "fc2_8_to_11_raw_vadd"
 from .fake_quant_reference import NanoGPTFQReference
 from .host_runner import HostRunner
 from .stage5_ptq import (
