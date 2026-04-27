@@ -273,11 +273,10 @@ def execute_masked_softmax(state, insn):
 def execute_gelu(state, insn):
     """GELU: dequant INT8 → FP32, GELU activation, requant → INT8.
 
-    GELU(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
+    GELU-new (tanh approximation) matching GPT-2's gelu_new activation:
+        GELU(x) = x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 
-    All arithmetic in FP32. RTL implements erf via polynomial approximation
-    (see _erf_poly).  The golden model uses scipy.special.erf for reference
-    precision; both produce identical INT8 output.
+    All arithmetic in FP32.
     """
     from .simulator import ConfigError
     if state.tile_config is None:
@@ -298,10 +297,12 @@ def execute_gelu(state, insn):
         # Dequantize: INT8 × FP32(in_scale) → FP32
         x = inp.astype(np.float32) * in_scale
 
-    # GELU in FP32
-    from scipy.special import erf
-    sqrt2 = np.float32(np.sqrt(np.float32(2.0)))
-    x_out = x * np.float32(0.5) * (np.float32(1.0) + erf(x / sqrt2).astype(np.float32))
+    # GELU-new (tanh approximation) in FP32
+    x_out = x * np.float32(0.5) * (
+        np.float32(1.0) + np.tanh(
+            np.float32(np.sqrt(2.0 / np.pi)) * (x + np.float32(0.044715) * x ** 3)
+        )
+    )
     gelu_spec = _runtime_twin_spec(state, "gelu")
     if gelu_spec is not None:
         x_out = quantize_dequant_gelu_twin(

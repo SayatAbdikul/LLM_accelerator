@@ -89,6 +89,25 @@ def _gelu_np(x: np.ndarray) -> np.ndarray:
     return xf * np.float32(0.5) * (np.float32(1.0) + erf_approx)
 
 
+def _gelu_new_np(x: np.ndarray) -> np.ndarray:
+    """GELU-new (tanh approximation) used by GPT-2 (gelu_new / gelu_fast)."""
+    xf = x.astype(np.float32)
+    return xf * np.float32(0.5) * (
+        np.float32(1.0) + np.tanh(
+            np.float32(np.sqrt(2.0 / np.pi)) * (xf + np.float32(0.044715) * xf ** 3)
+        )
+    )
+
+
+def _resolve_gelu_fn(model_args: dict):
+    """Return the GELU function matching the model's activation_function."""
+    name = str(model_args.get(
+        "activation_function",
+        "gelu_new" if bool(model_args.get("split_qkv_bias", False)) else "gelu",
+    ))
+    return _gelu_new_np if name in {"gelu_new", "gelu_fast"} else _gelu_np
+
+
 def _causal_softmax(x: np.ndarray) -> np.ndarray:
     """Row-wise causal softmax for x[seq, seq], matching execute_masked_softmax.
 
@@ -248,6 +267,7 @@ class NanoGPTFQReference:
         self.attn_scale = np.float32(self.d_head ** -0.5)
         # sfu.py uses 1e-6 hardcoded — not from model_args
         self.eps = np.float32(1e-6)
+        self.gelu_fn = _resolve_gelu_fn(model_args)
         self.scales = dict(scales)
         self.requant_pc_weight_names = set(str(v) for v in (requant_pc_weight_names or ()))
         self.raw_residual1_blocks = set(int(v) for v in (raw_residual1_blocks or ()))
@@ -539,7 +559,7 @@ class NanoGPTFQReference:
                 fc1 = fc1_i8.astype(np.float32) * _arch_scale(fc1_scale)
             else:
                 fc1 = _qdq(ln2 @ layer["fc_w"].T + layer["fc_b"], fc1_scale)
-            gelu = _qdq(_gelu_np(fc1), _scale(s, f"block{L}_gelu", 1.0 / 127.0))
+            gelu = _qdq(self.gelu_fn(fc1), _scale(s, f"block{L}_gelu", 1.0 / 127.0))
             gelu_scale = _scale(s, f"block{L}_gelu", 1.0 / 127.0)
             gelu_i8 = _fp32_to_int8(gelu, gelu_scale)
             fc2_scale = _scale(s, f"block{L}_fc2")
@@ -817,7 +837,7 @@ class NanoGPTFQReference:
             fc2_scale = _scale(s, f"block{L}_fc2")
             if "mlp" in groups:
                 fc1 = ln2 @ layer["fc_w_fp32"].T + layer["fc_b"]
-                gelu = _gelu_np(fc1)
+                gelu = self.gelu_fn(fc1)
                 fc2 = gelu @ layer["proj_w_fp32"].T + layer["proj_b"]
                 fc2_i8 = _fp32_to_int8(_qdq(fc2, fc2_scale), fc2_scale)
                 fc2_accum = None
@@ -837,7 +857,7 @@ class NanoGPTFQReference:
                         fc1_scale,
                     )
                 fc1 = fc1_i8.astype(np.float32) * _arch_scale(fc1_scale)
-                gelu = _qdq(_gelu_np(fc1), gelu_scale)
+                gelu = _qdq(self.gelu_fn(fc1), gelu_scale)
                 gelu_i8 = _fp32_to_int8(gelu, gelu_scale)
                 fc2_accum = (
                     gelu_i8.astype(np.int32) @ layer["proj_w_q"].astype(np.int32).T
@@ -851,7 +871,7 @@ class NanoGPTFQReference:
                 fc2 = fc2_i8.astype(np.float32) * _arch_scale(fc2_scale)
             else:
                 fc1 = _qdq(ln2 @ layer["fc_w"].T + layer["fc_b"], fc1_scale)
-                gelu = _qdq(_gelu_np(fc1), gelu_scale)
+                gelu = _qdq(self.gelu_fn(fc1), gelu_scale)
                 gelu_i8 = _fp32_to_int8(gelu, gelu_scale)
                 fc2_accum = gelu_i8.astype(np.int32) @ layer["proj_w_q"].astype(np.int32).T
                 fc2_accum_scale = np.float32(gelu_scale) * np.float32(layer["proj_w_scale"])
@@ -920,6 +940,7 @@ def _fp32_forward(
     d_model = int(model_args["n_embd"])
     d_head = d_model // n_head
     eps = float(model_args.get("layer_norm_epsilon", 1e-5))
+    _gelu_fn = _resolve_gelu_fn(model_args)
     sd = state_dict
 
     tids = list(token_ids)
@@ -980,7 +1001,7 @@ def _fp32_forward(
         fc_w = _to_f32(sd[f"transformer.h.{L}.mlp.c_fc.weight"])
         fc_b = _to_f32(sd[f"transformer.h.{L}.mlp.c_fc.bias"])
         fc1 = out[f"block{L}_fc1"] = ln2 @ fc_w.T + fc_b
-        gelu = out[f"block{L}_gelu"] = _gelu_np(fc1)
+        gelu = out[f"block{L}_gelu"] = _gelu_fn(fc1)
         proj_w = _to_f32(sd[f"transformer.h.{L}.mlp.c_proj.weight"])
         proj_b = _to_f32(sd[f"transformer.h.{L}.mlp.c_proj.bias"])
         fc2 = out[f"block{L}_fc2"] = gelu @ proj_w.T + proj_b
