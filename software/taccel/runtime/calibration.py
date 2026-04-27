@@ -153,6 +153,7 @@ def build_calibration_scales_from_token_ids(
     percentile: float = 99.9,
     activation_percentile_overrides: Dict[str, float] | None = None,
     hessian_gelu_blocks: Sequence[int] = (),
+    ln_eps_calibration: float | None = None,
 ) -> Dict[str, float]:
     """Return per-node INT8 scales from tokenized calibration text."""
     model_args = payload["model_args"]
@@ -169,7 +170,7 @@ def build_calibration_scales_from_token_ids(
     node_percentiles = dict(activation_percentile_overrides or {})
     accum: Dict[str, List[float]] = {}
     for tids in seqs:
-        node_outputs = _fp32_forward(state_dict, model_args, tids)
+        node_outputs = _fp32_forward(state_dict, model_args, tids, ln_eps=ln_eps_calibration)
         for name, arr in node_outputs.items():
             arr_f = np.asarray(arr, dtype=np.float32).ravel()
             if arr_f.size == 0:

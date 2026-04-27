@@ -258,6 +258,7 @@ class NanoGPTFQReference:
         requant_pc_weight_names: Sequence[str] | None = None,
         raw_residual1_blocks: Sequence[int] | None = None,
         raw_residual2_blocks: Sequence[int] | None = None,
+        ln_eps: float | None = None,
     ) -> None:
         self.n_layer = int(model_args["n_layer"])
         self.n_head = int(model_args["n_head"])
@@ -265,8 +266,8 @@ class NanoGPTFQReference:
         self.d_head = self.d_model // self.n_head
         self.vocab_size = int(model_args["vocab_size"])
         self.attn_scale = np.float32(self.d_head ** -0.5)
-        # sfu.py uses 1e-6 hardcoded — not from model_args
-        self.eps = np.float32(1e-6)
+        # sfu.py uses 1e-6 hardcoded — not from model_args; ln_eps overrides for experiments
+        self.eps = np.float32(ln_eps if ln_eps is not None else 1e-6)
         self.gelu_fn = _resolve_gelu_fn(model_args)
         self.scales = dict(scales)
         self.requant_pc_weight_names = set(str(v) for v in (requant_pc_weight_names or ()))
@@ -933,13 +934,14 @@ def _fp32_forward(
     state_dict: dict,
     model_args: dict,
     token_ids: Sequence[int],
+    ln_eps: float | None = None,
 ) -> Dict[str, np.ndarray]:
     """Run FP32 forward and return per-node outputs keyed by IR node name."""
     n_layer = int(model_args["n_layer"])
     n_head = int(model_args["n_head"])
     d_model = int(model_args["n_embd"])
     d_head = d_model // n_head
-    eps = float(model_args.get("layer_norm_epsilon", 1e-5))
+    eps = ln_eps if ln_eps is not None else float(model_args.get("layer_norm_epsilon", 1e-5))
     _gelu_fn = _resolve_gelu_fn(model_args)
     sd = state_dict
 
