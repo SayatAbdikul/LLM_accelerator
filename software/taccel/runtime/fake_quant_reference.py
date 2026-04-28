@@ -219,13 +219,37 @@ def _dequant_add_accum_int8(
     ).astype(np.int8)
 
 
-def _bias_i32(state_dict: dict, name: str, act_scale: float, weight_scales: np.ndarray,
-              output_dim: int) -> np.ndarray:
-    if name not in state_dict:
-        return np.zeros(int(output_dim), dtype=np.int32)
-    bias = _to_f32(state_dict[name]).reshape(-1)
+def _bias_correction(
+    bias_corrections: Optional[Dict[str, np.ndarray]],
+    name: str,
+    output_dim: int,
+) -> np.ndarray:
+    if not bias_corrections or name not in bias_corrections:
+        return np.zeros(int(output_dim), dtype=np.float32)
+    correction = np.asarray(bias_corrections[name], dtype=np.float32).reshape(-1)
+    if correction.size != int(output_dim):
+        raise ValueError(f"{name!r} bias correction has {correction.size} values, expected {output_dim}")
+    return correction
+
+
+def _bias_fp32(
+    state_dict: dict,
+    name: str,
+    output_dim: int,
+    bias_corrections: Optional[Dict[str, np.ndarray]] = None,
+) -> np.ndarray:
+    if name in state_dict:
+        bias = _to_f32(state_dict[name]).reshape(-1)
+    else:
+        bias = np.zeros(int(output_dim), dtype=np.float32)
     if bias.size != int(output_dim):
         raise ValueError(f"{name!r} has {bias.size} values, expected {output_dim}")
+    return (bias + _bias_correction(bias_corrections, name, output_dim)).astype(np.float32)
+
+
+def _bias_i32(state_dict: dict, name: str, act_scale: float, weight_scales: np.ndarray,
+              output_dim: int, bias_corrections: Optional[Dict[str, np.ndarray]] = None) -> np.ndarray:
+    bias = _bias_fp32(state_dict, name, output_dim, bias_corrections)
     scales = np.asarray(weight_scales, dtype=np.float32)[:bias.size]
     denom = np.maximum(np.abs(np.float32(act_scale) * scales), 1e-10)
     return np.round(bias / denom).astype(np.int32)
@@ -259,6 +283,7 @@ class NanoGPTFQReference:
         raw_residual1_blocks: Sequence[int] | None = None,
         raw_residual2_blocks: Sequence[int] | None = None,
         ln_eps: float | None = None,
+        bias_corrections: Optional[Dict[str, np.ndarray]] = None,
     ) -> None:
         self.n_layer = int(model_args["n_layer"])
         self.n_head = int(model_args["n_head"])
@@ -273,6 +298,10 @@ class NanoGPTFQReference:
         self.requant_pc_weight_names = set(str(v) for v in (requant_pc_weight_names or ()))
         self.raw_residual1_blocks = set(int(v) for v in (raw_residual1_blocks or ()))
         self.raw_residual2_blocks = set(int(v) for v in (raw_residual2_blocks or ()))
+        self.bias_corrections = {
+            str(name): np.asarray(value, dtype=np.float32).reshape(-1)
+            for name, value in (bias_corrections or {}).items()
+        }
         sd = state_dict
         self._has_nonzero_linear_bias = any(
             ("bias" in name and ("c_attn" in name or "c_proj" in name or "c_fc" in name))
@@ -331,12 +360,12 @@ class NanoGPTFQReference:
                     q_scales,
                     k_scales,
                     v_scales,
-                    _bias_i32(sd, q_b_name, ln1_scale, q_scales, self.d_head),
-                    _bias_i32(sd, k_b_name, ln1_scale, k_scales, self.d_head),
-                    _bias_i32(sd, v_b_name, ln1_scale, v_scales, self.d_head),
-                    _to_f32(sd[q_b_name]) if q_b_name in sd else np.zeros(self.d_head, dtype=np.float32),
-                    _to_f32(sd[k_b_name]) if k_b_name in sd else np.zeros(self.d_head, dtype=np.float32),
-                    _to_f32(sd[v_b_name]) if v_b_name in sd else np.zeros(self.d_head, dtype=np.float32),
+                    _bias_i32(sd, q_b_name, ln1_scale, q_scales, self.d_head, self.bias_corrections),
+                    _bias_i32(sd, k_b_name, ln1_scale, k_scales, self.d_head, self.bias_corrections),
+                    _bias_i32(sd, v_b_name, ln1_scale, v_scales, self.d_head, self.bias_corrections),
+                    _bias_fp32(sd, q_b_name, self.d_head, self.bias_corrections),
+                    _bias_fp32(sd, k_b_name, self.d_head, self.bias_corrections),
+                    _bias_fp32(sd, v_b_name, self.d_head, self.bias_corrections),
                 ))
             c_proj_q, c_proj_scale_w, c_proj_w, c_proj_scales = _linear_components(sd[f"transformer.h.{L}.attn.c_proj.weight"])
             fc_q, fc_scale_w, fc_w, fc_scales = _linear_components(sd[f"transformer.h.{L}.mlp.c_fc.weight"])
@@ -364,13 +393,14 @@ class NanoGPTFQReference:
                     else None
                 ),
                 "c_proj_w_fp32": _to_f32(sd[f"transformer.h.{L}.attn.c_proj.weight"]),
-                "c_proj_b": _to_f32(sd[f"transformer.h.{L}.attn.c_proj.bias"]),
+                "c_proj_b": _bias_fp32(sd, f"transformer.h.{L}.attn.c_proj.bias", self.d_model, self.bias_corrections),
                 "c_proj_b_i32": _bias_i32(
                     sd,
                     f"transformer.h.{L}.attn.c_proj.bias",
                     _scale(self.scales, f"block{L}_concat"),
                     c_proj_scales,
                     self.d_model,
+                    self.bias_corrections,
                 ),
                 "fc_w": fc_w,
                 "fc_w_q": fc_q,
@@ -386,13 +416,14 @@ class NanoGPTFQReference:
                     else None
                 ),
                 "fc_w_fp32": _to_f32(sd[f"transformer.h.{L}.mlp.c_fc.weight"]),
-                "fc_b": _to_f32(sd[f"transformer.h.{L}.mlp.c_fc.bias"]),
+                "fc_b": _bias_fp32(sd, f"transformer.h.{L}.mlp.c_fc.bias", 4 * self.d_model, self.bias_corrections),
                 "fc_b_i32": _bias_i32(
                     sd,
                     f"transformer.h.{L}.mlp.c_fc.bias",
                     _scale(self.scales, f"block{L}_ln2"),
                     fc_scales,
                     4 * self.d_model,
+                    self.bias_corrections,
                 ),
                 "proj_w": proj_w,
                 "proj_w_q": proj_q,
@@ -408,13 +439,14 @@ class NanoGPTFQReference:
                     else None
                 ),
                 "proj_w_fp32": _to_f32(sd[f"transformer.h.{L}.mlp.c_proj.weight"]),
-                "proj_b": _to_f32(sd[f"transformer.h.{L}.mlp.c_proj.bias"]),
+                "proj_b": _bias_fp32(sd, f"transformer.h.{L}.mlp.c_proj.bias", self.d_model, self.bias_corrections),
                 "proj_b_i32": _bias_i32(
                     sd,
                     f"transformer.h.{L}.mlp.c_proj.bias",
                     _scale(self.scales, f"block{L}_gelu", 1.0 / 127.0),
                     proj_scales,
                     self.d_model,
+                    self.bias_corrections,
                 ),
             })
 

@@ -11,7 +11,10 @@ import numpy as np
 
 from .calibration import (
     apply_fc2_aware_gelu_scale_search_from_token_ids,
+    apply_output_aware_gelu_scale_search_from_token_ids,
+    apply_output_aware_mlp_scale_search_from_token_ids,
     build_calibration_scales_from_token_ids,
+    compute_mlp_bias_corrections_from_token_ids,
 )
 
 # Calibration budget constants — all production callers use LARGE; tests pin FAST.
@@ -22,7 +25,7 @@ CALIBRATION_SEQ_LEN_FAST = 32
 CALIBRATION_PERCENTILE_DEFAULT = 99.9
 
 # GPT-2-specific PTQ default — won the preset sweep on the real GPT-2 124M checkpoint.
-GPT2_DEFAULT_PTQ_PRESET = "fc2_8_to_11_raw_vadd"
+GPT2_DEFAULT_PTQ_PRESET = "output_aware_mlp_8_to_11"
 from .fake_quant_reference import NanoGPTFQReference
 from .host_runner import HostRunner
 from .stage5_ptq import (
@@ -113,6 +116,7 @@ def run_golden_teacher_forced_logits(
     calibration_scales: Dict[str, float],
     *,
     ptq_preset: str | Stage5PTQPreset | None = None,
+    bias_corrections: Dict[str, np.ndarray] | None = None,
 ) -> List[np.ndarray]:
     inputs, _ = teacher_forced_inputs_and_targets(context_tokens)
     tiny = build_stage3_tiny_decoder_bundle(
@@ -120,6 +124,7 @@ def run_golden_teacher_forced_logits(
         smoke_decode_steps=max(0, len(inputs) - 1),
         calibration_scales=calibration_scales,
         ptq_preset=ptq_preset,
+        bias_corrections=bias_corrections,
     )
     runner = HostRunner(tiny.build.bundle, logits_dtype=np.int8)
     logits: List[np.ndarray] = [runner.run_prefill([inputs[0]])]
@@ -134,6 +139,7 @@ def run_fake_quant_teacher_forced_logits(
     calibration_scales: Dict[str, float],
     *,
     ptq_preset: str | Stage5PTQPreset | None = None,
+    bias_corrections: Dict[str, np.ndarray] | None = None,
 ) -> List[np.ndarray]:
     inputs, _ = teacher_forced_inputs_and_targets(context_tokens)
     resolved_preset = resolve_stage5_ptq_preset(ptq_preset)
@@ -144,6 +150,7 @@ def run_fake_quant_teacher_forced_logits(
         requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset),
         raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
         raw_residual2_blocks=stage5_raw_residual2_blocks(resolved_preset),
+        bias_corrections=bias_corrections,
     )
     return ref.incremental_logits_trace(inputs)
 
@@ -200,6 +207,38 @@ def evaluate_gpt2_perplexity(
             n_seqs=calibration_n_seqs,
             seq_len=calibration_seq_len,
         )
+    if resolved_preset.output_aware_gelu_blocks:
+        calibration_scales, _ = apply_output_aware_gelu_scale_search_from_token_ids(
+            payload,
+            calibration_token_ids,
+            calibration_scales,
+            blocks=resolved_preset.output_aware_gelu_blocks,
+            ptq_preset=resolved_preset,
+            n_seqs=calibration_n_seqs,
+            seq_len=calibration_seq_len,
+        )
+    if resolved_preset.output_aware_mlp_blocks:
+        calibration_scales, _ = apply_output_aware_mlp_scale_search_from_token_ids(
+            payload,
+            calibration_token_ids,
+            calibration_scales,
+            blocks=resolved_preset.output_aware_mlp_blocks,
+            ptq_preset=resolved_preset,
+            n_seqs=calibration_n_seqs,
+            seq_len=calibration_seq_len,
+        )
+    bias_corrections = None
+    if resolved_preset.mlp_bias_correction_blocks:
+        bias_corrections, _ = compute_mlp_bias_corrections_from_token_ids(
+            payload,
+            calibration_token_ids,
+            calibration_scales,
+            blocks=resolved_preset.mlp_bias_correction_blocks,
+            ptq_preset=resolved_preset,
+            n_seqs=min(int(calibration_n_seqs), CALIBRATION_N_SEQS_FAST),
+            seq_len=min(int(calibration_seq_len), CALIBRATION_SEQ_LEN_FAST),
+            target=resolved_preset.mlp_bias_correction_target,
+        )
     _, targets = teacher_forced_inputs_and_targets(eval_tokens)
     vocab_size = int(payload["model_args"]["vocab_size"])
     lm_head_scale = float(calibration_scales.get("lm_head", 1.0))
@@ -209,12 +248,14 @@ def evaluate_gpt2_perplexity(
         eval_tokens,
         calibration_scales,
         ptq_preset=resolved_preset,
+        bias_corrections=bias_corrections,
     )
     fake_logits = run_fake_quant_teacher_forced_logits(
         payload,
         eval_tokens,
         calibration_scales,
         ptq_preset=resolved_preset,
+        bias_corrections=bias_corrections,
     )
     if len(golden_logits) != len(targets) or len(fake_logits) != len(targets):
         raise RuntimeError("teacher-forced logits/targets length mismatch")

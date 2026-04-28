@@ -19,14 +19,19 @@ import torch
 
 from taccel.runtime.calibration import (
     apply_fc2_aware_gelu_scale_search_from_token_ids,
+    apply_output_aware_gelu_scale_search_from_token_ids,
+    apply_output_aware_mlp_scale_search_from_token_ids,
     build_calibration_scales_from_token_ids,
+    compute_mlp_bias_corrections_from_token_ids,
 )
 from taccel.runtime.fake_quant import cosine_similarity
 from taccel.runtime.fake_quant_reference import NanoGPTFQReference
 from taccel.runtime.fp32_reference import NanoGPTFP32Reference
 from taccel.runtime.gpt2_perplexity import (
+    CALIBRATION_N_SEQS_FAST,
     CALIBRATION_N_SEQS_LARGE,
     CALIBRATION_PERCENTILE_DEFAULT,
+    CALIBRATION_SEQ_LEN_FAST,
     CALIBRATION_SEQ_LEN_LARGE,
     file_sha256,
     load_gpt2_tokenizer,
@@ -201,12 +206,12 @@ def _logit_pair_summary(lhs: Sequence[np.ndarray], rhs: Sequence[np.ndarray], *,
     }
 
 
-def _build_scales_and_diagnostics_for_preset(
+def _build_artifacts_for_preset(
     payload: dict,
     calibration_ids: Sequence[int],
     args,
     preset_name: str,
-) -> tuple[Dict[str, float], Dict[str, object]]:
+) -> tuple[Dict[str, float], Dict[str, np.ndarray], Dict[str, object]]:
     preset = resolve_stage5_ptq_preset(preset_name)
     scales = build_calibration_scales_from_token_ids(
         payload,
@@ -230,6 +235,56 @@ def _build_scales_and_diagnostics_for_preset(
             n_seqs=args.calibration_n_seqs,
             seq_len=args.calibration_seq_len,
         )
+    if preset.output_aware_gelu_blocks:
+        scales, output_diag = apply_output_aware_gelu_scale_search_from_token_ids(
+            payload,
+            calibration_ids,
+            scales,
+            blocks=preset.output_aware_gelu_blocks,
+            ptq_preset=preset,
+            n_seqs=args.calibration_n_seqs,
+            seq_len=args.calibration_seq_len,
+        )
+        diagnostics["output_aware_gelu"] = output_diag
+    if preset.output_aware_mlp_blocks:
+        scales, output_mlp_diag = apply_output_aware_mlp_scale_search_from_token_ids(
+            payload,
+            calibration_ids,
+            scales,
+            blocks=preset.output_aware_mlp_blocks,
+            ptq_preset=preset,
+            n_seqs=args.calibration_n_seqs,
+            seq_len=args.calibration_seq_len,
+        )
+        diagnostics["output_aware_mlp"] = output_mlp_diag
+    bias_corrections: Dict[str, np.ndarray] = {}
+    if preset.mlp_bias_correction_blocks:
+        bias_corrections, bias_diag = compute_mlp_bias_corrections_from_token_ids(
+            payload,
+            calibration_ids,
+            scales,
+            blocks=preset.mlp_bias_correction_blocks,
+            ptq_preset=preset,
+            n_seqs=min(int(args.calibration_n_seqs), CALIBRATION_N_SEQS_FAST),
+            seq_len=min(int(args.calibration_seq_len), CALIBRATION_SEQ_LEN_FAST),
+            target=preset.mlp_bias_correction_target,
+        )
+        diagnostics["mlp_bias_correction"] = bias_diag
+    return scales, bias_corrections, diagnostics
+
+
+def _build_scales_and_diagnostics_for_preset(
+    payload: dict,
+    calibration_ids: Sequence[int],
+    args,
+    preset_name: str,
+) -> tuple[Dict[str, float], Dict[str, object]]:
+    scales, _bias_corrections, diagnostics = _build_artifacts_for_preset(
+        payload,
+        calibration_ids,
+        args,
+        preset_name,
+    )
     return scales, diagnostics
 
 
@@ -572,7 +627,7 @@ def _preset_sweep(
         print(f"[{idx}/{total}] preset: {preset_name} ...", file=sys.stderr, flush=True)
         preset = resolve_stage5_ptq_preset(preset_name)
         try:
-            scales, scale_diagnostics = _build_scales_and_diagnostics_for_preset(
+            scales, bias_corrections, scale_diagnostics = _build_artifacts_for_preset(
                 payload,
                 calibration_ids,
                 args,
@@ -584,6 +639,7 @@ def _preset_sweep(
                 eval_tokens,
                 scales,
                 ptq_preset=preset,
+                bias_corrections=bias_corrections,
             )
         except ValueError as exc:
             print(f"[{idx}/{total}] {preset_name}: SKIPPED — {exc}", file=sys.stderr, flush=True)
@@ -593,6 +649,7 @@ def _preset_sweep(
             eval_tokens,
             scales,
             ptq_preset=preset,
+            bias_corrections=bias_corrections,
         )
         golden_deq = [np.asarray(row, dtype=np.float32)[:vocab_size] * np.float32(lm_scale) for row in golden_i8]
         fake_deq = [np.asarray(row, dtype=np.float32)[:vocab_size] * np.float32(lm_scale) for row in fake_i8]
@@ -618,8 +675,18 @@ def _preset_sweep(
                 and pair_golden_fake["min_top10_overlap"] >= expected_top10
             ),
         }
-        if scale_diagnostics:
-            row["fc2_aware_gelu"] = scale_diagnostics
+        if preset.fc2_aware_gelu_blocks and scale_diagnostics:
+            row["fc2_aware_gelu"] = {
+                key: value
+                for key, value in scale_diagnostics.items()
+                if key != "mlp_bias_correction"
+            }
+        if "mlp_bias_correction" in scale_diagnostics:
+            row["mlp_bias_correction"] = scale_diagnostics["mlp_bias_correction"]
+        if "output_aware_gelu" in scale_diagnostics:
+            row["output_aware_gelu"] = scale_diagnostics["output_aware_gelu"]
+        if "output_aware_mlp" in scale_diagnostics:
+            row["output_aware_mlp"] = scale_diagnostics["output_aware_mlp"]
         rows.append(row)
         print(
             f"[{idx}/{total}] {preset.name}: golden={row['golden_perplexity']:.1f}  fq={row['fake_quant_perplexity']:.1f}  rel_delta={row['relative_delta']:.4%}",
@@ -712,9 +779,45 @@ def _calibration_sweep(
                 n_seqs=n_seqs,
                 seq_len=seq_len,
             )
+        if preset.output_aware_gelu_blocks:
+            scales, _ = apply_output_aware_gelu_scale_search_from_token_ids(
+                payload,
+                calibration_ids,
+                scales,
+                blocks=preset.output_aware_gelu_blocks,
+                ptq_preset=preset,
+                n_seqs=n_seqs,
+                seq_len=seq_len,
+            )
+        if preset.output_aware_mlp_blocks:
+            scales, _ = apply_output_aware_mlp_scale_search_from_token_ids(
+                payload,
+                calibration_ids,
+                scales,
+                blocks=preset.output_aware_mlp_blocks,
+                ptq_preset=preset,
+                n_seqs=n_seqs,
+                seq_len=seq_len,
+            )
+        bias_corrections = {}
+        if preset.mlp_bias_correction_blocks:
+            bias_corrections, _ = compute_mlp_bias_corrections_from_token_ids(
+                payload,
+                calibration_ids,
+                scales,
+                blocks=preset.mlp_bias_correction_blocks,
+                ptq_preset=preset,
+                n_seqs=min(int(n_seqs), CALIBRATION_N_SEQS_FAST),
+                seq_len=min(int(seq_len), CALIBRATION_SEQ_LEN_FAST),
+                target=preset.mlp_bias_correction_target,
+            )
         lm_scale = float(scales.get("lm_head", 1.0))
-        golden = run_golden_teacher_forced_logits(payload, eval_tokens, scales, ptq_preset=preset)
-        fake = run_fake_quant_teacher_forced_logits(payload, eval_tokens, scales, ptq_preset=preset)
+        golden = run_golden_teacher_forced_logits(
+            payload, eval_tokens, scales, ptq_preset=preset, bias_corrections=bias_corrections
+        )
+        fake = run_fake_quant_teacher_forced_logits(
+            payload, eval_tokens, scales, ptq_preset=preset, bias_corrections=bias_corrections
+        )
         golden_deq = [np.asarray(row, dtype=np.float32)[:vocab_size] * np.float32(lm_scale) for row in golden]
         fake_deq = [np.asarray(row, dtype=np.float32)[:vocab_size] * np.float32(lm_scale) for row in fake]
         golden_ppl = _ppl_from_logits(golden_deq, targets, vocab_size=vocab_size)
@@ -802,7 +905,12 @@ def run_report(args) -> Dict[str, object]:
     ptq_preset = stage5_default_ptq_preset_name() if args.ptq_preset is None else args.ptq_preset
     resolved_preset = resolve_stage5_ptq_preset(ptq_preset)
 
-    scales = _build_scales_for_preset(payload, calibration_ids, args, resolved_preset.name)
+    scales, bias_corrections, scale_diagnostics = _build_artifacts_for_preset(
+        payload,
+        calibration_ids,
+        args,
+        resolved_preset.name,
+    )
     lm_scale = float(scales.get("lm_head", 1.0))
 
     fp32_ref = NanoGPTFP32Reference(payload["state_dict"], payload["model_args"])
@@ -814,9 +922,16 @@ def run_report(args) -> Dict[str, object]:
         requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset),
         raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
         raw_residual2_blocks=stage5_raw_residual2_blocks(resolved_preset),
+        bias_corrections=bias_corrections,
     )
     fake_incr, fake_full = _fake_incremental_and_full(fake_ref, eval_tokens)
-    golden_i8 = run_golden_teacher_forced_logits(payload, eval_tokens, scales, ptq_preset=resolved_preset)
+    golden_i8 = run_golden_teacher_forced_logits(
+        payload,
+        eval_tokens,
+        scales,
+        ptq_preset=resolved_preset,
+        bias_corrections=bias_corrections,
+    )
     direct_q = [_quantize_logits(row, lm_scale) for row in fp32_incr]
 
     fp32_ppl = _ppl_from_logits(fp32_incr, targets, vocab_size=vocab_size)
@@ -845,6 +960,7 @@ def run_report(args) -> Dict[str, object]:
         "calibration_sha256": file_sha256(args.calibration_text),
         "eval_sha256": file_sha256(args.eval_text),
         "ptq_preset": resolved_preset.name,
+        "ptq_diagnostics": scale_diagnostics,
         "vocab_size": vocab_size,
         "lm_head_scale": lm_scale,
         "token_count": len(eval_tokens),

@@ -11,6 +11,7 @@ from typing import Dict, List, Sequence
 import numpy as np
 
 from .fake_quant_reference import (
+    NanoGPTFQReference,
     _arch_scale,
     _bias_i32,
     _fp32_forward,
@@ -18,6 +19,11 @@ from .fake_quant_reference import (
     _int8_saturating_add,
     _requant_accum_pc_int8,
     _to_f32,
+)
+from .stage5_ptq import (
+    stage5_raw_residual1_blocks,
+    stage5_raw_residual2_blocks,
+    stage5_requant_pc_weight_names,
 )
 from ..quantizer.hessian_guided import find_hessian_gelu_scale
 from ..quantizer.quantize import quantize_tensor
@@ -37,6 +43,10 @@ FC2_AWARE_GELU_MULTIPLIERS = (
     2.5,
     3.0,
 )
+OUTPUT_AWARE_GELU_MULTIPLIERS = FC2_AWARE_GELU_MULTIPLIERS
+OUTPUT_AWARE_MLP_MULTIPLIERS = (0.75, 0.875, 1.0, 1.125, 1.25, 1.5)
+OUTPUT_AWARE_SEARCH_N_SEQS_MAX = 1
+OUTPUT_AWARE_SEARCH_SEQ_LEN_MAX = 16
 
 
 def _tokenize_text(text: str, stoi: Dict[str, int]) -> List[int]:
@@ -409,6 +419,348 @@ def apply_fc2_aware_gelu_scale_search_from_token_ids(
         scales[f"block{block}_gelu"] = float(result["new_scale"])
         diagnostics[f"block{block}"] = result
     return scales, diagnostics
+
+
+def _stable_cross_entropy_np(logits: np.ndarray, target: int, *, vocab_size: int) -> float:
+    active = np.asarray(logits, dtype=np.float32)[: int(vocab_size)]
+    target_i = int(target)
+    if target_i < 0 or target_i >= active.size:
+        raise ValueError(f"target token {target_i} is outside vocab size {active.size}")
+    row_max = float(np.max(active))
+    shifted = active - np.float32(row_max)
+    exp_shifted = np.exp(shifted.astype(np.float32)).astype(np.float32)
+    return float(row_max + float(np.log(exp_shifted.sum(dtype=np.float32))) - float(active[target_i]))
+
+
+def _mean_fake_quant_target_nll(
+    payload: Dict[str, object],
+    seqs: Sequence[Sequence[int]],
+    scales: Dict[str, float],
+    *,
+    ptq_preset,
+) -> float:
+    model_args = payload["model_args"]
+    vocab_size = int(model_args["vocab_size"])
+    lm_scale = float(scales.get("lm_head", 1.0))
+    ref = NanoGPTFQReference(
+        payload["state_dict"],
+        model_args,
+        scales,
+        requant_pc_weight_names=stage5_requant_pc_weight_names(model_args, ptq_preset),
+        raw_residual1_blocks=stage5_raw_residual1_blocks(ptq_preset),
+        raw_residual2_blocks=stage5_raw_residual2_blocks(ptq_preset),
+    )
+    nlls: List[float] = []
+    for seq in seqs:
+        tokens = [int(tok) for tok in seq]
+        if len(tokens) < 2:
+            continue
+        inputs = tokens[:-1]
+        targets = tokens[1:]
+        logits = ref.incremental_logits_trace(inputs)
+        for row, target in zip(logits, targets):
+            deq = np.asarray(row, dtype=np.float32) * np.float32(lm_scale)
+            nlls.append(_stable_cross_entropy_np(deq, target, vocab_size=vocab_size))
+    if not nlls:
+        raise ValueError("output-aware GELU search requires calibration windows with at least two tokens")
+    return float(np.mean(np.asarray(nlls, dtype=np.float64)))
+
+
+def apply_output_aware_gelu_scale_search_from_token_ids(
+    payload: Dict[str, object],
+    token_ids: Sequence[int],
+    calibration_scales: Dict[str, float],
+    *,
+    blocks: Sequence[int],
+    ptq_preset,
+    n_seqs: int = 8,
+    seq_len: int = 16,
+    multipliers: Sequence[float] = OUTPUT_AWARE_GELU_MULTIPLIERS,
+) -> tuple[Dict[str, float], Dict[str, Dict[str, object]]]:
+    """Greedily choose late GELU scales by final fake-quant token NLL.
+
+    This intentionally tunes only ``blockL_gelu``. The current best GPT-2 preset
+    uses raw INT8 residual2 VADD, so changing fc2/residual2 scales independently
+    would violate the shared-scale contract between the skip path and FC2 output.
+    """
+    block_set = sorted({int(block) for block in blocks})
+    if not block_set:
+        return dict(calibration_scales), {}
+
+    model_args = payload["model_args"]
+    n_layer = int(model_args["n_layer"])
+    invalid = [block for block in block_set if block < 0 or block >= n_layer]
+    if invalid:
+        raise ValueError(f"output-aware GELU blocks outside n_layer={n_layer}: {invalid}")
+
+    search_n_seqs = max(1, min(int(n_seqs), OUTPUT_AWARE_SEARCH_N_SEQS_MAX))
+    search_seq_len = max(2, min(int(seq_len), OUTPUT_AWARE_SEARCH_SEQ_LEN_MAX))
+    seqs = build_calibration_seqs_from_token_ids(
+        token_ids,
+        n_seqs=search_n_seqs,
+        seq_len=search_seq_len,
+    )
+    scales = dict(calibration_scales)
+    diagnostics: Dict[str, Dict[str, object]] = {}
+    current_nll = _mean_fake_quant_target_nll(payload, seqs, scales, ptq_preset=ptq_preset)
+
+    for block in block_set:
+        key = f"block{block}_gelu"
+        base_scale = float(scales.get(key, _SFU_DEFAULT_SCALES))
+        if base_scale <= 0.0:
+            raise ValueError(f"output-aware GELU search requires positive scale for {key}")
+        block_start_nll = float(current_nll)
+        candidate_rows: List[Dict[str, float]] = []
+        for multiplier in multipliers:
+            m = float(multiplier)
+            if m <= 0.0:
+                continue
+            candidate_scales = dict(scales)
+            candidate_scales[key] = float(base_scale * m)
+            mean_nll = _mean_fake_quant_target_nll(payload, seqs, candidate_scales, ptq_preset=ptq_preset)
+            candidate_rows.append({
+                "multiplier": m,
+                "scale": float(candidate_scales[key]),
+                "mean_nll": float(mean_nll),
+            })
+        if not candidate_rows:
+            raise ValueError("output-aware GELU search received no valid candidate multipliers")
+        best = min(
+            candidate_rows,
+            key=lambda row: (
+                row["mean_nll"],
+                abs(row["multiplier"] - 1.0),
+                row["multiplier"],
+            ),
+        )
+        accepted = bool(best["mean_nll"] < current_nll)
+        selected_scale = float(best["scale"]) if accepted else base_scale
+        if accepted:
+            scales[key] = selected_scale
+            current_nll = float(best["mean_nll"])
+        diagnostics[f"block{block}"] = {
+            "old_scale": float(base_scale),
+            "new_scale": float(selected_scale),
+            "multiplier": float(best["multiplier"]) if accepted else 1.0,
+            "accepted": accepted,
+            "baseline_mean_nll": block_start_nll,
+            "best_candidate_mean_nll": float(best["mean_nll"]),
+            "selected_mean_nll": float(current_nll),
+            "candidate_count": int(len(candidate_rows)),
+            "search_n_seqs": int(search_n_seqs),
+            "search_seq_len": int(search_seq_len),
+            "candidates": candidate_rows,
+        }
+    return scales, diagnostics
+
+
+def apply_output_aware_mlp_scale_search_from_token_ids(
+    payload: Dict[str, object],
+    token_ids: Sequence[int],
+    calibration_scales: Dict[str, float],
+    *,
+    blocks: Sequence[int],
+    ptq_preset,
+    n_seqs: int = 8,
+    seq_len: int = 16,
+    multipliers: Sequence[float] = OUTPUT_AWARE_MLP_MULTIPLIERS,
+) -> tuple[Dict[str, float], Dict[str, Dict[str, object]]]:
+    """Greedily tune late MLP scale groups against final fake-quant token NLL.
+
+    Each late block searches three valid groups:
+
+    * ``fc1``: changes the FC1 output quantization before GELU.
+    * ``gelu``: changes SFU/GELU output quantization before FC2.
+    * ``residual_group``: changes ``residual1``, ``fc2``, and ``residual2``
+      together, preserving the raw residual2 VADD shared-scale contract.
+    """
+    block_set = sorted({int(block) for block in blocks})
+    if not block_set:
+        return dict(calibration_scales), {}
+
+    model_args = payload["model_args"]
+    n_layer = int(model_args["n_layer"])
+    invalid = [block for block in block_set if block < 0 or block >= n_layer]
+    if invalid:
+        raise ValueError(f"output-aware MLP blocks outside n_layer={n_layer}: {invalid}")
+
+    search_n_seqs = max(1, min(int(n_seqs), OUTPUT_AWARE_SEARCH_N_SEQS_MAX))
+    search_seq_len = max(2, min(int(seq_len), OUTPUT_AWARE_SEARCH_SEQ_LEN_MAX))
+    seqs = build_calibration_seqs_from_token_ids(
+        token_ids,
+        n_seqs=search_n_seqs,
+        seq_len=search_seq_len,
+    )
+    scales = dict(calibration_scales)
+    diagnostics: Dict[str, Dict[str, object]] = {}
+    current_nll = _mean_fake_quant_target_nll(payload, seqs, scales, ptq_preset=ptq_preset)
+
+    def _candidate_for_group(group_keys: Sequence[str], base_scale: float, multiplier: float) -> Dict[str, float]:
+        candidate = dict(scales)
+        new_scale = float(base_scale) * float(multiplier)
+        for key in group_keys:
+            candidate[key] = new_scale
+        return candidate
+
+    for block in block_set:
+        block_start_nll = float(current_nll)
+        group_specs = [
+            ("fc1", (f"block{block}_fc1",)),
+            ("gelu", (f"block{block}_gelu",)),
+            (
+                "residual_group",
+                (
+                    f"block{block}_residual1",
+                    f"block{block}_fc2",
+                    f"block{block}_residual2",
+                ),
+            ),
+        ]
+        group_results: Dict[str, object] = {}
+        for group_name, keys in group_specs:
+            base_scale = float(scales.get(keys[0], _DEFAULT_SCALES))
+            if base_scale <= 0.0:
+                raise ValueError(f"output-aware MLP search requires positive scale for {keys[0]}")
+            group_start_nll = float(current_nll)
+            candidate_rows: List[Dict[str, float]] = []
+            for multiplier in multipliers:
+                m = float(multiplier)
+                if m <= 0.0:
+                    continue
+                candidate_scales = _candidate_for_group(keys, base_scale, m)
+                mean_nll = _mean_fake_quant_target_nll(payload, seqs, candidate_scales, ptq_preset=ptq_preset)
+                candidate_rows.append({
+                    "multiplier": m,
+                    "scale": float(base_scale * m),
+                    "mean_nll": float(mean_nll),
+                })
+            if not candidate_rows:
+                raise ValueError("output-aware MLP search received no valid candidate multipliers")
+            best = min(
+                candidate_rows,
+                key=lambda row: (
+                    row["mean_nll"],
+                    abs(row["multiplier"] - 1.0),
+                    row["multiplier"],
+                ),
+            )
+            accepted = bool(best["mean_nll"] < current_nll)
+            selected_scale = float(best["scale"]) if accepted else base_scale
+            if accepted:
+                for key in keys:
+                    scales[key] = selected_scale
+                current_nll = float(best["mean_nll"])
+            group_results[group_name] = {
+                "keys": list(keys),
+                "old_scale": float(base_scale),
+                "new_scale": float(selected_scale),
+                "multiplier": float(best["multiplier"]) if accepted else 1.0,
+                "accepted": accepted,
+                "baseline_mean_nll": group_start_nll,
+                "best_candidate_mean_nll": float(best["mean_nll"]),
+                "selected_mean_nll": float(current_nll),
+                "candidate_count": int(len(candidate_rows)),
+                "candidates": candidate_rows,
+            }
+        diagnostics[f"block{block}"] = {
+            "baseline_mean_nll": block_start_nll,
+            "selected_mean_nll": float(current_nll),
+            "search_n_seqs": int(search_n_seqs),
+            "search_seq_len": int(search_seq_len),
+            "groups": group_results,
+        }
+    return scales, diagnostics
+
+
+def compute_mlp_bias_corrections_from_token_ids(
+    payload: Dict[str, object],
+    token_ids: Sequence[int],
+    calibration_scales: Dict[str, float],
+    *,
+    blocks: Sequence[int],
+    ptq_preset=None,
+    n_seqs: int = 8,
+    seq_len: int = 16,
+    target: str = "fc2",
+) -> tuple[Dict[str, np.ndarray], Dict[str, Dict[str, float]]]:
+    """Return FP32 bias corrections for selected GPT-2 MLP projection biases.
+
+    The correction is deliberately output-side and additive: it estimates the
+    mean FP32-vs-fake error at either ``blockL_fc2`` or ``blockL_residual2`` on
+    calibration tokens and folds that vector into ``mlp.c_proj.bias``.  This
+    preserves the existing INT8 weight/noise pattern while correcting systematic
+    late-MLP offset.
+    """
+    block_set = sorted({int(block) for block in blocks})
+    if not block_set:
+        return {}, {}
+    if target not in {"fc2", "residual2"}:
+        raise ValueError(f"unsupported MLP bias-correction target {target!r}")
+
+    model_args = payload["model_args"]
+    state_dict = payload["state_dict"]
+    n_layer = int(model_args["n_layer"])
+    d_model = int(model_args["n_embd"])
+    invalid = [block for block in block_set if block < 0 or block >= n_layer]
+    if invalid:
+        raise ValueError(f"MLP bias-correction blocks outside n_layer={n_layer}: {invalid}")
+
+    seqs = build_calibration_seqs_from_token_ids(token_ids, n_seqs=n_seqs, seq_len=seq_len)
+    ref = NanoGPTFQReference(
+        state_dict,
+        model_args,
+        calibration_scales,
+        requant_pc_weight_names=stage5_requant_pc_weight_names(model_args, ptq_preset),
+        raw_residual1_blocks=stage5_raw_residual1_blocks(ptq_preset),
+        raw_residual2_blocks=stage5_raw_residual2_blocks(ptq_preset),
+    )
+
+    corrections: Dict[str, np.ndarray] = {}
+    diagnostics: Dict[str, Dict[str, float]] = {}
+    err_sums = {block: np.zeros(d_model, dtype=np.float64) for block in block_set}
+    counts = {block: 0 for block in block_set}
+    before_sq_sums = {block: 0.0 for block in block_set}
+
+    for tids in seqs:
+        fp32_nodes = _fp32_forward(state_dict, model_args, tids)
+        fq_steps = ref.incremental_node_trace(tids)
+        for block in block_set:
+            key = f"block{block}_{target}"
+            if key not in fp32_nodes:
+                raise ValueError(f"cannot compute MLP bias correction; missing FP32 node {key!r}")
+            fp32_value = np.asarray(fp32_nodes[key], dtype=np.float32).reshape(-1, d_model)
+            fq_rows = []
+            for step in fq_steps:
+                if key not in step:
+                    raise ValueError(f"cannot compute MLP bias correction; missing fake-quant node {key!r}")
+                fq_rows.append(np.asarray(step[key]["value"], dtype=np.float32).reshape(-1, d_model))
+            fq_value = np.concatenate(fq_rows, axis=0)
+            rows = min(fp32_value.shape[0], fq_value.shape[0])
+            if rows <= 0:
+                continue
+            delta = fp32_value[:rows] - fq_value[:rows]
+            err_sums[block] += np.sum(delta, axis=0, dtype=np.float64)
+            before_sq_sums[block] += float(np.sum(delta.astype(np.float64) ** 2))
+            counts[block] += rows
+
+    for block in block_set:
+        bias_name = f"transformer.h.{block}.mlp.c_proj.bias"
+        if counts[block] == 0:
+            correction = np.zeros(d_model, dtype=np.float32)
+            before_mse = 0.0
+        else:
+            correction = (err_sums[block] / float(counts[block])).astype(np.float32)
+            before_mse = before_sq_sums[block] / float(counts[block] * d_model)
+        corrections[bias_name] = correction
+        diagnostics[f"block{block}"] = {
+            "target": target,
+            "count": int(counts[block]),
+            "mean_abs_correction": float(np.mean(np.abs(correction))),
+            "max_abs_correction": float(np.max(np.abs(correction))) if correction.size else 0.0,
+            "rms_correction": float(np.sqrt(np.mean(correction.astype(np.float64) ** 2))) if correction.size else 0.0,
+            "before_mse": float(before_mse),
+        }
+    return corrections, diagnostics
 
 
 def _apply_raw_vadd_safe_tok_pos_scale(

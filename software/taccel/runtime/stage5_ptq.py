@@ -19,6 +19,10 @@ class Stage5PTQPreset:
     requant_pc_fc2_blocks: tuple[int, ...]
     hessian_gelu_blocks: tuple[int, ...]
     fc2_aware_gelu_blocks: tuple[int, ...]
+    output_aware_gelu_blocks: tuple[int, ...]
+    output_aware_mlp_blocks: tuple[int, ...]
+    mlp_bias_correction_blocks: tuple[int, ...]
+    mlp_bias_correction_target: str
 
 
 def _preset(
@@ -30,6 +34,10 @@ def _preset(
     requant_pc_fc2_blocks: Sequence[int] = (),
     hessian_gelu_blocks: Sequence[int] = (),
     fc2_aware_gelu_blocks: Sequence[int] = (),
+    output_aware_gelu_blocks: Sequence[int] = (),
+    output_aware_mlp_blocks: Sequence[int] = (),
+    mlp_bias_correction_blocks: Sequence[int] = (),
+    mlp_bias_correction_target: str = "fc2",
 ) -> Stage5PTQPreset:
     return Stage5PTQPreset(
         name=name,
@@ -39,6 +47,10 @@ def _preset(
         requant_pc_fc2_blocks=tuple(int(v) for v in requant_pc_fc2_blocks),
         hessian_gelu_blocks=tuple(int(v) for v in hessian_gelu_blocks),
         fc2_aware_gelu_blocks=tuple(int(v) for v in fc2_aware_gelu_blocks),
+        output_aware_gelu_blocks=tuple(int(v) for v in output_aware_gelu_blocks),
+        output_aware_mlp_blocks=tuple(int(v) for v in output_aware_mlp_blocks),
+        mlp_bias_correction_blocks=tuple(int(v) for v in mlp_bias_correction_blocks),
+        mlp_bias_correction_target=str(mlp_bias_correction_target),
     )
 
 
@@ -132,6 +144,18 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         "fc2_8_to_11_raw_vadd",
         requant_pc_fc2_blocks=(8, 9, 10, 11),
     ),
+    # Output-aware GELU scale search: keep the current late FC2 raw-VADD regime,
+    # but choose GELU scales by final token NLL instead of local GELU/FC2 MSE.
+    "output_aware_gelu_8_to_11": _preset(
+        "output_aware_gelu_8_to_11",
+        requant_pc_fc2_blocks=(8, 9, 10, 11),
+        output_aware_gelu_blocks=(8, 9, 10, 11),
+    ),
+    "output_aware_mlp_8_to_11": _preset(
+        "output_aware_mlp_8_to_11",
+        requant_pc_fc2_blocks=(8, 9, 10, 11),
+        output_aware_mlp_blocks=(8, 9, 10, 11),
+    ),
     "gpt2_fc2_all_raw_vadd": _preset(
         "gpt2_fc2_all_raw_vadd",
         requant_pc_fc2_blocks=tuple(range(12)),
@@ -162,6 +186,32 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         requant_pc_out_proj_blocks=(11,),
         requant_pc_fc2_blocks=(9, 10, 11),
     ),
+    # FC1 REQUANT_PC on blocks 8-11: improve GELU input distribution before the nonlinearity.
+    # No scale forcing required — only adds per-channel weight scales for fc1.
+    "fc1_8_to_11_pc": _preset(
+        "fc1_8_to_11_pc",
+        requant_pc_fc1_blocks=(8, 9, 10, 11),
+    ),
+    # FC1 PC + FC2 raw-VADD: checks whether FC1 precision composes with current residual handling.
+    "fc1_8_to_11_pc_fc2_8_to_11_raw_vadd": _preset(
+        "fc1_8_to_11_pc_fc2_8_to_11_raw_vadd",
+        requant_pc_fc1_blocks=(8, 9, 10, 11),
+        requant_pc_fc2_blocks=(8, 9, 10, 11),
+    ),
+    # MLP bias-correction experiments: keep the current fc2 raw-VADD regime and
+    # fold mean late-MLP output error into c_proj.bias.
+    "mlp_bias_fc2_8_to_11": _preset(
+        "mlp_bias_fc2_8_to_11",
+        requant_pc_fc2_blocks=(8, 9, 10, 11),
+        mlp_bias_correction_blocks=(8, 9, 10, 11),
+        mlp_bias_correction_target="fc2",
+    ),
+    "mlp_bias_resid2_8_to_11": _preset(
+        "mlp_bias_resid2_8_to_11",
+        requant_pc_fc2_blocks=(8, 9, 10, 11),
+        mlp_bias_correction_blocks=(8, 9, 10, 11),
+        mlp_bias_correction_target="residual2",
+    ),
     # GPT-2 124M specific (n_layer=12). Do not promote globally.
     "gpt2_all_pc": _preset(
         "gpt2_all_pc",
@@ -176,7 +226,7 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
 
 # Updated only after a preset wins on the real local GPT-2 checkpoint and still
 # keeps the existing golden-vs-fake gates green.
-PROMOTED_STAGE5_PTQ_PRESET = "fc2_8_to_11_raw_vadd"
+PROMOTED_STAGE5_PTQ_PRESET = "output_aware_mlp_8_to_11"
 
 
 def stage5_default_ptq_preset_name() -> str:
@@ -215,6 +265,9 @@ def validate_stage5_ptq_preset_for_model(
                 + resolved.requant_pc_fc2_blocks
                 + resolved.hessian_gelu_blocks
                 + resolved.fc2_aware_gelu_blocks
+                + resolved.output_aware_gelu_blocks
+                + resolved.output_aware_mlp_blocks
+                + resolved.mlp_bias_correction_blocks
             )
             if idx < 0 or idx >= n_layer
         }
@@ -227,6 +280,21 @@ def validate_stage5_ptq_preset_for_model(
     if fc2_aware_without_pc:
         raise ValueError(
             f"Stage 5 PTQ preset {resolved.name!r} uses FC2-aware GELU blocks without matching fc2 REQUANT_PC/raw VADD blocks: {fc2_aware_without_pc}"
+        )
+    output_aware_without_pc = sorted(set(resolved.output_aware_gelu_blocks) - set(resolved.requant_pc_fc2_blocks))
+    if output_aware_without_pc:
+        raise ValueError(
+            f"Stage 5 PTQ preset {resolved.name!r} uses output-aware GELU blocks without matching fc2 REQUANT_PC/raw VADD blocks: {output_aware_without_pc}"
+        )
+    output_aware_mlp_without_pc = sorted(set(resolved.output_aware_mlp_blocks) - set(resolved.requant_pc_fc2_blocks))
+    if output_aware_mlp_without_pc:
+        raise ValueError(
+            f"Stage 5 PTQ preset {resolved.name!r} uses output-aware MLP blocks without matching fc2 REQUANT_PC/raw VADD blocks: {output_aware_mlp_without_pc}"
+        )
+    if resolved.mlp_bias_correction_target not in {"fc2", "residual2"}:
+        raise ValueError(
+            f"Stage 5 PTQ preset {resolved.name!r} has unsupported MLP bias-correction target "
+            f"{resolved.mlp_bias_correction_target!r}"
         )
     return resolved
 
