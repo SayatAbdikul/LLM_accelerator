@@ -1018,10 +1018,16 @@ class CodeGenerator:
         """
         weight_name = node.inputs[1]
         use_requant_pc = weight_name in self.requant_pc_weight_names
-        if node.attrs.get("inline_gelu"):
+        gelu_name = node.attrs.get("inline_gelu")
+        gelu_from_accum = self._gelu_from_accum_enabled_for(node, gelu_name)
+        if gelu_name and not gelu_from_accum:
             raise ValueError(
                 f"Stage 4 large-weight striping expects standalone GELU for {node.name!r}; "
                 "remove inline_gelu or handle GELU from DRAM temp"
+            )
+        if gelu_from_accum and use_requant_pc:
+            raise ValueError(
+                f"GELU-from-ACCUM requires scalar FC1 accumulator scale, got REQUANT_PC weight '{weight_name}'"
             )
 
         M_pad = pad_dim(M)
@@ -1190,7 +1196,44 @@ class CodeGenerator:
                         self._emit(SyncInsn(resource_mask=0b001))
                     self.mem.abuf.free(skip_stage.name)
                 else:
-                    if use_requant_pc:
+                    if gelu_from_accum:
+                        gelu_sreg = self._alloc_sreg_pair()
+                        gelu_in_scale = input_act_scale * mean_w_scale
+                        gelu_out_scale = self.calibration_scales.get(gelu_name, 1.0 / 127.0)
+                        self._emit(SetScaleInsn(
+                            sreg=gelu_sreg,
+                            src_mode=0,
+                            imm16=_fp16_to_uint16(gelu_in_scale),
+                        ))
+                        self._emit(SetScaleInsn(
+                            sreg=gelu_sreg + 1,
+                            src_mode=0,
+                            imm16=_fp16_to_uint16(gelu_out_scale),
+                        ))
+                        self._emit(GeluInsn(
+                            src1_buf=BUF_ACCUM,
+                            src1_off=0,
+                            dst_buf=BUF_ABUF,
+                            dst_off=tile_alloc.offset_units,
+                            sreg=gelu_sreg,
+                        ))
+                        self._emit(SyncInsn(resource_mask=0b100))
+                        if n_len == N_pad:
+                            self._record_trace_event(
+                                gelu_name,
+                                BUF_ABUF,
+                                tile_alloc.offset_units,
+                                strip_rows,
+                                N_pad,
+                                logical_rows,
+                                N,
+                                "int8",
+                                gelu_out_scale,
+                                row_start=row_start,
+                                full_rows=M,
+                                full_cols=N,
+                            )
+                    elif use_requant_pc:
                         pc_scale_alloc = self.mem.wbuf.alloc(
                             f"_rqpc_{node.name}_n{n_start}",
                             n_len * 2,
@@ -1222,7 +1265,7 @@ class CodeGenerator:
                             dst_off=tile_alloc.offset_units,
                             sreg=sreg,
                         ))
-                    if n_len == N_pad:
+                    if n_len == N_pad and not gelu_from_accum:
                         self._record_trace_event(
                             node.name,
                             BUF_ABUF,

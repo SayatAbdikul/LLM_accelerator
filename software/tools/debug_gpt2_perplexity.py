@@ -45,6 +45,7 @@ from taccel.runtime.stage5_ptq import (
     rank_stage5_ptq_rows,
     resolve_stage5_ptq_preset,
     stage5_default_ptq_preset_name,
+    stage5_gelu_from_accum_blocks,
     stage5_raw_residual1_blocks,
     stage5_raw_residual2_blocks,
     stage5_requant_pc_weight_names,
@@ -70,6 +71,16 @@ ABLATION_GROUPS = (
     "mlp",
     "ln_f",
     "lm_head",
+)
+
+MLP_SUBABLATION_GROUPS = (
+    "mlp_fc1",
+    "mlp_gelu",
+    "mlp_fc2",
+    "mlp_fc1_gelu",
+    "mlp_gelu_fc2",
+    "mlp_fc1_gelu_fc2",
+    "mlp_full",
 )
 
 
@@ -252,6 +263,9 @@ def _build_artifacts_for_preset(
             ptq_preset=preset,
             n_seqs=args.calibration_n_seqs,
             seq_len=args.calibration_seq_len,
+            search_n_seqs_max=getattr(args, "output_aware_search_n_seqs", None),
+            search_seq_len_max=getattr(args, "output_aware_search_seq_len", None),
+            include_pair_candidates=bool(getattr(args, "output_aware_include_pairs", False)),
         )
         diagnostics["output_aware_mlp"] = output_mlp_diag
     return scales, diagnostics
@@ -558,6 +572,7 @@ def _ablation_sweep(
             requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset) if resolved_preset else set(),
             raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset) if resolved_preset else set(),
             raw_residual2_blocks=stage5_raw_residual2_blocks(resolved_preset) if resolved_preset else set(),
+            gelu_from_accum_blocks=stage5_gelu_from_accum_blocks(resolved_preset) if resolved_preset else set(),
         )
         logits = ref.incremental_logits_trace(inputs, fp32_groups={group})
         deq = [
@@ -577,6 +592,121 @@ def _ablation_sweep(
             "baseline_golden_vs_fake_min_cosine": baseline_summary["min_cosine"],
             "baseline_golden_vs_fake_min_top10_overlap": baseline_summary["min_top10_overlap"],
         })
+    return rows
+
+
+def _ablation_rows_for_groups(
+    *,
+    payload: dict,
+    scales: Dict[str, float],
+    inputs: Sequence[int],
+    targets: Sequence[int],
+    fp32_logits: Sequence[np.ndarray],
+    fake_i8: Sequence[np.ndarray],
+    vocab_size: int,
+    lm_scale: float,
+    resolved_preset,
+    group_names: Sequence[str],
+    label_key: str,
+) -> List[Dict[str, object]]:
+    baseline_fake_deq = [
+        _dequantize_fake_logits(row, lm_scale)[:vocab_size]
+        for row in fake_i8
+    ]
+    baseline_ppl = _ppl_from_logits(baseline_fake_deq, targets, vocab_size=vocab_size)
+    rows: List[Dict[str, object]] = []
+    for group in group_names:
+        ref = NanoGPTFQReference(
+            payload["state_dict"],
+            payload["model_args"],
+            scales,
+            requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset),
+            raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
+            raw_residual2_blocks=stage5_raw_residual2_blocks(resolved_preset),
+            gelu_from_accum_blocks=stage5_gelu_from_accum_blocks(resolved_preset),
+        )
+        logits = ref.incremental_logits_trace(inputs, fp32_groups={group})
+        deq = [
+            _dequantize_fake_logits(row, lm_scale, group=group)[:vocab_size]
+            for row in logits
+        ]
+        ppl = _ppl_from_logits(deq, targets, vocab_size=vocab_size)
+        pair = _logit_pair_summary(deq, fp32_logits, vocab_size=vocab_size)
+        rows.append({
+            label_key: group,
+            "perplexity": ppl["perplexity"],
+            "mean_nll": ppl["mean_nll"],
+            "nll_improvement_vs_baseline": float(baseline_ppl["mean_nll"] - ppl["mean_nll"]),
+            "min_top10_overlap_vs_fp32": pair["min_top10_overlap"],
+            "mean_top10_overlap_vs_fp32": pair["mean_top10_overlap"],
+            "min_cosine_vs_fp32": pair["min_cosine"],
+            "mean_cosine_vs_fp32": pair["mean_cosine"],
+        })
+    rows.sort(
+        key=lambda row: (
+            -float(row["nll_improvement_vs_baseline"]),
+            -float(row["mean_top10_overlap_vs_fp32"]),
+            str(row[label_key]),
+        )
+    )
+    return rows
+
+
+def _mlp_subablation_sweep(
+    *,
+    payload: dict,
+    scales: Dict[str, float],
+    inputs: Sequence[int],
+    targets: Sequence[int],
+    fp32_logits: Sequence[np.ndarray],
+    fake_i8: Sequence[np.ndarray],
+    vocab_size: int,
+    lm_scale: float,
+    resolved_preset,
+) -> List[Dict[str, object]]:
+    return _ablation_rows_for_groups(
+        payload=payload,
+        scales=scales,
+        inputs=inputs,
+        targets=targets,
+        fp32_logits=fp32_logits,
+        fake_i8=fake_i8,
+        vocab_size=vocab_size,
+        lm_scale=lm_scale,
+        resolved_preset=resolved_preset,
+        group_names=MLP_SUBABLATION_GROUPS,
+        label_key="group",
+    )
+
+
+def _mlp_block_ablation_sweep(
+    *,
+    payload: dict,
+    scales: Dict[str, float],
+    inputs: Sequence[int],
+    targets: Sequence[int],
+    fp32_logits: Sequence[np.ndarray],
+    fake_i8: Sequence[np.ndarray],
+    vocab_size: int,
+    lm_scale: float,
+    resolved_preset,
+) -> List[Dict[str, object]]:
+    n_layer = int(payload["model_args"]["n_layer"])
+    rows = _ablation_rows_for_groups(
+        payload=payload,
+        scales=scales,
+        inputs=inputs,
+        targets=targets,
+        fp32_logits=fp32_logits,
+        fake_i8=fake_i8,
+        vocab_size=vocab_size,
+        lm_scale=lm_scale,
+        resolved_preset=resolved_preset,
+        group_names=[f"mlp_block_{idx}" for idx in range(n_layer)],
+        label_key="block_group",
+    )
+    for row in rows:
+        row["block"] = int(str(row["block_group"]).split("_")[-1])
     return rows
 
 
@@ -764,6 +894,9 @@ def _calibration_sweep(
                 ptq_preset=preset,
                 n_seqs=n_seqs,
                 seq_len=seq_len,
+                search_n_seqs_max=getattr(args, "output_aware_search_n_seqs", None),
+                search_seq_len_max=getattr(args, "output_aware_search_seq_len", None),
+                include_pair_candidates=bool(getattr(args, "output_aware_include_pairs", False)),
             )
         if preset.output_aware_mlp_blocks:
             scales, _ = apply_output_aware_mlp_scale_search_from_token_ids(
@@ -882,6 +1015,7 @@ def run_report(args) -> Dict[str, object]:
         requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset),
         raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
         raw_residual2_blocks=stage5_raw_residual2_blocks(resolved_preset),
+        gelu_from_accum_blocks=stage5_gelu_from_accum_blocks(resolved_preset),
     )
     fake_incr, fake_full = _fake_incremental_and_full(fake_ref, eval_tokens)
     golden_i8 = run_golden_teacher_forced_logits(
@@ -1010,6 +1144,7 @@ def run_report(args) -> Dict[str, object]:
             requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset),
             raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
             raw_residual2_blocks=stage5_raw_residual2_blocks(resolved_preset),
+            gelu_from_accum_blocks=stage5_gelu_from_accum_blocks(resolved_preset),
         ).incremental_node_trace(prefix)[-1]
         fp32_trace = NanoGPTFP32Reference(
             payload["state_dict"],
@@ -1038,6 +1173,30 @@ def run_report(args) -> Dict[str, object]:
             targets=targets,
             fp32_logits=fp32_incr,
             golden_i8=golden_i8,
+            fake_i8=fake_incr,
+            vocab_size=vocab_size,
+            lm_scale=lm_scale,
+            resolved_preset=resolved_preset,
+        )
+    if bool(getattr(args, "mlp_subablation", False)):
+        report["mlp_subablation"] = _mlp_subablation_sweep(
+            payload=payload,
+            scales=scales,
+            inputs=inputs,
+            targets=targets,
+            fp32_logits=fp32_incr,
+            fake_i8=fake_incr,
+            vocab_size=vocab_size,
+            lm_scale=lm_scale,
+            resolved_preset=resolved_preset,
+        )
+    if bool(getattr(args, "mlp_block_ablation", False)):
+        report["mlp_block_ablation"] = _mlp_block_ablation_sweep(
+            payload=payload,
+            scales=scales,
+            inputs=inputs,
+            targets=targets,
+            fp32_logits=fp32_incr,
             fake_i8=fake_incr,
             vocab_size=vocab_size,
             lm_scale=lm_scale,
@@ -1075,7 +1234,12 @@ def main(argv=None) -> int:
     parser.add_argument("--trace-node", default="all")
     parser.add_argument("--first-divergence", action="store_true")
     parser.add_argument("--ablation-sweep", action="store_true")
+    parser.add_argument("--mlp-subablation", action="store_true")
+    parser.add_argument("--mlp-block-ablation", action="store_true")
     parser.add_argument("--preset-sweep", action="store_true")
+    parser.add_argument("--output-aware-search-n-seqs", type=int)
+    parser.add_argument("--output-aware-search-seq-len", type=int)
+    parser.add_argument("--output-aware-include-pairs", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     report = run_report(args)
@@ -1100,6 +1264,8 @@ def main(argv=None) -> int:
             "preset_sweep": report.get("preset_sweep"),
             "dominant_loss_point": report.get("dominant_loss_point"),
             "ablation_sweep": report.get("ablation_sweep"),
+            "mlp_subablation": report.get("mlp_subablation"),
+            "mlp_block_ablation": report.get("mlp_block_ablation"),
             "node_trace": report.get("node_trace"),
         }), indent=2, sort_keys=True))
     return 0

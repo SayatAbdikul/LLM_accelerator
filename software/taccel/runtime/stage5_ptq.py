@@ -21,6 +21,7 @@ class Stage5PTQPreset:
     fc2_aware_gelu_blocks: tuple[int, ...]
     output_aware_gelu_blocks: tuple[int, ...]
     output_aware_mlp_blocks: tuple[int, ...]
+    gelu_from_accum_blocks: tuple[int, ...]
 
 
 def _preset(
@@ -34,6 +35,7 @@ def _preset(
     fc2_aware_gelu_blocks: Sequence[int] = (),
     output_aware_gelu_blocks: Sequence[int] = (),
     output_aware_mlp_blocks: Sequence[int] = (),
+    gelu_from_accum_blocks: Sequence[int] = (),
 ) -> Stage5PTQPreset:
     return Stage5PTQPreset(
         name=name,
@@ -45,6 +47,7 @@ def _preset(
         fc2_aware_gelu_blocks=tuple(int(v) for v in fc2_aware_gelu_blocks),
         output_aware_gelu_blocks=tuple(int(v) for v in output_aware_gelu_blocks),
         output_aware_mlp_blocks=tuple(int(v) for v in output_aware_mlp_blocks),
+        gelu_from_accum_blocks=tuple(int(v) for v in gelu_from_accum_blocks),
     )
 
 
@@ -150,6 +153,17 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         requant_pc_fc2_blocks=(8, 9, 10, 11),
         output_aware_mlp_blocks=(8, 9, 10, 11),
     ),
+    "gelu_accum_8_to_11": _preset(
+        "gelu_accum_8_to_11",
+        requant_pc_fc2_blocks=(8, 9, 10, 11),
+        gelu_from_accum_blocks=(8, 9, 10, 11),
+    ),
+    "output_aware_mlp_gelu_accum_8_to_11": _preset(
+        "output_aware_mlp_gelu_accum_8_to_11",
+        requant_pc_fc2_blocks=(8, 9, 10, 11),
+        output_aware_mlp_blocks=(8, 9, 10, 11),
+        gelu_from_accum_blocks=(8, 9, 10, 11),
+    ),
     "gpt2_fc2_all_raw_vadd": _preset(
         "gpt2_fc2_all_raw_vadd",
         requant_pc_fc2_blocks=tuple(range(12)),
@@ -247,6 +261,7 @@ def validate_stage5_ptq_preset_for_model(
                 + resolved.fc2_aware_gelu_blocks
                 + resolved.output_aware_gelu_blocks
                 + resolved.output_aware_mlp_blocks
+                + resolved.gelu_from_accum_blocks
             )
             if idx < 0 or idx >= n_layer
         }
@@ -269,6 +284,11 @@ def validate_stage5_ptq_preset_for_model(
     if output_aware_mlp_without_pc:
         raise ValueError(
             f"Stage 5 PTQ preset {resolved.name!r} uses output-aware MLP blocks without matching fc2 REQUANT_PC/raw VADD blocks: {output_aware_mlp_without_pc}"
+        )
+    gelu_fc1_overlap = sorted(set(resolved.gelu_from_accum_blocks).intersection(resolved.requant_pc_fc1_blocks))
+    if gelu_fc1_overlap:
+        raise ValueError(
+            f"Stage 5 PTQ preset {resolved.name!r} uses GELU-from-ACCUM and FC1 REQUANT_PC on the same blocks: {gelu_fc1_overlap}"
         )
     return resolved
 
@@ -310,6 +330,11 @@ def stage5_dequant_add_residual1_blocks(
 def stage5_raw_residual2_blocks(preset: str | Stage5PTQPreset | None) -> set[int]:
     resolved = resolve_stage5_ptq_preset(preset)
     return set(int(idx) for idx in resolved.requant_pc_fc2_blocks)
+
+
+def stage5_gelu_from_accum_blocks(preset: str | Stage5PTQPreset | None) -> set[int]:
+    resolved = resolve_stage5_ptq_preset(preset)
+    return set(int(idx) for idx in resolved.gelu_from_accum_blocks)
 
 
 def stage5_dequant_add_residual2_blocks(

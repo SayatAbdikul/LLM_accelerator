@@ -30,6 +30,7 @@ from taccel.runtime.gpt2_perplexity import (
 from taccel.runtime.stage5_ptq import (
     apply_stage5_ptq_scale_policy,
     resolve_stage5_ptq_preset,
+    stage5_gelu_from_accum_blocks,
     stage5_raw_residual1_blocks,
     stage5_raw_residual2_blocks,
     stage5_requant_pc_weight_names,
@@ -74,6 +75,7 @@ def _run_condition(
         requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved),
         raw_residual1_blocks=stage5_raw_residual1_blocks(resolved),
         raw_residual2_blocks=stage5_raw_residual2_blocks(resolved),
+        gelu_from_accum_blocks=stage5_gelu_from_accum_blocks(resolved),
         ln_eps=ln_eps_inference,
     )
     fake_logits: List[np.ndarray] = list(ref.incremental_logits_trace(inputs))

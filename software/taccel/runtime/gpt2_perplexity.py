@@ -31,6 +31,7 @@ from .stage5_ptq import (
     apply_stage5_ptq_scale_policy,
     resolve_stage5_ptq_preset,
     stage5_default_ptq_preset_name,
+    stage5_gelu_from_accum_blocks,
     stage5_raw_residual1_blocks,
     stage5_raw_residual2_blocks,
     stage5_requant_pc_weight_names,
@@ -145,6 +146,7 @@ def run_fake_quant_teacher_forced_logits(
         requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset),
         raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
         raw_residual2_blocks=stage5_raw_residual2_blocks(resolved_preset),
+        gelu_from_accum_blocks=stage5_gelu_from_accum_blocks(resolved_preset),
     )
     return ref.incremental_logits_trace(inputs)
 

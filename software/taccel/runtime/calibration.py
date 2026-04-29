@@ -21,6 +21,7 @@ from .fake_quant_reference import (
     _to_f32,
 )
 from .stage5_ptq import (
+    stage5_gelu_from_accum_blocks,
     stage5_raw_residual1_blocks,
     stage5_raw_residual2_blocks,
     stage5_requant_pc_weight_names,
@@ -449,6 +450,7 @@ def _mean_fake_quant_target_nll(
         requant_pc_weight_names=stage5_requant_pc_weight_names(model_args, ptq_preset),
         raw_residual1_blocks=stage5_raw_residual1_blocks(ptq_preset),
         raw_residual2_blocks=stage5_raw_residual2_blocks(ptq_preset),
+        gelu_from_accum_blocks=stage5_gelu_from_accum_blocks(ptq_preset),
     )
     nlls: List[float] = []
     for seq in seqs:
@@ -564,6 +566,9 @@ def apply_output_aware_mlp_scale_search_from_token_ids(
     n_seqs: int = 8,
     seq_len: int = 16,
     multipliers: Sequence[float] = OUTPUT_AWARE_MLP_MULTIPLIERS,
+    search_n_seqs_max: int | None = None,
+    search_seq_len_max: int | None = None,
+    include_pair_candidates: bool = False,
 ) -> tuple[Dict[str, float], Dict[str, Dict[str, object]]]:
     """Greedily tune late MLP scale groups against final fake-quant token NLL.
 
@@ -584,8 +589,10 @@ def apply_output_aware_mlp_scale_search_from_token_ids(
     if invalid:
         raise ValueError(f"output-aware MLP blocks outside n_layer={n_layer}: {invalid}")
 
-    search_n_seqs = max(1, min(int(n_seqs), OUTPUT_AWARE_SEARCH_N_SEQS_MAX))
-    search_seq_len = max(2, min(int(seq_len), OUTPUT_AWARE_SEARCH_SEQ_LEN_MAX))
+    n_cap = OUTPUT_AWARE_SEARCH_N_SEQS_MAX if search_n_seqs_max is None else int(search_n_seqs_max)
+    len_cap = OUTPUT_AWARE_SEARCH_SEQ_LEN_MAX if search_seq_len_max is None else int(search_seq_len_max)
+    search_n_seqs = max(1, min(int(n_seqs), max(1, n_cap)))
+    search_seq_len = max(2, min(int(seq_len), max(2, len_cap)))
     seqs = build_calibration_seqs_from_token_ids(
         token_ids,
         n_seqs=search_n_seqs,
@@ -605,33 +612,68 @@ def apply_output_aware_mlp_scale_search_from_token_ids(
     for block in block_set:
         block_start_nll = float(current_nll)
         group_specs = [
-            ("fc1", (f"block{block}_fc1",)),
-            ("gelu", (f"block{block}_gelu",)),
+            ("fc1", ((f"block{block}_fc1",),)),
+            ("gelu", ((f"block{block}_gelu",),)),
             (
                 "residual_group",
-                (
+                ((
                     f"block{block}_residual1",
                     f"block{block}_fc2",
                     f"block{block}_residual2",
-                ),
+                ),),
             ),
         ]
+        if include_pair_candidates:
+            group_specs.extend([
+                (
+                    "fc1_gelu",
+                    ((f"block{block}_fc1",), (f"block{block}_gelu",)),
+                ),
+                (
+                    "gelu_residual_group",
+                    (
+                        (f"block{block}_gelu",),
+                        (
+                            f"block{block}_residual1",
+                            f"block{block}_fc2",
+                            f"block{block}_residual2",
+                        ),
+                    ),
+                ),
+                (
+                    "fc1_gelu_residual_group",
+                    (
+                        (f"block{block}_fc1",),
+                        (f"block{block}_gelu",),
+                        (
+                            f"block{block}_residual1",
+                            f"block{block}_fc2",
+                            f"block{block}_residual2",
+                        ),
+                    ),
+                ),
+            ])
         group_results: Dict[str, object] = {}
-        for group_name, keys in group_specs:
-            base_scale = float(scales.get(keys[0], _DEFAULT_SCALES))
-            if base_scale <= 0.0:
-                raise ValueError(f"output-aware MLP search requires positive scale for {keys[0]}")
+        for group_name, key_groups in group_specs:
+            base_scales = [float(scales.get(keys[0], _DEFAULT_SCALES)) for keys in key_groups]
+            if any(scale <= 0.0 for scale in base_scales):
+                raise ValueError(f"output-aware MLP search requires positive scales for {key_groups}")
             group_start_nll = float(current_nll)
             candidate_rows: List[Dict[str, float]] = []
             for multiplier in multipliers:
                 m = float(multiplier)
                 if m <= 0.0:
                     continue
-                candidate_scales = _candidate_for_group(keys, base_scale, m)
+                candidate_scales = dict(scales)
+                for keys, base_scale in zip(key_groups, base_scales):
+                    candidate_scales.update(_candidate_for_group(keys, base_scale, m))
                 mean_nll = _mean_fake_quant_target_nll(payload, seqs, candidate_scales, ptq_preset=ptq_preset)
                 candidate_rows.append({
                     "multiplier": m,
-                    "scale": float(base_scale * m),
+                    "scales": {
+                        keys[0]: float(base_scale * m)
+                        for keys, base_scale in zip(key_groups, base_scales)
+                    },
                     "mean_nll": float(mean_nll),
                 })
             if not candidate_rows:
@@ -645,15 +687,22 @@ def apply_output_aware_mlp_scale_search_from_token_ids(
                 ),
             )
             accepted = bool(best["mean_nll"] < current_nll)
-            selected_scale = float(best["scale"]) if accepted else base_scale
             if accepted:
-                for key in keys:
-                    scales[key] = selected_scale
+                for keys, base_scale in zip(key_groups, base_scales):
+                    selected_scale = float(base_scale * float(best["multiplier"]))
+                    for key in keys:
+                        scales[key] = selected_scale
                 current_nll = float(best["mean_nll"])
             group_results[group_name] = {
-                "keys": list(keys),
-                "old_scale": float(base_scale),
-                "new_scale": float(selected_scale),
+                "key_groups": [list(keys) for keys in key_groups],
+                "old_scales": {
+                    keys[0]: float(base_scale)
+                    for keys, base_scale in zip(key_groups, base_scales)
+                },
+                "new_scales": {
+                    keys[0]: float(scales.get(keys[0], base_scale))
+                    for keys, base_scale in zip(key_groups, base_scales)
+                },
                 "multiplier": float(best["multiplier"]) if accepted else 1.0,
                 "accepted": accepted,
                 "baseline_mean_nll": group_start_nll,

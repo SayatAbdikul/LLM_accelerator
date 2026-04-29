@@ -268,6 +268,7 @@ class NanoGPTFQReference:
         requant_pc_weight_names: Sequence[str] | None = None,
         raw_residual1_blocks: Sequence[int] | None = None,
         raw_residual2_blocks: Sequence[int] | None = None,
+        gelu_from_accum_blocks: Sequence[int] | None = None,
         ln_eps: float | None = None,
     ) -> None:
         self.n_layer = int(model_args["n_layer"])
@@ -283,6 +284,7 @@ class NanoGPTFQReference:
         self.requant_pc_weight_names = set(str(v) for v in (requant_pc_weight_names or ()))
         self.raw_residual1_blocks = set(int(v) for v in (raw_residual1_blocks or ()))
         self.raw_residual2_blocks = set(int(v) for v in (raw_residual2_blocks or ()))
+        self.gelu_from_accum_blocks = set(int(v) for v in (gelu_from_accum_blocks or ()))
         sd = state_dict
         self._has_nonzero_linear_bias = any(
             ("bias" in name and ("c_attn" in name or "c_proj" in name or "c_fc" in name))
@@ -559,15 +561,21 @@ class NanoGPTFQReference:
                     ln2_i8.astype(np.int32) @ layer["fc_w_q"].astype(np.int32).T
                     + layer["fc_b_i32"]
                 )
-                if layer["fc_requant_pc"] is not None:
+                if L in self.gelu_from_accum_blocks:
+                    fc1 = _dequant_accum_fp32(
+                        fc1_accum,
+                        np.float32(ln2_scale) * np.float32(layer["fc_w_scale"]),
+                    )
+                elif layer["fc_requant_pc"] is not None:
                     fc1_i8 = _requant_accum_pc_int8(fc1_accum, layer["fc_requant_pc"])
+                    fc1 = fc1_i8.astype(np.float32) * _arch_scale(fc1_scale)
                 else:
                     fc1_i8 = _requant_accum_int8(
                         fc1_accum,
                         np.float32(ln2_scale) * np.float32(layer["fc_w_scale"]),
                         fc1_scale,
                     )
-                fc1 = fc1_i8.astype(np.float32) * _arch_scale(fc1_scale)
+                    fc1 = fc1_i8.astype(np.float32) * _arch_scale(fc1_scale)
             else:
                 fc1 = _qdq(ln2 @ layer["fc_w"].T + layer["fc_b"], fc1_scale)
             gelu = _qdq(self.gelu_fn(fc1), _scale(s, f"block{L}_gelu", 1.0 / 127.0))
@@ -683,6 +691,9 @@ class NanoGPTFQReference:
     ) -> np.ndarray:
         s = self.scales
         groups = set(fp32_groups or ())
+
+        def mlp_group_active(name: str, layer_idx: int) -> bool:
+            return name in groups or f"{name}_block_{layer_idx}" in groups
 
         def record(name: str, value: np.ndarray, *, scale: Optional[float] = None,
                    int8: Optional[np.ndarray] = None) -> None:
@@ -846,29 +857,68 @@ class NanoGPTFQReference:
             fc1_scale = _scale(s, f"block{L}_fc1")
             gelu_scale = _scale(s, f"block{L}_gelu", 1.0 / 127.0)
             fc2_scale = _scale(s, f"block{L}_fc2")
-            if "mlp" in groups:
-                fc1 = ln2 @ layer["fc_w_fp32"].T + layer["fc_b"]
-                gelu = self.gelu_fn(fc1)
-                fc2 = gelu @ layer["proj_w_fp32"].T + layer["proj_b"]
-                fc2_i8 = _fp32_to_int8(_qdq(fc2, fc2_scale), fc2_scale)
-                fc2_accum = None
-                fc2_accum_scale = None
+            full_mlp_fp32 = (
+                "mlp" in groups
+                or "mlp_full" in groups
+                or f"mlp_block_{L}" in groups
+            )
+            fc1_fp32 = (
+                full_mlp_fp32
+                or mlp_group_active("mlp_fc1", L)
+                or mlp_group_active("mlp_fc1_gelu", L)
+                or mlp_group_active("mlp_fc1_gelu_fc2", L)
+            )
+            gelu_fp32 = (
+                full_mlp_fp32
+                or mlp_group_active("mlp_gelu", L)
+                or mlp_group_active("mlp_fc1_gelu", L)
+                or mlp_group_active("mlp_gelu_fc2", L)
+                or mlp_group_active("mlp_fc1_gelu_fc2", L)
+            )
+            fc2_fp32 = (
+                full_mlp_fp32
+                or mlp_group_active("mlp_fc2", L)
+                or mlp_group_active("mlp_gelu_fc2", L)
+                or mlp_group_active("mlp_fc1_gelu_fc2", L)
+            )
+
+            fc1_accum = None
+            if fc1_fp32:
+                fc1_raw = ln2 @ layer["fc_w_fp32"].T + layer["fc_b"]
+                fc1 = fc1_raw if gelu_fp32 else _qdq(fc1_raw, fc1_scale)
             elif self._use_integer_linear(layer["fc_requant_pc"]):
                 ln2_i8 = _fp32_to_int8(ln2, ln2_scale)
                 fc1_accum = (
                     ln2_i8.astype(np.int32) @ layer["fc_w_q"].astype(np.int32).T
                     + layer["fc_b_i32"]
                 )
-                if layer["fc_requant_pc"] is not None:
+                if L in self.gelu_from_accum_blocks:
+                    fc1 = _dequant_accum_fp32(
+                        fc1_accum,
+                        np.float32(ln2_scale) * np.float32(layer["fc_w_scale"]),
+                    )
+                elif layer["fc_requant_pc"] is not None:
                     fc1_i8 = _requant_accum_pc_int8(fc1_accum, layer["fc_requant_pc"])
+                    fc1 = fc1_i8.astype(np.float32) * _arch_scale(fc1_scale)
                 else:
                     fc1_i8 = _requant_accum_int8(
                         fc1_accum,
                         np.float32(ln2_scale) * np.float32(layer["fc_w_scale"]),
                         fc1_scale,
                     )
-                fc1 = fc1_i8.astype(np.float32) * _arch_scale(fc1_scale)
-                gelu = _qdq(self.gelu_fn(fc1), gelu_scale)
+                    fc1 = fc1_i8.astype(np.float32) * _arch_scale(fc1_scale)
+            else:
+                fc1 = _qdq(ln2 @ layer["fc_w"].T + layer["fc_b"], fc1_scale)
+
+            gelu_raw = self.gelu_fn(fc1)
+            gelu = gelu_raw if (gelu_fp32 or fc2_fp32) else _qdq(gelu_raw, gelu_scale)
+            fc2_accum = None
+            fc2_accum_scale = None
+            if fc2_fp32:
+                fc2 = gelu @ layer["proj_w_fp32"].T + layer["proj_b"]
+                fc2_i8 = _fp32_to_int8(_qdq(fc2, fc2_scale), fc2_scale)
+            else:
+                gelu = _qdq(gelu, gelu_scale)
                 gelu_i8 = _fp32_to_int8(gelu, gelu_scale)
                 fc2_accum = (
                     gelu_i8.astype(np.int32) @ layer["proj_w_q"].astype(np.int32).T
@@ -880,15 +930,17 @@ class NanoGPTFQReference:
                 else:
                     fc2_i8 = _requant_accum_int8(fc2_accum, fc2_accum_scale, fc2_scale)
                 fc2 = fc2_i8.astype(np.float32) * _arch_scale(fc2_scale)
-            else:
-                fc1 = _qdq(ln2 @ layer["fc_w"].T + layer["fc_b"], fc1_scale)
-                gelu = _qdq(self.gelu_fn(fc1), gelu_scale)
-                gelu_i8 = _fp32_to_int8(gelu, gelu_scale)
-                fc2_accum = gelu_i8.astype(np.int32) @ layer["proj_w_q"].astype(np.int32).T
-                fc2_accum_scale = np.float32(gelu_scale) * np.float32(layer["proj_w_scale"])
-                fc2_i8 = _requant_accum_int8(fc2_accum, fc2_accum_scale, fc2_scale)
-                fc2 = fc2_i8.astype(np.float32) * _arch_scale(fc2_scale)
-            record(f"block{L}_fc1", fc1, scale=fc1_scale, int8=_fp32_to_int8(fc1, fc1_scale))
+            fc1_trace_scale = (
+                float(np.float32(ln2_scale) * np.float32(layer["fc_w_scale"]))
+                if L in self.gelu_from_accum_blocks and fc1_accum is not None
+                else fc1_scale
+            )
+            record(
+                f"block{L}_fc1",
+                fc1,
+                scale=fc1_trace_scale,
+                int8=None if L in self.gelu_from_accum_blocks and fc1_accum is not None else _fp32_to_int8(fc1, fc1_scale),
+            )
             record(f"block{L}_gelu", gelu, scale=gelu_scale, int8=_fp32_to_int8(gelu, gelu_scale))
             record(f"block{L}_fc2", fc2, scale=fc2_scale, int8=fc2_i8)
             residual1_int8 = x_int8

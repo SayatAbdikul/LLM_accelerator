@@ -129,7 +129,7 @@ def test_debug_gpt2_perplexity_outputs_json_sections():
     )
     data = json.loads(proc.stdout)
     assert "primary_suspect" in data
-    assert data["ptq_preset"] == "fc2_8_to_11_raw_vadd"
+    assert data["ptq_preset"] == "output_aware_mlp_8_to_11"
     assert {"fp32_baseline", "lm_head_quantization", "calibration_sensitivity", "shared_decode_semantics", "converter_bias_layout"}.issubset(data["suspects"])
     assert len(data["suspects"]["calibration_sensitivity"]) == 4
     assert len(data["per_step"]) == 1
@@ -171,14 +171,54 @@ def test_debug_gpt2_perplexity_preset_sweep_json_sections():
         ]
     )
     data = json.loads(proc.stdout)
-    assert data["preset_sweep"]["promoted_default"] == "fc2_8_to_11_raw_vadd"
+    assert data["preset_sweep"]["promoted_default"] == "output_aware_mlp_8_to_11"
     assert len(data["preset_sweep"]["rows"]) == len(STAGE5_PTQ_PRESETS)
     assert data["preset_sweep"]["rows"][0]["name"]
     assert data["preset_sweep"]["winner"]["name"]
-    assert data["preset_sweep"]["default_replacement_candidate"]["baseline"] == "fc2_8_to_11_raw_vadd"
+    assert data["preset_sweep"]["default_replacement_candidate"]["baseline"] == "output_aware_mlp_8_to_11"
     by_name = {row["name"]: row for row in data["preset_sweep"]["rows"]}
     assert "fc2_11_fc2aware_gelu" in by_name
     assert "fc2_aware_gelu" in by_name["fc2_11_fc2aware_gelu"]
+
+
+def test_mlp_ablation_flags_report_diagnostic_rows():
+    missing = [
+        str(path)
+        for path in (FIXTURE, TOKENIZER_DIR, CALIB_TEXT, EVAL_TEXT)
+        if not path.exists()
+    ]
+    if missing:
+        pytest.skip(f"local GPT-2 debug inputs missing: {missing}")
+
+    proc = _run_debug_cli(
+        [
+            str(FIXTURE),
+            "--tokenizer-dir",
+            str(TOKENIZER_DIR),
+            "--calibration-text",
+            str(CALIB_TEXT),
+            "--eval-text",
+            str(EVAL_TEXT),
+            "--max-eval-tokens",
+            "2",
+            "--context-len",
+            "1",
+            "--calibration-n-seqs",
+            "1",
+            "--calibration-seq-len",
+            "2",
+            "--mlp-subablation",
+            "--mlp-block-ablation",
+            "--json",
+        ]
+    )
+    data = json.loads(proc.stdout)
+    subgroups = {row["group"] for row in data["mlp_subablation"]}
+    assert {"mlp_fc1", "mlp_gelu", "mlp_fc2", "mlp_full"}.issubset(subgroups)
+    assert len(data["mlp_block_ablation"]) == 12
+    assert {"block", "nll_improvement_vs_baseline", "mean_top10_overlap_vs_fp32"}.issubset(
+        data["mlp_block_ablation"][0]
+    )
 
 
 def test_gpt2_node_trace_reports_first_divergence():

@@ -18,6 +18,7 @@ from taccel.runtime.stage5_ptq import (
     resolve_stage5_ptq_preset,
     stage5_dequant_add_residual1_blocks,
     stage5_dequant_add_residual2_blocks,
+    stage5_gelu_from_accum_blocks,
     stage5_default_ptq_preset_name,
     stage5_raw_residual1_blocks,
     stage5_raw_residual2_blocks,
@@ -47,6 +48,7 @@ def test_stage5_preset_registry_contains_core_presets_and_promoted_default():
         "fc2_11_raw_vadd", "out_proj_11_fc2_11_raw_vadd", "out_proj_11_fc2_10_11_raw_vadd",
         "hessian_gelu_11", "fc2_11_fc2aware_gelu", "out_proj_11_fc2_11_fc2aware_gelu",
         "output_aware_gelu_8_to_11", "output_aware_mlp_8_to_11",
+        "gelu_accum_8_to_11", "output_aware_mlp_gelu_accum_8_to_11",
     }
     assert core.issubset(set(STAGE5_PTQ_PRESETS))
     assert stage5_default_ptq_preset_name() == "output_aware_mlp_8_to_11"
@@ -75,6 +77,7 @@ def test_stage5_preset_weight_names_and_residual_policy():
     assert len(stage5_dequant_add_residual2_blocks(model_args, "fc2_11_raw_vadd")) == 11
     assert stage5_raw_residual2_blocks("out_proj_11") == set()
     assert len(stage5_dequant_add_residual2_blocks(model_args, "out_proj_11")) == 12
+    assert stage5_gelu_from_accum_blocks("gelu_accum_8_to_11") == {8, 9, 10, 11}
 
 
 def test_stage5_preset_rejects_unsupported_block_indices():
@@ -92,6 +95,7 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         fc2_aware_gelu_blocks=(0,),
         output_aware_gelu_blocks=(),
         output_aware_mlp_blocks=(),
+        gelu_from_accum_blocks=(),
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
         validate_stage5_ptq_preset_for_model({"n_layer": 1}, invalid)
@@ -105,6 +109,7 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         fc2_aware_gelu_blocks=(),
         output_aware_gelu_blocks=(0,),
         output_aware_mlp_blocks=(),
+        gelu_from_accum_blocks=(),
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
         validate_stage5_ptq_preset_for_model({"n_layer": 1}, invalid_output_aware)
@@ -118,9 +123,24 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         fc2_aware_gelu_blocks=(),
         output_aware_gelu_blocks=(),
         output_aware_mlp_blocks=(0,),
+        gelu_from_accum_blocks=(),
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
         validate_stage5_ptq_preset_for_model({"n_layer": 1}, invalid_output_aware_mlp)
+    invalid_gelu_accum = Stage5PTQPreset(
+        name="bad_gelu_accum_overlap",
+        activation_percentile_nodes={},
+        requant_pc_out_proj_blocks=(),
+        requant_pc_fc1_blocks=(0,),
+        requant_pc_fc2_blocks=(),
+        hessian_gelu_blocks=(),
+        fc2_aware_gelu_blocks=(),
+        output_aware_gelu_blocks=(),
+        output_aware_mlp_blocks=(),
+        gelu_from_accum_blocks=(0,),
+    )
+    with pytest.raises(ValueError, match="GELU-from-ACCUM and FC1 REQUANT_PC"):
+        validate_stage5_ptq_preset_for_model({"n_layer": 1}, invalid_gelu_accum)
 
 
 def test_stage5_scale_policy_ties_out_proj_and_residual_for_raw_vadd_block():

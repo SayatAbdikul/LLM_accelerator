@@ -28,6 +28,7 @@ from .stage5_ptq import (
     resolve_stage5_ptq_preset,
     stage5_dequant_add_residual1_blocks,
     stage5_dequant_add_residual2_blocks,
+    stage5_gelu_from_accum_blocks,
     stage5_raw_residual1_blocks,
     stage5_raw_residual2_blocks,
     stage5_requant_pc_weight_names,
@@ -95,6 +96,17 @@ class TinyFP32E2EResult:
     @property
     def min_fp32_cosine(self) -> float:
         return min(self.fp32_cosine_per_step) if self.fp32_cosine_per_step else 1.0
+
+
+def _mark_gelu_from_accum_inline(graph, blocks: set[int]) -> None:
+    """Inline selected nanoGPT FC1->GELU pairs so GELU can consume ACCUM."""
+    for block in sorted(int(v) for v in blocks):
+        fc1 = graph.get_node(f"block{block}_fc1")
+        gelu = graph.get_node(f"block{block}_gelu")
+        if fc1 is None or gelu is None:
+            continue
+        fc1.attrs["inline_gelu"] = gelu.name
+        gelu.attrs["inline_with"] = fc1.name
 
 
 def _to_numpy(tensor) -> np.ndarray:
@@ -291,6 +303,9 @@ def build_stage3_tiny_decoder_bundle(
     calibration_scales = apply_stage5_ptq_scale_policy(calibration_scales, config, resolved_preset)
     frontend = load_nanogpt(config=payload["model_args"], variant="forward_1token")
     graph = mark_runtime_embedding_lookups(frontend.graph)
+    gelu_from_accum_blocks = stage5_gelu_from_accum_blocks(resolved_preset)
+    if gelu_from_accum_blocks:
+        _mark_gelu_from_accum_inline(graph, gelu_from_accum_blocks)
     decode_key_len = 1 + int(smoke_decode_steps)
     prefill_graph = inject_kv_cache_nodes(graph, config, decode=False, seq_len=1)
     decode_graph = inject_kv_cache_nodes(graph, config, decode=True, seq_len=decode_key_len)
@@ -306,6 +321,7 @@ def build_stage3_tiny_decoder_bundle(
         requant_pc_weight_names=stage5_requant_pc_weight_names(config, resolved_preset),
         dequant_add_residual1_blocks=stage5_dequant_add_residual1_blocks(config, resolved_preset),
         dequant_add_residual2_blocks=stage5_dequant_add_residual2_blocks(config, resolved_preset),
+        gelu_from_accum_blocks=gelu_from_accum_blocks or None,
     )
     return TinyFixtureBundle(build=build, config=config, logits_size=logits_size)
 
@@ -426,6 +442,7 @@ def run_stage3_tiny_e2e(payload: Dict[str, object], *,
         requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset),
         raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
         raw_residual2_blocks=stage5_raw_residual2_blocks(resolved_preset),
+        gelu_from_accum_blocks=stage5_gelu_from_accum_blocks(resolved_preset),
     )
     reference = _run_reference_trace(
         ref, prompt_ids, max_new_tokens=max_new_tokens, vocab_size=tiny.config.vocab_size

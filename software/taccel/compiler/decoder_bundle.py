@@ -193,6 +193,7 @@ def build_decoder_program_bundle(
     requant_pc_scale_tables: Optional[Dict[str, np.ndarray]] = None,
     dequant_add_residual1_blocks: Optional[set[int]] = None,
     dequant_add_residual2_blocks: Optional[set[int]] = None,
+    gelu_from_accum_blocks: Optional[set[int]] = None,
 ) -> DecoderBundleBuild:
     """Build a ProgramBundle from already-formed decoder IR graphs."""
     kv_layout = build_kv_cache_layout(model_config, max_seq_len=max_seq_len)
@@ -228,6 +229,8 @@ def build_decoder_program_bundle(
         kv_layout=kv_layout,
         dequant_add_residual1_blocks=residual1_dequant_blocks,
         dequant_add_residual2_blocks=residual2_dequant_blocks,
+        gelu_from_accum=gelu_from_accum_blocks is not None,
+        gelu_from_accum_blocks=gelu_from_accum_blocks,
         requant_pc_weight_names=requant_pc_weight_names,
         requant_pc_scale_tables=requant_pc_scale_tables,
     )
@@ -240,6 +243,8 @@ def build_decoder_program_bundle(
         kv_layout=kv_layout,
         dequant_add_residual1_blocks=residual1_dequant_blocks,
         dequant_add_residual2_blocks=residual2_dequant_blocks,
+        gelu_from_accum=gelu_from_accum_blocks is not None,
+        gelu_from_accum_blocks=gelu_from_accum_blocks,
         requant_pc_weight_names=requant_pc_weight_names,
         requant_pc_scale_tables=requant_pc_scale_tables,
     )
