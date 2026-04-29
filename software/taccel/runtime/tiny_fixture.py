@@ -138,7 +138,6 @@ def _prescale_bias(
     output_dim: int,
     act_scale: float,
     weight_scales: np.ndarray,
-    bias_corrections: Optional[Dict[str, np.ndarray]] = None,
 ) -> np.ndarray:
     """Return compiler-domain INT32 bias, padded to the matmul output width."""
     output_pad = pad_dim(int(output_dim))
@@ -148,11 +147,6 @@ def _prescale_bias(
         arr = np.zeros(int(output_dim), dtype=np.float32)
     if arr.size != int(output_dim):
         raise ValueError(f"{name!r} has {arr.size} values, expected {output_dim}")
-    if bias_corrections and name in bias_corrections:
-        correction = np.asarray(bias_corrections[name], dtype=np.float32).reshape(-1)
-        if correction.size != arr.size:
-            raise ValueError(f"{name!r} bias correction has {correction.size} values, expected {arr.size}")
-        arr = arr + correction
     scales = np.asarray(weight_scales, dtype=np.float32)
     if scales.size < output_pad:
         scales = np.pad(scales, (0, output_pad - scales.size), constant_values=scales[-1])
@@ -186,7 +180,6 @@ def model_config_from_fixture_payload(payload: Dict[str, object]) -> ModelConfig
 def quantize_fixture_payload(
     payload: Dict[str, object],
     calibration_scales: Optional[Dict[str, float]] = None,
-    bias_corrections: Optional[Dict[str, np.ndarray]] = None,
 ):
     """Return codegen-ready weights, zero biases, scales, config, and logits size.
 
@@ -233,7 +226,6 @@ def quantize_fixture_payload(
                         output_dim=config.d_head,
                         act_scale=calibration_scales.get(f"block{layer}_ln1", 6.0 / 127.0),
                         weight_scales=weight_data[name][1],
-                        bias_corrections=bias_corrections,
                     )
         for name in (
             f"transformer.h.{layer}.attn.c_proj.weight",
@@ -268,7 +260,6 @@ def quantize_fixture_payload(
                 output_dim=output_dim,
                 act_scale=calibration_scales.get(act_name, 6.0 / 127.0),
                 weight_scales=weight_data[weight_name][1],
-                bias_corrections=bias_corrections,
             )
 
     weight_data["lm_head.weight"] = _quantize_linear_weight(state_dict["lm_head.weight"])
@@ -281,7 +272,6 @@ def build_stage3_tiny_decoder_bundle(
     smoke_decode_steps: int = 2,
     calibration_scales: Optional[Dict[str, float]] = None,
     ptq_preset: str | Stage5PTQPreset | None = None,
-    bias_corrections: Optional[Dict[str, np.ndarray]] = None,
 ) -> TinyFixtureBundle:
     """Build the full 1-token tiny decoder ProgramBundle used by Stage 3 tests."""
     resolved_preset = resolve_stage5_ptq_preset(ptq_preset)
@@ -296,7 +286,6 @@ def build_stage3_tiny_decoder_bundle(
     weight_data, prescaled_biases, calibration_scales, config, logits_size = quantize_fixture_payload(
         payload,
         calibration_scales=calibration_scales,
-        bias_corrections=bias_corrections,
     )
     validate_stage5_ptq_preset_for_model(config, resolved_preset)
     calibration_scales = apply_stage5_ptq_scale_policy(calibration_scales, config, resolved_preset)

@@ -21,8 +21,6 @@ class Stage5PTQPreset:
     fc2_aware_gelu_blocks: tuple[int, ...]
     output_aware_gelu_blocks: tuple[int, ...]
     output_aware_mlp_blocks: tuple[int, ...]
-    mlp_bias_correction_blocks: tuple[int, ...]
-    mlp_bias_correction_target: str
 
 
 def _preset(
@@ -36,8 +34,6 @@ def _preset(
     fc2_aware_gelu_blocks: Sequence[int] = (),
     output_aware_gelu_blocks: Sequence[int] = (),
     output_aware_mlp_blocks: Sequence[int] = (),
-    mlp_bias_correction_blocks: Sequence[int] = (),
-    mlp_bias_correction_target: str = "fc2",
 ) -> Stage5PTQPreset:
     return Stage5PTQPreset(
         name=name,
@@ -49,8 +45,6 @@ def _preset(
         fc2_aware_gelu_blocks=tuple(int(v) for v in fc2_aware_gelu_blocks),
         output_aware_gelu_blocks=tuple(int(v) for v in output_aware_gelu_blocks),
         output_aware_mlp_blocks=tuple(int(v) for v in output_aware_mlp_blocks),
-        mlp_bias_correction_blocks=tuple(int(v) for v in mlp_bias_correction_blocks),
-        mlp_bias_correction_target=str(mlp_bias_correction_target),
     )
 
 
@@ -198,20 +192,6 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         requant_pc_fc1_blocks=(8, 9, 10, 11),
         requant_pc_fc2_blocks=(8, 9, 10, 11),
     ),
-    # MLP bias-correction experiments: keep the current fc2 raw-VADD regime and
-    # fold mean late-MLP output error into c_proj.bias.
-    "mlp_bias_fc2_8_to_11": _preset(
-        "mlp_bias_fc2_8_to_11",
-        requant_pc_fc2_blocks=(8, 9, 10, 11),
-        mlp_bias_correction_blocks=(8, 9, 10, 11),
-        mlp_bias_correction_target="fc2",
-    ),
-    "mlp_bias_resid2_8_to_11": _preset(
-        "mlp_bias_resid2_8_to_11",
-        requant_pc_fc2_blocks=(8, 9, 10, 11),
-        mlp_bias_correction_blocks=(8, 9, 10, 11),
-        mlp_bias_correction_target="residual2",
-    ),
     # GPT-2 124M specific (n_layer=12). Do not promote globally.
     "gpt2_all_pc": _preset(
         "gpt2_all_pc",
@@ -267,7 +247,6 @@ def validate_stage5_ptq_preset_for_model(
                 + resolved.fc2_aware_gelu_blocks
                 + resolved.output_aware_gelu_blocks
                 + resolved.output_aware_mlp_blocks
-                + resolved.mlp_bias_correction_blocks
             )
             if idx < 0 or idx >= n_layer
         }
@@ -290,11 +269,6 @@ def validate_stage5_ptq_preset_for_model(
     if output_aware_mlp_without_pc:
         raise ValueError(
             f"Stage 5 PTQ preset {resolved.name!r} uses output-aware MLP blocks without matching fc2 REQUANT_PC/raw VADD blocks: {output_aware_mlp_without_pc}"
-        )
-    if resolved.mlp_bias_correction_target not in {"fc2", "residual2"}:
-        raise ValueError(
-            f"Stage 5 PTQ preset {resolved.name!r} has unsupported MLP bias-correction target "
-            f"{resolved.mlp_bias_correction_target!r}"
         )
     return resolved
 
