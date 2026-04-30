@@ -25,9 +25,50 @@ from taccel.runtime.stage5_ptq import (
     stage5_requant_pc_weight_names,
     validate_stage5_ptq_preset_for_model,
 )
+from taccel.runtime.tiny_fixture import quantize_fixture_payload
 
 
 DEBUG_TOOL = Path(__file__).resolve().parents[1] / "tools" / "debug_gpt2_perplexity.py"
+
+
+def _one_layer_payload():
+    d_model = 16
+    mlp_dim = 4 * d_model
+    vocab = 16
+    block = 16
+    state = {
+        "transformer.wte.weight": np.linspace(-0.2, 0.2, vocab * d_model, dtype=np.float32).reshape(vocab, d_model),
+        "transformer.wpe.weight": np.linspace(0.05, 0.25, block * d_model, dtype=np.float32).reshape(block, d_model),
+        "transformer.ln_f.weight": np.ones(d_model, dtype=np.float32),
+        "transformer.ln_f.bias": np.zeros(d_model, dtype=np.float32),
+        "lm_head.weight": np.linspace(-0.3, 0.4, vocab * d_model, dtype=np.float32).reshape(vocab, d_model),
+    }
+    for ln in ("ln_1", "ln_2"):
+        state[f"transformer.h.0.{ln}.weight"] = np.ones(d_model, dtype=np.float32)
+        state[f"transformer.h.0.{ln}.bias"] = np.zeros(d_model, dtype=np.float32)
+    for proj in ("query", "key", "value"):
+        state[f"transformer.h.0.attn.c_attn.weight_h0_{proj}"] = np.linspace(
+            -0.4, 0.4, d_model * d_model, dtype=np.float32
+        ).reshape(d_model, d_model)
+        state[f"transformer.h.0.attn.c_attn.bias_h0_{proj}"] = np.zeros(d_model, dtype=np.float32)
+    state["transformer.h.0.attn.c_proj.weight"] = np.linspace(-0.5, 0.5, d_model * d_model, dtype=np.float32).reshape(d_model, d_model)
+    state["transformer.h.0.attn.c_proj.bias"] = np.zeros(d_model, dtype=np.float32)
+    fc_rows = [np.linspace(-0.05 * (idx + 1), 0.05 * (idx + 1), d_model, dtype=np.float32) for idx in range(mlp_dim)]
+    state["transformer.h.0.mlp.c_fc.weight"] = np.stack(fc_rows, axis=0)
+    state["transformer.h.0.mlp.c_fc.bias"] = np.zeros(mlp_dim, dtype=np.float32)
+    state["transformer.h.0.mlp.c_proj.weight"] = np.linspace(-0.3, 0.3, d_model * mlp_dim, dtype=np.float32).reshape(d_model, mlp_dim)
+    state["transformer.h.0.mlp.c_proj.bias"] = np.zeros(d_model, dtype=np.float32)
+    return {
+        "model_args": {
+            "n_layer": 1,
+            "n_head": 1,
+            "n_embd": d_model,
+            "block_size": block,
+            "vocab_size": vocab,
+            "layer_norm_epsilon": 1e-5,
+        },
+        "state_dict": state,
+    }
 
 
 def _debug_module():
@@ -48,6 +89,7 @@ def test_stage5_preset_registry_contains_core_presets_and_promoted_default():
         "fc2_11_raw_vadd", "out_proj_11_fc2_11_raw_vadd", "out_proj_11_fc2_10_11_raw_vadd",
         "hessian_gelu_11", "fc2_11_fc2aware_gelu", "out_proj_11_fc2_11_fc2aware_gelu",
         "output_aware_gelu_8_to_11", "output_aware_mlp_8_to_11",
+        "output_aware_mlp_0_to_11", "output_aware_mlp_0_1_4_8_to_11",
         "gelu_accum_8_to_11", "output_aware_mlp_gelu_accum_8_to_11",
     }
     assert core.issubset(set(STAGE5_PTQ_PRESETS))
@@ -78,6 +120,28 @@ def test_stage5_preset_weight_names_and_residual_policy():
     assert stage5_raw_residual2_blocks("out_proj_11") == set()
     assert len(stage5_dequant_add_residual2_blocks(model_args, "out_proj_11")) == 12
     assert stage5_gelu_from_accum_blocks("gelu_accum_8_to_11") == {8, 9, 10, 11}
+
+
+def test_gelu_from_accum_quantizes_fc1_with_uniform_weight_scale():
+    payload = _one_layer_payload()
+    scales = {
+        "tok_pos_add": 0.01,
+        "block0_ln1": 0.01,
+        "block0_concat": 0.01,
+        "block0_ln2": 0.01,
+        "block0_gelu": 0.01,
+    }
+    per_channel_weights, _, _, _, _ = quantize_fixture_payload(payload, calibration_scales=scales)
+    per_tensor_weights, _, _, _, _ = quantize_fixture_payload(
+        payload,
+        calibration_scales=scales,
+        per_tensor_fc1_blocks={0},
+    )
+
+    per_channel_scales = per_channel_weights["transformer.h.0.mlp.c_fc.weight"][1]
+    per_tensor_scales = per_tensor_weights["transformer.h.0.mlp.c_fc.weight"][1]
+    assert not np.allclose(per_channel_scales, per_channel_scales[0])
+    assert np.allclose(per_tensor_scales, per_tensor_scales[0])
 
 
 def test_stage5_preset_rejects_unsupported_block_indices():

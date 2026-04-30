@@ -153,6 +153,19 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         requant_pc_fc2_blocks=(8, 9, 10, 11),
         output_aware_mlp_blocks=(8, 9, 10, 11),
     ),
+    # Full-range extension: NLL-driven search self-selects which early blocks benefit.
+    # Per-block MLP ablation identified blocks 1, 0, 4 as top recovery targets after 8-11 were tuned.
+    "output_aware_mlp_0_to_11": _preset(
+        "output_aware_mlp_0_to_11",
+        requant_pc_fc2_blocks=tuple(range(12)),
+        output_aware_mlp_blocks=tuple(range(12)),
+    ),
+    # Sparse variant targeting only the top-3 per-block ablation winners plus existing 8-11.
+    "output_aware_mlp_0_1_4_8_to_11": _preset(
+        "output_aware_mlp_0_1_4_8_to_11",
+        requant_pc_fc2_blocks=(0, 1, 4, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 1, 4, 8, 9, 10, 11),
+    ),
     "gelu_accum_8_to_11": _preset(
         "gelu_accum_8_to_11",
         requant_pc_fc2_blocks=(8, 9, 10, 11),
@@ -220,7 +233,7 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
 
 # Updated only after a preset wins on the real local GPT-2 checkpoint and still
 # keeps the existing golden-vs-fake gates green.
-PROMOTED_STAGE5_PTQ_PRESET = "output_aware_mlp_8_to_11"
+PROMOTED_STAGE5_PTQ_PRESET = "output_aware_mlp_0_1_4_8_to_11"
 
 
 def stage5_default_ptq_preset_name() -> str:

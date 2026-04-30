@@ -23,7 +23,7 @@ CALIBRATION_SEQ_LEN_LARGE = 128
 CALIBRATION_PERCENTILE_DEFAULT = 99.9
 
 # GPT-2-specific PTQ default — won the preset sweep on the real GPT-2 124M checkpoint.
-GPT2_DEFAULT_PTQ_PRESET = "output_aware_mlp_8_to_11"
+GPT2_DEFAULT_PTQ_PRESET = "output_aware_mlp_0_1_4_8_to_11"
 from .fake_quant_reference import NanoGPTFQReference
 from .host_runner import HostRunner
 from .stage5_ptq import (
