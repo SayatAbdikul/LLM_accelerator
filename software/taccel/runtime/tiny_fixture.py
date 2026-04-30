@@ -125,9 +125,9 @@ def _quantize_embedding(tensor, scale: Optional[float] = None) -> np.ndarray:
     return np.clip(np.round(arr / np.float32(scale)), -128, 127).astype(np.int8)
 
 
-def _quantize_linear_weight(tensor) -> Tuple[np.ndarray, np.ndarray]:
+def _quantize_linear_weight(tensor, *, per_channel: bool = True) -> Tuple[np.ndarray, np.ndarray]:
     """Quantize a PyTorch-layout [out, in] weight into TACCEL [K, N] layout."""
-    q, scales = quantize_tensor(_to_numpy(tensor).astype(np.float32), per_channel=True)
+    q, scales = quantize_tensor(_to_numpy(tensor).astype(np.float32), per_channel=per_channel)
     q = np.pad(
         q,
         ((0, (16 - q.shape[0] % 16) % 16), (0, (16 - q.shape[1] % 16) % 16)),
@@ -192,6 +192,7 @@ def model_config_from_fixture_payload(payload: Dict[str, object]) -> ModelConfig
 def quantize_fixture_payload(
     payload: Dict[str, object],
     calibration_scales: Optional[Dict[str, float]] = None,
+    per_tensor_fc1_blocks: Optional[set[int]] = None,
 ):
     """Return codegen-ready weights, zero biases, scales, config, and logits size.
 
@@ -203,6 +204,7 @@ def quantize_fixture_payload(
         calibration_scales = build_calibration_scales(payload)
     state_dict = payload["state_dict"]
     config = model_config_from_fixture_payload(payload)
+    per_tensor_fc1_blocks = set(int(v) for v in (per_tensor_fc1_blocks or set()))
     # Token and position embeddings are added by a raw INT8 VADD in the
     # generated program.  Both tables therefore must share the output scale used
     # for tok_pos_add; otherwise q_token + q_pos is not a representation of
@@ -239,12 +241,16 @@ def quantize_fixture_payload(
                         act_scale=calibration_scales.get(f"block{layer}_ln1", 6.0 / 127.0),
                         weight_scales=weight_data[name][1],
                     )
-        for name in (
-            f"transformer.h.{layer}.attn.c_proj.weight",
-            f"transformer.h.{layer}.mlp.c_fc.weight",
-            f"transformer.h.{layer}.mlp.c_proj.weight",
-        ):
-            weight_data[name] = _quantize_linear_weight(state_dict[name])
+        weight_data[f"transformer.h.{layer}.attn.c_proj.weight"] = _quantize_linear_weight(
+            state_dict[f"transformer.h.{layer}.attn.c_proj.weight"],
+        )
+        weight_data[f"transformer.h.{layer}.mlp.c_fc.weight"] = _quantize_linear_weight(
+            state_dict[f"transformer.h.{layer}.mlp.c_fc.weight"],
+            per_channel=layer not in per_tensor_fc1_blocks,
+        )
+        weight_data[f"transformer.h.{layer}.mlp.c_proj.weight"] = _quantize_linear_weight(
+            state_dict[f"transformer.h.{layer}.mlp.c_proj.weight"],
+        )
         bias_specs = (
             (
                 f"transformer.h.{layer}.attn.c_proj.bias",
@@ -295,15 +301,16 @@ def build_stage3_tiny_decoder_bundle(
         )
     else:
         calibration_scales = dict(calibration_scales)
+    gelu_from_accum_blocks = stage5_gelu_from_accum_blocks(resolved_preset)
     weight_data, prescaled_biases, calibration_scales, config, logits_size = quantize_fixture_payload(
         payload,
         calibration_scales=calibration_scales,
+        per_tensor_fc1_blocks=gelu_from_accum_blocks,
     )
     validate_stage5_ptq_preset_for_model(config, resolved_preset)
     calibration_scales = apply_stage5_ptq_scale_policy(calibration_scales, config, resolved_preset)
     frontend = load_nanogpt(config=payload["model_args"], variant="forward_1token")
     graph = mark_runtime_embedding_lookups(frontend.graph)
-    gelu_from_accum_blocks = stage5_gelu_from_accum_blocks(resolved_preset)
     if gelu_from_accum_blocks:
         _mark_gelu_from_accum_inline(graph, gelu_from_accum_blocks)
     decode_key_len = 1 + int(smoke_decode_steps)

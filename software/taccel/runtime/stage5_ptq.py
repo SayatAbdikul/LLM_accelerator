@@ -166,6 +166,12 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         requant_pc_fc2_blocks=(0, 1, 4, 8, 9, 10, 11),
         output_aware_mlp_blocks=(0, 1, 4, 8, 9, 10, 11),
     ),
+    # Second ablation pass added blocks 6 and 7 as new recovery targets.
+    "output_aware_mlp_0_1_4_6_7_8_to_11": _preset(
+        "output_aware_mlp_0_1_4_6_7_8_to_11",
+        requant_pc_fc2_blocks=(0, 1, 4, 6, 7, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 1, 4, 6, 7, 8, 9, 10, 11),
+    ),
     "gelu_accum_8_to_11": _preset(
         "gelu_accum_8_to_11",
         requant_pc_fc2_blocks=(8, 9, 10, 11),

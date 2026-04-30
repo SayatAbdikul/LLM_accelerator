@@ -130,7 +130,11 @@ def _causal_softmax(x: np.ndarray) -> np.ndarray:
 # Weight fake-quantisation at build time
 # ---------------------------------------------------------------------------
 
-def _linear_components(tensor) -> tuple[np.ndarray, np.float32, np.ndarray, np.ndarray]:
+def _linear_components(
+    tensor,
+    *,
+    per_channel: bool = True,
+) -> tuple[np.ndarray, np.float32, np.ndarray, np.ndarray]:
     """Return compiler-matched linear weight components.
 
     The codegen REQUANT uses a single scalar scale = mean(per_channel_scales),
@@ -140,7 +144,7 @@ def _linear_components(tensor) -> tuple[np.ndarray, np.float32, np.ndarray, np.n
     """
     from ..quantizer.quantize import quantize_tensor
     arr = _to_f32(tensor)  # [out, in]
-    q, scales = quantize_tensor(arr, per_channel=True)
+    q, scales = quantize_tensor(arr, per_channel=per_channel)
     padded_out = q.shape[0] + ((16 - q.shape[0] % 16) % 16)
     scales_f = scales.astype(np.float32)
     if scales_f.size < padded_out:
@@ -351,7 +355,10 @@ class NanoGPTFQReference:
                     _bias_fp32(sd, v_b_name, self.d_head),
                 ))
             c_proj_q, c_proj_scale_w, c_proj_w, c_proj_scales = _linear_components(sd[f"transformer.h.{L}.attn.c_proj.weight"])
-            fc_q, fc_scale_w, fc_w, fc_scales = _linear_components(sd[f"transformer.h.{L}.mlp.c_fc.weight"])
+            fc_q, fc_scale_w, fc_w, fc_scales = _linear_components(
+                sd[f"transformer.h.{L}.mlp.c_fc.weight"],
+                per_channel=L not in self.gelu_from_accum_blocks,
+            )
             proj_q, proj_scale_w, proj_w, proj_scales = _linear_components(sd[f"transformer.h.{L}.mlp.c_proj.weight"])
             c_proj_name = f"transformer.h.{L}.attn.c_proj.weight"
             fc_name = f"transformer.h.{L}.mlp.c_fc.weight"
