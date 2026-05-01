@@ -21,6 +21,7 @@ class Stage5PTQPreset:
     fc2_aware_gelu_blocks: tuple[int, ...]
     output_aware_gelu_blocks: tuple[int, ...]
     output_aware_mlp_blocks: tuple[int, ...]
+    output_aware_attn_blocks: tuple[int, ...]
     gelu_from_accum_blocks: tuple[int, ...]
 
 
@@ -35,6 +36,7 @@ def _preset(
     fc2_aware_gelu_blocks: Sequence[int] = (),
     output_aware_gelu_blocks: Sequence[int] = (),
     output_aware_mlp_blocks: Sequence[int] = (),
+    output_aware_attn_blocks: Sequence[int] = (),
     gelu_from_accum_blocks: Sequence[int] = (),
 ) -> Stage5PTQPreset:
     return Stage5PTQPreset(
@@ -47,6 +49,7 @@ def _preset(
         fc2_aware_gelu_blocks=tuple(int(v) for v in fc2_aware_gelu_blocks),
         output_aware_gelu_blocks=tuple(int(v) for v in output_aware_gelu_blocks),
         output_aware_mlp_blocks=tuple(int(v) for v in output_aware_mlp_blocks),
+        output_aware_attn_blocks=tuple(int(v) for v in output_aware_attn_blocks),
         gelu_from_accum_blocks=tuple(int(v) for v in gelu_from_accum_blocks),
     )
 
@@ -172,6 +175,21 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         requant_pc_fc2_blocks=(0, 1, 4, 6, 7, 8, 9, 10, 11),
         output_aware_mlp_blocks=(0, 1, 4, 6, 7, 8, 9, 10, 11),
     ),
+    # Output-aware attn_v scale search: per-block attn_v requant scale multiplier search.
+    # Block selection TBD from attn_v block ablation sweep; placeholder uses all blocks.
+    "output_aware_attn_all": _preset(
+        "output_aware_attn_all",
+        requant_pc_fc2_blocks=(0, 1, 4, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 1, 4, 8, 9, 10, 11),
+        output_aware_attn_blocks=tuple(range(12)),
+    ),
+    # Combined MLP + attn_v search on the same set of blocks.
+    "output_aware_mlp_attn_0_1_4_8_to_11": _preset(
+        "output_aware_mlp_attn_0_1_4_8_to_11",
+        requant_pc_fc2_blocks=(0, 1, 4, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 1, 4, 8, 9, 10, 11),
+        output_aware_attn_blocks=(0, 1, 4, 8, 9, 10, 11),
+    ),
     "gelu_accum_8_to_11": _preset(
         "gelu_accum_8_to_11",
         requant_pc_fc2_blocks=(8, 9, 10, 11),
@@ -280,6 +298,7 @@ def validate_stage5_ptq_preset_for_model(
                 + resolved.fc2_aware_gelu_blocks
                 + resolved.output_aware_gelu_blocks
                 + resolved.output_aware_mlp_blocks
+                + resolved.output_aware_attn_blocks
                 + resolved.gelu_from_accum_blocks
             )
             if idx < 0 or idx >= n_layer

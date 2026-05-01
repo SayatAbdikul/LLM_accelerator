@@ -19,6 +19,7 @@ import torch
 
 from taccel.runtime.calibration import (
     apply_fc2_aware_gelu_scale_search_from_token_ids,
+    apply_output_aware_attn_scale_search_from_token_ids,
     apply_output_aware_gelu_scale_search_from_token_ids,
     apply_output_aware_mlp_scale_search_from_token_ids,
     build_calibration_scales_from_token_ids,
@@ -268,6 +269,19 @@ def _build_artifacts_for_preset(
             include_pair_candidates=bool(getattr(args, "output_aware_include_pairs", False)),
         )
         diagnostics["output_aware_mlp"] = output_mlp_diag
+    if preset.output_aware_attn_blocks:
+        scales, output_attn_diag = apply_output_aware_attn_scale_search_from_token_ids(
+            payload,
+            calibration_ids,
+            scales,
+            blocks=preset.output_aware_attn_blocks,
+            ptq_preset=preset,
+            n_seqs=args.calibration_n_seqs,
+            seq_len=args.calibration_seq_len,
+            search_n_seqs_max=getattr(args, "output_aware_search_n_seqs", None),
+            search_seq_len_max=getattr(args, "output_aware_search_seq_len", None),
+        )
+        diagnostics["output_aware_attn"] = output_attn_diag
     return scales, diagnostics
 
 
@@ -710,6 +724,75 @@ def _mlp_block_ablation_sweep(
     return rows
 
 
+def _attn_v_block_ablation_sweep(
+    *,
+    payload: dict,
+    scales: Dict[str, float],
+    inputs: Sequence[int],
+    targets: Sequence[int],
+    fp32_logits: Sequence[np.ndarray],
+    fake_i8: Sequence[np.ndarray],
+    vocab_size: int,
+    lm_scale: float,
+    resolved_preset,
+) -> List[Dict[str, object]]:
+    n_layer = int(payload["model_args"]["n_layer"])
+    rows = _ablation_rows_for_groups(
+        payload=payload,
+        scales=scales,
+        inputs=inputs,
+        targets=targets,
+        fp32_logits=fp32_logits,
+        fake_i8=fake_i8,
+        vocab_size=vocab_size,
+        lm_scale=lm_scale,
+        resolved_preset=resolved_preset,
+        group_names=[f"attn_v_block_{idx}" for idx in range(n_layer)],
+        label_key="block_group",
+    )
+    for row in rows:
+        row["block"] = int(str(row["block_group"]).split("_")[-1])
+    return rows
+
+
+def _attn_v_head_ablation_sweep(
+    *,
+    payload: dict,
+    scales: Dict[str, float],
+    inputs: Sequence[int],
+    targets: Sequence[int],
+    fp32_logits: Sequence[np.ndarray],
+    fake_i8: Sequence[np.ndarray],
+    vocab_size: int,
+    lm_scale: float,
+    resolved_preset,
+) -> List[Dict[str, object]]:
+    n_layer = int(payload["model_args"]["n_layer"])
+    n_head = int(payload["model_args"]["n_head"])
+    rows = _ablation_rows_for_groups(
+        payload=payload,
+        scales=scales,
+        inputs=inputs,
+        targets=targets,
+        fp32_logits=fp32_logits,
+        fake_i8=fake_i8,
+        vocab_size=vocab_size,
+        lm_scale=lm_scale,
+        resolved_preset=resolved_preset,
+        group_names=[
+            f"attn_v_head_{layer}_{head}"
+            for layer in range(n_layer)
+            for head in range(n_head)
+        ],
+        label_key="head_group",
+    )
+    for row in rows:
+        _, _, _, layer, head = str(row["head_group"]).split("_")
+        row["block"] = int(layer)
+        row["head"] = int(head)
+    return rows
+
+
 def _best_ablation(ablation_rows: Sequence[Dict[str, object]]) -> Dict[str, object] | None:
     if not ablation_rows:
         return None
@@ -793,6 +876,8 @@ def _preset_sweep(
             row["output_aware_gelu"] = scale_diagnostics["output_aware_gelu"]
         if "output_aware_mlp" in scale_diagnostics:
             row["output_aware_mlp"] = scale_diagnostics["output_aware_mlp"]
+        if "output_aware_attn" in scale_diagnostics:
+            row["output_aware_attn"] = scale_diagnostics["output_aware_attn"]
         rows.append(row)
         print(
             f"[{idx}/{total}] {preset.name}: golden={row['golden_perplexity']:.1f}  fq={row['fake_quant_perplexity']:.1f}  rel_delta={row['relative_delta']:.4%}",
@@ -907,6 +992,18 @@ def _calibration_sweep(
                 ptq_preset=preset,
                 n_seqs=n_seqs,
                 seq_len=seq_len,
+            )
+        if preset.output_aware_attn_blocks:
+            scales, _ = apply_output_aware_attn_scale_search_from_token_ids(
+                payload,
+                calibration_ids,
+                scales,
+                blocks=preset.output_aware_attn_blocks,
+                ptq_preset=preset,
+                n_seqs=n_seqs,
+                seq_len=seq_len,
+                search_n_seqs_max=getattr(args, "output_aware_search_n_seqs", None),
+                search_seq_len_max=getattr(args, "output_aware_search_seq_len", None),
             )
         lm_scale = float(scales.get("lm_head", 1.0))
         golden = run_golden_teacher_forced_logits(payload, eval_tokens, scales, ptq_preset=preset)
@@ -1202,6 +1299,30 @@ def run_report(args) -> Dict[str, object]:
             lm_scale=lm_scale,
             resolved_preset=resolved_preset,
         )
+    if bool(getattr(args, "attn_v_block_ablation", False)):
+        report["attn_v_block_ablation"] = _attn_v_block_ablation_sweep(
+            payload=payload,
+            scales=scales,
+            inputs=inputs,
+            targets=targets,
+            fp32_logits=fp32_incr,
+            fake_i8=fake_incr,
+            vocab_size=vocab_size,
+            lm_scale=lm_scale,
+            resolved_preset=resolved_preset,
+        )
+    if bool(getattr(args, "attn_v_head_ablation", False)):
+        report["attn_v_head_ablation"] = _attn_v_head_ablation_sweep(
+            payload=payload,
+            scales=scales,
+            inputs=inputs,
+            targets=targets,
+            fp32_logits=fp32_incr,
+            fake_i8=fake_incr,
+            vocab_size=vocab_size,
+            lm_scale=lm_scale,
+            resolved_preset=resolved_preset,
+        )
     if bool(getattr(args, "preset_sweep", False)):
         report["preset_sweep"] = _preset_sweep(
             payload=payload,
@@ -1236,6 +1357,8 @@ def main(argv=None) -> int:
     parser.add_argument("--ablation-sweep", action="store_true")
     parser.add_argument("--mlp-subablation", action="store_true")
     parser.add_argument("--mlp-block-ablation", action="store_true")
+    parser.add_argument("--attn-v-block-ablation", action="store_true")
+    parser.add_argument("--attn-v-head-ablation", action="store_true")
     parser.add_argument("--preset-sweep", action="store_true")
     parser.add_argument("--output-aware-search-n-seqs", type=int)
     parser.add_argument("--output-aware-search-seq-len", type=int)
@@ -1266,6 +1389,8 @@ def main(argv=None) -> int:
             "ablation_sweep": report.get("ablation_sweep"),
             "mlp_subablation": report.get("mlp_subablation"),
             "mlp_block_ablation": report.get("mlp_block_ablation"),
+            "attn_v_block_ablation": report.get("attn_v_block_ablation"),
+            "attn_v_head_ablation": report.get("attn_v_head_ablation"),
             "node_trace": report.get("node_trace"),
         }), indent=2, sort_keys=True))
     return 0

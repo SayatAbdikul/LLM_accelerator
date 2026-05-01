@@ -11,6 +11,7 @@ import numpy as np
 
 from .calibration import (
     apply_fc2_aware_gelu_scale_search_from_token_ids,
+    apply_output_aware_attn_scale_search_from_token_ids,
     apply_output_aware_gelu_scale_search_from_token_ids,
     apply_output_aware_mlp_scale_search_from_token_ids,
     build_calibration_scales_from_token_ids,
@@ -165,6 +166,8 @@ def evaluate_gpt2_perplexity(
     calibration_n_seqs: int = 64,
     calibration_percentile: float = 99.9,
     ptq_preset: str | Stage5PTQPreset | None = None,
+    output_aware_search_n_seqs: int | None = None,
+    output_aware_search_seq_len: int | None = None,
 ) -> GPT2PerplexityResult:
     if context_len < 1:
         raise ValueError("context_len must be positive")
@@ -222,6 +225,18 @@ def evaluate_gpt2_perplexity(
             ptq_preset=resolved_preset,
             n_seqs=calibration_n_seqs,
             seq_len=calibration_seq_len,
+        )
+    if resolved_preset.output_aware_attn_blocks:
+        calibration_scales, _ = apply_output_aware_attn_scale_search_from_token_ids(
+            payload,
+            calibration_token_ids,
+            calibration_scales,
+            blocks=resolved_preset.output_aware_attn_blocks,
+            ptq_preset=resolved_preset,
+            n_seqs=calibration_n_seqs,
+            seq_len=calibration_seq_len,
+            search_n_seqs_max=output_aware_search_n_seqs,
+            search_seq_len_max=output_aware_search_seq_len,
         )
     _, targets = teacher_forced_inputs_and_targets(eval_tokens)
     vocab_size = int(payload["model_args"]["vocab_size"])

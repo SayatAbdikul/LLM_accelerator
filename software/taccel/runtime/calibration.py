@@ -721,6 +721,145 @@ def apply_output_aware_mlp_scale_search_from_token_ids(
     return scales, diagnostics
 
 
+def apply_output_aware_attn_scale_search_from_token_ids(
+    payload: Dict[str, object],
+    token_ids: Sequence[int],
+    calibration_scales: Dict[str, float],
+    *,
+    blocks: Sequence[int],
+    ptq_preset,
+    n_seqs: int = 8,
+    seq_len: int = 16,
+    multipliers: Sequence[float] = OUTPUT_AWARE_MLP_MULTIPLIERS,
+    search_n_seqs_max: int | None = None,
+    search_seq_len_max: int | None = None,
+    include_value_search: bool = False,
+) -> tuple[Dict[str, float], Dict[str, Dict[str, object]]]:
+    """Greedily tune attn_v scale groups against final fake-quant token NLL.
+
+    Searches one primary group per block:
+
+    * ``attn_v``: applies a shared multiplier to all per-head attn_v scales.
+
+    Optionally also searches ``value`` (per-head V projection output scales)
+    as a secondary group after attn_v if ``include_value_search=True``.
+    """
+    block_set = sorted({int(block) for block in blocks})
+    if not block_set:
+        return dict(calibration_scales), {}
+
+    model_args = payload["model_args"]
+    n_layer = int(model_args["n_layer"])
+    n_head = int(model_args["n_head"])
+    invalid = [block for block in block_set if block < 0 or block >= n_layer]
+    if invalid:
+        raise ValueError(f"output-aware attn blocks outside n_layer={n_layer}: {invalid}")
+
+    n_cap = OUTPUT_AWARE_SEARCH_N_SEQS_MAX if search_n_seqs_max is None else int(search_n_seqs_max)
+    len_cap = OUTPUT_AWARE_SEARCH_SEQ_LEN_MAX if search_seq_len_max is None else int(search_seq_len_max)
+    search_n_seqs = max(1, min(int(n_seqs), max(1, n_cap)))
+    search_seq_len = max(2, min(int(seq_len), max(2, len_cap)))
+    seqs = build_calibration_seqs_from_token_ids(
+        token_ids,
+        n_seqs=search_n_seqs,
+        seq_len=search_seq_len,
+    )
+    scales = dict(calibration_scales)
+    diagnostics: Dict[str, Dict[str, object]] = {}
+    current_nll = _mean_fake_quant_target_nll(payload, seqs, scales, ptq_preset=ptq_preset)
+
+    def _candidate_for_group(group_keys: Sequence[str], base_scale: float, multiplier: float) -> Dict[str, float]:
+        candidate = dict(scales)
+        new_scale = float(base_scale) * float(multiplier)
+        for key in group_keys:
+            candidate[key] = new_scale
+        return candidate
+
+    def _value_keys(block: int, head: int) -> tuple[str, str]:
+        value_key = f"block{block}_head{head}_value"
+        return value_key, f"block{block}_head{head}_value_kv_load"
+
+    for block in block_set:
+        block_start_nll = float(current_nll)
+        group_specs = [
+            (
+                "attn_v",
+                tuple((f"block{block}_head{H}_attn_v",) for H in range(n_head)),
+            ),
+        ]
+        if include_value_search:
+            group_specs.append((
+                "value",
+                tuple(_value_keys(block, H) for H in range(n_head)),
+            ))
+        group_results: Dict[str, object] = {}
+        for group_name, key_groups in group_specs:
+            base_scales = [float(scales.get(keys[0], _DEFAULT_SCALES)) for keys in key_groups]
+            if any(scale <= 0.0 for scale in base_scales):
+                raise ValueError(f"output-aware attn search requires positive scales for {key_groups}")
+            group_start_nll = float(current_nll)
+            candidate_rows: List[Dict[str, float]] = []
+            for multiplier in multipliers:
+                m = float(multiplier)
+                if m <= 0.0:
+                    continue
+                candidate_scales = dict(scales)
+                for keys, base_scale in zip(key_groups, base_scales):
+                    candidate_scales.update(_candidate_for_group(keys, base_scale, m))
+                mean_nll = _mean_fake_quant_target_nll(payload, seqs, candidate_scales, ptq_preset=ptq_preset)
+                candidate_rows.append({
+                    "multiplier": m,
+                    "scales": {
+                        keys[0]: float(base_scale * m)
+                        for keys, base_scale in zip(key_groups, base_scales)
+                    },
+                    "mean_nll": float(mean_nll),
+                })
+            if not candidate_rows:
+                raise ValueError("output-aware attn search received no valid candidate multipliers")
+            best = min(
+                candidate_rows,
+                key=lambda row: (
+                    row["mean_nll"],
+                    abs(row["multiplier"] - 1.0),
+                    row["multiplier"],
+                ),
+            )
+            accepted = bool(best["mean_nll"] < current_nll)
+            if accepted:
+                for keys, base_scale in zip(key_groups, base_scales):
+                    selected_scale = float(base_scale * float(best["multiplier"]))
+                    for key in keys:
+                        scales[key] = selected_scale
+                current_nll = float(best["mean_nll"])
+            group_results[group_name] = {
+                "key_groups": [list(keys) for keys in key_groups],
+                "old_scales": {
+                    keys[0]: float(base_scale)
+                    for keys, base_scale in zip(key_groups, base_scales)
+                },
+                "new_scales": {
+                    keys[0]: float(scales.get(keys[0], base_scale))
+                    for keys, base_scale in zip(key_groups, base_scales)
+                },
+                "multiplier": float(best["multiplier"]) if accepted else 1.0,
+                "accepted": accepted,
+                "baseline_mean_nll": group_start_nll,
+                "best_candidate_mean_nll": float(best["mean_nll"]),
+                "selected_mean_nll": float(current_nll),
+                "candidate_count": int(len(candidate_rows)),
+                "candidates": candidate_rows,
+            }
+        diagnostics[f"block{block}"] = {
+            "baseline_mean_nll": block_start_nll,
+            "selected_mean_nll": float(current_nll),
+            "search_n_seqs": int(search_n_seqs),
+            "search_seq_len": int(search_seq_len),
+            "groups": group_results,
+        }
+    return scales, diagnostics
+
+
 def _apply_raw_vadd_safe_tok_pos_scale(
     scales: Dict[str, float],
     state_dict: dict,

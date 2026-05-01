@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from taccel.runtime import calibration as calibration_mod
 from taccel.runtime.stage5_ptq import (
     STAGE5_PTQ_PRESETS,
     Stage5PTQPreset,
@@ -90,10 +91,12 @@ def test_stage5_preset_registry_contains_core_presets_and_promoted_default():
         "hessian_gelu_11", "fc2_11_fc2aware_gelu", "out_proj_11_fc2_11_fc2aware_gelu",
         "output_aware_gelu_8_to_11", "output_aware_mlp_8_to_11",
         "output_aware_mlp_0_to_11", "output_aware_mlp_0_1_4_8_to_11",
+        "output_aware_mlp_0_1_4_6_7_8_to_11",
+        "output_aware_attn_all", "output_aware_mlp_attn_0_1_4_8_to_11",
         "gelu_accum_8_to_11", "output_aware_mlp_gelu_accum_8_to_11",
     }
     assert core.issubset(set(STAGE5_PTQ_PRESETS))
-    assert stage5_default_ptq_preset_name() == "output_aware_mlp_8_to_11"
+    assert stage5_default_ptq_preset_name() == "output_aware_mlp_0_1_4_8_to_11"
     assert resolve_stage5_ptq_preset("control").name == "control"
     with pytest.raises(KeyError, match="unknown Stage 5 PTQ preset"):
         resolve_stage5_ptq_preset("not_a_preset")
@@ -159,6 +162,7 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         fc2_aware_gelu_blocks=(0,),
         output_aware_gelu_blocks=(),
         output_aware_mlp_blocks=(),
+        output_aware_attn_blocks=(),
         gelu_from_accum_blocks=(),
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
@@ -173,6 +177,7 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         fc2_aware_gelu_blocks=(),
         output_aware_gelu_blocks=(0,),
         output_aware_mlp_blocks=(),
+        output_aware_attn_blocks=(),
         gelu_from_accum_blocks=(),
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
@@ -187,6 +192,7 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         fc2_aware_gelu_blocks=(),
         output_aware_gelu_blocks=(),
         output_aware_mlp_blocks=(0,),
+        output_aware_attn_blocks=(),
         gelu_from_accum_blocks=(),
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
@@ -201,6 +207,7 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         fc2_aware_gelu_blocks=(),
         output_aware_gelu_blocks=(),
         output_aware_mlp_blocks=(),
+        output_aware_attn_blocks=(),
         gelu_from_accum_blocks=(0,),
     )
     with pytest.raises(ValueError, match="GELU-from-ACCUM and FC1 REQUANT_PC"):
@@ -217,6 +224,60 @@ def test_stage5_scale_policy_ties_out_proj_and_residual_for_raw_vadd_block():
     assert updated["block11_out_proj"] == pytest.approx(scales["block10_residual2"])
     assert updated["block11_residual1"] == pytest.approx(scales["block10_residual2"])
     assert scales["block11_out_proj"] == 0.5
+
+
+def test_output_aware_attn_blockwide_uses_one_multiplier_for_all_heads(monkeypatch):
+    payload = {"model_args": {"n_layer": 1, "n_head": 2, "vocab_size": 4}, "state_dict": {}}
+    scales = {
+        "block0_head0_attn_v": 1.0,
+        "block0_head1_attn_v": 2.0,
+    }
+
+    def fake_mean(payload, seqs, scales, *, ptq_preset):
+        return float(scales["block0_head0_attn_v"] + scales["block0_head1_attn_v"])
+
+    monkeypatch.setattr(calibration_mod, "_mean_fake_quant_target_nll", fake_mean)
+    updated, diagnostics = calibration_mod.apply_output_aware_attn_scale_search_from_token_ids(
+        payload,
+        [0, 1, 2],
+        scales,
+        blocks=(0,),
+        ptq_preset="control",
+        multipliers=(0.75, 1.0),
+    )
+
+    assert updated["block0_head0_attn_v"] == pytest.approx(0.75)
+    assert updated["block0_head1_attn_v"] == pytest.approx(1.5)
+    assert tuple(diagnostics["block0"]["groups"]) == ("attn_v",)
+
+
+def test_output_aware_attn_value_search_keeps_kv_load_scale_synced(monkeypatch):
+    payload = {"model_args": {"n_layer": 1, "n_head": 1, "vocab_size": 4}, "state_dict": {}}
+    scales = {
+        "block0_head0_attn_v": 1.0,
+        "block0_head0_value": 1.0,
+        "block0_head0_value_kv_load": 1.0,
+    }
+
+    def fake_mean(payload, seqs, scales, *, ptq_preset):
+        return float(scales["block0_head0_value"] + scales["block0_head0_value_kv_load"])
+
+    monkeypatch.setattr(calibration_mod, "_mean_fake_quant_target_nll", fake_mean)
+    updated, diagnostics = calibration_mod.apply_output_aware_attn_scale_search_from_token_ids(
+        payload,
+        [0, 1, 2],
+        scales,
+        blocks=(0,),
+        ptq_preset="control",
+        multipliers=(0.75, 1.0),
+        include_value_search=True,
+    )
+
+    assert updated["block0_head0_value"] == pytest.approx(0.75)
+    assert updated["block0_head0_value_kv_load"] == pytest.approx(0.75)
+    assert diagnostics["block0"]["groups"]["value"]["key_groups"] == [
+        ["block0_head0_value", "block0_head0_value_kv_load"]
+    ]
 
 
 def test_stage5_scale_policy_ties_fc2_and_residual2_for_raw_vadd_block():
@@ -310,6 +371,8 @@ def test_debug_preset_sweep_reports_all_presets_and_deterministic_winner(monkeyp
             diagnostics = {"output_aware_gelu": {"block11": {"multiplier": 1.125, "selected_mean_nll": 1.0}}}
         if "output_aware_mlp" in preset_name:
             diagnostics = {"output_aware_mlp": {"block11": {"selected_mean_nll": 1.0}}}
+        if "output_aware_attn" in preset_name:
+            diagnostics["output_aware_attn"] = {"block0": {"selected_mean_nll": 1.0}}
         return {"lm_head": 1.0}, diagnostics
 
     def fake_fake(payload, eval_tokens, scales, *, ptq_preset=None):
@@ -338,11 +401,13 @@ def test_debug_preset_sweep_reports_all_presets_and_deterministic_winner(monkeyp
     assert set(preset_names).issubset(result_names)
     assert report["winner"]["name"] == "late_ln_combo"
     assert report["proposed_promotion"] == "late_ln_combo"
-    assert report["promoted_default"] == "output_aware_mlp_8_to_11"
-    assert report["default_replacement_candidate"]["baseline"] == "output_aware_mlp_8_to_11"
+    assert report["promoted_default"] == "output_aware_mlp_0_1_4_8_to_11"
+    assert report["default_replacement_candidate"]["baseline"] == "output_aware_mlp_0_1_4_8_to_11"
     fc2aware_rows = [row for row in report["rows"] if row["name"] == "fc2_11_fc2aware_gelu"]
     assert fc2aware_rows and "fc2_aware_gelu" in fc2aware_rows[0]
     output_aware_rows = [row for row in report["rows"] if row["name"] == "output_aware_gelu_8_to_11"]
     assert output_aware_rows and "output_aware_gelu" in output_aware_rows[0]
-    output_aware_mlp_rows = [row for row in report["rows"] if row["name"] == "output_aware_mlp_8_to_11"]
+    output_aware_mlp_rows = [row for row in report["rows"] if row["name"] == "output_aware_mlp_0_1_4_8_to_11"]
     assert output_aware_mlp_rows and "output_aware_mlp" in output_aware_mlp_rows[0]
+    output_aware_attn_rows = [row for row in report["rows"] if row["name"] == "output_aware_attn_all"]
+    assert output_aware_attn_rows and "output_aware_attn" in output_aware_attn_rows[0]

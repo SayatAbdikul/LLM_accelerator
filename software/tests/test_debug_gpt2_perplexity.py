@@ -129,7 +129,7 @@ def test_debug_gpt2_perplexity_outputs_json_sections():
     )
     data = json.loads(proc.stdout)
     assert "primary_suspect" in data
-    assert data["ptq_preset"] == "output_aware_mlp_8_to_11"
+    assert data["ptq_preset"] == "output_aware_mlp_0_1_4_8_to_11"
     assert {"fp32_baseline", "lm_head_quantization", "calibration_sensitivity", "shared_decode_semantics", "converter_bias_layout"}.issubset(data["suspects"])
     assert len(data["suspects"]["calibration_sensitivity"]) == 4
     assert len(data["per_step"]) == 1
@@ -171,11 +171,11 @@ def test_debug_gpt2_perplexity_preset_sweep_json_sections():
         ]
     )
     data = json.loads(proc.stdout)
-    assert data["preset_sweep"]["promoted_default"] == "output_aware_mlp_8_to_11"
+    assert data["preset_sweep"]["promoted_default"] == "output_aware_mlp_0_1_4_8_to_11"
     assert len(data["preset_sweep"]["rows"]) == len(STAGE5_PTQ_PRESETS)
     assert data["preset_sweep"]["rows"][0]["name"]
     assert data["preset_sweep"]["winner"]["name"]
-    assert data["preset_sweep"]["default_replacement_candidate"]["baseline"] == "output_aware_mlp_8_to_11"
+    assert data["preset_sweep"]["default_replacement_candidate"]["baseline"] == "output_aware_mlp_0_1_4_8_to_11"
     by_name = {row["name"]: row for row in data["preset_sweep"]["rows"]}
     assert "fc2_11_fc2aware_gelu" in by_name
     assert "fc2_aware_gelu" in by_name["fc2_11_fc2aware_gelu"]
@@ -306,6 +306,47 @@ def test_gpt2_ablation_sweep_reports_all_groups():
 
     assert [row["group"] for row in rows] == list(dbg.ABLATION_GROUPS)
     assert best["group"] == dbg.ABLATION_GROUPS[-1]
+
+
+def test_attn_v_head_ablation_reports_every_head(monkeypatch):
+    dbg = _debug_module()
+
+    def fake_rows_for_groups(**kwargs):
+        assert kwargs["label_key"] == "head_group"
+        return [
+            {
+                "head_group": group,
+                "perplexity": 10.0,
+                "mean_nll": 1.0,
+                "nll_improvement_vs_baseline": float(idx),
+                "min_top10_overlap_vs_fp32": 7,
+                "mean_top10_overlap_vs_fp32": 8.0,
+                "min_cosine_vs_fp32": 0.9,
+                "mean_cosine_vs_fp32": 0.95,
+            }
+            for idx, group in enumerate(kwargs["group_names"])
+        ]
+
+    monkeypatch.setattr(dbg, "_ablation_rows_for_groups", fake_rows_for_groups)
+    rows = dbg._attn_v_head_ablation_sweep(
+        payload={"model_args": {"n_layer": 12, "n_head": 12}},
+        scales={},
+        inputs=[0],
+        targets=[1],
+        fp32_logits=[],
+        fake_i8=[],
+        vocab_size=4,
+        lm_scale=1.0,
+        resolved_preset=None,
+    )
+
+    assert len(rows) == 144
+    assert rows[0]["head_group"] == "attn_v_head_0_0"
+    assert rows[0]["block"] == 0
+    assert rows[0]["head"] == 0
+    assert rows[-1]["head_group"] == "attn_v_head_11_11"
+    assert rows[-1]["block"] == 11
+    assert rows[-1]["head"] == 11
 
 
 def test_embedding_add_diagnostics_report_before_and_active_scale():
