@@ -999,9 +999,11 @@ class NanoGPTFQReference:
         elif "lm_head_output_fp32" in groups:
             ln_f_i8 = _fp32_to_int8(ln_f, ln_f_scale)
             logits_accum = ln_f_i8.astype(np.int32) @ self.lm_head_w_q.astype(np.int32).T
+            # requant_pc may be padded to 16-wide boundary; slice to actual vocab size.
             # Returns accum * requant_pc = true_logits / lm_head_scale so that the
             # caller's normal dequant (* lm_scale) produces true FP32 logits without INT8 clipping.
-            return (logits_accum.astype(np.float32) * self.lm_head_requant_pc.astype(np.float32))[0]
+            requant_pc = self.lm_head_requant_pc.astype(np.float32)[:logits_accum.shape[-1]]
+            return (logits_accum.astype(np.float32) * requant_pc)[0]
         if not self._large_vocab_lm_head_reference():
             logits = ln_f @ self.lm_head_w.T
             logits_i8 = _to_int8_logits(logits[0], _scale(s, "lm_head"))
