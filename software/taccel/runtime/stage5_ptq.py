@@ -267,7 +267,7 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
 
 # Updated only after a preset wins on the real local GPT-2 checkpoint and still
 # keeps the existing golden-vs-fake gates green.
-PROMOTED_STAGE5_PTQ_PRESET = "output_aware_mlp_0_1_4_8_to_11"
+PROMOTED_STAGE5_PTQ_PRESET = "output_aware_mlp_lm_head_0_1_4_8_to_11"
 
 
 def stage5_default_ptq_preset_name() -> str:
