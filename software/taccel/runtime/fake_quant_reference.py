@@ -702,6 +702,13 @@ class NanoGPTFQReference:
         def mlp_group_active(name: str, layer_idx: int) -> bool:
             return name in groups or f"{name}_block_{layer_idx}" in groups
 
+        def attn_group_active(name: str, layer_idx: int, head_idx: int) -> bool:
+            return (
+                name in groups
+                or f"{name}_block_{layer_idx}" in groups
+                or f"{name}_head_{layer_idx}_{head_idx}" in groups
+            )
+
         def record(name: str, value: np.ndarray, *, scale: Optional[float] = None,
                    int8: Optional[np.ndarray] = None) -> None:
             if trace is None:
@@ -744,10 +751,11 @@ class NanoGPTFQReference:
                 v_scale = _scale(s, f"block{L}_head{H}_value")
                 attn_v_scale = _scale(s, f"block{L}_head{H}_attn_v")
 
+                value_fp32 = ln1 @ v_w_fp32.T + v_b_fp32
                 if "qkv" in groups:
                     q = ln1 @ q_w_fp32.T + q_b_fp32
                     k = ln1 @ k_w_fp32.T + k_b_fp32
-                    v = ln1 @ v_w_fp32.T + v_b_fp32
+                    v = value_fp32
                 elif self._integer_linear_reference():
                     q_accum = ln1_i8.astype(np.int32) @ q_q.astype(np.int32).T + q_b_i32
                     k_accum = ln1_i8.astype(np.int32) @ k_q.astype(np.int32).T + k_b_i32
@@ -770,10 +778,12 @@ class NanoGPTFQReference:
                 record(f"block{L}_head{H}_value", v, scale=v_scale, int8=v_i8)
                 caches[L][H]["k"].append(k_i8[0].copy())
                 caches[L][H]["v"].append(v_i8[0].copy())
+                caches[L][H].setdefault("v_fp32", []).append(value_fp32[0].copy())
 
                 k_cache_i8 = np.stack(caches[L][H]["k"], axis=0).astype(np.int8)
                 v_cache_i8 = np.stack(caches[L][H]["v"], axis=0).astype(np.int8)
                 v_cache = v_cache_i8.astype(np.float32) * _arch_scale(v_scale)
+                v_cache_fp32 = np.stack(caches[L][H]["v_fp32"], axis=0).astype(np.float32)
                 if self._integer_linear_reference():
                     qkt_accum = q_i8.astype(np.int32) @ k_cache_i8.astype(np.int32).T
                     attn = _dequant_accum_fp32(
@@ -788,7 +798,7 @@ class NanoGPTFQReference:
                 exp_row = np.exp(row - row_max)
                 probs = (exp_row / float(exp_row.sum()))[None, :]
                 softmax_scale = _scale(s, f"block{L}_head{H}_softmax", 1.0 / 127.0)
-                if "softmax" not in groups:
+                if not attn_group_active("softmax", L, H):
                     probs = _qdq(probs, softmax_scale)
                 probs_i8 = _fp32_to_int8(probs, softmax_scale)
                 record(
@@ -797,7 +807,9 @@ class NanoGPTFQReference:
                     scale=softmax_scale,
                     int8=probs_i8,
                 )
-                if "attn_v" not in groups:
+                attn_v_fp32 = attn_group_active("attn_v", L, H)
+                value_cache_fp32 = attn_group_active("attn_v_value_fp32", L, H)
+                if not (attn_v_fp32 or value_cache_fp32):
                     if self._integer_linear_reference():
                         head_accum = probs_i8.astype(np.int32) @ v_cache_i8.astype(np.int32)
                         head_out_i8 = _requant_accum_int8(
@@ -810,7 +822,7 @@ class NanoGPTFQReference:
                         head_out = _qdq(probs @ v_cache, attn_v_scale)
                         head_out_i8 = _fp32_to_int8(head_out, attn_v_scale)
                 else:
-                    head_out = probs @ v_cache
+                    head_out = probs @ (v_cache_fp32 if value_cache_fp32 else v_cache)
                     head_out_i8 = _fp32_to_int8(head_out, attn_v_scale)
                 record(
                     f"block{L}_head{H}_attn_v",
@@ -972,6 +984,24 @@ class NanoGPTFQReference:
             logits = ln_f @ self.lm_head_w_fp32.T
             record("lm_head", logits, scale=None, int8=None)
             return logits[0].astype(np.float32)
+        elif "lm_head_weight_fp32" in groups:
+            logits_fp32 = ln_f[-1:] @ self.lm_head_w_fp32.T
+            return _to_int8_logits(logits_fp32[0], _scale(s, "lm_head"))
+        elif "lm_head_requant_fp32" in groups:
+            ln_f_i8 = _fp32_to_int8(ln_f, ln_f_scale)
+            logits_accum = ln_f_i8.astype(np.int32) @ self.lm_head_w_q.astype(np.int32).T
+            requant_f32 = (
+                np.float32(ln_f_scale)
+                * self.lm_head_w_scales.astype(np.float32)
+                / max(np.float32(_scale(s, "lm_head")), np.float32(1e-12))
+            )
+            return _requant_accum_pc_int8(logits_accum, requant_f32)[0]
+        elif "lm_head_output_fp32" in groups:
+            ln_f_i8 = _fp32_to_int8(ln_f, ln_f_scale)
+            logits_accum = ln_f_i8.astype(np.int32) @ self.lm_head_w_q.astype(np.int32).T
+            # Returns accum * requant_pc = true_logits / lm_head_scale so that the
+            # caller's normal dequant (* lm_scale) produces true FP32 logits without INT8 clipping.
+            return (logits_accum.astype(np.float32) * self.lm_head_requant_pc.astype(np.float32))[0]
         if not self._large_vocab_lm_head_reference():
             logits = ln_f @ self.lm_head_w.T
             logits_i8 = _to_int8_logits(logits[0], _scale(s, "lm_head"))

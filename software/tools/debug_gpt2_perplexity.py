@@ -21,6 +21,7 @@ from taccel.runtime.calibration import (
     apply_fc2_aware_gelu_scale_search_from_token_ids,
     apply_output_aware_attn_scale_search_from_token_ids,
     apply_output_aware_gelu_scale_search_from_token_ids,
+    apply_output_aware_lm_head_scale_search_from_token_ids,
     apply_output_aware_mlp_scale_search_from_token_ids,
     build_calibration_scales_from_token_ids,
 )
@@ -82,6 +83,47 @@ MLP_SUBABLATION_GROUPS = (
     "mlp_gelu_fc2",
     "mlp_fc1_gelu_fc2",
     "mlp_full",
+)
+
+ATTN_V_STRUCTURAL_GROUPS = (
+    {
+        "name": "int8_product_bypass",
+        "fp32_groups": ("attn_v",),
+        "description": "quantized softmax probabilities times dequantized INT8 V cache",
+    },
+    {
+        "name": "softmax_product_bypass",
+        "fp32_groups": ("softmax", "attn_v"),
+        "description": "FP32 softmax probabilities times dequantized INT8 V cache",
+    },
+    {
+        "name": "value_product_bypass",
+        "fp32_groups": ("attn_v_value_fp32",),
+        "description": "quantized softmax probabilities times FP32 V cache",
+    },
+    {
+        "name": "softmax_value_product_bypass",
+        "fp32_groups": ("softmax", "attn_v_value_fp32"),
+        "description": "FP32 softmax probabilities times FP32 V cache",
+    },
+)
+
+LM_HEAD_STRUCTURAL_GROUPS = (
+    {
+        "name": "weight_fp32_output_int8",
+        "fp32_groups": ("lm_head_weight_fp32",),
+        "description": "FP32 weights, INT8 output — isolates weight quantization error",
+    },
+    {
+        "name": "weight_int8_requant_fp32_output_int8",
+        "fp32_groups": ("lm_head_requant_fp32",),
+        "description": "INT8 weights with FP32 requant scales — tests FP16 truncation error",
+    },
+    {
+        "name": "weight_int8_output_fp32",
+        "fp32_groups": ("lm_head_output_fp32",),
+        "description": "INT8 weights, FP32 output — isolates INT8 clipping/range error",
+    },
 )
 
 
@@ -282,6 +324,18 @@ def _build_artifacts_for_preset(
             search_seq_len_max=getattr(args, "output_aware_search_seq_len", None),
         )
         diagnostics["output_aware_attn"] = output_attn_diag
+    if preset.output_aware_lm_head:
+        scales, lm_head_diag = apply_output_aware_lm_head_scale_search_from_token_ids(
+            payload,
+            calibration_ids,
+            scales,
+            ptq_preset=preset,
+            n_seqs=args.calibration_n_seqs,
+            seq_len=args.calibration_seq_len,
+            search_n_seqs_max=getattr(args, "output_aware_search_n_seqs", None),
+            search_seq_len_max=getattr(args, "output_aware_search_seq_len", None),
+        )
+        diagnostics["output_aware_lm_head"] = lm_head_diag
     return scales, diagnostics
 
 
@@ -793,6 +847,120 @@ def _attn_v_head_ablation_sweep(
     return rows
 
 
+def _attn_v_structural_sweep(
+    *,
+    payload: dict,
+    scales: Dict[str, float],
+    inputs: Sequence[int],
+    targets: Sequence[int],
+    fp32_logits: Sequence[np.ndarray],
+    fake_i8: Sequence[np.ndarray],
+    vocab_size: int,
+    lm_scale: float,
+    resolved_preset,
+) -> List[Dict[str, object]]:
+    baseline_fake_deq = [
+        _dequantize_fake_logits(row, lm_scale)[:vocab_size]
+        for row in fake_i8
+    ]
+    baseline_ppl = _ppl_from_logits(baseline_fake_deq, targets, vocab_size=vocab_size)
+    rows: List[Dict[str, object]] = []
+    for spec in ATTN_V_STRUCTURAL_GROUPS:
+        group_set = set(str(group) for group in spec["fp32_groups"])
+        ref = NanoGPTFQReference(
+            payload["state_dict"],
+            payload["model_args"],
+            scales,
+            requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset),
+            raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
+            raw_residual2_blocks=stage5_raw_residual2_blocks(resolved_preset),
+            gelu_from_accum_blocks=stage5_gelu_from_accum_blocks(resolved_preset),
+        )
+        logits = ref.incremental_logits_trace(inputs, fp32_groups=group_set)
+        deq = [
+            _dequantize_fake_logits(row, lm_scale)[:vocab_size]
+            for row in logits
+        ]
+        ppl = _ppl_from_logits(deq, targets, vocab_size=vocab_size)
+        pair = _logit_pair_summary(deq, fp32_logits, vocab_size=vocab_size)
+        rows.append({
+            "name": str(spec["name"]),
+            "fp32_groups": list(spec["fp32_groups"]),
+            "description": str(spec["description"]),
+            "perplexity": ppl["perplexity"],
+            "mean_nll": ppl["mean_nll"],
+            "nll_improvement_vs_baseline": float(baseline_ppl["mean_nll"] - ppl["mean_nll"]),
+            "min_top10_overlap_vs_fp32": pair["min_top10_overlap"],
+            "mean_top10_overlap_vs_fp32": pair["mean_top10_overlap"],
+            "min_cosine_vs_fp32": pair["min_cosine"],
+            "mean_cosine_vs_fp32": pair["mean_cosine"],
+        })
+    rows.sort(
+        key=lambda row: (
+            -float(row["nll_improvement_vs_baseline"]),
+            str(row["name"]),
+        )
+    )
+    return rows
+
+
+def _lm_head_structural_sweep(
+    *,
+    payload: dict,
+    scales: Dict[str, float],
+    inputs: Sequence[int],
+    targets: Sequence[int],
+    fp32_logits: Sequence[np.ndarray],
+    fake_i8: Sequence[np.ndarray],
+    vocab_size: int,
+    lm_scale: float,
+    resolved_preset,
+) -> List[Dict[str, object]]:
+    baseline_fake_deq = [
+        _dequantize_fake_logits(row, lm_scale)[:vocab_size]
+        for row in fake_i8
+    ]
+    baseline_ppl = _ppl_from_logits(baseline_fake_deq, targets, vocab_size=vocab_size)
+    rows: List[Dict[str, object]] = []
+    for spec in LM_HEAD_STRUCTURAL_GROUPS:
+        group_set = set(str(group) for group in spec["fp32_groups"])
+        ref = NanoGPTFQReference(
+            payload["state_dict"],
+            payload["model_args"],
+            scales,
+            requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset),
+            raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
+            raw_residual2_blocks=stage5_raw_residual2_blocks(resolved_preset),
+            gelu_from_accum_blocks=stage5_gelu_from_accum_blocks(resolved_preset),
+        )
+        logits = ref.incremental_logits_trace(inputs, fp32_groups=group_set)
+        deq = [
+            _dequantize_fake_logits(row, lm_scale)[:vocab_size]
+            for row in logits
+        ]
+        ppl = _ppl_from_logits(deq, targets, vocab_size=vocab_size)
+        pair = _logit_pair_summary(deq, fp32_logits, vocab_size=vocab_size)
+        rows.append({
+            "name": str(spec["name"]),
+            "fp32_groups": list(spec["fp32_groups"]),
+            "description": str(spec["description"]),
+            "perplexity": ppl["perplexity"],
+            "mean_nll": ppl["mean_nll"],
+            "nll_improvement_vs_baseline": float(baseline_ppl["mean_nll"] - ppl["mean_nll"]),
+            "min_top10_overlap_vs_fp32": pair["min_top10_overlap"],
+            "mean_top10_overlap_vs_fp32": pair["mean_top10_overlap"],
+            "min_cosine_vs_fp32": pair["min_cosine"],
+            "mean_cosine_vs_fp32": pair["mean_cosine"],
+        })
+    rows.sort(
+        key=lambda row: (
+            -float(row["nll_improvement_vs_baseline"]),
+            str(row["name"]),
+        )
+    )
+    return rows
+
+
 def _best_ablation(ablation_rows: Sequence[Dict[str, object]]) -> Dict[str, object] | None:
     if not ablation_rows:
         return None
@@ -878,6 +1046,8 @@ def _preset_sweep(
             row["output_aware_mlp"] = scale_diagnostics["output_aware_mlp"]
         if "output_aware_attn" in scale_diagnostics:
             row["output_aware_attn"] = scale_diagnostics["output_aware_attn"]
+        if "output_aware_lm_head" in scale_diagnostics:
+            row["output_aware_lm_head"] = scale_diagnostics["output_aware_lm_head"]
         rows.append(row)
         print(
             f"[{idx}/{total}] {preset.name}: golden={row['golden_perplexity']:.1f}  fq={row['fake_quant_perplexity']:.1f}  rel_delta={row['relative_delta']:.4%}",
@@ -1206,14 +1376,18 @@ def run_report(args) -> Dict[str, object]:
                 active_scale=float(scales.get("tok_pos_add", 6.0 / 127.0)),
                 percentile=args.calibration_percentile,
             ),
-            "calibration_sensitivity": _calibration_sweep(
-                payload,
-                calibration_ids=calibration_ids,
-                eval_tokens=eval_tokens,
-                vocab_size=vocab_size,
-                tokenizer_dir=tokenizer_dir,
-                args=args,
-                ptq_preset=resolved_preset.name,
+            "calibration_sensitivity": (
+                []
+                if bool(getattr(args, "skip_calibration_sensitivity", False))
+                else _calibration_sweep(
+                    payload,
+                    calibration_ids=calibration_ids,
+                    eval_tokens=eval_tokens,
+                    vocab_size=vocab_size,
+                    tokenizer_dir=tokenizer_dir,
+                    args=args,
+                    ptq_preset=resolved_preset.name,
+                )
             ),
             "shared_decode_semantics": {
                 "fp32_full_vs_incremental": _logit_pair_summary(fp32_full, fp32_incr, vocab_size=vocab_size),
@@ -1323,6 +1497,30 @@ def run_report(args) -> Dict[str, object]:
             lm_scale=lm_scale,
             resolved_preset=resolved_preset,
         )
+    if bool(getattr(args, "attn_v_structural", False)):
+        report["attn_v_structural"] = _attn_v_structural_sweep(
+            payload=payload,
+            scales=scales,
+            inputs=inputs,
+            targets=targets,
+            fp32_logits=fp32_incr,
+            fake_i8=fake_incr,
+            vocab_size=vocab_size,
+            lm_scale=lm_scale,
+            resolved_preset=resolved_preset,
+        )
+    if bool(getattr(args, "lm_head_structural", False)):
+        report["lm_head_structural"] = _lm_head_structural_sweep(
+            payload=payload,
+            scales=scales,
+            inputs=inputs,
+            targets=targets,
+            fp32_logits=fp32_incr,
+            fake_i8=fake_incr,
+            vocab_size=vocab_size,
+            lm_scale=lm_scale,
+            resolved_preset=resolved_preset,
+        )
     if bool(getattr(args, "preset_sweep", False)):
         report["preset_sweep"] = _preset_sweep(
             payload=payload,
@@ -1350,6 +1548,7 @@ def main(argv=None) -> int:
     parser.add_argument("--calibration-seq-len", type=int, default=CALIBRATION_SEQ_LEN_LARGE)
     parser.add_argument("--calibration-n-seqs", type=int, default=CALIBRATION_N_SEQS_LARGE)
     parser.add_argument("--calibration-percentile", type=float, default=CALIBRATION_PERCENTILE_DEFAULT)
+    parser.add_argument("--skip-calibration-sensitivity", action="store_true")
     parser.add_argument("--ptq-preset", default=None)
     parser.add_argument("--trace-step", type=int)
     parser.add_argument("--trace-node", default="all")
@@ -1359,6 +1558,8 @@ def main(argv=None) -> int:
     parser.add_argument("--mlp-block-ablation", action="store_true")
     parser.add_argument("--attn-v-block-ablation", action="store_true")
     parser.add_argument("--attn-v-head-ablation", action="store_true")
+    parser.add_argument("--attn-v-structural", action="store_true")
+    parser.add_argument("--lm-head-structural", action="store_true")
     parser.add_argument("--preset-sweep", action="store_true")
     parser.add_argument("--output-aware-search-n-seqs", type=int)
     parser.add_argument("--output-aware-search-seq-len", type=int)
@@ -1391,6 +1592,8 @@ def main(argv=None) -> int:
             "mlp_block_ablation": report.get("mlp_block_ablation"),
             "attn_v_block_ablation": report.get("attn_v_block_ablation"),
             "attn_v_head_ablation": report.get("attn_v_head_ablation"),
+            "attn_v_structural": report.get("attn_v_structural"),
+            "lm_head_structural": report.get("lm_head_structural"),
             "node_trace": report.get("node_trace"),
         }), indent=2, sort_keys=True))
     return 0

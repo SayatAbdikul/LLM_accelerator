@@ -93,6 +93,7 @@ def test_stage5_preset_registry_contains_core_presets_and_promoted_default():
         "output_aware_mlp_0_to_11", "output_aware_mlp_0_1_4_8_to_11",
         "output_aware_mlp_0_1_4_6_7_8_to_11",
         "output_aware_attn_all", "output_aware_mlp_attn_0_1_4_8_to_11",
+        "output_aware_mlp_lm_head_0_1_4_8_to_11",
         "gelu_accum_8_to_11", "output_aware_mlp_gelu_accum_8_to_11",
     }
     assert core.issubset(set(STAGE5_PTQ_PRESETS))
@@ -163,6 +164,7 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         output_aware_gelu_blocks=(),
         output_aware_mlp_blocks=(),
         output_aware_attn_blocks=(),
+        output_aware_lm_head=False,
         gelu_from_accum_blocks=(),
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
@@ -178,6 +180,7 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         output_aware_gelu_blocks=(0,),
         output_aware_mlp_blocks=(),
         output_aware_attn_blocks=(),
+        output_aware_lm_head=False,
         gelu_from_accum_blocks=(),
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
@@ -193,6 +196,7 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         output_aware_gelu_blocks=(),
         output_aware_mlp_blocks=(0,),
         output_aware_attn_blocks=(),
+        output_aware_lm_head=False,
         gelu_from_accum_blocks=(),
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
@@ -208,6 +212,7 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         output_aware_gelu_blocks=(),
         output_aware_mlp_blocks=(),
         output_aware_attn_blocks=(),
+        output_aware_lm_head=False,
         gelu_from_accum_blocks=(0,),
     )
     with pytest.raises(ValueError, match="GELU-from-ACCUM and FC1 REQUANT_PC"):
@@ -278,6 +283,29 @@ def test_output_aware_attn_value_search_keeps_kv_load_scale_synced(monkeypatch):
     assert diagnostics["block0"]["groups"]["value"]["key_groups"] == [
         ["block0_head0_value", "block0_head0_value_kv_load"]
     ]
+
+
+def test_output_aware_lm_head_scale_search_updates_lm_head_scale(monkeypatch):
+    payload = {"model_args": {"n_layer": 1, "n_head": 1, "vocab_size": 4}, "state_dict": {}}
+    scales = {"lm_head": 2.0}
+
+    def fake_mean(payload, seqs, scales, *, ptq_preset):
+        return float(scales.get("lm_head", 1.0))
+
+    monkeypatch.setattr(calibration_mod, "_mean_fake_quant_target_nll", fake_mean)
+    updated, diagnostics = calibration_mod.apply_output_aware_lm_head_scale_search_from_token_ids(
+        payload,
+        [0, 1, 2],
+        scales,
+        ptq_preset="control",
+        multipliers=(0.75, 1.0, 1.25),
+    )
+
+    assert updated["lm_head"] == pytest.approx(2.0 * 0.75)
+    assert diagnostics["accepted"] is True
+    assert diagnostics["multiplier"] == pytest.approx(0.75)
+    assert diagnostics["old_scale"] == pytest.approx(2.0)
+    assert diagnostics["new_scale"] == pytest.approx(2.0 * 0.75)
 
 
 def test_stage5_scale_policy_ties_fc2_and_residual2_for_raw_vadd_block():
@@ -373,6 +401,8 @@ def test_debug_preset_sweep_reports_all_presets_and_deterministic_winner(monkeyp
             diagnostics = {"output_aware_mlp": {"block11": {"selected_mean_nll": 1.0}}}
         if "output_aware_attn" in preset_name:
             diagnostics["output_aware_attn"] = {"block0": {"selected_mean_nll": 1.0}}
+        if "lm_head" in preset_name:
+            diagnostics["output_aware_lm_head"] = {"accepted": True, "multiplier": 0.875}
         return {"lm_head": 1.0}, diagnostics
 
     def fake_fake(payload, eval_tokens, scales, *, ptq_preset=None):
@@ -411,3 +441,5 @@ def test_debug_preset_sweep_reports_all_presets_and_deterministic_winner(monkeyp
     assert output_aware_mlp_rows and "output_aware_mlp" in output_aware_mlp_rows[0]
     output_aware_attn_rows = [row for row in report["rows"] if row["name"] == "output_aware_attn_all"]
     assert output_aware_attn_rows and "output_aware_attn" in output_aware_attn_rows[0]
+    lm_head_rows = [row for row in report["rows"] if row["name"] == "output_aware_mlp_lm_head_0_1_4_8_to_11"]
+    assert lm_head_rows and "output_aware_lm_head" in lm_head_rows[0]

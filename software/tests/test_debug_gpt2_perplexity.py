@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import numpy as np
 from taccel.runtime.stage5_ptq import STAGE5_PTQ_PRESETS
 
 
@@ -349,6 +350,48 @@ def test_attn_v_head_ablation_reports_every_head(monkeypatch):
     assert rows[-1]["head"] == 11
 
 
+def test_attn_v_structural_sweep_reports_component_bypasses(monkeypatch):
+    dbg = _debug_module()
+
+    class FakeReference:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def incremental_logits_trace(self, inputs, fp32_groups=None):
+            groups = set(fp32_groups or ())
+            target_logit = 2.0 + float(len(groups))
+            if "attn_v_value_fp32" in groups:
+                target_logit += 2.0
+            return [np.asarray([target_logit, 1.0, 0.0, -1.0], dtype=np.float32)]
+
+    monkeypatch.setattr(dbg, "NanoGPTFQReference", FakeReference)
+    rows = dbg._attn_v_structural_sweep(
+        payload={"state_dict": {}, "model_args": {"n_layer": 1, "n_head": 1}},
+        scales={"lm_head": 1.0},
+        inputs=[0],
+        targets=[0],
+        fp32_logits=[np.asarray([8.0, 1.0, 0.0, -1.0], dtype=np.float32)],
+        fake_i8=[np.asarray([1.0, 1.0, 0.0, -1.0], dtype=np.float32)],
+        vocab_size=4,
+        lm_scale=1.0,
+        resolved_preset=None,
+    )
+
+    by_name = {row["name"]: row for row in rows}
+    assert set(by_name) == {
+        "int8_product_bypass",
+        "softmax_product_bypass",
+        "value_product_bypass",
+        "softmax_value_product_bypass",
+    }
+    assert by_name["softmax_value_product_bypass"]["fp32_groups"] == [
+        "softmax",
+        "attn_v_value_fp32",
+    ]
+    assert rows[0]["name"] == "softmax_value_product_bypass"
+    assert rows[0]["nll_improvement_vs_baseline"] > 0.0
+
+
 def test_embedding_add_diagnostics_report_before_and_active_scale():
     dbg = _debug_module()
     payload = {
@@ -368,3 +411,56 @@ def test_embedding_add_diagnostics_report_before_and_active_scale():
     assert report["raw_vadd_safe_scale"] >= report["legacy_sum_scale"]
     assert "centered_cosine" in report["legacy"]
     assert "saturation_rate" in report["active"]["int8"]
+
+
+def test_lm_head_structural_groups_constant_has_three_entries():
+    dbg = _debug_module()
+    assert len(dbg.LM_HEAD_STRUCTURAL_GROUPS) == 3
+    names = {g["name"] for g in dbg.LM_HEAD_STRUCTURAL_GROUPS}
+    assert {"weight_fp32_output_int8", "weight_int8_output_fp32",
+            "weight_int8_requant_fp32_output_int8"}.issubset(names)
+    for g in dbg.LM_HEAD_STRUCTURAL_GROUPS:
+        assert "fp32_groups" in g
+        assert "description" in g
+
+
+def test_lm_head_structural_sweep_reports_component_bypasses(monkeypatch):
+    dbg = _debug_module()
+
+    class FakeReference:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def incremental_logits_trace(self, inputs, fp32_groups=None):
+            groups = set(fp32_groups or ())
+            if "lm_head_weight_fp32" in groups:
+                target_logit = 3.0
+            elif "lm_head_output_fp32" in groups:
+                target_logit = 4.0
+            else:
+                target_logit = 2.0
+            return [np.asarray([target_logit, 1.0, 0.0, -1.0], dtype=np.float32)]
+
+    monkeypatch.setattr(dbg, "NanoGPTFQReference", FakeReference)
+    rows = dbg._lm_head_structural_sweep(
+        payload={"state_dict": {}, "model_args": {"n_layer": 1, "n_head": 1}},
+        scales={"lm_head": 1.0},
+        inputs=[0],
+        targets=[0],
+        fp32_logits=[np.asarray([8.0, 1.0, 0.0, -1.0], dtype=np.float32)],
+        fake_i8=[np.asarray([1.0, 1.0, 0.0, -1.0], dtype=np.float32)],
+        vocab_size=4,
+        lm_scale=1.0,
+        resolved_preset=None,
+    )
+
+    by_name = {row["name"]: row for row in rows}
+    assert set(by_name) == {
+        "weight_fp32_output_int8",
+        "weight_int8_requant_fp32_output_int8",
+        "weight_int8_output_fp32",
+    }
+    for row in rows:
+        assert "perplexity" in row
+        assert "nll_improvement_vs_baseline" in row
+        assert "description" in row

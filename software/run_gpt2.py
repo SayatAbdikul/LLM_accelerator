@@ -64,6 +64,8 @@ def main(argv=None) -> int:
     parser.add_argument("--calibration-seq-len", type=int, default=CALIBRATION_SEQ_LEN_LARGE)
     parser.add_argument("--calibration-n-seqs", type=int, default=CALIBRATION_N_SEQS_LARGE)
     parser.add_argument("--calibration-percentile", type=float, default=CALIBRATION_PERCENTILE_DEFAULT)
+    parser.add_argument("--output-aware-search-n-seqs", type=int)
+    parser.add_argument("--output-aware-search-seq-len", type=int)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
@@ -130,6 +132,8 @@ def main(argv=None) -> int:
             calibration_seq_len=args.calibration_seq_len,
             calibration_percentile=args.calibration_percentile,
             ptq_preset=ptq_preset,
+            output_aware_search_n_seqs=args.output_aware_search_n_seqs,
+            output_aware_search_seq_len=args.output_aware_search_seq_len,
         )
         summary.update({
             "perplexity_golden": ppl.golden_perplexity,

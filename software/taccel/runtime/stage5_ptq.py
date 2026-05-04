@@ -22,6 +22,7 @@ class Stage5PTQPreset:
     output_aware_gelu_blocks: tuple[int, ...]
     output_aware_mlp_blocks: tuple[int, ...]
     output_aware_attn_blocks: tuple[int, ...]
+    output_aware_lm_head: bool
     gelu_from_accum_blocks: tuple[int, ...]
 
 
@@ -37,6 +38,7 @@ def _preset(
     output_aware_gelu_blocks: Sequence[int] = (),
     output_aware_mlp_blocks: Sequence[int] = (),
     output_aware_attn_blocks: Sequence[int] = (),
+    output_aware_lm_head: bool = False,
     gelu_from_accum_blocks: Sequence[int] = (),
 ) -> Stage5PTQPreset:
     return Stage5PTQPreset(
@@ -50,6 +52,7 @@ def _preset(
         output_aware_gelu_blocks=tuple(int(v) for v in output_aware_gelu_blocks),
         output_aware_mlp_blocks=tuple(int(v) for v in output_aware_mlp_blocks),
         output_aware_attn_blocks=tuple(int(v) for v in output_aware_attn_blocks),
+        output_aware_lm_head=bool(output_aware_lm_head),
         gelu_from_accum_blocks=tuple(int(v) for v in gelu_from_accum_blocks),
     )
 
@@ -189,6 +192,13 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         requant_pc_fc2_blocks=(0, 1, 4, 8, 9, 10, 11),
         output_aware_mlp_blocks=(0, 1, 4, 8, 9, 10, 11),
         output_aware_attn_blocks=(0, 1, 4, 8, 9, 10, 11),
+    ),
+    # MLP search + output-aware lm_head scale search.
+    "output_aware_mlp_lm_head_0_1_4_8_to_11": _preset(
+        "output_aware_mlp_lm_head_0_1_4_8_to_11",
+        requant_pc_fc2_blocks=(0, 1, 4, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 1, 4, 8, 9, 10, 11),
+        output_aware_lm_head=True,
     ),
     "gelu_accum_8_to_11": _preset(
         "gelu_accum_8_to_11",

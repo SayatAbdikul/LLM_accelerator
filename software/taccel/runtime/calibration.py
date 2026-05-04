@@ -860,6 +860,64 @@ def apply_output_aware_attn_scale_search_from_token_ids(
     return scales, diagnostics
 
 
+def apply_output_aware_lm_head_scale_search_from_token_ids(
+    payload: Dict[str, object],
+    token_ids: Sequence[int],
+    calibration_scales: Dict[str, float],
+    *,
+    ptq_preset,
+    n_seqs: int = 8,
+    seq_len: int = 16,
+    multipliers: Sequence[float] = OUTPUT_AWARE_MLP_MULTIPLIERS,
+    search_n_seqs_max: int | None = None,
+    search_seq_len_max: int | None = None,
+) -> tuple[Dict[str, float], Dict[str, object]]:
+    """Greedily tune the lm_head output scale against final fake-quant token NLL."""
+    n_cap = OUTPUT_AWARE_SEARCH_N_SEQS_MAX if search_n_seqs_max is None else int(search_n_seqs_max)
+    len_cap = OUTPUT_AWARE_SEARCH_SEQ_LEN_MAX if search_seq_len_max is None else int(search_seq_len_max)
+    search_n_seqs = max(1, min(int(n_seqs), max(1, n_cap)))
+    search_seq_len = max(2, min(int(seq_len), max(2, len_cap)))
+    seqs = build_calibration_seqs_from_token_ids(token_ids, n_seqs=search_n_seqs, seq_len=search_seq_len)
+    scales = dict(calibration_scales)
+    base_scale = float(scales.get("lm_head", _DEFAULT_SCALES))
+    if base_scale <= 0.0:
+        raise ValueError("output-aware lm_head search requires a positive lm_head scale")
+    baseline_nll = _mean_fake_quant_target_nll(payload, seqs, scales, ptq_preset=ptq_preset)
+    current_nll = baseline_nll
+    candidate_rows: List[Dict[str, float]] = []
+    for multiplier in multipliers:
+        m = float(multiplier)
+        if m <= 0.0:
+            continue
+        candidate = dict(scales)
+        candidate["lm_head"] = base_scale * m
+        mean_nll = _mean_fake_quant_target_nll(payload, seqs, candidate, ptq_preset=ptq_preset)
+        candidate_rows.append({"multiplier": m, "lm_head": base_scale * m, "mean_nll": float(mean_nll)})
+    if not candidate_rows:
+        raise ValueError("output-aware lm_head search received no valid candidate multipliers")
+    best = min(
+        candidate_rows,
+        key=lambda row: (row["mean_nll"], abs(row["multiplier"] - 1.0), row["multiplier"]),
+    )
+    accepted = bool(best["mean_nll"] < current_nll)
+    if accepted:
+        scales["lm_head"] = float(best["lm_head"])
+        current_nll = float(best["mean_nll"])
+    diagnostics: Dict[str, object] = {
+        "old_scale": base_scale,
+        "new_scale": float(scales["lm_head"]),
+        "multiplier": float(best["multiplier"]) if accepted else 1.0,
+        "accepted": accepted,
+        "baseline_mean_nll": float(baseline_nll),
+        "best_candidate_mean_nll": float(best["mean_nll"]),
+        "selected_mean_nll": float(current_nll),
+        "search_n_seqs": int(search_n_seqs),
+        "search_seq_len": int(search_seq_len),
+        "candidates": candidate_rows,
+    }
+    return scales, diagnostics
+
+
 def _apply_raw_vadd_safe_tok_pos_scale(
     scales: Dict[str, float],
     state_dict: dict,

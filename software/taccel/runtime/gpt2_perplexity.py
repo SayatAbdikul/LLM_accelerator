@@ -13,6 +13,7 @@ from .calibration import (
     apply_fc2_aware_gelu_scale_search_from_token_ids,
     apply_output_aware_attn_scale_search_from_token_ids,
     apply_output_aware_gelu_scale_search_from_token_ids,
+    apply_output_aware_lm_head_scale_search_from_token_ids,
     apply_output_aware_mlp_scale_search_from_token_ids,
     build_calibration_scales_from_token_ids,
 )
@@ -232,6 +233,17 @@ def evaluate_gpt2_perplexity(
             calibration_token_ids,
             calibration_scales,
             blocks=resolved_preset.output_aware_attn_blocks,
+            ptq_preset=resolved_preset,
+            n_seqs=calibration_n_seqs,
+            seq_len=calibration_seq_len,
+            search_n_seqs_max=output_aware_search_n_seqs,
+            search_seq_len_max=output_aware_search_seq_len,
+        )
+    if resolved_preset.output_aware_lm_head:
+        calibration_scales, _ = apply_output_aware_lm_head_scale_search_from_token_ids(
+            payload,
+            calibration_token_ids,
+            calibration_scales,
             ptq_preset=resolved_preset,
             n_seqs=calibration_n_seqs,
             seq_len=calibration_seq_len,
