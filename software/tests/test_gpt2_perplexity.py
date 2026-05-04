@@ -61,12 +61,13 @@ def test_gpt2_perplexity_gate_against_fake_quant_reference():
             "software/tests/fixtures/generated/gpt2_converted_nanogpt.pt "
             "--tokenizer-dir software/tests/fixtures/generated/hf_gpt2 "
             "--calibration-text software/tests/fixtures/generated/wikitext2_stage5_calibration.txt "
-            "--eval-text software/tests/fixtures/generated/wikitext2_stage5_eval.txt --max-eval-tokens 33 --json"
+            "--eval-text software/tests/fixtures/generated/wikitext2_stage5_eval.txt "
+            "--max-eval-tokens 257 --context-len 256 --json"
         )
 
     payload = torch.load(FIXTURE, map_location="cpu")
     calibration_ids = tokenize_text_file(TOKENIZER_DIR, CALIB_TEXT)
-    eval_ids = tokenize_text_file(TOKENIZER_DIR, EVAL_TEXT, max_tokens=33)
+    eval_ids = tokenize_text_file(TOKENIZER_DIR, EVAL_TEXT, max_tokens=257)
     result = evaluate_gpt2_perplexity(
         payload,
         calibration_token_ids=calibration_ids,
@@ -74,13 +75,13 @@ def test_gpt2_perplexity_gate_against_fake_quant_reference():
         tokenizer_dir=TOKENIZER_DIR,
         calibration_sha256=file_sha256(CALIB_TEXT),
         eval_sha256=file_sha256(EVAL_TEXT),
-        max_eval_tokens=33,
-        context_len=32,
+        max_eval_tokens=257,
+        context_len=256,
         calibration_n_seqs=8,
         calibration_seq_len=32,
     )
 
-    assert result.target_count == 32
+    assert result.target_count == 256
     assert result.ptq_preset == "output_aware_mlp_lm_head_0_1_4_8_to_11"
     assert result.relative_delta <= 0.02, (
         f"golden_ppl={result.golden_perplexity:.6f}, "
