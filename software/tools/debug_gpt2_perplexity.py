@@ -295,6 +295,9 @@ def _build_artifacts_for_preset(
             ptq_preset=preset,
             n_seqs=args.calibration_n_seqs,
             seq_len=args.calibration_seq_len,
+            search_n_seqs_max=getattr(args, "output_aware_search_n_seqs", None),
+            search_seq_len_max=getattr(args, "output_aware_search_seq_len", None),
+            search_workers=getattr(args, "output_aware_search_workers", None),
         )
         diagnostics["output_aware_gelu"] = output_diag
     if preset.output_aware_mlp_blocks:
@@ -308,6 +311,7 @@ def _build_artifacts_for_preset(
             seq_len=args.calibration_seq_len,
             search_n_seqs_max=getattr(args, "output_aware_search_n_seqs", None),
             search_seq_len_max=getattr(args, "output_aware_search_seq_len", None),
+            search_workers=getattr(args, "output_aware_search_workers", None),
             include_pair_candidates=bool(getattr(args, "output_aware_include_pairs", False)),
         )
         diagnostics["output_aware_mlp"] = output_mlp_diag
@@ -322,6 +326,7 @@ def _build_artifacts_for_preset(
             seq_len=args.calibration_seq_len,
             search_n_seqs_max=getattr(args, "output_aware_search_n_seqs", None),
             search_seq_len_max=getattr(args, "output_aware_search_seq_len", None),
+            search_workers=getattr(args, "output_aware_search_workers", None),
         )
         diagnostics["output_aware_attn"] = output_attn_diag
     if preset.output_aware_lm_head:
@@ -334,6 +339,7 @@ def _build_artifacts_for_preset(
             seq_len=args.calibration_seq_len,
             search_n_seqs_max=getattr(args, "output_aware_search_n_seqs", None),
             search_seq_len_max=getattr(args, "output_aware_search_seq_len", None),
+            search_workers=getattr(args, "output_aware_search_workers", None),
         )
         diagnostics["output_aware_lm_head"] = lm_head_diag
     return scales, diagnostics
@@ -585,6 +591,271 @@ def _per_step_rows(
             },
         })
     return rows
+
+
+def _first_per_step_divergence(rows: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    for row in rows:
+        cosine = float(row["cosine"]["golden_vs_fake"])
+        top10_overlap = int(row["top10_overlap"]["golden_vs_fake"])
+        nll_delta = abs(float(row["target_nll"]["golden"]) - float(row["target_nll"]["fake_quant"]))
+        reasons = []
+        if cosine < 0.995:
+            reasons.append("golden_vs_fake_cosine<0.995")
+        if top10_overlap < 10:
+            reasons.append("golden_vs_fake_top10_overlap<10")
+        if nll_delta > 0.1:
+            reasons.append("target_nll_delta>0.1")
+        if reasons:
+            return {
+                "step": int(row["step"]),
+                "input_token_id": int(row["input_token_id"]),
+                "target_token_id": int(row["target_token_id"]),
+                "reasons": reasons,
+                "golden_target_nll": float(row["target_nll"]["golden"]),
+                "fake_quant_target_nll": float(row["target_nll"]["fake_quant"]),
+                "target_nll_delta": float(nll_delta),
+                "golden_vs_fake_cosine": cosine,
+                "golden_vs_fake_top10_overlap": top10_overlap,
+            }
+    return {"step": None, "reasons": []}
+
+
+def _scale_diffs(
+    lhs: Dict[str, float],
+    rhs: Dict[str, float],
+    *,
+    lhs_name: str,
+    rhs_name: str,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for key in sorted(set(lhs) | set(rhs)):
+        lval = lhs.get(key)
+        rval = rhs.get(key)
+        if lval is None or rval is None:
+            rows.append({
+                "key": key,
+                lhs_name: None if lval is None else float(lval),
+                rhs_name: None if rval is None else float(rval),
+                "ratio": None,
+            })
+            continue
+        lf = float(lval)
+        rf = float(rval)
+        if not np.isclose(lf, rf, rtol=1e-7, atol=1e-12):
+            rows.append({
+                "key": key,
+                lhs_name: lf,
+                rhs_name: rf,
+                "ratio": None if abs(lf) < 1e-12 else float(rf / lf),
+            })
+    return rows
+
+
+def _base_scales_for_search_window_compare(
+    payload: dict,
+    calibration_ids: Sequence[int],
+    args,
+    preset,
+) -> tuple[Dict[str, float], Dict[str, object]]:
+    scales = build_calibration_scales_from_token_ids(
+        payload,
+        calibration_ids,
+        n_seqs=args.calibration_n_seqs,
+        seq_len=args.calibration_seq_len,
+        percentile=args.calibration_percentile,
+        activation_percentile_overrides=(
+            preset.activation_percentile_nodes or None
+        ),
+        hessian_gelu_blocks=preset.hessian_gelu_blocks,
+    )
+    scales = apply_stage5_ptq_scale_policy(scales, payload["model_args"], preset)
+    diagnostics: Dict[str, object] = {}
+    if preset.fc2_aware_gelu_blocks:
+        scales, diagnostics = apply_fc2_aware_gelu_scale_search_from_token_ids(
+            payload,
+            calibration_ids,
+            scales,
+            blocks=preset.fc2_aware_gelu_blocks,
+            n_seqs=args.calibration_n_seqs,
+            seq_len=args.calibration_seq_len,
+        )
+    return scales, diagnostics
+
+
+def _apply_search_window(
+    payload: dict,
+    calibration_ids: Sequence[int],
+    args,
+    preset,
+    base_scales: Dict[str, float],
+    *,
+    search_n_seqs: int,
+    search_seq_len: int,
+) -> tuple[Dict[str, float], Dict[str, object]]:
+    scales = dict(base_scales)
+    diagnostics: Dict[str, object] = {}
+    if preset.output_aware_gelu_blocks:
+        scales, output_diag = apply_output_aware_gelu_scale_search_from_token_ids(
+            payload,
+            calibration_ids,
+            scales,
+            blocks=preset.output_aware_gelu_blocks,
+            ptq_preset=preset,
+            n_seqs=args.calibration_n_seqs,
+            seq_len=args.calibration_seq_len,
+            search_n_seqs_max=search_n_seqs,
+            search_seq_len_max=search_seq_len,
+            search_workers=getattr(args, "output_aware_search_workers", None),
+        )
+        diagnostics["output_aware_gelu"] = output_diag
+    if preset.output_aware_mlp_blocks:
+        scales, output_mlp_diag = apply_output_aware_mlp_scale_search_from_token_ids(
+            payload,
+            calibration_ids,
+            scales,
+            blocks=preset.output_aware_mlp_blocks,
+            ptq_preset=preset,
+            n_seqs=args.calibration_n_seqs,
+            seq_len=args.calibration_seq_len,
+            search_n_seqs_max=search_n_seqs,
+            search_seq_len_max=search_seq_len,
+            search_workers=getattr(args, "output_aware_search_workers", None),
+            include_pair_candidates=bool(getattr(args, "output_aware_include_pairs", False)),
+        )
+        diagnostics["output_aware_mlp"] = output_mlp_diag
+    if preset.output_aware_attn_blocks:
+        scales, output_attn_diag = apply_output_aware_attn_scale_search_from_token_ids(
+            payload,
+            calibration_ids,
+            scales,
+            blocks=preset.output_aware_attn_blocks,
+            ptq_preset=preset,
+            n_seqs=args.calibration_n_seqs,
+            seq_len=args.calibration_seq_len,
+            search_n_seqs_max=search_n_seqs,
+            search_seq_len_max=search_seq_len,
+            search_workers=getattr(args, "output_aware_search_workers", None),
+        )
+        diagnostics["output_aware_attn"] = output_attn_diag
+    if preset.output_aware_lm_head:
+        scales, lm_head_diag = apply_output_aware_lm_head_scale_search_from_token_ids(
+            payload,
+            calibration_ids,
+            scales,
+            ptq_preset=preset,
+            n_seqs=args.calibration_n_seqs,
+            seq_len=args.calibration_seq_len,
+            search_n_seqs_max=search_n_seqs,
+            search_seq_len_max=search_seq_len,
+            search_workers=getattr(args, "output_aware_search_workers", None),
+        )
+        diagnostics["output_aware_lm_head"] = lm_head_diag
+    return scales, diagnostics
+
+
+def _compare_search_windows(
+    *,
+    payload: dict,
+    calibration_ids: Sequence[int],
+    eval_tokens: Sequence[int],
+    targets: Sequence[int],
+    tokenizer,
+    vocab_size: int,
+    fp32_logits: Sequence[np.ndarray],
+    args,
+    preset,
+) -> Dict[str, object]:
+    base_scales, base_diagnostics = _base_scales_for_search_window_compare(
+        payload,
+        calibration_ids,
+        args,
+        preset,
+    )
+    windows = [
+        ("1x16", 1, 16),
+        ("4x64", 4, 64),
+    ]
+    rows: List[Dict[str, object]] = []
+    scale_by_window: Dict[str, Dict[str, float]] = {}
+    for label, search_n_seqs, search_seq_len in windows:
+        scales, diagnostics = _apply_search_window(
+            payload,
+            calibration_ids,
+            args,
+            preset,
+            base_scales,
+            search_n_seqs=search_n_seqs,
+            search_seq_len=search_seq_len,
+        )
+        scale_by_window[label] = scales
+        lm_scale = float(scales.get("lm_head", 1.0))
+        golden_i8 = run_golden_teacher_forced_logits(
+            payload,
+            eval_tokens,
+            scales,
+            ptq_preset=preset,
+        )
+        fake_i8 = run_fake_quant_teacher_forced_logits(
+            payload,
+            eval_tokens,
+            scales,
+            ptq_preset=preset,
+        )
+        golden_deq = [np.asarray(row, dtype=np.float32)[:vocab_size] * np.float32(lm_scale) for row in golden_i8]
+        fake_deq = [np.asarray(row, dtype=np.float32)[:vocab_size] * np.float32(lm_scale) for row in fake_i8]
+        golden_ppl = _ppl_from_logits(golden_deq, targets, vocab_size=vocab_size)
+        fake_ppl = _ppl_from_logits(fake_deq, targets, vocab_size=vocab_size)
+        direct_q = [_quantize_logits(row, lm_scale) for row in fp32_logits]
+        per_step = _per_step_rows(
+            tokenizer=tokenizer,
+            tokens=eval_tokens,
+            targets=targets,
+            vocab_size=vocab_size,
+            lm_head_scale=lm_scale,
+            golden_i8=golden_i8,
+            fake_i8=fake_i8,
+            fp32_logits=fp32_logits,
+            direct_quant_i8=direct_q,
+        )
+        rows.append({
+            "label": label,
+            "search_n_seqs": search_n_seqs,
+            "search_seq_len": search_seq_len,
+            "lm_head_scale": lm_scale,
+            "golden_perplexity": golden_ppl["perplexity"],
+            "fake_quant_perplexity": fake_ppl["perplexity"],
+            "golden_nll": golden_ppl["mean_nll"],
+            "fake_quant_nll": fake_ppl["mean_nll"],
+            "relative_delta": abs(golden_ppl["perplexity"] - fake_ppl["perplexity"]) / max(abs(fake_ppl["perplexity"]), 1e-12),
+            "diagnostics": diagnostics,
+            "scale_diffs_vs_base": _scale_diffs(
+                base_scales,
+                scales,
+                lhs_name="base",
+                rhs_name=label,
+            ),
+            "first_per_step_divergence": _first_per_step_divergence(per_step),
+            "per_step": per_step,
+        })
+    by_label = {row["label"]: row for row in rows}
+    return {
+        "preset": preset.name,
+        "base_scale_count": len(base_scales),
+        "base_diagnostics": base_diagnostics,
+        "windows": rows,
+        "scale_diffs_1x16_vs_4x64": _scale_diffs(
+            scale_by_window["1x16"],
+            scale_by_window["4x64"],
+            lhs_name="1x16",
+            rhs_name="4x64",
+        ),
+        "golden_improvement_4x64_vs_1x16": (
+            1.0 - float(by_label["4x64"]["golden_perplexity"]) / max(float(by_label["1x16"]["golden_perplexity"]), 1e-12)
+        ),
+        "fake_quant_improvement_4x64_vs_1x16": (
+            1.0 - float(by_label["4x64"]["fake_quant_perplexity"]) / max(float(by_label["1x16"]["fake_quant_perplexity"]), 1e-12)
+        ),
+    }
 
 
 def _fp32_incremental_and_full(ref: NanoGPTFP32Reference, tokens: Sequence[int]) -> tuple[List[np.ndarray], List[np.ndarray]]:
@@ -1063,7 +1334,13 @@ def _preset_sweep(
     )
     promoted_default = stage5_default_ptq_preset_name()
     default_row = next((row for row in rows if str(row["name"]) == promoted_default), None)
-    replacement: dict[str, object] = {"baseline": promoted_default, "candidate": promoted_default, "passes_5pct_rule": False}
+    promotion_threshold = 0.10
+    replacement: dict[str, object] = {
+        "baseline": promoted_default,
+        "candidate": promoted_default,
+        "promotion_threshold": promotion_threshold,
+        "passes_10pct_rule": False,
+    }
     if default_row is not None:
         eligible = [row for row in ranked if bool(row.get("logits_gate_passed"))]
         best = eligible[0] if eligible else None
@@ -1075,10 +1352,11 @@ def _preset_sweep(
                 "candidate": str(best["name"]),
                 "golden_improvement_vs_default": float(golden_improvement),
                 "fake_quant_improvement_vs_default": float(fake_improvement),
-                "passes_5pct_rule": bool(
+                "promotion_threshold": promotion_threshold,
+                "passes_10pct_rule": bool(
                     str(best["name"]) != promoted_default
-                    and golden_improvement >= 0.05
-                    and fake_improvement >= 0.05
+                    and golden_improvement >= promotion_threshold
+                    and fake_improvement >= promotion_threshold
                 ),
             }
     return {
@@ -1151,7 +1429,7 @@ def _calibration_sweep(
                 seq_len=seq_len,
                 search_n_seqs_max=getattr(args, "output_aware_search_n_seqs", None),
                 search_seq_len_max=getattr(args, "output_aware_search_seq_len", None),
-                include_pair_candidates=bool(getattr(args, "output_aware_include_pairs", False)),
+                search_workers=getattr(args, "output_aware_search_workers", None),
             )
         if preset.output_aware_mlp_blocks:
             scales, _ = apply_output_aware_mlp_scale_search_from_token_ids(
@@ -1162,6 +1440,10 @@ def _calibration_sweep(
                 ptq_preset=preset,
                 n_seqs=n_seqs,
                 seq_len=seq_len,
+                search_n_seqs_max=getattr(args, "output_aware_search_n_seqs", None),
+                search_seq_len_max=getattr(args, "output_aware_search_seq_len", None),
+                search_workers=getattr(args, "output_aware_search_workers", None),
+                include_pair_candidates=bool(getattr(args, "output_aware_include_pairs", False)),
             )
         if preset.output_aware_attn_blocks:
             scales, _ = apply_output_aware_attn_scale_search_from_token_ids(
@@ -1174,6 +1456,19 @@ def _calibration_sweep(
                 seq_len=seq_len,
                 search_n_seqs_max=getattr(args, "output_aware_search_n_seqs", None),
                 search_seq_len_max=getattr(args, "output_aware_search_seq_len", None),
+                search_workers=getattr(args, "output_aware_search_workers", None),
+            )
+        if preset.output_aware_lm_head:
+            scales, _ = apply_output_aware_lm_head_scale_search_from_token_ids(
+                payload,
+                calibration_ids,
+                scales,
+                ptq_preset=preset,
+                n_seqs=n_seqs,
+                seq_len=seq_len,
+                search_n_seqs_max=getattr(args, "output_aware_search_n_seqs", None),
+                search_seq_len_max=getattr(args, "output_aware_search_seq_len", None),
+                search_workers=getattr(args, "output_aware_search_workers", None),
             )
         lm_scale = float(scales.get("lm_head", 1.0))
         golden = run_golden_teacher_forced_logits(payload, eval_tokens, scales, ptq_preset=preset)
@@ -1401,6 +1696,18 @@ def run_report(args) -> Dict[str, object]:
         },
     }
     report["primary_suspect"] = choose_primary_suspect(report)
+    if bool(getattr(args, "compare_search_windows", False)):
+        report["search_window_comparison"] = _compare_search_windows(
+            payload=payload,
+            calibration_ids=calibration_ids,
+            eval_tokens=eval_tokens,
+            targets=targets,
+            tokenizer=tokenizer,
+            vocab_size=vocab_size,
+            fp32_logits=fp32_incr,
+            args=args,
+            preset=resolved_preset,
+        )
     trace_step = getattr(args, "trace_step", None)
     if trace_step is not None:
         step = int(trace_step)
@@ -1561,8 +1868,10 @@ def main(argv=None) -> int:
     parser.add_argument("--attn-v-structural", action="store_true")
     parser.add_argument("--lm-head-structural", action="store_true")
     parser.add_argument("--preset-sweep", action="store_true")
+    parser.add_argument("--compare-search-windows", action="store_true")
     parser.add_argument("--output-aware-search-n-seqs", type=int)
     parser.add_argument("--output-aware-search-seq-len", type=int)
+    parser.add_argument("--output-aware-search-workers", type=int)
     parser.add_argument("--output-aware-include-pairs", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -1594,6 +1903,7 @@ def main(argv=None) -> int:
             "attn_v_head_ablation": report.get("attn_v_head_ablation"),
             "attn_v_structural": report.get("attn_v_structural"),
             "lm_head_structural": report.get("lm_head_structural"),
+            "search_window_comparison": report.get("search_window_comparison"),
             "node_trace": report.get("node_trace"),
         }), indent=2, sort_keys=True))
     return 0

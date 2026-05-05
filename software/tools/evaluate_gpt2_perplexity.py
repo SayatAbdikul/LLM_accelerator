@@ -32,6 +32,7 @@ def main(argv=None) -> int:
     parser.add_argument("--calibration-percentile", type=float, default=CALIBRATION_PERCENTILE_DEFAULT)
     parser.add_argument("--output-aware-search-n-seqs", type=int)
     parser.add_argument("--output-aware-search-seq-len", type=int)
+    parser.add_argument("--output-aware-search-workers", type=int)
     parser.add_argument("--ptq-preset", default=None)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -63,6 +64,7 @@ def main(argv=None) -> int:
         ptq_preset=args.ptq_preset,
         output_aware_search_n_seqs=args.output_aware_search_n_seqs,
         output_aware_search_seq_len=args.output_aware_search_seq_len,
+        output_aware_search_workers=args.output_aware_search_workers,
     )
     out = asdict(result)
     if args.json:

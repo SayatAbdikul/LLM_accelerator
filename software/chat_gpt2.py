@@ -11,7 +11,9 @@ import torch
 
 from taccel.runtime.calibration import (
     apply_fc2_aware_gelu_scale_search_from_token_ids,
+    apply_output_aware_attn_scale_search_from_token_ids,
     apply_output_aware_gelu_scale_search_from_token_ids,
+    apply_output_aware_lm_head_scale_search_from_token_ids,
     apply_output_aware_mlp_scale_search_from_token_ids,
     build_calibration_scales_from_token_ids,
 )
@@ -20,7 +22,6 @@ from taccel.runtime.gpt2_perplexity import (
     CALIBRATION_N_SEQS_LARGE,
     CALIBRATION_PERCENTILE_DEFAULT,
     CALIBRATION_SEQ_LEN_LARGE,
-    GPT2_DEFAULT_PTQ_PRESET,
     load_gpt2_tokenizer,
     tokenize_text_file,
 )
@@ -28,6 +29,7 @@ from taccel.runtime.host_runner import HostRunner
 from taccel.runtime.stage5_ptq import (
     apply_stage5_ptq_scale_policy,
     resolve_stage5_ptq_preset,
+    stage5_default_ptq_preset_name,
     stage5_gelu_from_accum_blocks,
 )
 from taccel.runtime.tiny_fixture import build_stage3_tiny_decoder_bundle
@@ -123,6 +125,25 @@ def _build_stage5_scales(
             calibration_ids,
             scales,
             blocks=ptq_preset.output_aware_mlp_blocks,
+            ptq_preset=ptq_preset,
+            n_seqs=calibration_n_seqs,
+            seq_len=calibration_seq_len,
+        )
+    if ptq_preset.output_aware_attn_blocks:
+        scales, _ = apply_output_aware_attn_scale_search_from_token_ids(
+            payload,
+            calibration_ids,
+            scales,
+            blocks=ptq_preset.output_aware_attn_blocks,
+            ptq_preset=ptq_preset,
+            n_seqs=calibration_n_seqs,
+            seq_len=calibration_seq_len,
+        )
+    if ptq_preset.output_aware_lm_head:
+        scales, _ = apply_output_aware_lm_head_scale_search_from_token_ids(
+            payload,
+            calibration_ids,
+            scales,
             ptq_preset=ptq_preset,
             n_seqs=calibration_n_seqs,
             seq_len=calibration_seq_len,
@@ -224,7 +245,7 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--quality-preset",
         action="store_true",
-        help=f"use the current Stage 5 promoted preset ({GPT2_DEFAULT_PTQ_PRESET}); slower startup",
+        help=f"use the current Stage 5 promoted preset ({stage5_default_ptq_preset_name()}); slower startup",
     )
     parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--context-tokens", type=int, default=96)
@@ -286,7 +307,7 @@ def main(argv=None) -> int:
 
     golden_scales = None
     preset_name = (
-        GPT2_DEFAULT_PTQ_PRESET
+        stage5_default_ptq_preset_name()
         if args.quality_preset and args.ptq_preset is None
         else CHAT_DEFAULT_PTQ_PRESET
         if args.ptq_preset is None

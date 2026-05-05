@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import numpy as np
@@ -180,6 +181,111 @@ def test_debug_gpt2_perplexity_preset_sweep_json_sections():
     by_name = {row["name"]: row for row in data["preset_sweep"]["rows"]}
     assert "fc2_11_fc2aware_gelu" in by_name
     assert "fc2_aware_gelu" in by_name["fc2_11_fc2aware_gelu"]
+
+
+def test_debug_gpt2_perplexity_compare_search_windows_report_sections(monkeypatch):
+    dbg = _debug_module()
+
+    class FakeTokenizer:
+        def decode(self, ids):
+            return f"tok{int(ids[0])}"
+
+    def fake_base(*args, **kwargs):
+        return {"lm_head": 1.0, "block0_gelu": 1.0}, {"base": True}
+
+    def fake_apply(*args, search_n_seqs, search_seq_len, **kwargs):
+        scale = 1.0 if search_n_seqs == 1 else 0.5
+        return {"lm_head": scale, "block0_gelu": scale}, {"window": f"{search_n_seqs}x{search_seq_len}"}
+
+    def fake_golden(*args, **kwargs):
+        return [np.asarray([2, 1, 0, -1], dtype=np.int8)]
+
+    def fake_fake(*args, **kwargs):
+        return [np.asarray([2, 0, 1, -1], dtype=np.int8)]
+
+    monkeypatch.setattr(dbg, "_base_scales_for_search_window_compare", fake_base)
+    monkeypatch.setattr(dbg, "_apply_search_window", fake_apply)
+    monkeypatch.setattr(dbg, "run_golden_teacher_forced_logits", fake_golden)
+    monkeypatch.setattr(dbg, "run_fake_quant_teacher_forced_logits", fake_fake)
+
+    comparison = dbg._compare_search_windows(
+        payload={"model_args": {"vocab_size": 4}, "state_dict": {}},
+        calibration_ids=[0, 1, 2],
+        eval_tokens=[0, 1],
+        targets=[1],
+        tokenizer=FakeTokenizer(),
+        vocab_size=4,
+        fp32_logits=[np.asarray([4, 3, 2, 1], dtype=np.float32)],
+        args=SimpleNamespace(),
+        preset=SimpleNamespace(name="demo"),
+    )
+
+    assert comparison["preset"] == "demo"
+    assert comparison["base_diagnostics"] == {"base": True}
+    assert [row["label"] for row in comparison["windows"]] == ["1x16", "4x64"]
+    assert comparison["scale_diffs_1x16_vs_4x64"]
+    assert {"golden_improvement_4x64_vs_1x16", "fake_quant_improvement_4x64_vs_1x16"}.issubset(comparison)
+    for row in comparison["windows"]:
+        assert {"per_step", "first_per_step_divergence", "scale_diffs_vs_base"}.issubset(row)
+
+
+def test_calibration_sweep_forwards_mlp_search_caps(monkeypatch):
+    dbg = _debug_module()
+    captured = []
+
+    monkeypatch.setattr(dbg, "build_calibration_scales_from_token_ids", lambda *args, **kwargs: {"lm_head": 1.0})
+    monkeypatch.setattr(dbg, "apply_stage5_ptq_scale_policy", lambda scales, *args, **kwargs: dict(scales))
+    monkeypatch.setattr(dbg, "run_golden_teacher_forced_logits", lambda *args, **kwargs: [np.asarray([2, 1, 0, -1], dtype=np.int8)])
+    monkeypatch.setattr(dbg, "run_fake_quant_teacher_forced_logits", lambda *args, **kwargs: [np.asarray([2, 1, 0, -1], dtype=np.int8)])
+
+    def fake_mlp_search(*args, **kwargs):
+        captured.append((kwargs.get("search_n_seqs_max"), kwargs.get("search_seq_len_max")))
+        return dict(args[2]), {}
+
+    monkeypatch.setattr(dbg, "apply_output_aware_mlp_scale_search_from_token_ids", fake_mlp_search)
+
+    rows = dbg._calibration_sweep(
+        payload={"model_args": {"n_layer": 12, "vocab_size": 4}, "state_dict": {}},
+        calibration_ids=[0, 1, 2],
+        eval_tokens=[0, 1],
+        vocab_size=4,
+        tokenizer_dir=Path("."),
+        args=SimpleNamespace(output_aware_search_n_seqs=4, output_aware_search_seq_len=64),
+        ptq_preset="output_aware_mlp_0_1_4_8_to_11",
+    )
+
+    assert len(rows) == len(dbg.SWEEP_CONFIGS)
+    assert captured == [(4, 64)] * len(dbg.SWEEP_CONFIGS)
+
+
+def test_calibration_sweep_gelu_search_uses_supported_kwargs(monkeypatch):
+    dbg = _debug_module()
+    captured = []
+
+    monkeypatch.setattr(dbg, "build_calibration_scales_from_token_ids", lambda *args, **kwargs: {"lm_head": 1.0})
+    monkeypatch.setattr(dbg, "apply_stage5_ptq_scale_policy", lambda scales, *args, **kwargs: dict(scales))
+    monkeypatch.setattr(dbg, "run_golden_teacher_forced_logits", lambda *args, **kwargs: [np.asarray([2, 1, 0, -1], dtype=np.int8)])
+    monkeypatch.setattr(dbg, "run_fake_quant_teacher_forced_logits", lambda *args, **kwargs: [np.asarray([2, 1, 0, -1], dtype=np.int8)])
+
+    def fake_gelu_search(*args, **kwargs):
+        assert "include_pair_candidates" not in kwargs
+        captured.append((kwargs.get("search_n_seqs_max"), kwargs.get("search_seq_len_max")))
+        return dict(args[2]), {}
+
+    monkeypatch.setattr(dbg, "apply_output_aware_gelu_scale_search_from_token_ids", fake_gelu_search)
+
+    rows = dbg._calibration_sweep(
+        payload={"model_args": {"n_layer": 12, "vocab_size": 4}, "state_dict": {}},
+        calibration_ids=[0, 1, 2],
+        eval_tokens=[0, 1],
+        vocab_size=4,
+        tokenizer_dir=Path("."),
+        args=SimpleNamespace(output_aware_search_n_seqs=4, output_aware_search_seq_len=64),
+        ptq_preset="output_aware_gelu_8_to_11",
+    )
+
+    assert len(rows) == len(dbg.SWEEP_CONFIGS)
+    assert captured == [(4, 64)] * len(dbg.SWEEP_CONFIGS)
 
 
 def test_mlp_ablation_flags_report_diagnostic_rows():

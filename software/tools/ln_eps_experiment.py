@@ -15,13 +15,19 @@ from typing import Dict, List, Sequence
 import numpy as np
 import torch
 
-from taccel.runtime.calibration import build_calibration_scales_from_token_ids
+from taccel.runtime.calibration import (
+    apply_fc2_aware_gelu_scale_search_from_token_ids,
+    apply_output_aware_attn_scale_search_from_token_ids,
+    apply_output_aware_gelu_scale_search_from_token_ids,
+    apply_output_aware_lm_head_scale_search_from_token_ids,
+    apply_output_aware_mlp_scale_search_from_token_ids,
+    build_calibration_scales_from_token_ids,
+)
 from taccel.runtime.fake_quant_reference import NanoGPTFQReference
 from taccel.runtime.gpt2_perplexity import (
     CALIBRATION_N_SEQS_LARGE,
     CALIBRATION_PERCENTILE_DEFAULT,
     CALIBRATION_SEQ_LEN_LARGE,
-    GPT2_DEFAULT_PTQ_PRESET,
     perplexity_from_nlls,
     stable_cross_entropy,
     teacher_forced_inputs_and_targets,
@@ -30,6 +36,7 @@ from taccel.runtime.gpt2_perplexity import (
 from taccel.runtime.stage5_ptq import (
     apply_stage5_ptq_scale_policy,
     resolve_stage5_ptq_preset,
+    stage5_default_ptq_preset_name,
     stage5_gelu_from_accum_blocks,
     stage5_raw_residual1_blocks,
     stage5_raw_residual2_blocks,
@@ -62,6 +69,54 @@ def _run_condition(
         ln_eps_calibration=ln_eps_calibration,
     )
     scales = apply_stage5_ptq_scale_policy(scales, payload["model_args"], resolved)
+    if resolved.fc2_aware_gelu_blocks:
+        scales, _ = apply_fc2_aware_gelu_scale_search_from_token_ids(
+            payload,
+            calibration_token_ids,
+            scales,
+            blocks=resolved.fc2_aware_gelu_blocks,
+            n_seqs=calibration_n_seqs,
+            seq_len=calibration_seq_len,
+        )
+    if resolved.output_aware_gelu_blocks:
+        scales, _ = apply_output_aware_gelu_scale_search_from_token_ids(
+            payload,
+            calibration_token_ids,
+            scales,
+            blocks=resolved.output_aware_gelu_blocks,
+            ptq_preset=resolved,
+            n_seqs=calibration_n_seqs,
+            seq_len=calibration_seq_len,
+        )
+    if resolved.output_aware_mlp_blocks:
+        scales, _ = apply_output_aware_mlp_scale_search_from_token_ids(
+            payload,
+            calibration_token_ids,
+            scales,
+            blocks=resolved.output_aware_mlp_blocks,
+            ptq_preset=resolved,
+            n_seqs=calibration_n_seqs,
+            seq_len=calibration_seq_len,
+        )
+    if resolved.output_aware_attn_blocks:
+        scales, _ = apply_output_aware_attn_scale_search_from_token_ids(
+            payload,
+            calibration_token_ids,
+            scales,
+            blocks=resolved.output_aware_attn_blocks,
+            ptq_preset=resolved,
+            n_seqs=calibration_n_seqs,
+            seq_len=calibration_seq_len,
+        )
+    if resolved.output_aware_lm_head:
+        scales, _ = apply_output_aware_lm_head_scale_search_from_token_ids(
+            payload,
+            calibration_token_ids,
+            scales,
+            ptq_preset=resolved,
+            n_seqs=calibration_n_seqs,
+            seq_len=calibration_seq_len,
+        )
 
     eval_tokens = list(eval_token_ids)
     inputs, targets = teacher_forced_inputs_and_targets(eval_tokens)
@@ -103,9 +158,10 @@ def main(argv=None) -> int:
     parser.add_argument("--calibration-seq-len", type=int, default=CALIBRATION_SEQ_LEN_LARGE)
     parser.add_argument("--calibration-n-seqs", type=int, default=CALIBRATION_N_SEQS_LARGE)
     parser.add_argument("--calibration-percentile", type=float, default=CALIBRATION_PERCENTILE_DEFAULT)
-    parser.add_argument("--ptq-preset", default=GPT2_DEFAULT_PTQ_PRESET)
+    parser.add_argument("--ptq-preset", default=None)
     args = parser.parse_args(argv)
 
+    ptq_preset_name = stage5_default_ptq_preset_name() if args.ptq_preset is None else args.ptq_preset
     payload = torch.load(args.checkpoint, map_location="cpu")
     calib_ids = tokenize_text_file(args.tokenizer_dir, args.calibration_text)
     eval_ids = tokenize_text_file(
@@ -123,7 +179,7 @@ def main(argv=None) -> int:
         calibration_n_seqs=args.calibration_n_seqs,
         calibration_seq_len=args.calibration_seq_len,
         calibration_percentile=args.calibration_percentile,
-        ptq_preset_name=args.ptq_preset,
+        ptq_preset_name=ptq_preset_name,
     )
 
     results = {}

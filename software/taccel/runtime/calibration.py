@@ -6,6 +6,8 @@ compiler (via calibration_scales) and the NanoGPTFQReference consume.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import os
 from typing import Dict, List, Sequence
 
 import numpy as np
@@ -48,6 +50,7 @@ OUTPUT_AWARE_GELU_MULTIPLIERS = FC2_AWARE_GELU_MULTIPLIERS
 OUTPUT_AWARE_MLP_MULTIPLIERS = (0.75, 0.875, 1.0, 1.125, 1.25, 1.5)
 OUTPUT_AWARE_SEARCH_N_SEQS_MAX = 1
 OUTPUT_AWARE_SEARCH_SEQ_LEN_MAX = 16
+OUTPUT_AWARE_SEARCH_WORKERS_DEFAULT = 4
 
 
 def _tokenize_text(text: str, stoi: Dict[str, int]) -> List[int]:
@@ -459,13 +462,56 @@ def _mean_fake_quant_target_nll(
             continue
         inputs = tokens[:-1]
         targets = tokens[1:]
-        logits = ref.incremental_logits_trace(inputs)
+        logits = ref.forward(inputs, return_all_logits=True)
         for row, target in zip(logits, targets):
             deq = np.asarray(row, dtype=np.float32) * np.float32(lm_scale)
             nlls.append(_stable_cross_entropy_np(deq, target, vocab_size=vocab_size))
     if not nlls:
         raise ValueError("output-aware GELU search requires calibration windows with at least two tokens")
     return float(np.mean(np.asarray(nlls, dtype=np.float64)))
+
+
+def _resolve_output_aware_search_workers(
+    search_workers: int | None,
+    candidate_count: int,
+) -> int:
+    if candidate_count <= 1:
+        return 1
+    requested = search_workers
+    if requested is None:
+        env_value = os.environ.get("TACCEL_OUTPUT_AWARE_SEARCH_WORKERS")
+        requested = int(env_value) if env_value else OUTPUT_AWARE_SEARCH_WORKERS_DEFAULT
+    return max(1, min(int(requested), int(candidate_count)))
+
+
+def _candidate_mean_fake_quant_target_nlls(
+    payload: Dict[str, object],
+    seqs: Sequence[Sequence[int]],
+    candidate_scales: Sequence[Dict[str, float]],
+    *,
+    ptq_preset,
+    search_workers: int | None = None,
+) -> List[float]:
+    if not candidate_scales:
+        return []
+    worker_count = _resolve_output_aware_search_workers(search_workers, len(candidate_scales))
+    if worker_count <= 1:
+        return [
+            _mean_fake_quant_target_nll(payload, seqs, scales, ptq_preset=ptq_preset)
+            for scales in candidate_scales
+        ]
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        return list(
+            executor.map(
+                lambda scales: _mean_fake_quant_target_nll(
+                    payload,
+                    seqs,
+                    scales,
+                    ptq_preset=ptq_preset,
+                ),
+                candidate_scales,
+            )
+        )
 
 
 def apply_output_aware_gelu_scale_search_from_token_ids(
@@ -478,6 +524,9 @@ def apply_output_aware_gelu_scale_search_from_token_ids(
     n_seqs: int = 8,
     seq_len: int = 16,
     multipliers: Sequence[float] = OUTPUT_AWARE_GELU_MULTIPLIERS,
+    search_n_seqs_max: int | None = None,
+    search_seq_len_max: int | None = None,
+    search_workers: int | None = None,
 ) -> tuple[Dict[str, float], Dict[str, Dict[str, object]]]:
     """Greedily choose late GELU scales by final fake-quant token NLL.
 
@@ -495,8 +544,10 @@ def apply_output_aware_gelu_scale_search_from_token_ids(
     if invalid:
         raise ValueError(f"output-aware GELU blocks outside n_layer={n_layer}: {invalid}")
 
-    search_n_seqs = max(1, min(int(n_seqs), OUTPUT_AWARE_SEARCH_N_SEQS_MAX))
-    search_seq_len = max(2, min(int(seq_len), OUTPUT_AWARE_SEARCH_SEQ_LEN_MAX))
+    n_cap = OUTPUT_AWARE_SEARCH_N_SEQS_MAX if search_n_seqs_max is None else int(search_n_seqs_max)
+    len_cap = OUTPUT_AWARE_SEARCH_SEQ_LEN_MAX if search_seq_len_max is None else int(search_seq_len_max)
+    search_n_seqs = max(1, min(int(n_seqs), max(1, n_cap)))
+    search_seq_len = max(2, min(int(seq_len), max(2, len_cap)))
     seqs = build_calibration_seqs_from_token_ids(
         token_ids,
         n_seqs=search_n_seqs,
@@ -512,19 +563,37 @@ def apply_output_aware_gelu_scale_search_from_token_ids(
         if base_scale <= 0.0:
             raise ValueError(f"output-aware GELU search requires positive scale for {key}")
         block_start_nll = float(current_nll)
-        candidate_rows: List[Dict[str, float]] = []
+        candidate_rows: List[Dict[str, object]] = []
+        pending_indices: List[int] = []
+        pending_scales: List[Dict[str, float]] = []
         for multiplier in multipliers:
             m = float(multiplier)
             if m <= 0.0:
                 continue
             candidate_scales = dict(scales)
             candidate_scales[key] = float(base_scale * m)
-            mean_nll = _mean_fake_quant_target_nll(payload, seqs, candidate_scales, ptq_preset=ptq_preset)
+            if m == 1.0:
+                mean_nll = block_start_nll
+            else:
+                mean_nll = float("nan")
+                pending_indices.append(len(candidate_rows))
+                pending_scales.append(candidate_scales)
             candidate_rows.append({
                 "multiplier": m,
                 "scale": float(candidate_scales[key]),
                 "mean_nll": float(mean_nll),
             })
+        for row_index, mean_nll in zip(
+            pending_indices,
+            _candidate_mean_fake_quant_target_nlls(
+                payload,
+                seqs,
+                pending_scales,
+                ptq_preset=ptq_preset,
+                search_workers=search_workers,
+            ),
+        ):
+            candidate_rows[row_index]["mean_nll"] = float(mean_nll)
         if not candidate_rows:
             raise ValueError("output-aware GELU search received no valid candidate multipliers")
         best = min(
@@ -568,6 +637,7 @@ def apply_output_aware_mlp_scale_search_from_token_ids(
     multipliers: Sequence[float] = OUTPUT_AWARE_MLP_MULTIPLIERS,
     search_n_seqs_max: int | None = None,
     search_seq_len_max: int | None = None,
+    search_workers: int | None = None,
     include_pair_candidates: bool = False,
 ) -> tuple[Dict[str, float], Dict[str, Dict[str, object]]]:
     """Greedily tune late MLP scale groups against final fake-quant token NLL.
@@ -659,7 +729,9 @@ def apply_output_aware_mlp_scale_search_from_token_ids(
             if any(scale <= 0.0 for scale in base_scales):
                 raise ValueError(f"output-aware MLP search requires positive scales for {key_groups}")
             group_start_nll = float(current_nll)
-            candidate_rows: List[Dict[str, float]] = []
+            candidate_rows: List[Dict[str, object]] = []
+            pending_indices: List[int] = []
+            pending_scales: List[Dict[str, float]] = []
             for multiplier in multipliers:
                 m = float(multiplier)
                 if m <= 0.0:
@@ -667,7 +739,12 @@ def apply_output_aware_mlp_scale_search_from_token_ids(
                 candidate_scales = dict(scales)
                 for keys, base_scale in zip(key_groups, base_scales):
                     candidate_scales.update(_candidate_for_group(keys, base_scale, m))
-                mean_nll = _mean_fake_quant_target_nll(payload, seqs, candidate_scales, ptq_preset=ptq_preset)
+                if m == 1.0:
+                    mean_nll = group_start_nll
+                else:
+                    mean_nll = float("nan")
+                    pending_indices.append(len(candidate_rows))
+                    pending_scales.append(candidate_scales)
                 candidate_rows.append({
                     "multiplier": m,
                     "scales": {
@@ -676,6 +753,17 @@ def apply_output_aware_mlp_scale_search_from_token_ids(
                     },
                     "mean_nll": float(mean_nll),
                 })
+            for row_index, mean_nll in zip(
+                pending_indices,
+                _candidate_mean_fake_quant_target_nlls(
+                    payload,
+                    seqs,
+                    pending_scales,
+                    ptq_preset=ptq_preset,
+                    search_workers=search_workers,
+                ),
+            ):
+                candidate_rows[row_index]["mean_nll"] = float(mean_nll)
             if not candidate_rows:
                 raise ValueError("output-aware MLP search received no valid candidate multipliers")
             best = min(
@@ -733,6 +821,7 @@ def apply_output_aware_attn_scale_search_from_token_ids(
     multipliers: Sequence[float] = OUTPUT_AWARE_MLP_MULTIPLIERS,
     search_n_seqs_max: int | None = None,
     search_seq_len_max: int | None = None,
+    search_workers: int | None = None,
     include_value_search: bool = False,
 ) -> tuple[Dict[str, float], Dict[str, Dict[str, object]]]:
     """Greedily tune attn_v scale groups against final fake-quant token NLL.
@@ -798,7 +887,9 @@ def apply_output_aware_attn_scale_search_from_token_ids(
             if any(scale <= 0.0 for scale in base_scales):
                 raise ValueError(f"output-aware attn search requires positive scales for {key_groups}")
             group_start_nll = float(current_nll)
-            candidate_rows: List[Dict[str, float]] = []
+            candidate_rows: List[Dict[str, object]] = []
+            pending_indices: List[int] = []
+            pending_scales: List[Dict[str, float]] = []
             for multiplier in multipliers:
                 m = float(multiplier)
                 if m <= 0.0:
@@ -806,7 +897,12 @@ def apply_output_aware_attn_scale_search_from_token_ids(
                 candidate_scales = dict(scales)
                 for keys, base_scale in zip(key_groups, base_scales):
                     candidate_scales.update(_candidate_for_group(keys, base_scale, m))
-                mean_nll = _mean_fake_quant_target_nll(payload, seqs, candidate_scales, ptq_preset=ptq_preset)
+                if m == 1.0:
+                    mean_nll = group_start_nll
+                else:
+                    mean_nll = float("nan")
+                    pending_indices.append(len(candidate_rows))
+                    pending_scales.append(candidate_scales)
                 candidate_rows.append({
                     "multiplier": m,
                     "scales": {
@@ -815,6 +911,17 @@ def apply_output_aware_attn_scale_search_from_token_ids(
                     },
                     "mean_nll": float(mean_nll),
                 })
+            for row_index, mean_nll in zip(
+                pending_indices,
+                _candidate_mean_fake_quant_target_nlls(
+                    payload,
+                    seqs,
+                    pending_scales,
+                    ptq_preset=ptq_preset,
+                    search_workers=search_workers,
+                ),
+            ):
+                candidate_rows[row_index]["mean_nll"] = float(mean_nll)
             if not candidate_rows:
                 raise ValueError("output-aware attn search received no valid candidate multipliers")
             best = min(
@@ -871,6 +978,7 @@ def apply_output_aware_lm_head_scale_search_from_token_ids(
     multipliers: Sequence[float] = OUTPUT_AWARE_MLP_MULTIPLIERS,
     search_n_seqs_max: int | None = None,
     search_seq_len_max: int | None = None,
+    search_workers: int | None = None,
 ) -> tuple[Dict[str, float], Dict[str, object]]:
     """Greedily tune the lm_head output scale against final fake-quant token NLL."""
     n_cap = OUTPUT_AWARE_SEARCH_N_SEQS_MAX if search_n_seqs_max is None else int(search_n_seqs_max)
@@ -885,14 +993,32 @@ def apply_output_aware_lm_head_scale_search_from_token_ids(
     baseline_nll = _mean_fake_quant_target_nll(payload, seqs, scales, ptq_preset=ptq_preset)
     current_nll = baseline_nll
     candidate_rows: List[Dict[str, float]] = []
+    pending_indices: List[int] = []
+    pending_scales: List[Dict[str, float]] = []
     for multiplier in multipliers:
         m = float(multiplier)
         if m <= 0.0:
             continue
         candidate = dict(scales)
         candidate["lm_head"] = base_scale * m
-        mean_nll = _mean_fake_quant_target_nll(payload, seqs, candidate, ptq_preset=ptq_preset)
+        if m == 1.0:
+            mean_nll = baseline_nll
+        else:
+            mean_nll = float("nan")
+            pending_indices.append(len(candidate_rows))
+            pending_scales.append(candidate)
         candidate_rows.append({"multiplier": m, "lm_head": base_scale * m, "mean_nll": float(mean_nll)})
+    for row_index, mean_nll in zip(
+        pending_indices,
+        _candidate_mean_fake_quant_target_nlls(
+            payload,
+            seqs,
+            pending_scales,
+            ptq_preset=ptq_preset,
+            search_workers=search_workers,
+        ),
+    ):
+        candidate_rows[row_index]["mean_nll"] = float(mean_nll)
     if not candidate_rows:
         raise ValueError("output-aware lm_head search received no valid candidate multipliers")
     best = min(

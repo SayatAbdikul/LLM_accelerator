@@ -78,8 +78,12 @@ def test_incremental_fake_quant_matches_full_sequence_reference(tmp_path):
     token_ids = [0, 0, 1, 2, 3, 4, 5, 6]
 
     incremental = ref.incremental_logits_trace(token_ids)
+    full_trace = ref.forward(token_ids, return_all_logits=True)
+    assert full_trace.shape[0] == len(token_ids)
 
     for idx, logits in enumerate(incremental):
         full = ref.forward(token_ids[:idx + 1])
         diff = logits.astype(np.int16) - full.astype(np.int16)
         assert np.percentile(np.abs(diff), 99) <= 1
+        trace_diff = logits.astype(np.int16) - full_trace[idx].astype(np.int16)
+        assert np.percentile(np.abs(trace_diff), 99) <= 1

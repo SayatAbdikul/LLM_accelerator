@@ -245,6 +245,98 @@ def _bias_i32(state_dict: dict, name: str, act_scale: float, weight_scales: np.n
     return np.round(bias / denom).astype(np.int32)
 
 
+_WEIGHT_COMPONENT_CACHE: dict[tuple[int, int, int, tuple[int, ...]], dict] = {}
+
+
+def clear_weight_component_cache() -> None:
+    """Clear cached fake-quant weight components used by NanoGPTFQReference."""
+    _WEIGHT_COMPONENT_CACHE.clear()
+
+
+def _cached_weight_components(state_dict: dict, model_args: dict, gelu_from_accum_blocks: set[int]) -> dict:
+    key = (
+        id(state_dict),
+        int(model_args["n_layer"]),
+        int(model_args["n_head"]),
+        tuple(sorted(int(v) for v in gelu_from_accum_blocks)),
+    )
+    cached = _WEIGHT_COMPONENT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    sd = state_dict
+    n_layer = int(model_args["n_layer"])
+    n_head = int(model_args["n_head"])
+    d_model = int(model_args["n_embd"])
+    d_head = d_model // n_head
+    components: dict[str, object] = {
+        "wte_fp32": _to_f32(sd["transformer.wte.weight"]),
+        "wpe_fp32": _to_f32(sd["transformer.wpe.weight"]),
+        "ln_f_w": _to_fp16_widened_f32(sd["transformer.ln_f.weight"]),
+        "ln_f_b": _to_fp16_widened_f32(sd["transformer.ln_f.bias"]),
+        "lm_head": _linear_components(sd["lm_head.weight"]),
+        "lm_head_w_fp32": _to_f32(sd["lm_head.weight"]),
+        "layers": [],
+    }
+    layers = components["layers"]
+    for L in range(n_layer):
+        heads = []
+        for H in range(n_head):
+            q_name = f"transformer.h.{L}.attn.c_attn.weight_h{H}_query"
+            k_name = f"transformer.h.{L}.attn.c_attn.weight_h{H}_key"
+            v_name = f"transformer.h.{L}.attn.c_attn.weight_h{H}_value"
+            q_q, q_scale_w, q_w, q_scales = _linear_components(sd[q_name])
+            k_q, k_scale_w, k_w, k_scales = _linear_components(sd[k_name])
+            v_q, v_scale_w, v_w, v_scales = _linear_components(sd[v_name])
+            q_b_name = f"transformer.h.{L}.attn.c_attn.bias_h{H}_query"
+            k_b_name = f"transformer.h.{L}.attn.c_attn.bias_h{H}_key"
+            v_b_name = f"transformer.h.{L}.attn.c_attn.bias_h{H}_value"
+            heads.append((
+                q_w,
+                k_w,
+                v_w,
+                _to_f32(sd[q_name]),
+                _to_f32(sd[k_name]),
+                _to_f32(sd[v_name]),
+                q_q,
+                k_q,
+                v_q,
+                q_scale_w,
+                k_scale_w,
+                v_scale_w,
+                q_scales,
+                k_scales,
+                v_scales,
+                _bias_fp32(sd, q_b_name, d_head),
+                _bias_fp32(sd, k_b_name, d_head),
+                _bias_fp32(sd, v_b_name, d_head),
+            ))
+        c_proj_q, c_proj_scale_w, c_proj_w, c_proj_scales = _linear_components(sd[f"transformer.h.{L}.attn.c_proj.weight"])
+        fc_q, fc_scale_w, fc_w, fc_scales = _linear_components(
+            sd[f"transformer.h.{L}.mlp.c_fc.weight"],
+            per_channel=L not in gelu_from_accum_blocks,
+        )
+        proj_q, proj_scale_w, proj_w, proj_scales = _linear_components(sd[f"transformer.h.{L}.mlp.c_proj.weight"])
+        layers.append({
+            "ln1_w": _to_fp16_widened_f32(sd[f"transformer.h.{L}.ln_1.weight"]),
+            "ln1_b": _to_fp16_widened_f32(sd[f"transformer.h.{L}.ln_1.bias"]),
+            "ln2_w": _to_fp16_widened_f32(sd[f"transformer.h.{L}.ln_2.weight"]),
+            "ln2_b": _to_fp16_widened_f32(sd[f"transformer.h.{L}.ln_2.bias"]),
+            "heads": heads,
+            "c_proj_components": (c_proj_q, c_proj_scale_w, c_proj_w, c_proj_scales),
+            "c_proj_w_fp32": _to_f32(sd[f"transformer.h.{L}.attn.c_proj.weight"]),
+            "c_proj_b": _bias_fp32(sd, f"transformer.h.{L}.attn.c_proj.bias", d_model),
+            "fc_components": (fc_q, fc_scale_w, fc_w, fc_scales),
+            "fc_w_fp32": _to_f32(sd[f"transformer.h.{L}.mlp.c_fc.weight"]),
+            "fc_b": _bias_fp32(sd, f"transformer.h.{L}.mlp.c_fc.bias", 4 * d_model),
+            "proj_components": (proj_q, proj_scale_w, proj_w, proj_scales),
+            "proj_w_fp32": _to_f32(sd[f"transformer.h.{L}.mlp.c_proj.weight"]),
+            "proj_b": _bias_fp32(sd, f"transformer.h.{L}.mlp.c_proj.bias", d_model),
+        })
+    _WEIGHT_COMPONENT_CACHE[key] = components
+    return components
+
+
 class NanoGPTFQReference:
     """NumPy fake-quantised nanoGPT forward pass sharing scales with the compiler.
 
@@ -295,22 +387,23 @@ class NanoGPTFQReference:
             and np.any(np.abs(_to_f32(value)) > 0.0)
             for name, value in sd.items()
         )
+        cached = _cached_weight_components(sd, model_args, self.gelu_from_accum_blocks)
 
         # INT8 embeddings are stored at the tok_pos_add scale because the
         # compiled program uses a raw INT8 VADD for token + position.  Separate
         # table scales would make q_token + q_pos numerically meaningless.
-        self.wte_fp32 = _to_f32(sd["transformer.wte.weight"])
-        self.wpe_fp32 = _to_f32(sd["transformer.wpe.weight"])
+        self.wte_fp32 = cached["wte_fp32"]
+        self.wpe_fp32 = cached["wpe_fp32"]
         embed_add_scale = _scale(self.scales, "tok_pos_add")
         wte_q = np.clip(np.round(self.wte_fp32 / np.float32(embed_add_scale)), -128, 127).astype(np.int8)
         wpe_q = np.clip(np.round(self.wpe_fp32 / np.float32(embed_add_scale)), -128, 127).astype(np.int8)
         self.wte_int8 = wte_q  # [V, d], INT8
         self.wpe_int8 = wpe_q  # [T, d], INT8
 
-        self.ln_f_w = _to_fp16_widened_f32(sd["transformer.ln_f.weight"])
-        self.ln_f_b = _to_fp16_widened_f32(sd["transformer.ln_f.bias"])
-        self.lm_head_w_q, self.lm_head_w_scale, self.lm_head_w, self.lm_head_w_scales = _linear_components(sd["lm_head.weight"])
-        self.lm_head_w_fp32 = _to_f32(sd["lm_head.weight"])
+        self.ln_f_w = cached["ln_f_w"]
+        self.ln_f_b = cached["ln_f_b"]
+        self.lm_head_w_q, self.lm_head_w_scale, self.lm_head_w, self.lm_head_w_scales = cached["lm_head"]
+        self.lm_head_w_fp32 = cached["lm_head_w_fp32"]
         self.lm_head_requant_pc = (
             np.float32(_scale(self.scales, "ln_f"))
             * self.lm_head_w_scales.astype(np.float32)
@@ -318,26 +411,16 @@ class NanoGPTFQReference:
         ).astype(np.float16)
 
         self.layers = []
-        for L in range(self.n_layer):
+        for L, cached_layer in enumerate(cached["layers"]):
             heads = []
-            for H in range(self.n_head):
-                q_name = f"transformer.h.{L}.attn.c_attn.weight_h{H}_query"
-                k_name = f"transformer.h.{L}.attn.c_attn.weight_h{H}_key"
-                v_name = f"transformer.h.{L}.attn.c_attn.weight_h{H}_value"
-                q_q, q_scale_w, q_w, q_scales = _linear_components(sd[q_name])
-                k_q, k_scale_w, k_w, k_scales = _linear_components(sd[k_name])
-                v_q, v_scale_w, v_w, v_scales = _linear_components(sd[v_name])
-                ln1_scale = _scale(self.scales, f"block{L}_ln1")
-                q_b_name = f"transformer.h.{L}.attn.c_attn.bias_h{H}_query"
-                k_b_name = f"transformer.h.{L}.attn.c_attn.bias_h{H}_key"
-                v_b_name = f"transformer.h.{L}.attn.c_attn.bias_h{H}_value"
-                heads.append((
+            for H, cached_head in enumerate(cached_layer["heads"]):
+                (
                     q_w,
                     k_w,
                     v_w,
-                    _to_f32(sd[f"transformer.h.{L}.attn.c_attn.weight_h{H}_query"]),
-                    _to_f32(sd[f"transformer.h.{L}.attn.c_attn.weight_h{H}_key"]),
-                    _to_f32(sd[f"transformer.h.{L}.attn.c_attn.weight_h{H}_value"]),
+                    q_w_fp32,
+                    k_w_fp32,
+                    v_w_fp32,
                     q_q,
                     k_q,
                     v_q,
@@ -347,27 +430,45 @@ class NanoGPTFQReference:
                     q_scales,
                     k_scales,
                     v_scales,
-                    _bias_i32(sd, q_b_name, ln1_scale, q_scales, self.d_head),
-                    _bias_i32(sd, k_b_name, ln1_scale, k_scales, self.d_head),
-                    _bias_i32(sd, v_b_name, ln1_scale, v_scales, self.d_head),
-                    _bias_fp32(sd, q_b_name, self.d_head),
-                    _bias_fp32(sd, k_b_name, self.d_head),
-                    _bias_fp32(sd, v_b_name, self.d_head),
+                    q_b,
+                    k_b,
+                    v_b,
+                ) = cached_head
+                ln1_scale = _scale(self.scales, f"block{L}_ln1")
+                heads.append((
+                    q_w,
+                    k_w,
+                    v_w,
+                    q_w_fp32,
+                    k_w_fp32,
+                    v_w_fp32,
+                    q_q,
+                    k_q,
+                    v_q,
+                    q_scale_w,
+                    k_scale_w,
+                    v_scale_w,
+                    q_scales,
+                    k_scales,
+                    v_scales,
+                    np.round(q_b / np.maximum(np.abs(np.float32(ln1_scale) * q_scales.astype(np.float32)[:self.d_head]), 1e-10)).astype(np.int32),
+                    np.round(k_b / np.maximum(np.abs(np.float32(ln1_scale) * k_scales.astype(np.float32)[:self.d_head]), 1e-10)).astype(np.int32),
+                    np.round(v_b / np.maximum(np.abs(np.float32(ln1_scale) * v_scales.astype(np.float32)[:self.d_head]), 1e-10)).astype(np.int32),
+                    q_b,
+                    k_b,
+                    v_b,
                 ))
-            c_proj_q, c_proj_scale_w, c_proj_w, c_proj_scales = _linear_components(sd[f"transformer.h.{L}.attn.c_proj.weight"])
-            fc_q, fc_scale_w, fc_w, fc_scales = _linear_components(
-                sd[f"transformer.h.{L}.mlp.c_fc.weight"],
-                per_channel=L not in self.gelu_from_accum_blocks,
-            )
-            proj_q, proj_scale_w, proj_w, proj_scales = _linear_components(sd[f"transformer.h.{L}.mlp.c_proj.weight"])
+            c_proj_q, c_proj_scale_w, c_proj_w, c_proj_scales = cached_layer["c_proj_components"]
+            fc_q, fc_scale_w, fc_w, fc_scales = cached_layer["fc_components"]
+            proj_q, proj_scale_w, proj_w, proj_scales = cached_layer["proj_components"]
             c_proj_name = f"transformer.h.{L}.attn.c_proj.weight"
             fc_name = f"transformer.h.{L}.mlp.c_fc.weight"
             proj_name = f"transformer.h.{L}.mlp.c_proj.weight"
             self.layers.append({
-                "ln1_w": _to_fp16_widened_f32(sd[f"transformer.h.{L}.ln_1.weight"]),
-                "ln1_b": _to_fp16_widened_f32(sd[f"transformer.h.{L}.ln_1.bias"]),
-                "ln2_w": _to_fp16_widened_f32(sd[f"transformer.h.{L}.ln_2.weight"]),
-                "ln2_b": _to_fp16_widened_f32(sd[f"transformer.h.{L}.ln_2.bias"]),
+                "ln1_w": cached_layer["ln1_w"],
+                "ln1_b": cached_layer["ln1_b"],
+                "ln2_w": cached_layer["ln2_w"],
+                "ln2_b": cached_layer["ln2_b"],
                 "heads": heads,
                 "c_proj_w": c_proj_w,
                 "c_proj_w_q": c_proj_q,
@@ -382,15 +483,12 @@ class NanoGPTFQReference:
                     if c_proj_name in self.requant_pc_weight_names
                     else None
                 ),
-                "c_proj_w_fp32": _to_f32(sd[f"transformer.h.{L}.attn.c_proj.weight"]),
-                "c_proj_b": _bias_fp32(sd, f"transformer.h.{L}.attn.c_proj.bias", self.d_model),
-                "c_proj_b_i32": _bias_i32(
-                    sd,
-                    f"transformer.h.{L}.attn.c_proj.bias",
-                    _scale(self.scales, f"block{L}_concat"),
-                    c_proj_scales,
-                    self.d_model,
-                ),
+                "c_proj_w_fp32": cached_layer["c_proj_w_fp32"],
+                "c_proj_b": cached_layer["c_proj_b"],
+                "c_proj_b_i32": np.round(
+                    cached_layer["c_proj_b"]
+                    / np.maximum(np.abs(np.float32(_scale(self.scales, f"block{L}_concat")) * c_proj_scales.astype(np.float32)[:self.d_model]), 1e-10)
+                ).astype(np.int32),
                 "fc_w": fc_w,
                 "fc_w_q": fc_q,
                 "fc_w_scale": fc_scale_w,
@@ -404,15 +502,12 @@ class NanoGPTFQReference:
                     if fc_name in self.requant_pc_weight_names
                     else None
                 ),
-                "fc_w_fp32": _to_f32(sd[f"transformer.h.{L}.mlp.c_fc.weight"]),
-                "fc_b": _bias_fp32(sd, f"transformer.h.{L}.mlp.c_fc.bias", 4 * self.d_model),
-                "fc_b_i32": _bias_i32(
-                    sd,
-                    f"transformer.h.{L}.mlp.c_fc.bias",
-                    _scale(self.scales, f"block{L}_ln2"),
-                    fc_scales,
-                    4 * self.d_model,
-                ),
+                "fc_w_fp32": cached_layer["fc_w_fp32"],
+                "fc_b": cached_layer["fc_b"],
+                "fc_b_i32": np.round(
+                    cached_layer["fc_b"]
+                    / np.maximum(np.abs(np.float32(_scale(self.scales, f"block{L}_ln2")) * fc_scales.astype(np.float32)[:4 * self.d_model]), 1e-10)
+                ).astype(np.int32),
                 "proj_w": proj_w,
                 "proj_w_q": proj_q,
                 "proj_w_scale": proj_scale_w,
@@ -426,15 +521,12 @@ class NanoGPTFQReference:
                     if proj_name in self.requant_pc_weight_names
                     else None
                 ),
-                "proj_w_fp32": _to_f32(sd[f"transformer.h.{L}.mlp.c_proj.weight"]),
-                "proj_b": _bias_fp32(sd, f"transformer.h.{L}.mlp.c_proj.bias", self.d_model),
-                "proj_b_i32": _bias_i32(
-                    sd,
-                    f"transformer.h.{L}.mlp.c_proj.bias",
-                    _scale(self.scales, f"block{L}_gelu", 1.0 / 127.0),
-                    proj_scales,
-                    self.d_model,
-                ),
+                "proj_w_fp32": cached_layer["proj_w_fp32"],
+                "proj_b": cached_layer["proj_b"],
+                "proj_b_i32": np.round(
+                    cached_layer["proj_b"]
+                    / np.maximum(np.abs(np.float32(_scale(self.scales, f"block{L}_gelu", 1.0 / 127.0)) * proj_scales.astype(np.float32)[:self.d_model]), 1e-10)
+                ).astype(np.int32),
             })
 
     def _large_vocab_lm_head_reference(self) -> bool:
@@ -452,8 +544,10 @@ class NanoGPTFQReference:
         self,
         token_ids: Sequence[int],
         position_ids: Optional[Sequence[int]] = None,
+        *,
+        return_all_logits: bool = False,
     ) -> np.ndarray:
-        """Return INT8 logits for the last position. Shape [vocab_size]."""
+        """Return INT8 logits for the last position, or every causal position."""
         tids = list(token_ids)
         seq = len(tids)
         pids = list(position_ids) if position_ids is not None else list(range(seq))
@@ -610,13 +704,15 @@ class NanoGPTFQReference:
 
         ln_f_scale = _scale(s, "ln_f")
         ln_f = _qdq(_layernorm_np(x, self.ln_f_w, self.ln_f_b, self.eps), ln_f_scale)
+        lm_input = ln_f if return_all_logits else ln_f[-1:]
         if not self._large_vocab_lm_head_reference():
-            logits = ln_f[-1:] @ self.lm_head_w.T
-            return _to_int8_logits(logits[0], _scale(s, "lm_head"))
-        ln_f_i8 = _fp32_to_int8(ln_f[-1:], ln_f_scale)
+            logits = lm_input @ self.lm_head_w.T
+            logits_i8 = _to_int8_logits(logits, _scale(s, "lm_head"))
+            return logits_i8 if return_all_logits else logits_i8[0]
+        ln_f_i8 = _fp32_to_int8(lm_input, ln_f_scale)
         logits_accum = ln_f_i8.astype(np.int32) @ self.lm_head_w_q.astype(np.int32).T
         logits_i8 = _requant_accum_pc_int8(logits_accum, self.lm_head_requant_pc)
-        return logits_i8[0]
+        return logits_i8 if return_all_logits else logits_i8[0]
 
     def forward_incremental(
         self,

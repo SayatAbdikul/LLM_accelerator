@@ -24,8 +24,6 @@ CALIBRATION_N_SEQS_LARGE = 64
 CALIBRATION_SEQ_LEN_LARGE = 128
 CALIBRATION_PERCENTILE_DEFAULT = 99.9
 
-# GPT-2-specific PTQ default — won the preset sweep on the real GPT-2 124M checkpoint.
-GPT2_DEFAULT_PTQ_PRESET = "output_aware_mlp_lm_head_0_1_4_8_to_11"
 from .fake_quant_reference import NanoGPTFQReference
 from .host_runner import HostRunner
 from .stage5_ptq import (
@@ -39,6 +37,11 @@ from .stage5_ptq import (
     stage5_requant_pc_weight_names,
 )
 from .tiny_fixture import build_stage3_tiny_decoder_bundle
+
+# Backward-compatible alias for older tools. Runtime default resolution should
+# call stage5_default_ptq_preset_name() so the source of truth stays in
+# stage5_ptq.py.
+GPT2_DEFAULT_PTQ_PRESET = stage5_default_ptq_preset_name()
 
 
 @dataclass
@@ -169,6 +172,7 @@ def evaluate_gpt2_perplexity(
     ptq_preset: str | Stage5PTQPreset | None = None,
     output_aware_search_n_seqs: int | None = None,
     output_aware_search_seq_len: int | None = None,
+    output_aware_search_workers: int | None = None,
 ) -> GPT2PerplexityResult:
     if context_len < 1:
         raise ValueError("context_len must be positive")
@@ -180,7 +184,7 @@ def evaluate_gpt2_perplexity(
         raise ValueError("evaluation text produced fewer than two tokens")
 
     resolved_preset = resolve_stage5_ptq_preset(
-        GPT2_DEFAULT_PTQ_PRESET if ptq_preset is None else ptq_preset
+        stage5_default_ptq_preset_name() if ptq_preset is None else ptq_preset
     )
     calibration_scales = build_calibration_scales_from_token_ids(
         payload,
@@ -216,6 +220,9 @@ def evaluate_gpt2_perplexity(
             ptq_preset=resolved_preset,
             n_seqs=calibration_n_seqs,
             seq_len=calibration_seq_len,
+            search_n_seqs_max=output_aware_search_n_seqs,
+            search_seq_len_max=output_aware_search_seq_len,
+            search_workers=output_aware_search_workers,
         )
     if resolved_preset.output_aware_mlp_blocks:
         calibration_scales, _ = apply_output_aware_mlp_scale_search_from_token_ids(
@@ -226,6 +233,9 @@ def evaluate_gpt2_perplexity(
             ptq_preset=resolved_preset,
             n_seqs=calibration_n_seqs,
             seq_len=calibration_seq_len,
+            search_n_seqs_max=output_aware_search_n_seqs,
+            search_seq_len_max=output_aware_search_seq_len,
+            search_workers=output_aware_search_workers,
         )
     if resolved_preset.output_aware_attn_blocks:
         calibration_scales, _ = apply_output_aware_attn_scale_search_from_token_ids(
@@ -238,6 +248,7 @@ def evaluate_gpt2_perplexity(
             seq_len=calibration_seq_len,
             search_n_seqs_max=output_aware_search_n_seqs,
             search_seq_len_max=output_aware_search_seq_len,
+            search_workers=output_aware_search_workers,
         )
     if resolved_preset.output_aware_lm_head:
         calibration_scales, _ = apply_output_aware_lm_head_scale_search_from_token_ids(
@@ -249,6 +260,7 @@ def evaluate_gpt2_perplexity(
             seq_len=calibration_seq_len,
             search_n_seqs_max=output_aware_search_n_seqs,
             search_seq_len_max=output_aware_search_seq_len,
+            search_workers=output_aware_search_workers,
         )
     _, targets = teacher_forced_inputs_and_targets(eval_tokens)
     vocab_size = int(payload["model_args"]["vocab_size"])

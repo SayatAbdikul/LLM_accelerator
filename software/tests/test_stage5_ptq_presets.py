@@ -308,6 +308,35 @@ def test_output_aware_lm_head_scale_search_updates_lm_head_scale(monkeypatch):
     assert diagnostics["new_scale"] == pytest.approx(2.0 * 0.75)
 
 
+def test_output_aware_gelu_scale_search_accepts_search_caps(monkeypatch):
+    payload = {"model_args": {"n_layer": 1, "n_head": 1, "vocab_size": 4}, "state_dict": {}}
+    scales = {"block0_gelu": 2.0, "lm_head": 1.0}
+    seen_lengths = []
+
+    def fake_mean(payload, seqs, scales, *, ptq_preset):
+        seen_lengths.append((len(seqs), len(seqs[0]) if seqs else 0))
+        return float(scales["block0_gelu"])
+
+    monkeypatch.setattr(calibration_mod, "_mean_fake_quant_target_nll", fake_mean)
+    updated, diagnostics = calibration_mod.apply_output_aware_gelu_scale_search_from_token_ids(
+        payload,
+        list(range(20)),
+        scales,
+        blocks=(0,),
+        ptq_preset="control",
+        n_seqs=8,
+        seq_len=16,
+        multipliers=(0.75, 1.0),
+        search_n_seqs_max=2,
+        search_seq_len_max=4,
+    )
+
+    assert updated["block0_gelu"] == pytest.approx(1.5)
+    assert diagnostics["block0"]["search_n_seqs"] == 2
+    assert diagnostics["block0"]["search_seq_len"] == 4
+    assert all(shape == (2, 4) for shape in seen_lengths)
+
+
 def test_stage5_scale_policy_ties_fc2_and_residual2_for_raw_vadd_block():
     scales = {
         "block11_residual1": 0.03125,
@@ -433,6 +462,8 @@ def test_debug_preset_sweep_reports_all_presets_and_deterministic_winner(monkeyp
     assert report["proposed_promotion"] == "late_ln_combo"
     assert report["promoted_default"] == "output_aware_mlp_lm_head_0_1_4_8_to_11"
     assert report["default_replacement_candidate"]["baseline"] == "output_aware_mlp_lm_head_0_1_4_8_to_11"
+    assert report["default_replacement_candidate"]["promotion_threshold"] == pytest.approx(0.10)
+    assert "passes_10pct_rule" in report["default_replacement_candidate"]
     fc2aware_rows = [row for row in report["rows"] if row["name"] == "fc2_11_fc2aware_gelu"]
     assert fc2aware_rows and "fc2_aware_gelu" in fc2aware_rows[0]
     output_aware_rows = [row for row in report["rows"] if row["name"] == "output_aware_gelu_8_to_11"]
