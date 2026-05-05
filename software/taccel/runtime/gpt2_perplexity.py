@@ -173,6 +173,7 @@ def evaluate_gpt2_perplexity(
     output_aware_search_n_seqs: int | None = None,
     output_aware_search_seq_len: int | None = None,
     output_aware_search_workers: int | None = None,
+    output_aware_include_pairs: bool = False,
 ) -> GPT2PerplexityResult:
     if context_len < 1:
         raise ValueError("context_len must be positive")
@@ -236,6 +237,7 @@ def evaluate_gpt2_perplexity(
             search_n_seqs_max=output_aware_search_n_seqs,
             search_seq_len_max=output_aware_search_seq_len,
             search_workers=output_aware_search_workers,
+            include_pair_candidates=output_aware_include_pairs,
         )
     if resolved_preset.output_aware_attn_blocks:
         calibration_scales, _ = apply_output_aware_attn_scale_search_from_token_ids(

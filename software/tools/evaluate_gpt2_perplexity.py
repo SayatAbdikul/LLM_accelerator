@@ -33,6 +33,7 @@ def main(argv=None) -> int:
     parser.add_argument("--output-aware-search-n-seqs", type=int)
     parser.add_argument("--output-aware-search-seq-len", type=int)
     parser.add_argument("--output-aware-search-workers", type=int)
+    parser.add_argument("--output-aware-include-pairs", action="store_true")
     parser.add_argument("--ptq-preset", default=None)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -65,6 +66,7 @@ def main(argv=None) -> int:
         output_aware_search_n_seqs=args.output_aware_search_n_seqs,
         output_aware_search_seq_len=args.output_aware_search_seq_len,
         output_aware_search_workers=args.output_aware_search_workers,
+        output_aware_include_pairs=args.output_aware_include_pairs,
     )
     out = asdict(result)
     if args.json:

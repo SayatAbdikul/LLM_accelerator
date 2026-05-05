@@ -263,6 +263,32 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         requant_pc_out_proj_blocks=tuple(range(12)),
         requant_pc_fc1_blocks=tuple(range(12)),
     ),
+    # Single-block ablations: add blocks 2, 3, 5 individually to the winning base.
+    "output_aware_mlp_lm_head_0_1_2_4_8_to_11": _preset(
+        "output_aware_mlp_lm_head_0_1_2_4_8_to_11",
+        requant_pc_fc2_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        output_aware_lm_head=True,
+    ),
+    "output_aware_mlp_lm_head_0_1_3_4_8_to_11": _preset(
+        "output_aware_mlp_lm_head_0_1_3_4_8_to_11",
+        requant_pc_fc2_blocks=(0, 1, 3, 4, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 1, 3, 4, 8, 9, 10, 11),
+        output_aware_lm_head=True,
+    ),
+    "output_aware_mlp_lm_head_0_1_4_5_8_to_11": _preset(
+        "output_aware_mlp_lm_head_0_1_4_5_8_to_11",
+        requant_pc_fc2_blocks=(0, 1, 4, 5, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 1, 4, 5, 8, 9, 10, 11),
+        output_aware_lm_head=True,
+    ),
+    # All-blocks MLP search + lm_head.
+    "output_aware_mlp_lm_head_0_to_11": _preset(
+        "output_aware_mlp_lm_head_0_to_11",
+        requant_pc_fc2_blocks=tuple(range(12)),
+        output_aware_mlp_blocks=tuple(range(12)),
+        output_aware_lm_head=True,
+    ),
 }
 
 # Updated only after a preset wins on the real local GPT-2 checkpoint and still
