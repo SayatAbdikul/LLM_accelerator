@@ -23,6 +23,7 @@ class Stage5PTQPreset:
     output_aware_mlp_blocks: tuple[int, ...]
     output_aware_attn_blocks: tuple[int, ...]
     output_aware_lm_head: bool
+    output_aware_include_pairs: bool
     gelu_from_accum_blocks: tuple[int, ...]
 
 
@@ -39,6 +40,7 @@ def _preset(
     output_aware_mlp_blocks: Sequence[int] = (),
     output_aware_attn_blocks: Sequence[int] = (),
     output_aware_lm_head: bool = False,
+    output_aware_include_pairs: bool = False,
     gelu_from_accum_blocks: Sequence[int] = (),
 ) -> Stage5PTQPreset:
     return Stage5PTQPreset(
@@ -53,6 +55,7 @@ def _preset(
         output_aware_mlp_blocks=tuple(int(v) for v in output_aware_mlp_blocks),
         output_aware_attn_blocks=tuple(int(v) for v in output_aware_attn_blocks),
         output_aware_lm_head=bool(output_aware_lm_head),
+        output_aware_include_pairs=bool(output_aware_include_pairs),
         gelu_from_accum_blocks=tuple(int(v) for v in gelu_from_accum_blocks),
     )
 
@@ -269,6 +272,7 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         requant_pc_fc2_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
         output_aware_mlp_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
         output_aware_lm_head=True,
+        output_aware_include_pairs=True,
     ),
     "output_aware_mlp_lm_head_0_1_3_4_8_to_11": _preset(
         "output_aware_mlp_lm_head_0_1_3_4_8_to_11",
@@ -293,7 +297,7 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
 
 # Updated only after a preset wins on the real local GPT-2 checkpoint and still
 # keeps the existing golden-vs-fake gates green.
-PROMOTED_STAGE5_PTQ_PRESET = "output_aware_mlp_lm_head_0_1_4_8_to_11"
+PROMOTED_STAGE5_PTQ_PRESET = "output_aware_mlp_lm_head_0_1_2_4_8_to_11"
 
 
 def stage5_default_ptq_preset_name() -> str:
