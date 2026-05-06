@@ -367,6 +367,31 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         output_aware_include_pairs=True,
         output_aware_mlp_passes=2,
     ),
+    # Cross-component variants — empirically tested, kept for registry
+    # completeness. Neither beats the new default; do NOT promote.
+    #
+    # WARNING: pc_out_proj_0_11 produced relative_delta=1.37 (golden vs
+    # fake-quant divergence) at 33-token eval — likely a missing scale-policy
+    # invariant when per-channel out_proj is applied to a strict subset of
+    # the fc2 PC blocks. Investigate before reusing this combination.
+    "output_aware_mlp_lm_head_0_11_pc_full_pc_out_proj_0_11": _preset(
+        "output_aware_mlp_lm_head_0_11_pc_full_pc_out_proj_0_11",
+        requant_pc_out_proj_blocks=(0, 11),
+        requant_pc_fc2_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 11),
+        output_aware_lm_head=True,
+        output_aware_include_pairs=True,
+    ),
+    # FC2-aware GELU on block 11 layered on the default produces 4,903 PPL
+    # (vs 4,243). Fidelity is clean.
+    "output_aware_mlp_lm_head_0_11_pc_full_fc2aware_gelu_11": _preset(
+        "output_aware_mlp_lm_head_0_11_pc_full_fc2aware_gelu_11",
+        requant_pc_fc2_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        fc2_aware_gelu_blocks=(11,),
+        output_aware_mlp_blocks=(0, 11),
+        output_aware_lm_head=True,
+        output_aware_include_pairs=True,
+    ),
 }
 
 # Updated only after a preset wins on the real local GPT-2 checkpoint and still
