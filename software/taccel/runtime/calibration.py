@@ -639,6 +639,7 @@ def apply_output_aware_mlp_scale_search_from_token_ids(
     search_seq_len_max: int | None = None,
     search_workers: int | None = None,
     include_pair_candidates: bool = False,
+    passes: int = 1,
 ) -> tuple[Dict[str, float], Dict[str, Dict[str, object]]]:
     """Greedily tune late MLP scale groups against final fake-quant token NLL.
 
@@ -648,6 +649,12 @@ def apply_output_aware_mlp_scale_search_from_token_ids(
     * ``gelu``: changes SFU/GELU output quantization before FC2.
     * ``residual_group``: changes ``residual1``, ``fc2``, and ``residual2``
       together, preserving the raw residual2 VADD shared-scale contract.
+
+    With ``passes > 1`` the block loop is repeated; each subsequent pass
+    operates on the already-tuned scales as base, so a multiplier of 1.25
+    on the second pass compounds with whatever multiplier was accepted on
+    the first pass for that group. This lets blocks reach scale targets
+    further from the original than a single grid step allows.
     """
     block_set = sorted({int(block) for block in blocks})
     if not block_set:
@@ -679,133 +686,139 @@ def apply_output_aware_mlp_scale_search_from_token_ids(
             candidate[key] = new_scale
         return candidate
 
-    for block in block_set:
-        block_start_nll = float(current_nll)
-        group_specs = [
-            ("fc1", ((f"block{block}_fc1",),)),
-            ("gelu", ((f"block{block}_gelu",),)),
-            (
-                "residual_group",
-                ((
-                    f"block{block}_residual1",
-                    f"block{block}_fc2",
-                    f"block{block}_residual2",
-                ),),
-            ),
-        ]
-        if include_pair_candidates:
-            group_specs.extend([
+    pass_count = max(1, int(passes))
+    for pass_index in range(pass_count):
+        for block in block_set:
+            block_start_nll = float(current_nll)
+            group_specs = [
+                ("fc1", ((f"block{block}_fc1",),)),
+                ("gelu", ((f"block{block}_gelu",),)),
                 (
-                    "fc1_gelu",
-                    ((f"block{block}_fc1",), (f"block{block}_gelu",)),
+                    "residual_group",
+                    ((
+                        f"block{block}_residual1",
+                        f"block{block}_fc2",
+                        f"block{block}_residual2",
+                    ),),
                 ),
-                (
-                    "gelu_residual_group",
+            ]
+            if include_pair_candidates:
+                group_specs.extend([
                     (
-                        (f"block{block}_gelu",),
+                        "fc1_gelu",
+                        ((f"block{block}_fc1",), (f"block{block}_gelu",)),
+                    ),
+                    (
+                        "gelu_residual_group",
                         (
-                            f"block{block}_residual1",
-                            f"block{block}_fc2",
-                            f"block{block}_residual2",
+                            (f"block{block}_gelu",),
+                            (
+                                f"block{block}_residual1",
+                                f"block{block}_fc2",
+                                f"block{block}_residual2",
+                            ),
                         ),
                     ),
-                ),
-                (
-                    "fc1_gelu_residual_group",
                     (
-                        (f"block{block}_fc1",),
-                        (f"block{block}_gelu",),
+                        "fc1_gelu_residual_group",
                         (
-                            f"block{block}_residual1",
-                            f"block{block}_fc2",
-                            f"block{block}_residual2",
+                            (f"block{block}_fc1",),
+                            (f"block{block}_gelu",),
+                            (
+                                f"block{block}_residual1",
+                                f"block{block}_fc2",
+                                f"block{block}_residual2",
+                            ),
                         ),
                     ),
-                ),
-            ])
-        group_results: Dict[str, object] = {}
-        for group_name, key_groups in group_specs:
-            base_scales = [float(scales.get(keys[0], _DEFAULT_SCALES)) for keys in key_groups]
-            if any(scale <= 0.0 for scale in base_scales):
-                raise ValueError(f"output-aware MLP search requires positive scales for {key_groups}")
-            group_start_nll = float(current_nll)
-            candidate_rows: List[Dict[str, object]] = []
-            pending_indices: List[int] = []
-            pending_scales: List[Dict[str, float]] = []
-            for multiplier in multipliers:
-                m = float(multiplier)
-                if m <= 0.0:
-                    continue
-                candidate_scales = dict(scales)
-                for keys, base_scale in zip(key_groups, base_scales):
-                    candidate_scales.update(_candidate_for_group(keys, base_scale, m))
-                if m == 1.0:
-                    mean_nll = group_start_nll
-                else:
-                    mean_nll = float("nan")
-                    pending_indices.append(len(candidate_rows))
-                    pending_scales.append(candidate_scales)
-                candidate_rows.append({
-                    "multiplier": m,
-                    "scales": {
-                        keys[0]: float(base_scale * m)
+                ])
+            group_results: Dict[str, object] = {}
+            for group_name, key_groups in group_specs:
+                base_scales = [float(scales.get(keys[0], _DEFAULT_SCALES)) for keys in key_groups]
+                if any(scale <= 0.0 for scale in base_scales):
+                    raise ValueError(f"output-aware MLP search requires positive scales for {key_groups}")
+                group_start_nll = float(current_nll)
+                candidate_rows: List[Dict[str, object]] = []
+                pending_indices: List[int] = []
+                pending_scales: List[Dict[str, float]] = []
+                for multiplier in multipliers:
+                    m = float(multiplier)
+                    if m <= 0.0:
+                        continue
+                    candidate_scales = dict(scales)
+                    for keys, base_scale in zip(key_groups, base_scales):
+                        candidate_scales.update(_candidate_for_group(keys, base_scale, m))
+                    if m == 1.0:
+                        mean_nll = group_start_nll
+                    else:
+                        mean_nll = float("nan")
+                        pending_indices.append(len(candidate_rows))
+                        pending_scales.append(candidate_scales)
+                    candidate_rows.append({
+                        "multiplier": m,
+                        "scales": {
+                            keys[0]: float(base_scale * m)
+                            for keys, base_scale in zip(key_groups, base_scales)
+                        },
+                        "mean_nll": float(mean_nll),
+                    })
+                for row_index, mean_nll in zip(
+                    pending_indices,
+                    _candidate_mean_fake_quant_target_nlls(
+                        payload,
+                        seqs,
+                        pending_scales,
+                        ptq_preset=ptq_preset,
+                        search_workers=search_workers,
+                    ),
+                ):
+                    candidate_rows[row_index]["mean_nll"] = float(mean_nll)
+                if not candidate_rows:
+                    raise ValueError("output-aware MLP search received no valid candidate multipliers")
+                best = min(
+                    candidate_rows,
+                    key=lambda row: (
+                        row["mean_nll"],
+                        abs(row["multiplier"] - 1.0),
+                        row["multiplier"],
+                    ),
+                )
+                accepted = bool(best["mean_nll"] < current_nll)
+                if accepted:
+                    for keys, base_scale in zip(key_groups, base_scales):
+                        selected_scale = float(base_scale * float(best["multiplier"]))
+                        for key in keys:
+                            scales[key] = selected_scale
+                    current_nll = float(best["mean_nll"])
+                group_results[group_name] = {
+                    "key_groups": [list(keys) for keys in key_groups],
+                    "old_scales": {
+                        keys[0]: float(base_scale)
                         for keys, base_scale in zip(key_groups, base_scales)
                     },
-                    "mean_nll": float(mean_nll),
-                })
-            for row_index, mean_nll in zip(
-                pending_indices,
-                _candidate_mean_fake_quant_target_nlls(
-                    payload,
-                    seqs,
-                    pending_scales,
-                    ptq_preset=ptq_preset,
-                    search_workers=search_workers,
-                ),
-            ):
-                candidate_rows[row_index]["mean_nll"] = float(mean_nll)
-            if not candidate_rows:
-                raise ValueError("output-aware MLP search received no valid candidate multipliers")
-            best = min(
-                candidate_rows,
-                key=lambda row: (
-                    row["mean_nll"],
-                    abs(row["multiplier"] - 1.0),
-                    row["multiplier"],
-                ),
+                    "new_scales": {
+                        keys[0]: float(scales.get(keys[0], base_scale))
+                        for keys, base_scale in zip(key_groups, base_scales)
+                    },
+                    "multiplier": float(best["multiplier"]) if accepted else 1.0,
+                    "accepted": accepted,
+                    "baseline_mean_nll": group_start_nll,
+                    "best_candidate_mean_nll": float(best["mean_nll"]),
+                    "selected_mean_nll": float(current_nll),
+                    "candidate_count": int(len(candidate_rows)),
+                    "candidates": candidate_rows,
+                }
+            diag_key = (
+                f"block{block}" if pass_count == 1 else f"pass{pass_index}_block{block}"
             )
-            accepted = bool(best["mean_nll"] < current_nll)
-            if accepted:
-                for keys, base_scale in zip(key_groups, base_scales):
-                    selected_scale = float(base_scale * float(best["multiplier"]))
-                    for key in keys:
-                        scales[key] = selected_scale
-                current_nll = float(best["mean_nll"])
-            group_results[group_name] = {
-                "key_groups": [list(keys) for keys in key_groups],
-                "old_scales": {
-                    keys[0]: float(base_scale)
-                    for keys, base_scale in zip(key_groups, base_scales)
-                },
-                "new_scales": {
-                    keys[0]: float(scales.get(keys[0], base_scale))
-                    for keys, base_scale in zip(key_groups, base_scales)
-                },
-                "multiplier": float(best["multiplier"]) if accepted else 1.0,
-                "accepted": accepted,
-                "baseline_mean_nll": group_start_nll,
-                "best_candidate_mean_nll": float(best["mean_nll"]),
+            diagnostics[diag_key] = {
+                "pass": int(pass_index),
+                "baseline_mean_nll": block_start_nll,
                 "selected_mean_nll": float(current_nll),
-                "candidate_count": int(len(candidate_rows)),
-                "candidates": candidate_rows,
+                "search_n_seqs": int(search_n_seqs),
+                "search_seq_len": int(search_seq_len),
+                "groups": group_results,
             }
-        diagnostics[f"block{block}"] = {
-            "baseline_mean_nll": block_start_nll,
-            "selected_mean_nll": float(current_nll),
-            "search_n_seqs": int(search_n_seqs),
-            "search_seq_len": int(search_seq_len),
-            "groups": group_results,
-        }
     return scales, diagnostics
 
 

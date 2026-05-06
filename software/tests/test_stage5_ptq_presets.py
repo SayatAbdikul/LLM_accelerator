@@ -168,6 +168,7 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         output_aware_attn_blocks=(),
         output_aware_lm_head=False,
         output_aware_include_pairs=False,
+        output_aware_mlp_passes=1,
         gelu_from_accum_blocks=(),
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
@@ -185,6 +186,7 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         output_aware_attn_blocks=(),
         output_aware_lm_head=False,
         output_aware_include_pairs=False,
+        output_aware_mlp_passes=1,
         gelu_from_accum_blocks=(),
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
@@ -202,6 +204,7 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         output_aware_attn_blocks=(),
         output_aware_lm_head=False,
         output_aware_include_pairs=False,
+        output_aware_mlp_passes=1,
         gelu_from_accum_blocks=(),
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
@@ -219,6 +222,7 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         output_aware_attn_blocks=(),
         output_aware_lm_head=False,
         output_aware_include_pairs=False,
+        output_aware_mlp_passes=1,
         gelu_from_accum_blocks=(0,),
     )
     with pytest.raises(ValueError, match="GELU-from-ACCUM and FC1 REQUANT_PC"):

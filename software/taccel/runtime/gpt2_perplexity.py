@@ -238,6 +238,7 @@ def evaluate_gpt2_perplexity(
             search_seq_len_max=output_aware_search_seq_len,
             search_workers=output_aware_search_workers,
             include_pair_candidates=(output_aware_include_pairs or resolved_preset.output_aware_include_pairs),
+            passes=resolved_preset.output_aware_mlp_passes,
         )
     if resolved_preset.output_aware_attn_blocks:
         calibration_scales, _ = apply_output_aware_attn_scale_search_from_token_ids(

@@ -24,6 +24,7 @@ class Stage5PTQPreset:
     output_aware_attn_blocks: tuple[int, ...]
     output_aware_lm_head: bool
     output_aware_include_pairs: bool
+    output_aware_mlp_passes: int
     gelu_from_accum_blocks: tuple[int, ...]
 
 
@@ -41,6 +42,7 @@ def _preset(
     output_aware_attn_blocks: Sequence[int] = (),
     output_aware_lm_head: bool = False,
     output_aware_include_pairs: bool = False,
+    output_aware_mlp_passes: int = 1,
     gelu_from_accum_blocks: Sequence[int] = (),
 ) -> Stage5PTQPreset:
     return Stage5PTQPreset(
@@ -56,6 +58,7 @@ def _preset(
         output_aware_attn_blocks=tuple(int(v) for v in output_aware_attn_blocks),
         output_aware_lm_head=bool(output_aware_lm_head),
         output_aware_include_pairs=bool(output_aware_include_pairs),
+        output_aware_mlp_passes=max(1, int(output_aware_mlp_passes)),
         gelu_from_accum_blocks=tuple(int(v) for v in gelu_from_accum_blocks),
     )
 
@@ -351,6 +354,18 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         output_aware_mlp_blocks=(0, 11),
         output_aware_lm_head=True,
         output_aware_include_pairs=True,
+    ),
+    # Same as the default but the MLP search runs two passes. Block 11's
+    # residual_group hit grid edge (1.5) on pass 1; a second pass lets it
+    # compound to a higher effective multiplier without widening the grid
+    # globally (which causes overfitting).
+    "output_aware_mlp_lm_head_0_11_pc_full_2pass": _preset(
+        "output_aware_mlp_lm_head_0_11_pc_full_2pass",
+        requant_pc_fc2_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 11),
+        output_aware_lm_head=True,
+        output_aware_include_pairs=True,
+        output_aware_mlp_passes=2,
     ),
 }
 
