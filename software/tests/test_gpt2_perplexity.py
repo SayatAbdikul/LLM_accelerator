@@ -132,7 +132,7 @@ def test_gpt2_perplexity_gate_against_fake_quant_reference():
     )
 
     assert result.target_count == 256
-    assert result.ptq_preset == "output_aware_mlp_lm_head_0_1_4_8_to_11"
+    assert result.ptq_preset == stage5_default_ptq_preset_name()
     assert result.relative_delta <= 0.02, (
         f"golden_ppl={result.golden_perplexity:.6f}, "
         f"fake_quant_ppl={result.fake_quant_perplexity:.6f}, "

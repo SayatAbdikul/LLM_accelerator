@@ -293,6 +293,53 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         output_aware_mlp_blocks=tuple(range(12)),
         output_aware_lm_head=True,
     ),
+    # Block-stacking variants on top of the new winning base (block 2 + pairs).
+    "output_aware_mlp_lm_head_0_1_2_4_5_8_to_11": _preset(
+        "output_aware_mlp_lm_head_0_1_2_4_5_8_to_11",
+        requant_pc_fc2_blocks=(0, 1, 2, 4, 5, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 1, 2, 4, 5, 8, 9, 10, 11),
+        output_aware_lm_head=True,
+        output_aware_include_pairs=True,
+    ),
+    "output_aware_mlp_lm_head_0_1_2_4_6_8_to_11": _preset(
+        "output_aware_mlp_lm_head_0_1_2_4_6_8_to_11",
+        requant_pc_fc2_blocks=(0, 1, 2, 4, 6, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 1, 2, 4, 6, 8, 9, 10, 11),
+        output_aware_lm_head=True,
+        output_aware_include_pairs=True,
+    ),
+    "output_aware_mlp_lm_head_0_1_2_4_7_8_to_11": _preset(
+        "output_aware_mlp_lm_head_0_1_2_4_7_8_to_11",
+        requant_pc_fc2_blocks=(0, 1, 2, 4, 7, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 1, 2, 4, 7, 8, 9, 10, 11),
+        output_aware_lm_head=True,
+        output_aware_include_pairs=True,
+    ),
+    # Percentile-override combinations layered on the new winning base.
+    "output_aware_mlp_lm_head_0_1_2_4_8_to_11_ln_f_99_8": _preset(
+        "output_aware_mlp_lm_head_0_1_2_4_8_to_11_ln_f_99_8",
+        activation_percentile_nodes={"ln_f": 99.8},
+        requant_pc_fc2_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        output_aware_lm_head=True,
+        output_aware_include_pairs=True,
+    ),
+    "output_aware_mlp_lm_head_0_1_2_4_8_to_11_block9_ln2_99_0": _preset(
+        "output_aware_mlp_lm_head_0_1_2_4_8_to_11_block9_ln2_99_0",
+        activation_percentile_nodes={"block9_ln2": 99.0},
+        requant_pc_fc2_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        output_aware_lm_head=True,
+        output_aware_include_pairs=True,
+    ),
+    "output_aware_mlp_lm_head_0_1_2_4_8_to_11_late_ln_combo": _preset(
+        "output_aware_mlp_lm_head_0_1_2_4_8_to_11_late_ln_combo",
+        activation_percentile_nodes={"ln_f": 99.8, "block9_ln2": 99.0},
+        requant_pc_fc2_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        output_aware_lm_head=True,
+        output_aware_include_pairs=True,
+    ),
 }
 
 # Updated only after a preset wins on the real local GPT-2 checkpoint and still
