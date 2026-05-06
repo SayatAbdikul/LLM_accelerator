@@ -340,11 +340,23 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         output_aware_lm_head=True,
         output_aware_include_pairs=True,
     ),
+    # Same broad per-channel FC2 coverage as the previous default
+    # (output_aware_mlp_lm_head_0_1_2_4_8_to_11) but the MLP scale search runs
+    # on blocks 0 and 11 only — the only blocks the diagnostic found gains on.
+    # Bit-identical PPL to the previous default at 33 and 257 tokens, with ~4×
+    # faster MLP search (60 candidate evaluations instead of 240).
+    "output_aware_mlp_lm_head_0_11_pc_full": _preset(
+        "output_aware_mlp_lm_head_0_11_pc_full",
+        requant_pc_fc2_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 11),
+        output_aware_lm_head=True,
+        output_aware_include_pairs=True,
+    ),
 }
 
 # Updated only after a preset wins on the real local GPT-2 checkpoint and still
 # keeps the existing golden-vs-fake gates green.
-PROMOTED_STAGE5_PTQ_PRESET = "output_aware_mlp_lm_head_0_1_2_4_8_to_11"
+PROMOTED_STAGE5_PTQ_PRESET = "output_aware_mlp_lm_head_0_11_pc_full"
 
 
 def stage5_default_ptq_preset_name() -> str:
