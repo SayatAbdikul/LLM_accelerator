@@ -19,6 +19,7 @@ import torch
 
 from taccel.runtime.calibration import (
     OUTPUT_AWARE_MLP_MULTIPLIERS,
+    apply_output_aware_lm_head_scale_search_from_token_ids,
     apply_output_aware_mlp_scale_search_from_token_ids,
     build_calibration_scales_from_token_ids,
 )
@@ -44,6 +45,8 @@ def main() -> int:
     parser.add_argument("--calibration-seq-len", type=int, default=CALIBRATION_SEQ_LEN_LARGE)
     parser.add_argument("--json-out", type=Path, default=None,
                         help="Optional path to dump full diagnostics JSON")
+    parser.add_argument("--include-lm-head", action="store_true",
+                        help="Also run and report the lm_head output-aware search")
     args = parser.parse_args()
 
     preset_name = args.ptq_preset or stage5_default_ptq_preset_name()
@@ -134,9 +137,52 @@ def main() -> int:
     print(f"  Grid-edge hits: {edge_hits} ({edge_frac:.1%}) — high fraction signals grid is too narrow")
     print(f"  Total NLL drop across search: {total_nll_drop:+.6f}")
 
+    full_diag = {"mlp": diag}
+
+    if args.include_lm_head and preset.output_aware_lm_head:
+        print()
+        print("=" * 80)
+        print("lm_head output-aware search:")
+        print("-" * 80)
+        # Run the lm_head search using the post-MLP scales (matches the
+        # production order in evaluate_gpt2_perplexity).
+        _, lm_diag = apply_output_aware_lm_head_scale_search_from_token_ids(
+            payload,
+            calib_ids,
+            final_scales,
+            ptq_preset=preset,
+            n_seqs=args.calibration_n_seqs,
+            seq_len=args.calibration_seq_len,
+        )
+        full_diag["lm_head"] = lm_diag
+        mult = float(lm_diag["multiplier"])
+        acc = bool(lm_diag["accepted"])
+        d_nll = float(lm_diag["selected_mean_nll"]) - float(lm_diag["baseline_mean_nll"])
+        marker = ""
+        if mult == grid_min or mult == grid_max:
+            marker = " <-- GRID EDGE"
+        if mult == 1.0:
+            marker = " <-- NO CHANGE"
+        print(f"  multiplier:        {mult:.3f}{marker}")
+        print(f"  accepted:          {acc}")
+        print(f"  baseline_nll:      {float(lm_diag['baseline_mean_nll']):.6f}")
+        print(f"  selected_nll:      {float(lm_diag['selected_mean_nll']):.6f}")
+        print(f"  Δ NLL:             {d_nll:+.6f}")
+        print(f"  old_scale:         {float(lm_diag['old_scale']):.6e}")
+        print(f"  new_scale:         {float(lm_diag['new_scale']):.6e}")
+        print()
+        print(f"  candidates ({'  Δ from baseline' if True else ''}):")
+        baseline_nll = float(lm_diag["baseline_mean_nll"])
+        for cand in lm_diag["candidates"]:
+            cm = float(cand["multiplier"])
+            cnll = float(cand["mean_nll"])
+            d = cnll - baseline_nll
+            star = " *" if cm == mult and acc else ""
+            print(f"    mult={cm:>6.3f}  nll={cnll:>10.6f}  Δ={d:>+10.6f}{star}")
+
     if args.json_out:
-        args.json_out.write_text(json.dumps(diag, indent=2))
-        print(f"  Full diagnostics written to {args.json_out}")
+        args.json_out.write_text(json.dumps(full_diag, indent=2))
+        print(f"\n  Full diagnostics written to {args.json_out}")
     return 0
 
 

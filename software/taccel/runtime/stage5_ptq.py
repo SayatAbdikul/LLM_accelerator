@@ -392,6 +392,17 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         output_aware_lm_head=True,
         output_aware_include_pairs=True,
     ),
+    # Targeted attn search on the same blocks the MLP search uses.
+    # output_aware_attn_all (12 blocks) broke fidelity at relative_delta=0.07977.
+    # Mirrors the MLP finding that only blocks 0 and 11 carry useful gains.
+    "output_aware_mlp_attn_lm_head_0_11_pc_full": _preset(
+        "output_aware_mlp_attn_lm_head_0_11_pc_full",
+        requant_pc_fc2_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 11),
+        output_aware_attn_blocks=(0, 11),
+        output_aware_lm_head=True,
+        output_aware_include_pairs=True,
+    ),
 }
 
 # Updated only after a preset wins on the real local GPT-2 checkpoint and still
