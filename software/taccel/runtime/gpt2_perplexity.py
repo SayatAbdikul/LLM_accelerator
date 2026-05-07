@@ -10,6 +10,7 @@ from typing import Dict, List, Sequence
 import numpy as np
 
 from .calibration import (
+    apply_bias_correction_from_token_ids,
     apply_fc2_aware_gelu_scale_search_from_token_ids,
     apply_output_aware_attn_scale_search_from_token_ids,
     apply_output_aware_gelu_scale_search_from_token_ids,
@@ -203,6 +204,37 @@ def evaluate_gpt2_perplexity(
         payload["model_args"],
         resolved_preset,
     )
+    if resolved_preset.bias_correction_blocks:
+        # Mutates payload["state_dict"] biases in-place; both the bundle builder
+        # and NanoGPTFQReference read biases from state_dict at construction, so
+        # the corrected biases will flow into both the golden and fake-quant
+        # paths automatically.
+        apply_bias_correction_from_token_ids(
+            payload,
+            calibration_token_ids,
+            calibration_scales,
+            blocks=resolved_preset.bias_correction_blocks,
+            weight_types=resolved_preset.bias_correction_weight_types,
+        )
+        # Re-derive activation scales with the corrected biases (the FP32
+        # forward through corrected biases shifts activations slightly). This
+        # matches the empirical setup that produced the validated PPL win.
+        calibration_scales = build_calibration_scales_from_token_ids(
+            payload,
+            calibration_token_ids,
+            n_seqs=calibration_n_seqs,
+            seq_len=calibration_seq_len,
+            percentile=calibration_percentile,
+            activation_percentile_overrides=(
+                resolved_preset.activation_percentile_nodes or None
+            ),
+            hessian_gelu_blocks=resolved_preset.hessian_gelu_blocks,
+        )
+        calibration_scales = apply_stage5_ptq_scale_policy(
+            calibration_scales,
+            payload["model_args"],
+            resolved_preset,
+        )
     if resolved_preset.fc2_aware_gelu_blocks:
         calibration_scales, _ = apply_fc2_aware_gelu_scale_search_from_token_ids(
             payload,

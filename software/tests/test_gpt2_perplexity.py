@@ -81,6 +81,11 @@ def test_evaluate_gpt2_perplexity_forwards_mlp_search_caps(monkeypatch):
         "apply_output_aware_lm_head_scale_search_from_token_ids",
         lambda *args, **kwargs: (dict(args[2]), {}),
     )
+    monkeypatch.setattr(
+        gpt2_ppl_mod,
+        "apply_bias_correction_from_token_ids",
+        lambda *args, **kwargs: (dict(args[2]), []),
+    )
     monkeypatch.setattr(gpt2_ppl_mod, "run_golden_teacher_forced_logits", fake_logits)
     monkeypatch.setattr(gpt2_ppl_mod, "run_fake_quant_teacher_forced_logits", fake_logits)
 

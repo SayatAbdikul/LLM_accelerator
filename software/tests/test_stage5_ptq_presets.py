@@ -96,10 +96,11 @@ def test_stage5_preset_registry_contains_core_presets_and_promoted_default():
         "output_aware_mlp_lm_head_0_1_4_8_to_11",
         "output_aware_mlp_lm_head_0_1_2_4_8_to_11",
         "output_aware_mlp_lm_head_0_11_pc_full",
+        "output_aware_mlp_lm_head_0_11_pc_full_bc",
         "gelu_accum_8_to_11", "output_aware_mlp_gelu_accum_8_to_11",
     }
     assert core.issubset(set(STAGE5_PTQ_PRESETS))
-    assert stage5_default_ptq_preset_name() == "output_aware_mlp_lm_head_0_11_pc_full"
+    assert stage5_default_ptq_preset_name() == "output_aware_mlp_lm_head_0_11_pc_full_bc"
     assert resolve_stage5_ptq_preset("control").name == "control"
     with pytest.raises(KeyError, match="unknown Stage 5 PTQ preset"):
         resolve_stage5_ptq_preset("not_a_preset")
@@ -169,6 +170,8 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         output_aware_lm_head=False,
         output_aware_include_pairs=False,
         output_aware_mlp_passes=1,
+        bias_correction_blocks=(),
+        bias_correction_weight_types=(),
         gelu_from_accum_blocks=(),
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
@@ -187,6 +190,8 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         output_aware_lm_head=False,
         output_aware_include_pairs=False,
         output_aware_mlp_passes=1,
+        bias_correction_blocks=(),
+        bias_correction_weight_types=(),
         gelu_from_accum_blocks=(),
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
@@ -205,6 +210,8 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         output_aware_lm_head=False,
         output_aware_include_pairs=False,
         output_aware_mlp_passes=1,
+        bias_correction_blocks=(),
+        bias_correction_weight_types=(),
         gelu_from_accum_blocks=(),
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
@@ -223,6 +230,8 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         output_aware_lm_head=False,
         output_aware_include_pairs=False,
         output_aware_mlp_passes=1,
+        bias_correction_blocks=(),
+        bias_correction_weight_types=(),
         gelu_from_accum_blocks=(0,),
     )
     with pytest.raises(ValueError, match="GELU-from-ACCUM and FC1 REQUANT_PC"):
@@ -470,17 +479,17 @@ def test_debug_preset_sweep_reports_all_presets_and_deterministic_winner(monkeyp
     assert set(preset_names).issubset(result_names)
     assert report["winner"]["name"] == "late_ln_combo"
     assert report["proposed_promotion"] == "late_ln_combo"
-    assert report["promoted_default"] == "output_aware_mlp_lm_head_0_11_pc_full"
-    assert report["default_replacement_candidate"]["baseline"] == "output_aware_mlp_lm_head_0_11_pc_full"
+    assert report["promoted_default"] == "output_aware_mlp_lm_head_0_11_pc_full_bc"
+    assert report["default_replacement_candidate"]["baseline"] == "output_aware_mlp_lm_head_0_11_pc_full_bc"
     assert report["default_replacement_candidate"]["promotion_threshold"] == pytest.approx(0.10)
     assert "passes_10pct_rule" in report["default_replacement_candidate"]
     fc2aware_rows = [row for row in report["rows"] if row["name"] == "fc2_11_fc2aware_gelu"]
     assert fc2aware_rows and "fc2_aware_gelu" in fc2aware_rows[0]
     output_aware_rows = [row for row in report["rows"] if row["name"] == "output_aware_gelu_8_to_11"]
     assert output_aware_rows and "output_aware_gelu" in output_aware_rows[0]
-    output_aware_mlp_rows = [row for row in report["rows"] if row["name"] == "output_aware_mlp_lm_head_0_11_pc_full"]
+    output_aware_mlp_rows = [row for row in report["rows"] if row["name"] == "output_aware_mlp_lm_head_0_11_pc_full_bc"]
     assert output_aware_mlp_rows and "output_aware_mlp" in output_aware_mlp_rows[0]
     output_aware_attn_rows = [row for row in report["rows"] if row["name"] == "output_aware_attn_all"]
     assert output_aware_attn_rows and "output_aware_attn" in output_aware_attn_rows[0]
-    lm_head_rows = [row for row in report["rows"] if row["name"] == "output_aware_mlp_lm_head_0_11_pc_full"]
+    lm_head_rows = [row for row in report["rows"] if row["name"] == "output_aware_mlp_lm_head_0_11_pc_full_bc"]
     assert lm_head_rows and "output_aware_lm_head" in lm_head_rows[0]
