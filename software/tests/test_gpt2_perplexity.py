@@ -56,6 +56,119 @@ def test_gpt2_default_ptq_preset_tracks_stage5_default():
     assert gpt2_ppl_mod.GPT2_DEFAULT_PTQ_PRESET == stage5_default_ptq_preset_name()
 
 
+def test_evaluate_gpt2_perplexity_runs_quarot_before_calibration(monkeypatch):
+    """When the preset has quarot_enabled=True, the rotation step must run
+    BEFORE the first build_calibration_scales call so that calibration sees
+    the rotated activation distribution."""
+    call_order: list[str] = []
+
+    def fake_quarot(*args, **kwargs):
+        call_order.append("quarot")
+        return [], {}
+
+    def fake_build_scales(*args, **kwargs):
+        call_order.append("build_scales")
+        return {"lm_head": 1.0}
+
+    def fake_policy(scales, *args, **kwargs):
+        call_order.append("policy")
+        return dict(scales)
+
+    def fake_logits(*args, **kwargs):
+        return [np.asarray([2, 1, 0, -1], dtype=np.int8)]
+
+    monkeypatch.setattr(gpt2_ppl_mod, "apply_quarot_rotation_from_token_ids", fake_quarot)
+    monkeypatch.setattr(gpt2_ppl_mod, "build_calibration_scales_from_token_ids", fake_build_scales)
+    monkeypatch.setattr(gpt2_ppl_mod, "apply_stage5_ptq_scale_policy", fake_policy)
+    monkeypatch.setattr(
+        gpt2_ppl_mod,
+        "apply_output_aware_mlp_scale_search_from_token_ids",
+        lambda *args, **kwargs: (dict(args[2]), {}),
+    )
+    monkeypatch.setattr(
+        gpt2_ppl_mod,
+        "apply_output_aware_lm_head_scale_search_from_token_ids",
+        lambda *args, **kwargs: (dict(args[2]), {}),
+    )
+    monkeypatch.setattr(
+        gpt2_ppl_mod,
+        "apply_bias_correction_from_token_ids",
+        lambda *args, **kwargs: (dict(args[2]), []),
+    )
+    monkeypatch.setattr(gpt2_ppl_mod, "run_golden_teacher_forced_logits", fake_logits)
+    monkeypatch.setattr(gpt2_ppl_mod, "run_fake_quant_teacher_forced_logits", fake_logits)
+
+    gpt2_ppl_mod.evaluate_gpt2_perplexity(
+        {"model_args": {"vocab_size": 4, "n_layer": 12, "n_embd": 768}, "state_dict": {}},
+        calibration_token_ids=[0, 1, 2],
+        eval_token_ids=[0, 1],
+        tokenizer_dir=Path("."),
+        ptq_preset="quarot_baseline",
+    )
+
+    # First call must be quarot, then build_scales+policy (calibration).
+    assert call_order[0] == "quarot", (
+        f"quarot must run first, got call_order={call_order}"
+    )
+    # build_scales should appear at least once after quarot.
+    assert "build_scales" in call_order[1:], (
+        f"build_calibration_scales not called after quarot; order={call_order}"
+    )
+
+
+def test_evaluate_gpt2_perplexity_skips_quarot_when_disabled(monkeypatch):
+    """When the preset has quarot_enabled=False (the default preset path),
+    apply_quarot_rotation_from_token_ids must NOT be called."""
+    quarot_call_count = [0]
+
+    def fake_quarot(*args, **kwargs):
+        quarot_call_count[0] += 1
+        return [], {}
+
+    def fake_build_scales(*args, **kwargs):
+        return {"lm_head": 1.0}
+
+    def fake_policy(scales, *args, **kwargs):
+        return dict(scales)
+
+    def fake_logits(*args, **kwargs):
+        return [np.asarray([2, 1, 0, -1], dtype=np.int8)]
+
+    monkeypatch.setattr(gpt2_ppl_mod, "apply_quarot_rotation_from_token_ids", fake_quarot)
+    monkeypatch.setattr(gpt2_ppl_mod, "build_calibration_scales_from_token_ids", fake_build_scales)
+    monkeypatch.setattr(gpt2_ppl_mod, "apply_stage5_ptq_scale_policy", fake_policy)
+    monkeypatch.setattr(
+        gpt2_ppl_mod,
+        "apply_output_aware_mlp_scale_search_from_token_ids",
+        lambda *args, **kwargs: (dict(args[2]), {}),
+    )
+    monkeypatch.setattr(
+        gpt2_ppl_mod,
+        "apply_output_aware_lm_head_scale_search_from_token_ids",
+        lambda *args, **kwargs: (dict(args[2]), {}),
+    )
+    monkeypatch.setattr(
+        gpt2_ppl_mod,
+        "apply_bias_correction_from_token_ids",
+        lambda *args, **kwargs: (dict(args[2]), []),
+    )
+    monkeypatch.setattr(gpt2_ppl_mod, "run_golden_teacher_forced_logits", fake_logits)
+    monkeypatch.setattr(gpt2_ppl_mod, "run_fake_quant_teacher_forced_logits", fake_logits)
+
+    # Use the current default preset, which has quarot_enabled=False.
+    gpt2_ppl_mod.evaluate_gpt2_perplexity(
+        {"model_args": {"vocab_size": 4, "n_layer": 12, "n_embd": 768}, "state_dict": {}},
+        calibration_token_ids=[0, 1, 2],
+        eval_token_ids=[0, 1],
+        tokenizer_dir=Path("."),
+    )
+
+    assert quarot_call_count[0] == 0, (
+        f"apply_quarot_rotation_from_token_ids should not be called for "
+        f"non-quarot preset; got {quarot_call_count[0]} calls"
+    )
+
+
 def test_evaluate_gpt2_perplexity_forwards_mlp_search_caps(monkeypatch):
     captured = {}
 

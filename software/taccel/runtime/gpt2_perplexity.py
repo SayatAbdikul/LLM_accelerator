@@ -16,6 +16,7 @@ from .calibration import (
     apply_output_aware_gelu_scale_search_from_token_ids,
     apply_output_aware_lm_head_scale_search_from_token_ids,
     apply_output_aware_mlp_scale_search_from_token_ids,
+    apply_quarot_rotation_from_token_ids,
     build_calibration_scales_from_token_ids,
 )
 
@@ -188,6 +189,19 @@ def evaluate_gpt2_perplexity(
     resolved_preset = resolve_stage5_ptq_preset(
         stage5_default_ptq_preset_name() if ptq_preset is None else ptq_preset
     )
+    if resolved_preset.quarot_enabled:
+        # QuaRot Phase 1 must run BEFORE any calibration so the 99.9-percentile
+        # activation scales are computed against the rotated (near-isotropic)
+        # distribution. Mutates payload["state_dict"] in place. Internally
+        # calls clear_weight_component_cache() so subsequent NanoGPTFQReference
+        # constructions re-derive their cached weight components from the
+        # rotated state.
+        apply_quarot_rotation_from_token_ids(
+            payload,
+            calibration_token_ids,
+            seed=resolved_preset.quarot_seed,
+            kind=resolved_preset.quarot_kind,
+        )
     calibration_scales = build_calibration_scales_from_token_ids(
         payload,
         calibration_token_ids,

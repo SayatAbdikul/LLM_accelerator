@@ -98,6 +98,7 @@ def test_stage5_preset_registry_contains_core_presets_and_promoted_default():
         "output_aware_mlp_lm_head_0_11_pc_full",
         "output_aware_mlp_lm_head_0_11_pc_full_bc",
         "gelu_accum_8_to_11", "output_aware_mlp_gelu_accum_8_to_11",
+        "quarot_baseline", "quarot_with_bc",
     }
     assert core.issubset(set(STAGE5_PTQ_PRESETS))
     assert stage5_default_ptq_preset_name() == "output_aware_mlp_lm_head_0_11_pc_full_bc"
@@ -173,6 +174,9 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         bias_correction_blocks=(),
         bias_correction_weight_types=(),
         gelu_from_accum_blocks=(),
+        quarot_enabled=False,
+        quarot_seed=0xCAFE,
+        quarot_kind="random_orthogonal",
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
         validate_stage5_ptq_preset_for_model({"n_layer": 1}, invalid)
@@ -193,6 +197,9 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         bias_correction_blocks=(),
         bias_correction_weight_types=(),
         gelu_from_accum_blocks=(),
+        quarot_enabled=False,
+        quarot_seed=0xCAFE,
+        quarot_kind="random_orthogonal",
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
         validate_stage5_ptq_preset_for_model({"n_layer": 1}, invalid_output_aware)
@@ -213,6 +220,9 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         bias_correction_blocks=(),
         bias_correction_weight_types=(),
         gelu_from_accum_blocks=(),
+        quarot_enabled=False,
+        quarot_seed=0xCAFE,
+        quarot_kind="random_orthogonal",
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
         validate_stage5_ptq_preset_for_model({"n_layer": 1}, invalid_output_aware_mlp)
@@ -233,9 +243,36 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         bias_correction_blocks=(),
         bias_correction_weight_types=(),
         gelu_from_accum_blocks=(0,),
+        quarot_enabled=False,
+        quarot_seed=0xCAFE,
+        quarot_kind="random_orthogonal",
     )
     with pytest.raises(ValueError, match="GELU-from-ACCUM and FC1 REQUANT_PC"):
         validate_stage5_ptq_preset_for_model({"n_layer": 1}, invalid_gelu_accum)
+
+    invalid_quarot_kind = Stage5PTQPreset(
+        name="bad_quarot_kind",
+        activation_percentile_nodes={},
+        requant_pc_out_proj_blocks=(),
+        requant_pc_fc1_blocks=(),
+        requant_pc_fc2_blocks=(),
+        hessian_gelu_blocks=(),
+        fc2_aware_gelu_blocks=(),
+        output_aware_gelu_blocks=(),
+        output_aware_mlp_blocks=(),
+        output_aware_attn_blocks=(),
+        output_aware_lm_head=False,
+        output_aware_include_pairs=False,
+        output_aware_mlp_passes=1,
+        bias_correction_blocks=(),
+        bias_correction_weight_types=(),
+        gelu_from_accum_blocks=(),
+        quarot_enabled=True,
+        quarot_seed=0xCAFE,
+        quarot_kind="bogus_rotation_kind",
+    )
+    with pytest.raises(ValueError, match="unsupported quarot_kind"):
+        validate_stage5_ptq_preset_for_model({"n_layer": 1}, invalid_quarot_kind)
 
 
 def test_stage5_scale_policy_ties_out_proj_and_residual_for_raw_vadd_block():

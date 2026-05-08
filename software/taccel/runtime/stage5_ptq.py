@@ -28,6 +28,13 @@ class Stage5PTQPreset:
     bias_correction_blocks: tuple[int, ...]
     bias_correction_weight_types: tuple[str, ...]
     gelu_from_accum_blocks: tuple[int, ...]
+    # QuaRot Phase 1 fields. When `quarot_enabled` is True, a 1-preserving
+    # orthogonal rotation is applied to the residual stream weights before
+    # any calibration runs. See `taccel/quantizer/rotation.py` and
+    # `taccel/quantizer/ln_fold.py`.
+    quarot_enabled: bool
+    quarot_seed: int
+    quarot_kind: str  # "random_orthogonal" only in this PR
 
 
 def _preset(
@@ -48,6 +55,9 @@ def _preset(
     bias_correction_blocks: Sequence[int] = (),
     bias_correction_weight_types: Sequence[str] = ("mlp.c_fc", "mlp.c_proj", "attn.c_proj"),
     gelu_from_accum_blocks: Sequence[int] = (),
+    quarot_enabled: bool = False,
+    quarot_seed: int = 0xCAFE,
+    quarot_kind: str = "random_orthogonal",
 ) -> Stage5PTQPreset:
     return Stage5PTQPreset(
         name=name,
@@ -66,6 +76,9 @@ def _preset(
         bias_correction_blocks=tuple(int(v) for v in bias_correction_blocks),
         bias_correction_weight_types=tuple(str(v) for v in bias_correction_weight_types),
         gelu_from_accum_blocks=tuple(int(v) for v in gelu_from_accum_blocks),
+        quarot_enabled=bool(quarot_enabled),
+        quarot_seed=int(quarot_seed),
+        quarot_kind=str(quarot_kind),
     )
 
 
@@ -421,6 +434,32 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         output_aware_include_pairs=True,
         bias_correction_blocks=tuple(range(12)),
     ),
+    # QuaRot Phase 1 presets. The diagnostic
+    # (software/tools/diagnose_activation_outliers.py) showed that residual-
+    # stream rotation by a 1-preserving orthogonal matrix recovers ~86% of the
+    # FP32→INT8 PPL gap when applied to the no-BC stripped baseline (PPL
+    # 18,627 → 2,637 at 257-tok), and ~59% on top of bias correction (PPL
+    # 5,943 → 2,543 at 33-tok with 64×128 calibration).
+    #
+    # The rotation step (apply_quarot_rotation_from_token_ids) runs FIRST in
+    # the PTQ pipeline — before BC, before any calibration. After it returns,
+    # the residual stream lives in a rotated basis; every downstream step
+    # (calibration, BC, output-aware searches) operates against the rotated
+    # state_dict transparently and its 99.9-percentile activation scales are
+    # tighter against the now-near-isotropic distribution.
+    "quarot_baseline": _preset(
+        "quarot_baseline",
+        quarot_enabled=True,
+    ),
+    "quarot_with_bc": _preset(
+        "quarot_with_bc",
+        requant_pc_fc2_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 11),
+        output_aware_lm_head=True,
+        output_aware_include_pairs=True,
+        bias_correction_blocks=tuple(range(12)),
+        quarot_enabled=True,
+    ),
 }
 
 # Updated only after a preset wins on the real local GPT-2 checkpoint and still
@@ -445,11 +484,20 @@ def resolve_stage5_ptq_preset(preset: str | Stage5PTQPreset | None) -> Stage5PTQ
         ) from exc
 
 
+_SUPPORTED_QUAROT_KINDS = ("random_orthogonal",)
+
+
 def validate_stage5_ptq_preset_for_model(
     model_args_or_config,
     preset: str | Stage5PTQPreset | None,
 ) -> Stage5PTQPreset:
     resolved = resolve_stage5_ptq_preset(preset)
+    if resolved.quarot_enabled and resolved.quarot_kind not in _SUPPORTED_QUAROT_KINDS:
+        raise ValueError(
+            f"Stage 5 PTQ preset {resolved.name!r} has unsupported "
+            f"quarot_kind={resolved.quarot_kind!r}; supported: "
+            f"{list(_SUPPORTED_QUAROT_KINDS)}"
+        )
     n_layer = int(
         getattr(model_args_or_config, "n_layer", None)
         if hasattr(model_args_or_config, "n_layer")

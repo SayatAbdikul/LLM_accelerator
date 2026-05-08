@@ -1075,6 +1075,89 @@ def _bias_correction_input_node(weight_name: str) -> str:
     raise ValueError(f"unsupported bias-correction weight name: {weight_name}")
 
 
+def apply_quarot_rotation_from_token_ids(
+    payload: Dict[str, object],
+    token_ids: Sequence[int],
+    *,
+    seed: int = 0xCAFE,
+    kind: str = "random_orthogonal",
+) -> tuple[List[str], dict]:
+    """Apply QuaRot Phase 1 to ``payload['state_dict']`` in place.
+
+    Pipeline (executed in order):
+      1. ``fold_layernorm_for_quarot(state_dict, model_args)`` — γ-fold + β-rescale.
+      2. Build rotation ``R`` per ``kind`` (and ``seed``).
+      3. ``rotate_residual_stream_state_dict(state_dict, model_args, R)`` —
+         pre-rotates wte, wpe, every block's c_attn/c_fc input cols and
+         c_proj output rows + biases, lm_head input cols, and every LN.bias.
+      4. Clear the cached weight components in NanoGPTFQReference (see
+         ``fake_quant_reference._WEIGHT_COMPONENT_CACHE``); the cache key uses
+         ``id(state_dict)`` and would otherwise return stale unrotated
+         components for any subsequent ``NanoGPTFQReference`` constructed
+         from the same dict.
+
+    The ``token_ids`` parameter is accepted for API symmetry with
+    :func:`apply_bias_correction_from_token_ids` and to keep the signature
+    stable when SpinQuant-style data-dependent rotations are added later.
+    For ``kind="random_orthogonal"`` it is unused.
+
+    Args:
+        payload: model payload with ``state_dict`` and ``model_args``.
+            ``state_dict`` is mutated in place.
+        token_ids: tokenized calibration text (currently unused).
+        seed: PRNG seed for ``build_random_orthogonal``.
+        kind: rotation kind. Currently only ``"random_orthogonal"`` is
+            supported; ``"block_hadamard_768"`` is reserved for a future PR.
+
+    Returns:
+        ``(modified_keys, diagnostics)`` where:
+            * ``modified_keys``: list of state_dict keys mutated, in order.
+            * ``diagnostics``: dict with ``kind``, ``seed``, ``d_model``,
+              ``n_keys_folded``, ``n_keys_rotated``,
+              ``rotation_orthogonality_error``.
+
+    Raises:
+        ValueError if ``kind`` is unsupported.
+    """
+    # Lazy imports to avoid circulars at module-load time.
+    from taccel.quantizer.ln_fold import fold_layernorm_for_quarot
+    from taccel.quantizer.rotation import (
+        build_random_orthogonal,
+        rotate_residual_stream_state_dict,
+    )
+    from taccel.runtime.fake_quant_reference import clear_weight_component_cache
+
+    state_dict = payload["state_dict"]
+    model_args = payload["model_args"]
+    d_model = int(model_args["n_embd"])
+
+    if kind == "random_orthogonal":
+        R = build_random_orthogonal(d_model, seed=int(seed))
+    else:
+        raise ValueError(
+            f"apply_quarot_rotation_from_token_ids: unsupported kind={kind!r}; "
+            f"supported: 'random_orthogonal'"
+        )
+
+    folded_keys = fold_layernorm_for_quarot(state_dict, model_args)
+    rotated_keys = rotate_residual_stream_state_dict(state_dict, model_args, R)
+
+    # Cache invalidation MUST happen here — see docstring.
+    clear_weight_component_cache()
+
+    eye = np.eye(d_model, dtype=np.float32)
+    orthogonality_error = float(np.abs(R @ R.T - eye).max())
+    diagnostics = {
+        "kind": kind,
+        "seed": int(seed),
+        "d_model": d_model,
+        "n_keys_folded": len(folded_keys),
+        "n_keys_rotated": len(rotated_keys),
+        "rotation_orthogonality_error": orthogonality_error,
+    }
+    return folded_keys + rotated_keys, diagnostics
+
+
 def apply_bias_correction_from_token_ids(
     payload: Dict[str, object],
     token_ids: Sequence[int],
