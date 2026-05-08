@@ -41,6 +41,7 @@ import torch
 
 from taccel.quantizer.quantize import quantize_tensor
 from taccel.runtime.calibration import (
+    apply_bias_correction_from_token_ids,
     build_calibration_scales_from_token_ids,
     build_calibration_seqs_from_token_ids,
 )
@@ -1136,6 +1137,7 @@ def tier3_residual_stream_simulation(
     calib_seq_len: int = 64,
     calibration_token_ids: Optional[Sequence[int]] = None,
     ptq_preset_name: Optional[str] = None,
+    include_bc_baseline: bool = False,
 ) -> Dict[str, object]:
     """End-to-end simulation with FULL residual-stream rotation (proper QuaRot Phase 1).
 
@@ -1168,6 +1170,28 @@ def tier3_residual_stream_simulation(
         hessian_gelu_blocks=preset.hessian_gelu_blocks,
     )
     base_scales = apply_stage5_ptq_scale_policy(base_scales, model_args, preset)
+
+    # Optionally apply bias correction to the baseline to get a closer-to-production
+    # baseline. This MUTATES state_dict in place. The rotation step below will see
+    # the BC-corrected biases.
+    if include_bc_baseline and preset.bias_correction_blocks:
+        apply_bias_correction_from_token_ids(
+            payload, calibration_token_ids, base_scales,
+            blocks=preset.bias_correction_blocks,
+            weight_types=preset.bias_correction_weight_types,
+            n_seqs=n_calib_seqs,
+            seq_len=calib_seq_len,
+        )
+        # Recompute scales with corrected biases.
+        base_scales = build_calibration_scales_from_token_ids(
+            payload, calibration_token_ids, n_seqs=n_calib_seqs, seq_len=calib_seq_len,
+            percentile=CALIBRATION_PERCENTILE_DEFAULT,
+            activation_percentile_overrides=preset.activation_percentile_nodes or None,
+            hessian_gelu_blocks=preset.hessian_gelu_blocks,
+        )
+        base_scales = apply_stage5_ptq_scale_policy(base_scales, model_args, preset)
+        # Update sd_snapshot to the post-BC state for restoration later.
+        sd_snapshot = {k: (v.clone() if hasattr(v, "clone") else v) for k, v in state_dict.items()}
 
     clear_weight_component_cache()
     base_ref = NanoGPTFQReference(
@@ -1292,6 +1316,7 @@ def tier3_residual_stream_simulation(
         "decision": decision,
         "mode": "residual_stream",
         "phase": 2 if gelu_rotation is not None else 1,
+        "include_bc_baseline": bool(include_bc_baseline),
         "target_blocks": list(target_blocks),
         "rotated_paths_count": len(modified),
         "self_tests": self_tests,
@@ -1691,6 +1716,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="Tier 3 rotation mode: 'input-only' rotates only matmul inputs "
                              "(LN→Q/K/V, LN→fc1); 'residual-stream' is the proper QuaRot Phase 1 "
                              "with full residual-stream rotation. 'both-modes' runs both.")
+    parser.add_argument("--include-bc-baseline", action="store_true",
+                        help="Tier 3 (residual-stream mode only): apply bias correction to the "
+                             "baseline state_dict before measuring rotation. Tests whether "
+                             "rotation composes with shipped BC.")
     parser.add_argument("--rotate-qk", action="store_true",
                         help="Tier 3: also rotate per-head Q/K (default off)")
     parser.add_argument("--seed-list", type=str, default="0xCAFE,0xC0FFEE",
@@ -1907,6 +1936,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     calib_seq_len=args.seq_len,
                     calibration_token_ids=calib_ids,
                     ptq_preset_name=args.ptq_preset,
+                    include_bc_baseline=args.include_bc_baseline,
                 )
             wall = time.time() - t0
             tier3_results[label] = result
