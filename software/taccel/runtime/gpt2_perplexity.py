@@ -27,6 +27,7 @@ CALIBRATION_SEQ_LEN_LARGE = 128
 CALIBRATION_PERCENTILE_DEFAULT = 99.9
 
 from .fake_quant_reference import NanoGPTFQReference
+from .fp32_reference import NanoGPTFP32Reference
 from .host_runner import HostRunner
 from .stage5_ptq import (
     Stage5PTQPreset,
@@ -59,6 +60,13 @@ class GPT2PerplexityResult:
     calibration_sha256: str
     eval_sha256: str
     ptq_preset: str
+    # Phase 0A: FP32 ceiling captured BEFORE any PTQ state_dict mutations
+    # (rotation, BC, etc.). This is the true pre-quantization perplexity for
+    # the same eval text and decode budget as golden_perplexity /
+    # fake_quant_perplexity, computed via NanoGPTFP32Reference. Default is
+    # NaN if FP32 evaluation was skipped.
+    fp32_perplexity: float = float("nan")
+    fp32_nll: float = float("nan")
 
 
 def file_sha256(path: Path) -> str:
@@ -137,12 +145,31 @@ def run_golden_teacher_forced_logits(
     return logits
 
 
+def run_fp32_teacher_forced_logits(
+    payload: Dict[str, object],
+    context_tokens: Sequence[int],
+) -> List[np.ndarray]:
+    """Phase 0A: FP32-reference logits for every teacher-forced position.
+
+    Uses NanoGPTFP32Reference.incremental_logits_trace, which mirrors the
+    incremental decode pattern of the golden / fake_quant paths so that the
+    resulting per-position NLLs are directly comparable. Caller is
+    responsible for invoking this BEFORE any state_dict mutations
+    (rotation, bias correction, etc.) so the returned logits represent the
+    true pre-quantization ceiling.
+    """
+    inputs, _ = teacher_forced_inputs_and_targets(context_tokens)
+    ref = NanoGPTFP32Reference(payload["state_dict"], payload["model_args"])
+    return ref.incremental_logits_trace(inputs)
+
+
 def run_fake_quant_teacher_forced_logits(
     payload: Dict[str, object],
     context_tokens: Sequence[int],
     calibration_scales: Dict[str, float],
     *,
     ptq_preset: str | Stage5PTQPreset | None = None,
+    keep_kv_cache_fp32: bool = False,
 ) -> List[np.ndarray]:
     inputs, _ = teacher_forced_inputs_and_targets(context_tokens)
     resolved_preset = resolve_stage5_ptq_preset(ptq_preset)
@@ -154,6 +181,7 @@ def run_fake_quant_teacher_forced_logits(
         raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
         raw_residual2_blocks=stage5_raw_residual2_blocks(resolved_preset),
         gelu_from_accum_blocks=stage5_gelu_from_accum_blocks(resolved_preset),
+        keep_kv_cache_fp32=keep_kv_cache_fp32,
     )
     return ref.incremental_logits_trace(inputs)
 
@@ -176,6 +204,8 @@ def evaluate_gpt2_perplexity(
     output_aware_search_seq_len: int | None = None,
     output_aware_search_workers: int | None = None,
     output_aware_include_pairs: bool = False,
+    compute_fp32_ceiling: bool = True,
+    debug_fp32_kv_cache: bool = False,
 ) -> GPT2PerplexityResult:
     if context_len < 1:
         raise ValueError("context_len must be positive")
@@ -185,6 +215,15 @@ def evaluate_gpt2_perplexity(
     eval_tokens = [int(tok) for tok in eval_token_ids[:token_budget]]
     if len(eval_tokens) < 2:
         raise ValueError("evaluation text produced fewer than two tokens")
+
+    # Phase 0A: capture FP32 ceiling BEFORE any state_dict mutations so the
+    # returned number represents the true pre-quantization perplexity. Done
+    # against the same eval_tokens / context_len as golden / fake_quant for
+    # apples-to-apples comparison. Set compute_fp32_ceiling=False to skip
+    # (saves ~30s per slow-gate run when not needed).
+    fp32_logits: List[np.ndarray] | None = None
+    if compute_fp32_ceiling:
+        fp32_logits = run_fp32_teacher_forced_logits(payload, eval_tokens)
 
     resolved_preset = resolve_stage5_ptq_preset(
         stage5_default_ptq_preset_name() if ptq_preset is None else ptq_preset
@@ -326,6 +365,7 @@ def evaluate_gpt2_perplexity(
         eval_tokens,
         calibration_scales,
         ptq_preset=resolved_preset,
+        keep_kv_cache_fp32=debug_fp32_kv_cache,
     )
     if len(golden_logits) != len(targets) or len(fake_logits) != len(targets):
         raise RuntimeError("teacher-forced logits/targets length mismatch")
@@ -341,6 +381,22 @@ def evaluate_gpt2_perplexity(
     golden_ppl, golden_nll = perplexity_from_nlls(golden_nlls)
     fake_ppl, fake_nll = perplexity_from_nlls(fake_nlls)
     rel = abs(golden_ppl - fake_ppl) / max(abs(fake_ppl), 1e-12)
+
+    # Phase 0A: FP32 ceiling NLL/PPL. Logits are raw logits (no lm_head_scale
+    # scaling) since the FP32 path doesn't pass through the INT8 logit
+    # requantization. Use the same stable_cross_entropy and vocab_size mask
+    # as golden / fake for consistency.
+    fp32_ppl = float("nan")
+    fp32_nll = float("nan")
+    if fp32_logits is not None:
+        if len(fp32_logits) != len(targets):
+            raise RuntimeError("FP32 logits/targets length mismatch")
+        fp32_nlls = [
+            stable_cross_entropy(np.asarray(row, dtype=np.float32), target, vocab_size=vocab_size)
+            for row, target in zip(fp32_logits, targets)
+        ]
+        fp32_ppl, fp32_nll = perplexity_from_nlls(fp32_nlls)
+
     return GPT2PerplexityResult(
         golden_perplexity=golden_ppl,
         fake_quant_perplexity=fake_ppl,
@@ -353,4 +409,6 @@ def evaluate_gpt2_perplexity(
         calibration_sha256=calibration_sha256,
         eval_sha256=eval_sha256,
         ptq_preset=resolved_preset.name,
+        fp32_perplexity=float(fp32_ppl),
+        fp32_nll=float(fp32_nll),
     )

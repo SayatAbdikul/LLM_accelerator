@@ -35,6 +35,21 @@ def main(argv=None) -> int:
     parser.add_argument("--output-aware-search-workers", type=int)
     parser.add_argument("--output-aware-include-pairs", action="store_true")
     parser.add_argument("--ptq-preset", default=None)
+    parser.add_argument(
+        "--skip-fp32-ceiling",
+        action="store_true",
+        help="Skip Phase 0A FP32-reference ceiling computation (saves ~30s/run).",
+    )
+    parser.add_argument(
+        "--debug-fp32-kv-cache",
+        action="store_true",
+        help=(
+            "Phase 0B diagnostic: keep K/V cache in FP32 in the fake-quant "
+            "reference (Q stays INT8). Tests whether K/V cache compounding "
+            "noise is the long-eval bottleneck. Reference-only — does NOT "
+            "ship to the deployed bundle."
+        ),
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
@@ -67,11 +82,14 @@ def main(argv=None) -> int:
         output_aware_search_seq_len=args.output_aware_search_seq_len,
         output_aware_search_workers=args.output_aware_search_workers,
         output_aware_include_pairs=args.output_aware_include_pairs,
+        compute_fp32_ceiling=(not args.skip_fp32_ceiling),
+        debug_fp32_kv_cache=args.debug_fp32_kv_cache,
     )
     out = asdict(result)
     if args.json:
         print(json.dumps(out, indent=2, sort_keys=True))
     else:
+        print(f"fp32_perplexity: {result.fp32_perplexity:.6f}")
         print(f"golden_perplexity: {result.golden_perplexity:.6f}")
         print(f"fake_quant_perplexity: {result.fake_quant_perplexity:.6f}")
         print(f"relative_delta: {result.relative_delta:.6%}")
