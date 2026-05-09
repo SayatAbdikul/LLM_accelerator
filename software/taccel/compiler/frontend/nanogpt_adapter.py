@@ -1,5 +1,5 @@
 """Direct Stage 1 frontend for Karpathy-style nanoGPT modules."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 from typing import Any, Mapping, Optional
 
 from . import FrontendResult
@@ -19,6 +19,8 @@ class NanoGPTShape:
     norm_epsilon: float
     bias: bool
     split_qkv_bias: bool
+    has_lm_head_bias: bool = False  # True iff `lm_head.bias` is in state_dict
+                                     # (created by `fold_layernorm_for_quarot`).
 
 
 def _config_value(config: Any, *names: str, default: Any = None) -> Any:
@@ -273,6 +275,14 @@ def _finish(graph: IRGraph, prev: str, seq_len: int, shape: NanoGPTShape) -> Non
         [ln_f, "lm_head.weight"],
         (seq_len, shape.vocab_size),
         weight_name="lm_head.weight",
+        # `lm_head.bias` is created by `fold_layernorm_for_quarot` (β-fold of
+        # ln_f) when `quarot_enabled` is True. It is absent in standard GPT-2.
+        # The matmul op accepts an optional `bias` kwarg; passing the key
+        # unconditionally and letting the codegen treat missing keys as zero
+        # would be cleanest, but the existing op API treats `bias=None` as
+        # "no bias add" — so we conditionally wire it based on a hint from
+        # the shape config (`shape.has_lm_head_bias`).
+        bias=("lm_head.bias" if getattr(shape, "has_lm_head_bias", False) else None),
         tied_to="transformer.wte.weight",
     )
 
@@ -307,11 +317,18 @@ def load_nanogpt(*, model: Optional[Any] = None, state_dict: Optional[Mapping[st
     instead of tracing HuggingFace GPT-2. Stage 1 only validates frontend shape
     and graph plumbing; full decoder codegen arrives in later stages.
     """
-    del state_dict  # Weight validation is deferred until decoder codegen lands.
     if config is None and model is not None:
         config = getattr(model, "config", None)
     if config is None:
         raise ValueError("load_nanogpt requires a nanoGPT config or model.config")
 
     shape = _coerce_shape(config)
+    # Detect QuaRot's lm_head.bias (created by `fold_layernorm_for_quarot`).
+    # When present, the lm_head matmul wires it as its bias input so the
+    # codegen produces a bundle that adds the per-vocab β-fold contribution
+    # to the logits, matching what `_fp32_forward` and `NanoGPTFQReference`
+    # do at the same step.
+    has_lm_head_bias = state_dict is not None and "lm_head.bias" in state_dict
+    if has_lm_head_bias and not shape.has_lm_head_bias:
+        shape = _dc_replace(shape, has_lm_head_bias=True)
     return FrontendResult(graph=_build_graph(shape, variant), config=_model_config(shape))

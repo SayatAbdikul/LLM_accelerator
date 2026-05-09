@@ -281,6 +281,17 @@ def quantize_fixture_payload(
             )
 
     weight_data["lm_head.weight"] = _quantize_linear_weight(state_dict["lm_head.weight"])
+    # `lm_head.bias` is created by `taccel.quantizer.ln_fold.fold_layernorm_for_quarot`
+    # (β-fold of `ln_f`) when `quarot_enabled=True` is set on the preset.
+    # Standard GPT-2 has no `lm_head.bias`; we prescale it only when present.
+    if "lm_head.bias" in state_dict:
+        prescaled_biases["lm_head.bias"] = _prescale_bias(
+            state_dict,
+            "lm_head.bias",
+            output_dim=config.vocab_size,
+            act_scale=calibration_scales.get("ln_f", 6.0 / 127.0),
+            weight_scales=weight_data["lm_head.weight"][1],
+        )
     return weight_data, prescaled_biases, calibration_scales, config, pad_dim(config.vocab_size)
 
 
@@ -309,7 +320,13 @@ def build_stage3_tiny_decoder_bundle(
     )
     validate_stage5_ptq_preset_for_model(config, resolved_preset)
     calibration_scales = apply_stage5_ptq_scale_policy(calibration_scales, config, resolved_preset)
-    frontend = load_nanogpt(config=payload["model_args"], variant="forward_1token")
+    # Thread state_dict so the frontend can detect optional `lm_head.bias`
+    # (created by `taccel.quantizer.ln_fold.fold_layernorm_for_quarot`).
+    frontend = load_nanogpt(
+        config=payload["model_args"],
+        state_dict=payload["state_dict"],
+        variant="forward_1token",
+    )
     graph = mark_runtime_embedding_lookups(frontend.graph)
     if gelu_from_accum_blocks:
         _mark_gelu_from_accum_inline(graph, gelu_from_accum_blocks)

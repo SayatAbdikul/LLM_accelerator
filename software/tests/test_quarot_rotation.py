@@ -317,54 +317,88 @@ def test_rotation_idempotency_with_inverse():
 
 
 # ---------------------------------------------------------------------------
-# Test 8: control test — rotation that SKIPS LN bias breaks FP32 equivalence.
-# Demonstrates that β-rotation is required.
+# Test 8: lm_head.bias is created by fold, persists through rotation, and
+# is read by _fp32_forward. Without these, β-fold of ln_f would silently
+# lose the β @ lm_head_orig^T contribution.
 # ---------------------------------------------------------------------------
 
 
-def test_skipping_ln_bias_rotation_breaks_fp32_equivalence():
+def test_lm_head_bias_created_by_fold_and_persists_through_rotation():
     payload = _load_payload()
     sd = payload["state_dict"]
     ma = payload["model_args"]
     d_model = int(ma["n_embd"])
-    n_layer = int(ma["n_layer"])
     snapshot = _snapshot_state_dict(sd)
 
-    test_seq = list(range(16))
-    ref_logits = _fp32_forward(sd, ma, test_seq)["lm_head"]
+    # Baseline: standard GPT-2 has NO lm_head.bias.
+    assert "lm_head.bias" not in sd, (
+        "GPT-2 fixture unexpectedly has lm_head.bias before fold"
+    )
 
-    # γ-fold + rotation, but ZERO OUT the LN bias rotation manually to verify
-    # it would have broken correctness.
-    fold_layernorm_for_quarot(sd, ma)
+    # Step 1: fold creates lm_head.bias.
+    modified = fold_layernorm_for_quarot(sd, ma)
+    assert "lm_head.bias" in sd, "fold did not create lm_head.bias"
+    assert "lm_head.bias" in modified, "fold did not report lm_head.bias as modified"
+    bias_after_fold = _to_f32_local(sd["lm_head.bias"])
+    # Bias should be lm_head_orig @ β_LNf — non-trivial.
+    assert float(np.abs(bias_after_fold).max()) > 1e-6, (
+        "lm_head.bias is suspiciously zero after fold; β_LNf folded incorrectly?"
+    )
+
+    # Step 2: rotation does NOT modify lm_head.bias (it lives in unrotated logit basis).
     R = build_random_orthogonal(d_model, seed=0xCAFE)
     rotate_residual_stream_state_dict(sd, ma, R)
+    bias_after_rotation = _to_f32_local(sd["lm_head.bias"])
+    assert np.allclose(bias_after_fold, bias_after_rotation, atol=1e-6), (
+        "rotation modified lm_head.bias; it should not"
+    )
 
-    # Now restore LN biases to their pre-rotation value (i.e., undo β-rotation).
-    # That is, we revert ln.bias values to their (unrotated) state from the
-    # γ-folded snapshot. This simulates what the old β-fold-only design would
-    # have done.
-    folded_snapshot = {}
+    # Step 3: _fp32_forward reads lm_head.bias.
+    test_seq = list(range(16))
+    logits_with_bias = _fp32_forward(sd, ma, test_seq)["lm_head"]
+
+    # Step 4: deleting lm_head.bias breaks FP32 equivalence (control).
+    del sd["lm_head.bias"]
+    logits_without_bias = _fp32_forward(sd, ma, test_seq)["lm_head"]
+    drift = float(np.abs(logits_with_bias - logits_without_bias).max())
+    assert drift > 1e-3, (
+        f"deleting lm_head.bias produced drift {drift:.4e}; expected > 1e-3 "
+        "(if drift is ~0, _fp32_forward isn't reading lm_head.bias)"
+    )
+
     _restore_state_dict(sd, snapshot)
-    fold_layernorm_for_quarot(sd, ma)
-    for k in sd:
-        if k.endswith(".bias") and (
-            ".ln_1." in k or ".ln_2." in k or k == "transformer.ln_f.bias"
-        ):
-            folded_snapshot[k] = sd[k].clone() if hasattr(sd[k], "clone") else sd[k]
-    # Now apply rotation, then revert ln biases to unrotated.
-    rotate_residual_stream_state_dict(sd, ma, R)
-    for k, v in folded_snapshot.items():
-        sd[k] = v.clone() if hasattr(v, "clone") else v
 
-    broken_logits = _fp32_forward(sd, ma, test_seq)["lm_head"]
-    drift = float(np.abs(ref_logits - broken_logits).max())
-    rel_drift = drift / max(float(np.abs(ref_logits).max()), 1e-8)
-    # If LN bias is NOT rotated, drift should be substantial (>> 1e-3) —
-    # demonstrating that β-rotation is necessary.
-    assert rel_drift > 0.01, (
-        f"control test failed: skipping LN bias rotation should break FP32 "
-        f"equivalence, but drift was only {rel_drift:.4e}; "
-        "β-rotation may not actually be necessary?"
+
+def _to_f32_local(x):
+    if hasattr(x, "detach"):
+        return x.detach().cpu().numpy().astype(np.float32)
+    return np.asarray(x, dtype=np.float32)
+
+
+def test_fold_is_idempotent():
+    """Calling fold twice must not double-apply β-fold contributions
+    (which would break FP32 equivalence)."""
+    payload = _load_payload()
+    sd = payload["state_dict"]
+    ma = payload["model_args"]
+    snapshot = _snapshot_state_dict(sd)
+
+    # First fold.
+    fold_layernorm_for_quarot(sd, ma)
+    bias_first = _to_f32_local(sd["lm_head.bias"]).copy()
+    consumer_bias_first = _to_f32_local(sd["transformer.h.0.mlp.c_fc.bias"]).copy()
+
+    # Second fold — must be a no-op.
+    fold_layernorm_for_quarot(sd, ma)
+    bias_second = _to_f32_local(sd["lm_head.bias"])
+    consumer_bias_second = _to_f32_local(sd["transformer.h.0.mlp.c_fc.bias"])
+
+    assert np.allclose(bias_first, bias_second, atol=1e-6), (
+        f"second fold doubled lm_head.bias: max diff = "
+        f"{float(np.abs(bias_first - bias_second).max()):.4e}"
+    )
+    assert np.allclose(consumer_bias_first, consumer_bias_second, atol=1e-6), (
+        "second fold doubled c_fc.bias contribution"
     )
 
     _restore_state_dict(sd, snapshot)

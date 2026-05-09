@@ -276,6 +276,10 @@ def _cached_weight_components(state_dict: dict, model_args: dict, gelu_from_accu
         "ln_f_b": _to_fp16_widened_f32(sd["transformer.ln_f.bias"]),
         "lm_head": _linear_components(sd["lm_head.weight"]),
         "lm_head_w_fp32": _to_f32(sd["lm_head.weight"]),
+        # Optional `lm_head.bias` exists when the model has been transformed
+        # by `fold_layernorm_for_quarot` (β-fold of `ln_f` produces this).
+        # Standard GPT-2 has no `lm_head.bias` — None signals "no bias to add".
+        "lm_head_b_fp32": _to_f32(sd["lm_head.bias"]) if "lm_head.bias" in sd else None,
         "layers": [],
     }
     layers = components["layers"]
@@ -409,6 +413,19 @@ class NanoGPTFQReference:
             * self.lm_head_w_scales.astype(np.float32)
             / max(_scale(self.scales, "lm_head"), 1e-12)
         ).astype(np.float16)
+        # Optional `lm_head.bias` (created by `fold_layernorm_for_quarot`'s
+        # β-fold of `ln_f`). When present, the bias must be added in the
+        # post-requant FP32 domain because INT8 requant is per-channel — we
+        # store the bias in "logit units" (bias / lm_head_scale) so adding it
+        # to the post-requant int values stays in INT8 logit space.
+        self.lm_head_b_fp32 = cached.get("lm_head_b_fp32")
+        if self.lm_head_b_fp32 is not None:
+            lm_head_scale = max(_scale(self.scales, "lm_head"), 1e-12)
+            self.lm_head_b_logit = (
+                self.lm_head_b_fp32.astype(np.float32) / np.float32(lm_head_scale)
+            )
+        else:
+            self.lm_head_b_logit = None
 
         self.layers = []
         for L, cached_layer in enumerate(cached["layers"]):
@@ -707,11 +724,18 @@ class NanoGPTFQReference:
         lm_input = ln_f if return_all_logits else ln_f[-1:]
         if not self._large_vocab_lm_head_reference():
             logits = lm_input @ self.lm_head_w.T
+            if self.lm_head_b_fp32 is not None:
+                logits = logits + self.lm_head_b_fp32
             logits_i8 = _to_int8_logits(logits, _scale(s, "lm_head"))
             return logits_i8 if return_all_logits else logits_i8[0]
         ln_f_i8 = _fp32_to_int8(lm_input, ln_f_scale)
         logits_accum = ln_f_i8.astype(np.int32) @ self.lm_head_w_q.astype(np.int32).T
         logits_i8 = _requant_accum_pc_int8(logits_accum, self.lm_head_requant_pc)
+        if self.lm_head_b_logit is not None:
+            # Add bias in INT8 logit-units (b / lm_head_scale, post-requant).
+            # Saturate to int8 range to mirror what hardware would do.
+            logits_with_bias = logits_i8.astype(np.float32) + self.lm_head_b_logit
+            logits_i8 = np.clip(np.round(logits_with_bias), -128, 127).astype(np.int8)
         return logits_i8 if return_all_logits else logits_i8[0]
 
     def forward_incremental(
@@ -1102,6 +1126,8 @@ class NanoGPTFQReference:
             return (logits_accum.astype(np.float32) * requant_pc)[0]
         if not self._large_vocab_lm_head_reference():
             logits = ln_f @ self.lm_head_w.T
+            if self.lm_head_b_fp32 is not None:
+                logits = logits + self.lm_head_b_fp32
             logits_i8 = _to_int8_logits(logits[0], _scale(s, "lm_head"))
             record(
                 "lm_head",
@@ -1113,6 +1139,10 @@ class NanoGPTFQReference:
         ln_f_i8 = _fp32_to_int8(ln_f, ln_f_scale)
         logits_accum = ln_f_i8.astype(np.int32) @ self.lm_head_w_q.astype(np.int32).T
         logits_i8 = _requant_accum_pc_int8(logits_accum, self.lm_head_requant_pc)
+        if self.lm_head_b_logit is not None:
+            # Add bias in INT8 logit-units (post-requant). See __init__ comment.
+            logits_with_bias = logits_i8.astype(np.float32) + self.lm_head_b_logit
+            logits_i8 = np.clip(np.round(logits_with_bias), -128, 127).astype(np.int8)
         logits = logits_i8.astype(np.float32) * _arch_scale(_scale(s, "lm_head"))
         record(
             "lm_head",
@@ -1207,5 +1237,11 @@ def _fp32_forward(
         x = out[f"block{L}_residual2"] = x + fc2
 
     ln_f = out["ln_f"] = _layernorm_np(x, ln_f_w, ln_f_b, eps)
-    out["lm_head"] = ln_f[-1:] @ lm_head_w.T
+    # Optional `lm_head.bias` is created by `fold_layernorm_for_quarot`
+    # (β-fold of `ln_f` produces this). For models without QuaRot, the key
+    # is absent and the bias contribution is zero.
+    lm_head_logits = ln_f[-1:] @ lm_head_w.T
+    if "lm_head.bias" in sd:
+        lm_head_logits = lm_head_logits + _to_f32(sd["lm_head.bias"])
+    out["lm_head"] = lm_head_logits
     return out

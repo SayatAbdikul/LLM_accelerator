@@ -307,16 +307,17 @@ def rotate_residual_stream_state_dict(
         w = _to_f32(state_dict[key])  # [vocab, d_model]
         _do(key, w @ R_t)
 
-    # 4. LN biases (β-rotation): per-block ln_1, ln_2, and global ln_f.
-    # Absorbs the β-fold step without needing to create lm_head.bias.
-    for L in range(n_layer):
-        for ln in ("ln_1", "ln_2"):
-            bkey = f"transformer.h.{L}.{ln}.bias"
-            if bkey in state_dict:
-                b = _to_f32(state_dict[bkey])  # [d_model]
-                _do(bkey, R_arr @ b)
-    if "transformer.ln_f.bias" in state_dict:
-        b = _to_f32(state_dict["transformer.ln_f.bias"])
-        _do("transformer.ln_f.bias", R_arr @ b)
+    # NOTE: LN biases (β) are NOT rotated. After `fold_layernorm_for_quarot`,
+    # every LN.β has been zeroed (β-fold absorbs the contribution into the
+    # consumer's bias, including a freshly created `lm_head.bias`). Rotating
+    # zeros would still produce zeros; we omit the work.
+    #
+    # Consumer biases (`c_proj.bias`, `fc2.bias`) ARE rotated above (steps 2c,
+    # 2d) because their outputs land in the rotated residual stream.
+    # `c_attn.bias_h{H}_*` (Q/K/V) are NOT rotated — they live in unrotated
+    # head/MLP-internal output basis.
+    # `c_fc.bias`, `c_proj_attn.bias_h{H}_*` analogous.
+    # `lm_head.bias` (created by β-fold) is NOT rotated — it's added to the
+    # logit output, which lives in the unrotated logit basis.
 
     return modified
