@@ -436,17 +436,27 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
     ),
     # QuaRot Phase 1 presets. The diagnostic
     # (software/tools/diagnose_activation_outliers.py) showed that residual-
-    # stream rotation by a 1-preserving orthogonal matrix recovers ~86% of the
-    # FP32→INT8 PPL gap when applied to the no-BC stripped baseline (PPL
-    # 18,627 → 2,637 at 257-tok), and ~59% on top of bias correction (PPL
-    # 5,943 → 2,543 at 33-tok with 64×128 calibration).
+    # stream rotation by an orthogonal matrix recovers a substantial fraction
+    # of the FP32→INT8 PPL gap. Production uses a 1-PRESERVING rotation
+    # (R · 1 = 1), which is mathematically required for LayerNorm's mean-
+    # subtraction to commute with rotation in the offline-only pipeline.
     #
-    # The rotation step (apply_quarot_rotation_from_token_ids) runs FIRST in
-    # the PTQ pipeline — before BC, before any calibration. After it returns,
-    # the residual stream lives in a rotated basis; every downstream step
-    # (calibration, BC, output-aware searches) operates against the rotated
-    # state_dict transparently and its 99.9-percentile activation scales are
-    # tighter against the now-near-isotropic distribution.
+    # Empirical findings (2026-05-08, 33-tok eval / 64×128 calibration):
+    #   * quarot_baseline (rotation only):                       8,694 PPL
+    #   * quarot_with_bc (rotation + BC, NO output-aware search): 2,828 PPL
+    #   * Diagnostic reference (general Haar + runtime un-rotate-LN):
+    #     2,543 PPL — production within ~10% despite offline-only.
+    #
+    # IMPORTANT: output-aware MLP/lm_head searches DO NOT compose with
+    # rotation. Empirically, adding them on top of `quarot_with_bc` blew up
+    # PPL from ~3k to 41k at 257-tok eval (search converged to a calibration-
+    # overfit optimum in the rotated landscape that didn't generalize). The
+    # searches are intentionally OMITTED from the QuaRot presets here.
+    # Re-enabling them is a follow-up: re-derive the search step to operate
+    # in the rotated basis (likely needs a per-rotation NLL gradient).
+    #
+    # The rotation step (apply_quarot_rotation_from_token_ids) runs FIRST
+    # in evaluate_gpt2_perplexity — before BC, before any calibration.
     "quarot_baseline": _preset(
         "quarot_baseline",
         quarot_enabled=True,
@@ -454,9 +464,6 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
     "quarot_with_bc": _preset(
         "quarot_with_bc",
         requant_pc_fc2_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
-        output_aware_mlp_blocks=(0, 11),
-        output_aware_lm_head=True,
-        output_aware_include_pairs=True,
         bias_correction_blocks=tuple(range(12)),
         quarot_enabled=True,
     ),
