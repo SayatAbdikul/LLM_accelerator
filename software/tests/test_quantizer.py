@@ -6,6 +6,7 @@ import torch.nn as nn
 from taccel.quantizer.quantize import (
     adaround_greedy,
     dequantize_tensor,
+    gptq_quantize,
     quantize_tensor,
     quantize_tensor_clipped,
     quantize_weights,
@@ -410,6 +411,99 @@ class TestQuantize:
             baseline_probs.detach().numpy(),
             atol=1e-6,
         )
+
+
+class TestGPTQ:
+    """GPTQ (Frantar et al. 2022) per-channel symmetric INT8 quantization."""
+
+    def _calibration_mse(self, W: np.ndarray, q: np.ndarray, scales: np.ndarray, X: np.ndarray) -> float:
+        dq = q.astype(np.float32) * scales.astype(np.float32).reshape(-1, 1)
+        diff = (X.astype(np.float32) @ (W - dq).T)
+        return float(np.mean(diff ** 2))
+
+    def test_signature_and_shapes(self):
+        np.random.seed(0)
+        W = np.random.randn(8, 32).astype(np.float32)
+        X = np.random.randn(64, 32).astype(np.float32)
+        q, scales = gptq_quantize(W, [X], per_channel=True)
+        assert q.dtype == np.int8
+        assert q.shape == W.shape
+        assert scales.dtype == np.float16
+        assert scales.shape == (8,)
+        assert np.all(q >= -128) and np.all(q <= 127)
+
+    def test_falls_back_to_rtn_without_calibration(self):
+        np.random.seed(1)
+        W = np.random.randn(4, 16).astype(np.float32)
+        q_gptq, s_gptq = gptq_quantize(W, None, per_channel=True)
+        q_rtn, s_rtn = quantize_tensor(W, per_channel=True)
+        np.testing.assert_array_equal(q_gptq, q_rtn)
+        np.testing.assert_array_equal(s_gptq, s_rtn)
+
+    def test_identity_hessian_matches_rtn(self):
+        """Uncorrelated whitened inputs make H ≈ I (after damping); the
+        column propagation step should then produce the same INT8 grid as
+        plain round-to-nearest. Same scale by construction."""
+        rng = np.random.default_rng(7)
+        W = rng.standard_normal((6, 24)).astype(np.float32)
+        # Whitened inputs: large N keeps the empirical Gram close to identity.
+        X = rng.standard_normal((4096, 24)).astype(np.float32)
+        # Unit variance per column.
+        X = X / X.std(axis=0, keepdims=True)
+        q_gptq, s_gptq = gptq_quantize(W, [X], per_channel=True, percdamp=0.05)
+        q_rtn, s_rtn = quantize_tensor(W, per_channel=True)
+        # Scales equal exactly (same max-abs source).
+        np.testing.assert_array_equal(s_gptq, s_rtn)
+        # The per-channel quantization error before/after GPTQ in the
+        # identity-Hessian regime differs by at most ±1 LSB on a small
+        # fraction of weights — propagation noise around damping.
+        diff = (q_gptq.astype(int) - q_rtn.astype(int))
+        assert np.max(np.abs(diff)) <= 1
+        assert np.mean(np.abs(diff) > 0) < 0.05
+
+    def test_correlated_inputs_gptq_beats_rtn(self):
+        """On correlated inputs the column propagation should reduce the
+        layer-output MSE versus plain round-to-nearest."""
+        rng = np.random.default_rng(13)
+        out_dim, in_dim = 16, 64
+        W = rng.standard_normal((out_dim, in_dim)).astype(np.float32) * 0.3
+        # Build calibration inputs with strong cross-column correlation by
+        # mixing a low-rank component into white noise.
+        N = 256
+        latent = rng.standard_normal((N, 8)).astype(np.float32)
+        mix = rng.standard_normal((8, in_dim)).astype(np.float32)
+        noise = 0.05 * rng.standard_normal((N, in_dim)).astype(np.float32)
+        X = (latent @ mix + noise).astype(np.float32)
+
+        q_gptq, s_gptq = gptq_quantize(W, [X], per_channel=True, percdamp=0.01)
+        q_rtn, s_rtn = quantize_tensor(W, per_channel=True)
+        # Same per-channel scale by construction.
+        np.testing.assert_array_equal(s_gptq, s_rtn)
+        mse_gptq = self._calibration_mse(W, q_gptq, s_gptq, X)
+        mse_rtn = self._calibration_mse(W, q_rtn, s_rtn, X)
+        # GPTQ should strictly improve calibration-output MSE on this setup.
+        assert mse_gptq < mse_rtn, (mse_gptq, mse_rtn)
+
+    def test_blocksize_invariance(self):
+        """blocksize is purely a perf knob; the result must not depend on it."""
+        rng = np.random.default_rng(21)
+        W = rng.standard_normal((10, 96)).astype(np.float32)
+        X = rng.standard_normal((512, 96)).astype(np.float32)
+        q_a, s_a = gptq_quantize(W, [X], per_channel=True, blocksize=16)
+        q_b, s_b = gptq_quantize(W, [X], per_channel=True, blocksize=128)
+        np.testing.assert_array_equal(q_a, q_b)
+        np.testing.assert_array_equal(s_a, s_b)
+
+    def test_dead_input_columns_are_zeroed(self):
+        """Calibration columns that are always zero should produce all-zero
+        weight columns (the standard GPTQ dead-column handling)."""
+        rng = np.random.default_rng(29)
+        W = rng.standard_normal((4, 12)).astype(np.float32) * 0.1
+        X = rng.standard_normal((128, 12)).astype(np.float32)
+        # Kill columns 3 and 7 in the calibration set.
+        X[:, [3, 7]] = 0.0
+        q, scales = gptq_quantize(W, [X], per_channel=True)
+        assert np.all(q[:, [3, 7]] == 0)
 
 
 class TestScalePropagator:

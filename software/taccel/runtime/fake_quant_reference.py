@@ -546,8 +546,17 @@ class NanoGPTFQReference:
         position_ids: Optional[Sequence[int]] = None,
         *,
         return_all_logits: bool = False,
+        capture: Optional[Dict[str, np.ndarray]] = None,
     ) -> np.ndarray:
-        """Return INT8 logits for the last position, or every causal position."""
+        """Return INT8 logits for the last position, or every causal position.
+
+        If ``capture`` is supplied, intermediate fake-quant activations are
+        written into it under the same names ``_fp32_forward`` uses (e.g.
+        ``block{L}_ln2``, ``block{L}_gelu``, ``block{L}_concat``). This is a
+        diagnostic hook for GPTQ Hessian capture — it copies the post-qdq
+        FP32 view of the matmul input, matching the value the c_fc / c_proj
+        / out_proj matmuls actually consume during fake-quant evaluation.
+        """
         tids = list(token_ids)
         seq = len(tids)
         pids = list(position_ids) if position_ids is not None else list(range(seq))
@@ -566,6 +575,8 @@ class NanoGPTFQReference:
                 _layernorm_np(x, layer["ln1_w"], layer["ln1_b"], self.eps),
                 ln1_scale,
             )
+            if capture is not None:
+                capture[f"block{L}_ln1"] = np.asarray(ln1, dtype=np.float32).copy()
             ln1_i8 = _fp32_to_int8(ln1, ln1_scale)
             head_outs_int8 = []
             for H, head_weights in enumerate(layer["heads"]):
@@ -625,6 +636,8 @@ class NanoGPTFQReference:
             concat_int8 = np.concatenate(head_outs_int8, axis=-1)
             concat_scale = _scale(s, f"block{L}_concat")
             concat = concat_int8.astype(np.float32) * _arch_scale(concat_scale)
+            if capture is not None:
+                capture[f"block{L}_concat"] = np.asarray(concat, dtype=np.float32).copy()
 
             concat_scale = _scale(s, f"block{L}_concat")
             out_proj_scale = _scale(s, f"block{L}_out_proj")
@@ -654,6 +667,8 @@ class NanoGPTFQReference:
                 _layernorm_np(x, layer["ln2_w"], layer["ln2_b"], self.eps),
                 _scale(s, f"block{L}_ln2"),
             )
+            if capture is not None:
+                capture[f"block{L}_ln2"] = np.asarray(ln2, dtype=np.float32).copy()
             fc1_scale = _scale(s, f"block{L}_fc1")
             ln2_scale = _scale(s, f"block{L}_ln2")
             ln2_i8 = _fp32_to_int8(ln2, ln2_scale)
@@ -680,6 +695,8 @@ class NanoGPTFQReference:
             else:
                 fc1 = _qdq(ln2 @ layer["fc_w"].T + layer["fc_b"], fc1_scale)
             gelu = _qdq(self.gelu_fn(fc1), _scale(s, f"block{L}_gelu", 1.0 / 127.0))
+            if capture is not None:
+                capture[f"block{L}_gelu"] = np.asarray(gelu, dtype=np.float32).copy()
             gelu_scale = _scale(s, f"block{L}_gelu", 1.0 / 127.0)
             gelu_i8 = _fp32_to_int8(gelu, gelu_scale)
             fc2_scale = _scale(s, f"block{L}_fc2")

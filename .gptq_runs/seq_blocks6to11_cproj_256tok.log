@@ -1,0 +1,51 @@
+# GPTQ target weights (6): ['transformer.h.6.mlp.c_proj.weight', 'transformer.h.7.mlp.c_proj.weight', 'transformer.h.8.mlp.c_proj.weight', 'transformer.h.9.mlp.c_proj.weight', 'transformer.h.10.mlp.c_proj.weight', 'transformer.h.11.mlp.c_proj.weight']
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (2391884 > 1024). Running this sequence through the model will result in indexing errors
+# Sequential GPTQ: processing 6 block groups
+# --- group 1/6 (block 6): ['transformer.h.6.mlp.c_proj.weight'] ---
+#   block6_gelu: shape=(8192, 3072)
+# transformer.h.6.mlp.c_proj.weight: GPTQ flipped 393629 weights vs RTN (max_scale=2.1805e-02, min_scale=5.1212e-04)
+#   weight_mse:  rtn=1.582395e-06  gptq=2.611489e-06  ratio=1.6503
+#   output_mse:  rtn=1.695045e-04  gptq=5.326455e-05  ratio=0.3142  (N_calib=8192)
+#   max_resid:   rtn=1.105410e-02  gptq=4.512052e-02
+#   round_trip:  rows_below_127=34/768  int_mismatch=6450  max_dq_drift=1.166534e-02  mean_dq_drift=1.008324e-05
+# --- group 2/6 (block 7): ['transformer.h.7.mlp.c_proj.weight'] ---
+#   block7_gelu: shape=(8192, 3072)
+# transformer.h.7.mlp.c_proj.weight: GPTQ flipped 391683 weights vs RTN (max_scale=3.5706e-02, min_scale=1.4043e-04)
+#   weight_mse:  rtn=1.842430e-06  gptq=3.002363e-06  ratio=1.6296
+#   output_mse:  rtn=2.229782e-04  gptq=6.940502e-05  ratio=0.3113  (N_calib=8192)
+#   max_resid:   rtn=1.816207e-02  gptq=5.969363e-02
+#   round_trip:  rows_below_127=39/768  int_mismatch=5277  max_dq_drift=2.284241e-02  mean_dq_drift=9.673163e-06
+# --- group 3/6 (block 8): ['transformer.h.8.mlp.c_proj.weight'] ---
+#   block8_gelu: shape=(8192, 3072)
+# transformer.h.8.mlp.c_proj.weight: GPTQ flipped 394680 weights vs RTN (max_scale=4.2328e-02, min_scale=1.0633e-03)
+#   weight_mse:  rtn=2.657952e-06  gptq=4.344966e-06  ratio=1.6347
+#   output_mse:  rtn=3.304144e-04  gptq=1.033412e-04  ratio=0.3128  (N_calib=8192)
+#   max_resid:   rtn=2.125323e-02  gptq=6.472340e-02
+#   round_trip:  rows_below_127=40/768  int_mismatch=4254  max_dq_drift=1.583862e-02  mean_dq_drift=8.471498e-06
+# --- group 4/6 (block 9): ['transformer.h.9.mlp.c_proj.weight'] ---
+#   block9_gelu: shape=(8192, 3072)
+# transformer.h.9.mlp.c_proj.weight: GPTQ flipped 393171 weights vs RTN (max_scale=4.3213e-02, min_scale=4.7922e-04)
+#   weight_mse:  rtn=3.448316e-06  gptq=5.606558e-06  ratio=1.6259
+#   output_mse:  rtn=4.763935e-04  gptq=1.469675e-04  ratio=0.3085  (N_calib=8192)
+#   max_resid:   rtn=2.164441e-02  gptq=6.321627e-02
+#   round_trip:  rows_below_127=23/768  int_mismatch=3394  max_dq_drift=8.987427e-03  mean_dq_drift=7.555788e-06
+# --- group 5/6 (block 10): ['transformer.h.10.mlp.c_proj.weight'] ---
+#   block10_gelu: shape=(8192, 3072)
+# transformer.h.10.mlp.c_proj.weight: GPTQ flipped 404800 weights vs RTN (max_scale=8.7036e-02, min_scale=2.1267e-03)
+#   weight_mse:  rtn=6.471213e-06  gptq=1.089335e-05  ratio=1.6834
+#   output_mse:  rtn=1.307510e-03  gptq=3.466966e-04  ratio=0.2652  (N_calib=8192)
+#   max_resid:   rtn=4.365128e-02  gptq=2.144499e-01
+#   round_trip:  rows_below_127=72/768  int_mismatch=8948  max_dq_drift=1.493073e-02  mean_dq_drift=2.363272e-05
+# --- group 6/6 (block 11): ['transformer.h.11.mlp.c_proj.weight'] ---
+#   block11_gelu: shape=(8192, 3072)
+# transformer.h.11.mlp.c_proj.weight: GPTQ flipped 420911 weights vs RTN (max_scale=7.2510e-02, min_scale=5.4283e-03)
+#   weight_mse:  rtn=1.459031e-05  gptq=2.559128e-05  ratio=1.7540
+#   output_mse:  rtn=3.794054e-03  gptq=8.629402e-04  ratio=0.2274  (N_calib=8192)
+#   max_resid:   rtn=3.628640e-02  gptq=1.504567e-01
+#   round_trip:  rows_below_127=57/768  int_mismatch=5293  max_dq_drift=7.250977e-02  mean_dq_drift=1.637790e-05
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (283287 > 1024). Running this sequence through the model will result in indexing errors
+
+golden_perplexity: 7190.520430
+fake_quant_perplexity: 7190.520430
+relative_delta: 0.000000%
+target_count: 255

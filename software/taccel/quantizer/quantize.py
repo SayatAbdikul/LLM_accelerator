@@ -116,6 +116,147 @@ def quantize_tensor_clipped(
     return best_q.astype(np.int8), np.full(tensor.shape[0], best_scale, dtype=np.float16)
 
 
+def gptq_quantize(
+    tensor: np.ndarray,
+    calibration_inputs,
+    *,
+    per_channel: bool = True,
+    percdamp: float = 0.01,
+    blocksize: int = 128,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """GPTQ (Frantar et al. 2022) per-channel symmetric INT8 quantization.
+
+    Quantizes the input dimension column-by-column, propagating each column's
+    rounding error into the unquantized columns via the inverse Hessian
+    `H = (X^T X)`. The per-output-channel scale is computed once from the
+    original `tensor` (same convention as `quantize_tensor`); the column
+    propagation only modifies the per-element rounding decisions, never the
+    scale, so the result round-trips through the existing `quantize_tensor`
+    consumer just like the clip-search and AdaRound paths do.
+
+    Args:
+        tensor: FP32 weight, shape `[out_dim, in_dim]`.
+        calibration_inputs: iterable of `[N_i, in_dim]` activation matrices
+            captured by FP32-forwarding the layer on calibration tokens. The
+            same shape `_flatten_calibration_inputs` accepts elsewhere.
+        per_channel: if True, one scale per output channel; if False, one
+            shared scale across all rows.
+        percdamp: damping ratio added to the Hessian diagonal as
+            `percdamp * mean(diag(H))`. The standard GPTQ default is 0.01.
+        blocksize: process columns in lazy panels of this width to keep the
+            running update on a small slice of the weight matrix at a time
+            (perf only — does not change the result).
+
+    Returns:
+        `(int8_tensor, fp16_scales)` matching the `quantize_tensor` contract.
+    """
+    tensor = np.asarray(tensor, dtype=np.float32)
+    if tensor.ndim == 1:
+        tensor = tensor.reshape(1, -1)
+    if tensor.ndim != 2:
+        raise ValueError(f"gptq_quantize expects a 2D tensor, got shape {tensor.shape}")
+    out_dim, in_dim = tensor.shape
+    if in_dim == 0 or out_dim == 0:
+        raise ValueError("gptq_quantize requires non-empty tensor")
+    if percdamp <= 0.0:
+        raise ValueError("percdamp must be positive")
+    if blocksize <= 0:
+        raise ValueError("blocksize must be positive")
+
+    calib_rows = _flatten_calibration_inputs(calibration_inputs)
+    if calib_rows is None or calib_rows.shape[0] == 0:
+        # No calibration data → fall back to RTN, same as quantize_tensor.
+        return quantize_tensor(tensor, per_channel=per_channel)
+    if calib_rows.shape[1] != in_dim:
+        raise ValueError(
+            f"calibration input dim {calib_rows.shape[1]} != tensor in_dim {in_dim}"
+        )
+
+    # Per-channel scales come from the *original* W so the downstream
+    # consumer (quantize_tensor on the rebuilt FP32 weight) recovers the
+    # same scale even if the GPTQ-perturbed columns reduce the row maxima.
+    if per_channel:
+        max_vals = np.maximum(np.max(np.abs(tensor), axis=1), 1e-8).astype(np.float32)
+        scales = max_vals / np.float32(127.0)
+    else:
+        m = max(float(np.max(np.abs(tensor))), 1e-8)
+        scales = np.full(out_dim, m / 127.0, dtype=np.float32)
+
+    # Hessian over the input dimension. Use float64 for the linear-algebra
+    # step — Cholesky on a 768- or 3072-wide matrix is cheap and the extra
+    # precision matters when columns are nearly collinear.
+    X = calib_rows.astype(np.float64)
+    H = (X.T @ X) * (2.0 / float(X.shape[0]))
+
+    # Drop dead input columns (never excited by calibration). The standard
+    # GPTQ trick: pin them to zero in the working copy and replace the
+    # corresponding Hessian diagonal with 1 so the Cholesky stays PD.
+    diag_idx = np.arange(in_dim)
+    dead = np.diag(H) <= 0.0
+    if dead.any():
+        H[diag_idx[dead], diag_idx[dead]] = 1.0
+
+    # Diagonal damping for numerical stability — proportional to the average
+    # diagonal magnitude (Frantar §3.2). Without this the Cholesky often
+    # fails on heavy-tailed activation distributions.
+    damp = float(percdamp) * float(np.mean(np.diag(H)))
+    H[diag_idx, diag_idx] += damp
+
+    # Cholesky factor of H_inv as upper triangular U with U^T U = H_inv.
+    # Compute it as L = chol(H_inv); U = L^T.
+    try:
+        H_inv = np.linalg.inv(H)
+        L_inv = np.linalg.cholesky(H_inv)
+    except np.linalg.LinAlgError:
+        # Damping was insufficient — bump it and retry once.
+        H[diag_idx, diag_idx] += 10.0 * damp
+        H_inv = np.linalg.inv(H)
+        L_inv = np.linalg.cholesky(H_inv)
+    U = L_inv.T  # upper triangular, U^T U = H_inv
+
+    W = tensor.astype(np.float64).copy()
+    if dead.any():
+        W[:, dead] = 0.0
+    Q = np.zeros((out_dim, in_dim), dtype=np.int8)
+    scales64 = scales.astype(np.float64).reshape(-1, 1)
+
+    # Process columns in panels of `blocksize` so the inner loop touches a
+    # narrow slice and the cross-panel update is one batched matmul.
+    for col_start in range(0, in_dim, blocksize):
+        col_end = min(col_start + blocksize, in_dim)
+        panel = col_end - col_start
+        # Local accumulator for the running rounding errors so we can update
+        # the *rest* of the matrix in a single matmul after the panel.
+        Err_panel = np.zeros((out_dim, panel), dtype=np.float64)
+        U_panel = U[col_start:col_end, col_start:col_end]
+        for j_local in range(panel):
+            j = col_start + j_local
+            w_j = W[:, j]
+            d = U_panel[j_local, j_local]
+            # Round-to-nearest with per-channel scale, then dequantize.
+            q_int = np.clip(
+                np.round(w_j / scales64[:, 0]),
+                -128,
+                127,
+            ).astype(np.int8)
+            q_dq = q_int.astype(np.float64) * scales64[:, 0]
+            err = (w_j - q_dq) / d
+            Err_panel[:, j_local] = err
+            # In-panel propagation: shrink the remaining columns inside the
+            # current panel by the new error along the diagonal of U.
+            if j_local + 1 < panel:
+                W[:, j + 1: col_end] -= np.outer(
+                    err, U_panel[j_local, j_local + 1:]
+                )
+            Q[:, j] = q_int
+        # Cross-panel propagation: update everything to the right of the
+        # panel with the accumulated panel errors at once.
+        if col_end < in_dim:
+            W[:, col_end:] -= Err_panel @ U[col_start:col_end, col_end:]
+
+    return Q, scales.astype(np.float16)
+
+
 def adaround_greedy(
     tensor: np.ndarray,
     q_init: np.ndarray,

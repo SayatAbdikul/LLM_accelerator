@@ -1,0 +1,93 @@
+# GPTQ target weights (12): ['transformer.h.0.mlp.c_proj.weight', 'transformer.h.1.mlp.c_proj.weight', 'transformer.h.2.mlp.c_proj.weight', 'transformer.h.3.mlp.c_proj.weight', 'transformer.h.4.mlp.c_proj.weight', 'transformer.h.5.mlp.c_proj.weight', 'transformer.h.6.mlp.c_proj.weight', 'transformer.h.7.mlp.c_proj.weight', 'transformer.h.8.mlp.c_proj.weight', 'transformer.h.9.mlp.c_proj.weight', 'transformer.h.10.mlp.c_proj.weight', 'transformer.h.11.mlp.c_proj.weight']
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (2391884 > 1024). Running this sequence through the model will result in indexing errors
+# Sequential GPTQ: processing 12 block groups
+# --- group 1/12 (block 0): ['transformer.h.0.mlp.c_proj.weight'] ---
+#   block0_gelu: shape=(8192, 3072)
+# transformer.h.0.mlp.c_proj.weight: GPTQ flipped 503919 weights vs RTN (max_scale=4.8370e-02, min_scale=2.0161e-03)
+#   weight_mse:  rtn=3.112114e-06  gptq=6.659198e-06  ratio=2.1398
+#   output_mse:  rtn=3.813837e-04  gptq=7.605862e-05  ratio=0.1994  (N_calib=8192)
+#   max_resid:   rtn=2.417644e-02  gptq=1.906251e-01
+#   round_trip:  rows_below_127=66/768  int_mismatch=8593  max_dq_drift=8.880615e-02  mean_dq_drift=1.054548e-05
+# --- group 2/12 (block 1): ['transformer.h.1.mlp.c_proj.weight'] ---
+#   block1_gelu: shape=(8192, 3072)
+# transformer.h.1.mlp.c_proj.weight: GPTQ flipped 474347 weights vs RTN (max_scale=1.0815e-01, min_scale=2.0084e-03)
+#   weight_mse:  rtn=2.740085e-06  gptq=5.393473e-06  ratio=1.9684
+#   output_mse:  rtn=2.928555e-04  gptq=5.173132e-05  ratio=0.1766  (N_calib=8192)
+#   max_resid:   rtn=5.407025e-02  gptq=1.914390e-01
+#   round_trip:  rows_below_127=67/768  int_mismatch=9608  max_dq_drift=7.366180e-03  mean_dq_drift=1.160536e-05
+# --- group 3/12 (block 2): ['transformer.h.2.mlp.c_proj.weight'] ---
+#   block2_gelu: shape=(8192, 3072)
+# transformer.h.2.mlp.c_proj.weight: GPTQ flipped 388006 weights vs RTN (max_scale=1.1865e-01, min_scale=2.3270e-03)
+#   weight_mse:  rtn=3.429363e-06  gptq=5.771069e-06  ratio=1.6828
+#   output_mse:  rtn=6.409744e-04  gptq=8.293061e-05  ratio=0.1294  (N_calib=8192)
+#   max_resid:   rtn=5.938196e-02  gptq=1.874406e-01
+#   round_trip:  rows_below_127=35/768  int_mismatch=5249  max_dq_drift=1.139069e-02  mean_dq_drift=6.727233e-06
+# --- group 4/12 (block 3): ['transformer.h.3.mlp.c_proj.weight'] ---
+#   block3_gelu: shape=(8192, 3072)
+# transformer.h.3.mlp.c_proj.weight: GPTQ flipped 407500 weights vs RTN (max_scale=1.3464e-01, min_scale=2.2278e-03)
+#   weight_mse:  rtn=3.417947e-06  gptq=5.916102e-06  ratio=1.7309
+#   output_mse:  rtn=4.768012e-04  gptq=8.532967e-05  ratio=0.1790  (N_calib=8192)
+#   max_resid:   rtn=6.732631e-02  gptq=2.592278e-01
+#   round_trip:  rows_below_127=61/768  int_mismatch=10123  max_dq_drift=1.582336e-02  mean_dq_drift=1.326370e-05
+# --- group 5/12 (block 4): ['transformer.h.4.mlp.c_proj.weight'] ---
+#   block4_gelu: shape=(8192, 3072)
+# transformer.h.4.mlp.c_proj.weight: GPTQ flipped 393667 weights vs RTN (max_scale=3.7628e-02, min_scale=2.1477e-03)
+#   weight_mse:  rtn=1.411884e-06  gptq=2.336377e-06  ratio=1.6548
+#   output_mse:  rtn=1.270469e-04  gptq=3.895433e-05  ratio=0.3066  (N_calib=8192)
+#   max_resid:   rtn=1.881895e-02  gptq=8.764514e-02
+#   round_trip:  rows_below_127=49/768  int_mismatch=6844  max_dq_drift=8.987427e-03  mean_dq_drift=8.889529e-06
+# --- group 6/12 (block 5): ['transformer.h.5.mlp.c_proj.weight'] ---
+#   block5_gelu: shape=(8192, 3072)
+# transformer.h.5.mlp.c_proj.weight: GPTQ flipped 392590 weights vs RTN (max_scale=2.2369e-02, min_scale=1.6603e-03)
+#   weight_mse:  rtn=1.309304e-06  gptq=2.148042e-06  ratio=1.6406
+#   output_mse:  rtn=1.285824e-04  gptq=4.116483e-05  ratio=0.3201  (N_calib=8192)
+#   max_resid:   rtn=1.119003e-02  gptq=3.881508e-02
+#   round_trip:  rows_below_127=58/768  int_mismatch=7634  max_dq_drift=2.236938e-02  mean_dq_drift=1.082553e-05
+# --- group 7/12 (block 6): ['transformer.h.6.mlp.c_proj.weight'] ---
+#   block6_gelu: shape=(8192, 3072)
+# transformer.h.6.mlp.c_proj.weight: GPTQ flipped 393944 weights vs RTN (max_scale=2.1805e-02, min_scale=5.1212e-04)
+#   weight_mse:  rtn=1.582395e-06  gptq=2.622149e-06  ratio=1.6571
+#   output_mse:  rtn=1.694909e-04  gptq=5.327528e-05  ratio=0.3143  (N_calib=8192)
+#   max_resid:   rtn=1.105410e-02  gptq=8.209576e-02
+#   round_trip:  rows_below_127=49/768  int_mismatch=8530  max_dq_drift=2.069092e-02  mean_dq_drift=1.362393e-05
+# --- group 8/12 (block 7): ['transformer.h.7.mlp.c_proj.weight'] ---
+#   block7_gelu: shape=(8192, 3072)
+# transformer.h.7.mlp.c_proj.weight: GPTQ flipped 391960 weights vs RTN (max_scale=3.5706e-02, min_scale=1.4043e-04)
+#   weight_mse:  rtn=1.842430e-06  gptq=2.991191e-06  ratio=1.6235
+#   output_mse:  rtn=2.229701e-04  gptq=6.923210e-05  ratio=0.3105  (N_calib=8192)
+#   max_resid:   rtn=1.816207e-02  gptq=4.730070e-02
+#   round_trip:  rows_below_127=47/768  int_mismatch=5669  max_dq_drift=2.284241e-02  mean_dq_drift=1.009483e-05
+# --- group 9/12 (block 8): ['transformer.h.8.mlp.c_proj.weight'] ---
+#   block8_gelu: shape=(8192, 3072)
+# transformer.h.8.mlp.c_proj.weight: GPTQ flipped 395611 weights vs RTN (max_scale=4.2328e-02, min_scale=1.0633e-03)
+#   weight_mse:  rtn=2.657952e-06  gptq=4.344497e-06  ratio=1.6345
+#   output_mse:  rtn=3.304080e-04  gptq=1.030454e-04  ratio=0.3119  (N_calib=8192)
+#   max_resid:   rtn=2.125323e-02  gptq=6.445318e-02
+#   round_trip:  rows_below_127=36/768  int_mismatch=4943  max_dq_drift=1.583862e-02  mean_dq_drift=9.788550e-06
+# --- group 10/12 (block 9): ['transformer.h.9.mlp.c_proj.weight'] ---
+#   block9_gelu: shape=(8192, 3072)
+# transformer.h.9.mlp.c_proj.weight: GPTQ flipped 393120 weights vs RTN (max_scale=4.3213e-02, min_scale=4.7922e-04)
+#   weight_mse:  rtn=3.448316e-06  gptq=5.617054e-06  ratio=1.6289
+#   output_mse:  rtn=4.764036e-04  gptq=1.468829e-04  ratio=0.3083  (N_calib=8192)
+#   max_resid:   rtn=2.164441e-02  gptq=6.446259e-02
+#   round_trip:  rows_below_127=21/768  int_mismatch=3436  max_dq_drift=8.880615e-03  mean_dq_drift=7.648547e-06
+# --- group 11/12 (block 10): ['transformer.h.10.mlp.c_proj.weight'] ---
+#   block10_gelu: shape=(8192, 3072)
+# transformer.h.10.mlp.c_proj.weight: GPTQ flipped 404709 weights vs RTN (max_scale=8.7036e-02, min_scale=2.1267e-03)
+#   weight_mse:  rtn=6.471213e-06  gptq=1.079861e-05  ratio=1.6687
+#   output_mse:  rtn=1.307597e-03  gptq=3.421708e-04  ratio=0.2617  (N_calib=8192)
+#   max_resid:   rtn=4.365128e-02  gptq=1.429214e-01
+#   round_trip:  rows_below_127=74/768  int_mismatch=9115  max_dq_drift=1.722717e-02  mean_dq_drift=2.477277e-05
+# --- group 12/12 (block 11): ['transformer.h.11.mlp.c_proj.weight'] ---
+#   block11_gelu: shape=(8192, 3072)
+# transformer.h.11.mlp.c_proj.weight: GPTQ flipped 420522 weights vs RTN (max_scale=7.2510e-02, min_scale=5.4283e-03)
+#   weight_mse:  rtn=1.459031e-05  gptq=2.563608e-05  ratio=1.7571
+#   output_mse:  rtn=3.794423e-03  gptq=8.585768e-04  ratio=0.2263  (N_calib=8192)
+#   max_resid:   rtn=3.628640e-02  gptq=1.627085e-01
+#   round_trip:  rows_below_127=51/768  int_mismatch=5053  max_dq_drift=1.719666e-02  mean_dq_drift=1.533593e-05
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (283287 > 1024). Running this sequence through the model will result in indexing errors
+
+golden_perplexity: 36720.191461
+fake_quant_perplexity: 37195.660834
+relative_delta: 1.278293%
+target_count: 255

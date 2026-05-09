@@ -1,0 +1,15 @@
+# GPTQ target weights (1): ['transformer.h.11.mlp.c_proj.weight']
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (2391884 > 1024). Running this sequence through the model will result in indexing errors
+# Capturing FAKE-QUANT activations for nodes: ['block11_gelu']
+#   block11_gelu: shape=(512, 3072)
+# transformer.h.11.mlp.c_proj.weight: GPTQ flipped 420359 weights vs RTN (max_scale=7.2510e-02, min_scale=5.4283e-03)
+#   weight_mse:  rtn=1.459031e-05  gptq=2.876013e-04  ratio=19.7118
+#   output_mse:  rtn=1.489530e-02  gptq=8.201646e-04  ratio=0.0551  (N_calib=512)
+#   max_resid:   rtn=3.628640e-02  gptq=3.126379e+00
+#   round_trip:  rows_below_127=82/768  int_mismatch=148686  max_dq_drift=5.553360e-01  mean_dq_drift=2.224936e-03
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (283287 > 1024). Running this sequence through the model will result in indexing errors
+
+golden_perplexity: 5430.385966
+fake_quant_perplexity: 6267.461286
+relative_delta: 13.355891%
+target_count: 32

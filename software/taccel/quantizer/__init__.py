@@ -6,6 +6,7 @@ can import small quantizer submodules without importing torch at collection.
 
 from .quantize import (
     adaround_greedy,
+    gptq_quantize,
     quantize_weights,
     quantize_tensor,
     quantize_tensor_clipped,
@@ -37,6 +38,7 @@ def __getattr__(name):
 
 __all__ = [
     "adaround_greedy",
+    "gptq_quantize",
     "quantize_weights",
     "quantize_tensor",
     "quantize_tensor_clipped",

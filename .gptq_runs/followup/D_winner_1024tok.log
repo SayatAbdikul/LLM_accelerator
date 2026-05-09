@@ -1,0 +1,56 @@
+# Composition steps: SQ=False  GPTQ=True  BC=False
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (2391884 > 1024). Running this sequence through the model will result in indexing errors
+# GPTQ targets (1): ['transformer.h.11.mlp.c_proj.weight']
+# Sequential GPTQ: processing 1 block groups
+# --- group 1/1 (block 11): ['transformer.h.11.mlp.c_proj.weight'] ---
+#   block11_gelu: shape=(8192, 3072)
+# transformer.h.11.mlp.c_proj.weight: GPTQ flipped 420349 weights vs RTN (max_scale=7.2510e-02, min_scale=5.4283e-03)
+#   weight_mse:  rtn=1.459031e-05  gptq=2.563195e-05  ratio=1.7568
+#   output_mse:  rtn=3.793226e-03  gptq=8.604342e-04  ratio=0.2268  (N_calib=8192)
+#   max_resid:   rtn=3.628640e-02  gptq=1.836979e-01
+#   round_trip:  rows_below_127=51/768  int_mismatch=4023  max_dq_drift=5.496216e-02  mean_dq_drift=1.208617e-05
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (283287 > 1024). Running this sequence through the model will result in indexing errors
+Traceback (most recent call last):
+  File "/home/user/LLM_accelerator/software/tools/eval_with_compose.py", line 382, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "/home/user/LLM_accelerator/software/tools/eval_with_compose.py", line 333, in main
+    result = evaluate_gpt2_perplexity(
+        payload,
+    ...<10 lines>...
+        ptq_preset=args.ptq_preset,
+    )
+  File "/home/user/LLM_accelerator/software/taccel/runtime/gpt2_perplexity.py", line 272, in evaluate_gpt2_perplexity
+    golden_logits = run_golden_teacher_forced_logits(
+        payload,
+    ...<2 lines>...
+        ptq_preset=resolved_preset,
+    )
+  File "/home/user/LLM_accelerator/software/taccel/runtime/gpt2_perplexity.py", line 125, in run_golden_teacher_forced_logits
+    tiny = build_stage3_tiny_decoder_bundle(
+        payload,
+    ...<2 lines>...
+        ptq_preset=ptq_preset,
+    )
+  File "/home/user/LLM_accelerator/software/taccel/runtime/tiny_fixture.py", line 319, in build_stage3_tiny_decoder_bundle
+    build = build_decoder_program_bundle(
+        prefill_graph=prefill_graph,
+    ...<10 lines>...
+        gelu_from_accum_blocks=gelu_from_accum_blocks or None,
+    )
+  File "/home/user/LLM_accelerator/software/taccel/compiler/decoder_bundle.py", line 252, in build_decoder_program_bundle
+    decode_instructions, decode_data = decode_codegen.generate(decode_graph)
+                                       ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/home/user/LLM_accelerator/software/taccel/compiler/codegen.py", line 139, in generate
+    self._emit_node(node)
+    ~~~~~~~~~~~~~~~^^^^^^
+  File "/home/user/LLM_accelerator/software/taccel/compiler/codegen.py", line 448, in _emit_node
+    self._emit_kv_load(node)
+    ~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/home/user/LLM_accelerator/software/taccel/compiler/codegen.py", line 2695, in _emit_kv_load
+    alloc = self.mem.abuf.alloc(node.name, alloc_bytes)
+  File "/home/user/LLM_accelerator/software/taccel/compiler/memory_alloc.py", line 65, in alloc
+    raise MemoryError(
+    ...<3 lines>...
+    )
+MemoryError: Cannot allocate 65536B (4096 units) in buffer 0. Capacity=131072B, live=91136B, largest free block=39936B

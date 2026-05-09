@@ -1,0 +1,5 @@
+# Composition steps: SQ=True  GPTQ=False  BC=False
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (2391884 > 1024). Running this sequence through the model will result in indexing errors
+# Applied SmoothQuant to 1 pairs:
+#   block11/ln_2_fc1: alpha=0.5  smooth=[4.297e-01, 1.933e+00] mean=9.927e-01
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (283287 > 1024). Running this sequence through the model will result in indexing errors

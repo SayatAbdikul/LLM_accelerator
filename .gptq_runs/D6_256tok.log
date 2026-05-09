@@ -1,0 +1,14 @@
+# GPTQ target weights (1): ['transformer.h.11.mlp.c_proj.weight']
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (2391884 > 1024). Running this sequence through the model will result in indexing errors
+# D6 path: --weight-search-n-seqs 0 → RTN fallback through GPTQ plumbing.
+# transformer.h.11.mlp.c_proj.weight: GPTQ flipped 0 weights vs RTN (max_scale=7.2510e-02, min_scale=5.4283e-03)
+#   weight_mse:  rtn=1.459031e-05  gptq=1.459031e-05  ratio=1.0000
+#   output_mse:  rtn=nan  gptq=nan  ratio=nan  (N_calib=0)
+#   max_resid:   rtn=3.628640e-02  gptq=3.628640e-02
+#   round_trip:  rows_below_127=0/768  int_mismatch=0  max_dq_drift=0.000000e+00  mean_dq_drift=0.000000e+00
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (283287 > 1024). Running this sequence through the model will result in indexing errors
+
+golden_perplexity: 9576.322817
+fake_quant_perplexity: 9576.322817
+relative_delta: 0.000000%
+target_count: 255
