@@ -747,12 +747,17 @@ class NanoGPTFQReference:
             return logits_i8 if return_all_logits else logits_i8[0]
         ln_f_i8 = _fp32_to_int8(lm_input, ln_f_scale)
         logits_accum = ln_f_i8.astype(np.int32) @ self.lm_head_w_q.astype(np.int32).T
-        logits_i8 = _requant_accum_pc_int8(logits_accum, self.lm_head_requant_pc)
         if self.lm_head_b_logit is not None:
-            # Add bias in INT8 logit-units (b / lm_head_scale, post-requant).
-            # Saturate to int8 range to mirror what hardware would do.
-            logits_with_bias = logits_i8.astype(np.float32) + self.lm_head_b_logit
-            logits_i8 = np.clip(np.round(logits_with_bias), -128, 127).astype(np.int8)
+            # Inline requant + bias to avoid double-saturation. Computing
+            # `_requant_accum_pc_int8` first (which clips to [-128, 127])
+            # and THEN adding bias loses precision on saturated logits and
+            # accumulates error across positions at long evals.
+            requant_pc = self.lm_head_requant_pc.astype(np.float16).astype(np.float32).reshape(1, -1)
+            logits_fp32 = logits_accum.astype(np.float32) * requant_pc[:, :logits_accum.shape[-1]]
+            logits_fp32 = logits_fp32 + self.lm_head_b_logit
+            logits_i8 = np.clip(np.round(logits_fp32), -128, 127).astype(np.int8)
+        else:
+            logits_i8 = _requant_accum_pc_int8(logits_accum, self.lm_head_requant_pc)
         return logits_i8 if return_all_logits else logits_i8[0]
 
     def forward_incremental(
@@ -1155,11 +1160,15 @@ class NanoGPTFQReference:
             return logits_i8
         ln_f_i8 = _fp32_to_int8(ln_f, ln_f_scale)
         logits_accum = ln_f_i8.astype(np.int32) @ self.lm_head_w_q.astype(np.int32).T
-        logits_i8 = _requant_accum_pc_int8(logits_accum, self.lm_head_requant_pc)
         if self.lm_head_b_logit is not None:
-            # Add bias in INT8 logit-units (post-requant). See __init__ comment.
-            logits_with_bias = logits_i8.astype(np.float32) + self.lm_head_b_logit
-            logits_i8 = np.clip(np.round(logits_with_bias), -128, 127).astype(np.int8)
+            # Inline requant + bias to avoid double-saturation (see forward()
+            # for explanation).
+            requant_pc = self.lm_head_requant_pc.astype(np.float16).astype(np.float32).reshape(1, -1)
+            logits_fp32 = logits_accum.astype(np.float32) * requant_pc[:, :logits_accum.shape[-1]]
+            logits_fp32 = logits_fp32 + self.lm_head_b_logit
+            logits_i8 = np.clip(np.round(logits_fp32), -128, 127).astype(np.int8)
+        else:
+            logits_i8 = _requant_accum_pc_int8(logits_accum, self.lm_head_requant_pc)
         logits = logits_i8.astype(np.float32) * _arch_scale(_scale(s, "lm_head"))
         record(
             "lm_head",
