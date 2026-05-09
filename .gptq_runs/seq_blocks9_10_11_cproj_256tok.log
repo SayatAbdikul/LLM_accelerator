@@ -1,0 +1,30 @@
+# GPTQ target weights (3): ['transformer.h.9.mlp.c_proj.weight', 'transformer.h.10.mlp.c_proj.weight', 'transformer.h.11.mlp.c_proj.weight']
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (2391884 > 1024). Running this sequence through the model will result in indexing errors
+# Sequential GPTQ: processing 3 block groups
+# --- group 1/3 (block 9): ['transformer.h.9.mlp.c_proj.weight'] ---
+#   block9_gelu: shape=(8192, 3072)
+# transformer.h.9.mlp.c_proj.weight: GPTQ flipped 392399 weights vs RTN (max_scale=4.3213e-02, min_scale=4.7922e-04)
+#   weight_mse:  rtn=3.448316e-06  gptq=5.609951e-06  ratio=1.6269
+#   output_mse:  rtn=4.763884e-04  gptq=1.468508e-04  ratio=0.3083  (N_calib=8192)
+#   max_resid:   rtn=2.164441e-02  gptq=8.430630e-02
+#   round_trip:  rows_below_127=18/768  int_mismatch=2632  max_dq_drift=8.880615e-03  mean_dq_drift=6.084158e-06
+# --- group 2/3 (block 10): ['transformer.h.10.mlp.c_proj.weight'] ---
+#   block10_gelu: shape=(8192, 3072)
+# transformer.h.10.mlp.c_proj.weight: GPTQ flipped 404399 weights vs RTN (max_scale=8.7036e-02, min_scale=2.1267e-03)
+#   weight_mse:  rtn=6.471213e-06  gptq=1.088418e-05  ratio=1.6819
+#   output_mse:  rtn=1.307520e-03  gptq=3.457241e-04  ratio=0.2644  (N_calib=8192)
+#   max_resid:   rtn=4.365128e-02  gptq=1.429214e-01
+#   round_trip:  rows_below_127=63/768  int_mismatch=10404  max_dq_drift=1.884460e-02  mean_dq_drift=2.894717e-05
+# --- group 3/3 (block 11): ['transformer.h.11.mlp.c_proj.weight'] ---
+#   block11_gelu: shape=(8192, 3072)
+# transformer.h.11.mlp.c_proj.weight: GPTQ flipped 420414 weights vs RTN (max_scale=7.2510e-02, min_scale=5.4283e-03)
+#   weight_mse:  rtn=1.459031e-05  gptq=2.552834e-05  ratio=1.7497
+#   output_mse:  rtn=3.793654e-03  gptq=8.600008e-04  ratio=0.2267  (N_calib=8192)
+#   max_resid:   rtn=3.628640e-02  gptq=1.289058e-01
+#   round_trip:  rows_below_127=50/768  int_mismatch=4686  max_dq_drift=1.525879e-02  mean_dq_drift=1.433985e-05
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (283287 > 1024). Running this sequence through the model will result in indexing errors
+
+golden_perplexity: 10290.728228
+fake_quant_perplexity: 10290.728228
+relative_delta: 0.000000%
+target_count: 255

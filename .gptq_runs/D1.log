@@ -1,0 +1,21 @@
+# GPTQ target weights (2): ['transformer.h.11.mlp.c_fc.weight', 'transformer.h.11.mlp.c_proj.weight']
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (2391884 > 1024). Running this sequence through the model will result in indexing errors
+# Capturing FP32 activations for nodes: ['block11_gelu', 'block11_ln2']
+#   block11_gelu: shape=(512, 3072)
+#   block11_ln2: shape=(512, 768)
+# transformer.h.11.mlp.c_fc.weight: GPTQ flipped 577421 weights vs RTN (max_scale=1.5472e-02, min_scale=2.3289e-03)
+#   weight_mse:  rtn=1.143106e-06  gptq=2.764330e-06  ratio=2.4183
+#   output_mse:  rtn=3.458819e-05  gptq=5.052149e-06  ratio=0.1461  (N_calib=512)
+#   max_resid:   rtn=7.707347e-03  gptq=2.944624e-02
+#   round_trip:  rows_below_127=159/3072  int_mismatch=19889  max_dq_drift=7.362366e-03  mean_dq_drift=2.805144e-05
+# transformer.h.11.mlp.c_proj.weight: GPTQ flipped 369438 weights vs RTN (max_scale=7.2510e-02, min_scale=5.4283e-03)
+#   weight_mse:  rtn=1.459031e-05  gptq=2.702389e-05  ratio=1.8522
+#   output_mse:  rtn=4.008329e-03  gptq=1.380562e-04  ratio=0.0344  (N_calib=512)
+#   max_resid:   rtn=3.628640e-02  gptq=2.191478e-01
+#   round_trip:  rows_below_127=32/768  int_mismatch=4631  max_dq_drift=5.496216e-02  mean_dq_drift=1.325282e-05
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (283287 > 1024). Running this sequence through the model will result in indexing errors
+
+golden_perplexity: 5644.520922
+fake_quant_perplexity: 5644.520922
+relative_delta: 0.000000%
+target_count: 32

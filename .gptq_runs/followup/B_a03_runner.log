@@ -1,0 +1,20 @@
+=== Step B α=0.3 ===
+# Composition steps: SQ=True  GPTQ=True  BC=False
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (2391884 > 1024). Running this sequence through the model will result in indexing errors
+# Applied SmoothQuant to 1 pairs:
+#   block11/ln_2_fc1: alpha=0.3  smooth=[4.753e-01, 1.969e+00] mean=1.172e+00
+# GPTQ targets (1): ['transformer.h.11.mlp.c_proj.weight']
+# Sequential GPTQ: processing 1 block groups
+# --- group 1/1 (block 11): ['transformer.h.11.mlp.c_proj.weight'] ---
+#   block11_gelu: shape=(8192, 3072)
+# transformer.h.11.mlp.c_proj.weight: GPTQ flipped 420349 weights vs RTN (max_scale=7.2510e-02, min_scale=5.4283e-03)
+#   weight_mse:  rtn=1.459031e-05  gptq=2.563195e-05  ratio=1.7568
+#   output_mse:  rtn=3.793226e-03  gptq=8.604342e-04  ratio=0.2268  (N_calib=8192)
+#   max_resid:   rtn=3.628640e-02  gptq=1.836979e-01
+#   round_trip:  rows_below_127=51/768  int_mismatch=4023  max_dq_drift=5.496216e-02  mean_dq_drift=1.208617e-05
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (283287 > 1024). Running this sequence through the model will result in indexing errors
+
+golden_perplexity: 8532.364138
+fake_quant_perplexity: 8532.364138
+relative_delta: 0.000000%
+target_count: 255

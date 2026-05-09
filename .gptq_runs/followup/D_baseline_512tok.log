@@ -1,0 +1,8 @@
+# Composition steps: SQ=False  GPTQ=False  BC=False
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (2391884 > 1024). Running this sequence through the model will result in indexing errors
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (283287 > 1024). Running this sequence through the model will result in indexing errors
+
+golden_perplexity: 7692.842381
+fake_quant_perplexity: 7692.842381
+relative_delta: 0.000000%
+target_count: 511

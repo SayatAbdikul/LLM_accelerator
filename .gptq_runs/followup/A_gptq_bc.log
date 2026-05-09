@@ -1,0 +1,23 @@
+# Composition steps: SQ=False  GPTQ=True  BC=True
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (2391884 > 1024). Running this sequence through the model will result in indexing errors
+# GPTQ targets (1): ['transformer.h.11.mlp.c_proj.weight']
+# Sequential GPTQ: processing 1 block groups
+# --- group 1/1 (block 11): ['transformer.h.11.mlp.c_proj.weight'] ---
+#   block11_gelu: shape=(8192, 3072)
+# transformer.h.11.mlp.c_proj.weight: GPTQ flipped 420349 weights vs RTN (max_scale=7.2510e-02, min_scale=5.4283e-03)
+#   weight_mse:  rtn=1.459031e-05  gptq=2.563195e-05  ratio=1.7568
+#   output_mse:  rtn=3.793226e-03  gptq=8.604341e-04  ratio=0.2268  (N_calib=8192)
+#   max_resid:   rtn=3.628640e-02  gptq=1.836979e-01
+#   round_trip:  rows_below_127=51/768  int_mismatch=4023  max_dq_drift=5.496216e-02  mean_dq_drift=1.208617e-05
+# Bias-correction targets (1): ['transformer.h.11.mlp.c_proj.weight']
+# Using preset for activation scale baseline: output_aware_mlp_lm_head_0_11_pc_full
+# Capturing FP32 activations for nodes: ['block11_gelu']
+# Applied bias correction to 1 layers
+#   err_abs_max overall = 5.5055e+00
+#   err_abs_mean overall = 1.3396e-01
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (283287 > 1024). Running this sequence through the model will result in indexing errors
+
+golden_perplexity: 11385.313243
+fake_quant_perplexity: 11385.313243
+relative_delta: 0.000000%
+target_count: 255
