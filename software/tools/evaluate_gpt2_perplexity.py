@@ -50,6 +50,18 @@ def main(argv=None) -> int:
             "ship to the deployed bundle."
         ),
     )
+    parser.add_argument(
+        "--debug-fp32-residual-stream",
+        action="store_true",
+        help=(
+            "Phase 1 Branch B diagnostic: route the residual stream through "
+            "FP32 in the fake-quant reference (no INT8 quantization on "
+            "block_residual1/2 or LN outputs ln1/ln2/ln_f; matmul outputs "
+            "Q/K/V/fc1/fc2/lm_head still INT8). Reference-only — does NOT "
+            "ship. Used to test whether residual-stream INT8 quantization "
+            "is the dominant long-eval bottleneck."
+        ),
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
@@ -84,6 +96,7 @@ def main(argv=None) -> int:
         output_aware_include_pairs=args.output_aware_include_pairs,
         compute_fp32_ceiling=(not args.skip_fp32_ceiling),
         debug_fp32_kv_cache=args.debug_fp32_kv_cache,
+        debug_fp32_residual_stream=args.debug_fp32_residual_stream,
     )
     out = asdict(result)
     if args.json:

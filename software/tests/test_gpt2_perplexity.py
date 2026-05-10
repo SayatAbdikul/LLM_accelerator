@@ -542,3 +542,57 @@ def test_nanogpt_fq_reference_keep_kv_cache_fp32_default_is_int8():
     sig = inspect.signature(NanoGPTFQReference.__init__)
     assert "keep_kv_cache_fp32" in sig.parameters
     assert sig.parameters["keep_kv_cache_fp32"].default is False
+
+
+# ----------------------------------------------------------------------------
+# Phase 1 Branch B: FP32 residual stream toggle
+# ----------------------------------------------------------------------------
+
+def test_nanogpt_fq_reference_fp32_residual_stream_toggle_changes_logits():
+    """Phase 1 Branch B: when fp32_residual_stream=True, the residual stream
+    (block_residual1/2 and LN outputs) is computed in FP32 instead of INT8.
+    Logits should differ from the default INT8-residual path."""
+    from taccel.runtime.fake_quant_reference import NanoGPTFQReference
+    from taccel.runtime.calibration import build_calibration_scales
+
+    fixture = Path("software/tests/fixtures/generated/nanogpt_shakespeare_char_d128_l2_trained.pt")
+    if not fixture.exists():
+        pytest.skip(f"fixture missing: {fixture}")
+
+    payload = torch.load(fixture, map_location="cpu")
+    state_dict = payload["state_dict"]
+    model_args = payload["model_args"]
+    scales = build_calibration_scales(payload, n_seqs=2, seq_len=8)
+
+    ref_default = NanoGPTFQReference(state_dict, model_args, scales, fp32_residual_stream=False)
+    ref_fp32_res = NanoGPTFQReference(state_dict, model_args, scales, fp32_residual_stream=True)
+
+    rng = np.random.default_rng(0xBEEF)
+    vocab = int(model_args["vocab_size"])
+    eval_tokens = rng.integers(0, vocab, size=10).tolist()
+
+    logits_default = ref_default.incremental_logits_trace(eval_tokens)
+    logits_fp32_res = ref_fp32_res.incremental_logits_trace(eval_tokens)
+
+    assert len(logits_default) == len(logits_fp32_res) == len(eval_tokens)
+
+    any_diff = False
+    for a, b in zip(logits_default, logits_fp32_res):
+        if not np.array_equal(np.asarray(a, dtype=np.float32), np.asarray(b, dtype=np.float32)):
+            any_diff = True
+            break
+    assert any_diff, (
+        "fp32_residual_stream=True must change logits vs the INT8-residual default; "
+        "got identical traces"
+    )
+
+
+def test_nanogpt_fq_reference_fp32_residual_stream_default_is_int8():
+    """Phase 1 Branch B: fp32_residual_stream defaults to False so the
+    deployed bundle reference is unchanged."""
+    from taccel.runtime.fake_quant_reference import NanoGPTFQReference
+    import inspect
+
+    sig = inspect.signature(NanoGPTFQReference.__init__)
+    assert "fp32_residual_stream" in sig.parameters
+    assert sig.parameters["fp32_residual_stream"].default is False

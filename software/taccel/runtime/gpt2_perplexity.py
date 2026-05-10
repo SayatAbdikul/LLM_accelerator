@@ -170,6 +170,7 @@ def run_fake_quant_teacher_forced_logits(
     *,
     ptq_preset: str | Stage5PTQPreset | None = None,
     keep_kv_cache_fp32: bool = False,
+    fp32_residual_stream: bool = False,
 ) -> List[np.ndarray]:
     inputs, _ = teacher_forced_inputs_and_targets(context_tokens)
     resolved_preset = resolve_stage5_ptq_preset(ptq_preset)
@@ -182,6 +183,7 @@ def run_fake_quant_teacher_forced_logits(
         raw_residual2_blocks=stage5_raw_residual2_blocks(resolved_preset),
         gelu_from_accum_blocks=stage5_gelu_from_accum_blocks(resolved_preset),
         keep_kv_cache_fp32=keep_kv_cache_fp32,
+        fp32_residual_stream=fp32_residual_stream,
     )
     return ref.incremental_logits_trace(inputs)
 
@@ -206,6 +208,7 @@ def evaluate_gpt2_perplexity(
     output_aware_include_pairs: bool = False,
     compute_fp32_ceiling: bool = True,
     debug_fp32_kv_cache: bool = False,
+    debug_fp32_residual_stream: bool = False,
 ) -> GPT2PerplexityResult:
     if context_len < 1:
         raise ValueError("context_len must be positive")
@@ -366,6 +369,7 @@ def evaluate_gpt2_perplexity(
         calibration_scales,
         ptq_preset=resolved_preset,
         keep_kv_cache_fp32=debug_fp32_kv_cache,
+        fp32_residual_stream=debug_fp32_residual_stream,
     )
     if len(golden_logits) != len(targets) or len(fake_logits) != len(targets):
         raise RuntimeError("teacher-forced logits/targets length mismatch")

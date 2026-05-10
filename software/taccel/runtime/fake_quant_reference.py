@@ -6,6 +6,7 @@ can run either a full causal forward or an incremental KV-cache decode path.
 """
 from __future__ import annotations
 
+import os
 from typing import Dict, Optional, Sequence
 
 import numpy as np
@@ -371,6 +372,7 @@ class NanoGPTFQReference:
         gelu_from_accum_blocks: Sequence[int] | None = None,
         ln_eps: float | None = None,
         keep_kv_cache_fp32: bool = False,
+        fp32_residual_stream: bool = False,
     ) -> None:
         self.n_layer = int(model_args["n_layer"])
         self.n_head = int(model_args["n_head"])
@@ -392,6 +394,22 @@ class NanoGPTFQReference:
         # computed each step — single-step noise, not compounding). The
         # deployed bundle never sets this; it's reference-only.
         self.keep_kv_cache_fp32 = bool(keep_kv_cache_fp32)
+        # Phase 1 Branch B (Branch B v1) diagnostic: when True, route the
+        # residual stream through FP32 (no INT8 quantization on
+        # block_residual1/2 or the LN outputs ln1/ln2/ln_f). This is the
+        # absolute upper bound for what per-token activation quantization on
+        # residual-stream nodes could ever achieve. Implementation:
+        #   - Forces NANOGPT_FQ_INTEGER_LINEAR=0 so the matmul branches read
+        #     clean FP32 LN outputs as inputs (in INT8 matmul mode the input
+        #     is re-quantized via _fp32_to_int8 anyway, so the experiment
+        #     would be a no-op there).
+        #   - Skips _qdq for ln1/ln2/ln_f.
+        #   - Tracks a parallel x_fp32_clean variable for residual1/2 so
+        #     consecutive residual additions don't accumulate INT8 rounding.
+        # Reference-only — never sets this in the deployed bundle.
+        self.fp32_residual_stream = bool(fp32_residual_stream)
+        if self.fp32_residual_stream:
+            os.environ["NANOGPT_FQ_INTEGER_LINEAR"] = "0"
         sd = state_dict
         self._has_nonzero_linear_bias = any(
             ("bias" in name and ("c_attn" in name or "c_proj" in name or "c_fc" in name))
@@ -880,12 +898,22 @@ class NanoGPTFQReference:
             x = x_int8.astype(np.float32) * _arch_scale(x_scale)
         record("tok_pos_add", x, scale=x_scale, int8=x_int8)
 
+        # Phase 1 Branch B: when fp32_residual_stream is enabled, track a
+        # parallel clean-FP32 residual stream alongside the INT8 path. The
+        # clean stream is what gets fed into LN ops, replacing x. Every
+        # residual1/2 update accumulates in FP32 to bypass INT8 rounding,
+        # but Q/K/V/fc1/fc2 matmul outputs are still INT8-quantized — this
+        # isolates the residual-stream contribution to PPL error.
+        if self.fp32_residual_stream:
+            x_fp32_clean = (
+                self.wte_fp32[[token_id]] + self.wpe_fp32[[position_id]]
+            )
+            x = x_fp32_clean
+
         for L, layer in enumerate(self.layers):
             ln1_scale = _scale(s, f"block{L}_ln1")
-            ln1 = _qdq(
-                _layernorm_np(x, layer["ln1_w"], layer["ln1_b"], self.eps),
-                ln1_scale,
-            )
+            ln1_raw = _layernorm_np(x, layer["ln1_w"], layer["ln1_b"], self.eps)
+            ln1 = ln1_raw if self.fp32_residual_stream else _qdq(ln1_raw, ln1_scale)
             record(f"block{L}_ln1", ln1, scale=ln1_scale, int8=_fp32_to_int8(ln1, ln1_scale))
             ln1_i8 = _fp32_to_int8(ln1, ln1_scale)
             head_outs_int8 = []
@@ -1035,13 +1063,22 @@ class NanoGPTFQReference:
             else:
                 x_int8 = _dequant_add_accum_int8(out_accum, out_accum_scale, x_int8, _scale(s, "tok_pos_add") if L == 0 else _scale(s, f"block{L - 1}_residual2"), x_scale)
                 x = x_int8.astype(np.float32) * _arch_scale(x_scale)
+            # Branch B: override `x` with clean-FP32 residual1 so the next LN
+            # gets clean input. Use out_accum * out_accum_scale (the FP32
+            # dequantized accumulator) when available — that's the c_proj
+            # output before INT8 rounding to out_proj_scale. Fall back to
+            # `out_proj` (the INT8-rounded form) otherwise.
+            if self.fp32_residual_stream:
+                if out_accum is not None and out_accum_scale is not None:
+                    x_fp32_clean = x_fp32_clean + out_accum.astype(np.float32) * np.float32(out_accum_scale)
+                else:
+                    x_fp32_clean = x_fp32_clean + out_proj
+                x = x_fp32_clean
             record(f"block{L}_residual1", x, scale=x_scale, int8=x_int8)
 
             ln2_scale = _scale(s, f"block{L}_ln2")
-            ln2 = _qdq(
-                _layernorm_np(x, layer["ln2_w"], layer["ln2_b"], self.eps),
-                ln2_scale,
-            )
+            ln2_raw = _layernorm_np(x, layer["ln2_w"], layer["ln2_b"], self.eps)
+            ln2 = ln2_raw if self.fp32_residual_stream else _qdq(ln2_raw, ln2_scale)
             record(f"block{L}_ln2", ln2, scale=ln2_scale, int8=_fp32_to_int8(ln2, ln2_scale))
             fc1_scale = _scale(s, f"block{L}_fc1")
             gelu_scale = _scale(s, f"block{L}_gelu", 1.0 / 127.0)
@@ -1144,11 +1181,18 @@ class NanoGPTFQReference:
             else:
                 x_int8 = _dequant_add_accum_int8(fc2_accum, fc2_accum_scale, residual1_int8, residual1_scale, x_scale)
                 x = x_int8.astype(np.float32) * _arch_scale(x_scale)
+            # Branch B: same as residual1 — accumulate FP32 add via fc2 path.
+            if self.fp32_residual_stream:
+                if fc2_accum is not None and fc2_accum_scale is not None:
+                    x_fp32_clean = x_fp32_clean + fc2_accum.astype(np.float32) * np.float32(fc2_accum_scale)
+                else:
+                    x_fp32_clean = x_fp32_clean + fc2
+                x = x_fp32_clean
             record(f"block{L}_residual2", x, scale=x_scale, int8=x_int8)
 
         ln_f_scale = _scale(s, "ln_f")
         ln_f_raw = _layernorm_np(x, self.ln_f_w, self.ln_f_b, self.eps)
-        ln_f = ln_f_raw if "ln_f" in groups else _qdq(ln_f_raw, ln_f_scale)
+        ln_f = ln_f_raw if ("ln_f" in groups or self.fp32_residual_stream) else _qdq(ln_f_raw, ln_f_scale)
         record("ln_f", ln_f, scale=ln_f_scale, int8=_fp32_to_int8(ln_f, ln_f_scale))
         if "lm_head" in groups:
             logits = ln_f @ self.lm_head_w_fp32.T
