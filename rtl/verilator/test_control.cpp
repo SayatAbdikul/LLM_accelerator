@@ -189,7 +189,7 @@ static void test_sync_all_idle() {
 }
 
 // ============================================================================
-// Test: Illegal opcode 0x14 → fault
+// Test: Illegal opcode 0x17 → fault
 // ============================================================================
 static void test_illegal_opcode() {
     const char* name = "illegal_opcode_fault";
@@ -200,6 +200,62 @@ static void test_illegal_opcode() {
     EXPECT(s.dut->done  == 0, "done should be 0 on fault");
     EXPECT(s.dut->fault_code == 1, "fault_code = FAULT_ILLEGAL_OP (1)");
     TEST_PASS(name);
+}
+
+// ============================================================================
+// Test: CONFIG_ATTN validates and persists attention context
+// ============================================================================
+static void test_config_attn_context() {
+    const char* name = "config_attn_context_registers";
+    SimHarness s;
+    s.load({
+        insn::CONFIG_TILE(1, 1, 1),
+        insn::CONFIG_ATTN(3, 16, 0b11),
+        insn::HALT(),
+    });
+    s.run(1000);
+    EXPECT(s.dut->done == 1, "done after CONFIG_ATTN + HALT");
+    EXPECT(s.dut->fault == 0, "CONFIG_ATTN should not fault");
+    EXPECT(s.dut->rootp->taccel_top__DOT__attn_valid == 1,
+           "attention context should be valid");
+    EXPECT(s.dut->rootp->taccel_top__DOT__attn_query_row_base == 3,
+           "query_row_base mismatch");
+    EXPECT(s.dut->rootp->taccel_top__DOT__attn_valid_kv_len == 16,
+           "valid_kv_len mismatch");
+    EXPECT(s.dut->rootp->taccel_top__DOT__attn_mode == 0b11,
+           "attention mode mismatch");
+    TEST_PASS(name);
+}
+
+// ============================================================================
+// Test: CONFIG_ATTN and masked ops report configuration faults
+// ============================================================================
+static void test_config_attn_faults() {
+    expect_fault_program("config_attn_without_config_tile",
+                         { insn::CONFIG_ATTN(0, 16, 0b01) }, 4, 1000);
+    expect_fault_program("config_attn_mode_zero",
+                         { insn::CONFIG_TILE(1, 1, 1),
+                           insn::CONFIG_ATTN(0, 16, 0b00) }, 4, 1000);
+    expect_fault_program("config_attn_valid_kv_zero",
+                         { insn::CONFIG_TILE(1, 1, 1),
+                           insn::CONFIG_ATTN(0, 0, 0b01) }, 4, 1000);
+    expect_fault_program("config_attn_reserved_bits",
+                         { insn::CONFIG_TILE(1, 1, 1),
+                           insn::CONFIG_ATTN(0, 16, 0b01) | 1ULL }, 1, 1000);
+}
+
+static void test_masked_sfu_context_faults() {
+    expect_fault_program("masked_softmax_without_config_attn",
+                         { insn::CONFIG_TILE(1, 1, 1),
+                           insn::MASKED_SOFTMAX(2, 0, 0, 0, 0) }, 4, 1000);
+    expect_fault_program("masked_softmax_padded_len_exceeds_tile",
+                         { insn::CONFIG_TILE(1, 1, 1),
+                           insn::CONFIG_ATTN(0, 32, 0b01),
+                           insn::MASKED_SOFTMAX(2, 0, 0, 0, 0) }, 4, 1000);
+    expect_fault_program("masked_attnv_pure_causal_len_mismatch",
+                         { insn::CONFIG_TILE(1, 1, 1),
+                           insn::CONFIG_ATTN(0, 32, 0b10),
+                           insn::MASKED_SOFTMAX_ATTNV(2, 0, 0, 0, 1, 0, 0) }, 4, 1000);
 }
 
 // ============================================================================
@@ -236,6 +292,26 @@ static void test_stage_e_paths() {
             insn::SET_SCALE(10, 0x3400),
             insn::SET_SCALE(11, 0x3000),
             insn::SOFTMAX_ATTNV(2, 0, 0, 0, 1, 0, 8),
+            insn::SYNC(0b100),
+            insn::HALT()
+        }},
+        { "masked_softmax_dispatch_sync", {
+            insn::CONFIG_TILE(1, 1, 1),
+            insn::CONFIG_ATTN(0, 16, 0b11),
+            insn::SET_SCALE(4, 0x3400),
+            insn::SET_SCALE(5, 0x3400),
+            insn::MASKED_SOFTMAX(2, 0, 0, 0, 4),
+            insn::SYNC(0b100),
+            insn::HALT()
+        }},
+        { "masked_softmax_attnv_dispatch_sync", {
+            insn::CONFIG_TILE(1, 1, 1),
+            insn::CONFIG_ATTN(0, 16, 0b11),
+            insn::SET_SCALE(8, 0x3400),
+            insn::SET_SCALE(9, 0x3400),
+            insn::SET_SCALE(10, 0x3400),
+            insn::SET_SCALE(11, 0x3000),
+            insn::MASKED_SOFTMAX_ATTNV(2, 0, 0, 0, 1, 0, 8),
             insn::SYNC(0b100),
             insn::HALT()
         }},
@@ -477,6 +553,9 @@ int main(int argc, char** argv) {
     test_sync_nop();
     test_sync_all_idle();
     test_illegal_opcode();
+    test_config_attn_context();
+    test_config_attn_faults();
+    test_masked_sfu_context_faults();
     test_stage_e_paths();
     test_sfu_no_config_faults();
     test_sfu_dispatch_paths();

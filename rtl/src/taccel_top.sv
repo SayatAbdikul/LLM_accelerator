@@ -197,6 +197,14 @@ module taccel_top
   logic [9:0]  tile_m_in, tile_n_in, tile_k_in;
   logic [9:0]  tile_m, tile_n, tile_k;
   logic        tile_valid;
+  logic        attn_we;
+  logic [11:0] attn_query_row_base_in;
+  logic [11:0] attn_valid_kv_len_in;
+  logic [1:0]  attn_mode_in;
+  logic        attn_valid /* verilator public_flat_rd */;
+  logic [11:0] attn_query_row_base /* verilator public_flat_rd */;
+  logic [11:0] attn_valid_kv_len /* verilator public_flat_rd */;
+  logic [1:0]  attn_mode /* verilator public_flat_rd */;
   logic [15:0] scale_rdata0, scale_rdata1, scale_rdata2, scale_rdata3;
   logic [55:0] addr_rdata;
   logic [1:0]  helper_src1_buf_w, helper_src2_buf_w, helper_dst_buf_w;
@@ -641,7 +649,16 @@ module taccel_top
     .tile_m_in      (tile_m_in),
     .tile_n_in      (tile_n_in),
     .tile_k_in      (tile_k_in),
+    .attn_we        (attn_we),
+    .attn_query_row_base_in(attn_query_row_base_in),
+    .attn_valid_kv_len_in  (attn_valid_kv_len_in),
+    .attn_mode_in          (attn_mode_in),
     .tile_valid     (tile_valid),
+    .tile_n         (tile_n),
+    .tile_k         (tile_k),
+    .attn_valid     (attn_valid),
+    .attn_valid_kv_len(attn_valid_kv_len),
+    .attn_mode      (attn_mode),
     .dma_dispatch   (dma_dispatch),
     .sys_dispatch   (sys_dispatch),
     .sfu_dispatch   (sfu_dispatch),
@@ -691,10 +708,18 @@ module taccel_top
     .tile_m_in    (tile_m_in),
     .tile_n_in    (tile_n_in),
     .tile_k_in    (tile_k_in),
+    .attn_we      (attn_we),
+    .attn_query_row_base_in(attn_query_row_base_in),
+    .attn_valid_kv_len_in  (attn_valid_kv_len_in),
+    .attn_mode_in          (attn_mode_in),
     .tile_m       (tile_m),
     .tile_n       (tile_n),
     .tile_k       (tile_k),
-    .tile_valid   (tile_valid)
+    .tile_valid   (tile_valid),
+    .attn_valid   (attn_valid),
+    .attn_query_row_base(attn_query_row_base),
+    .attn_valid_kv_len  (attn_valid_kv_len),
+    .attn_mode          (attn_mode)
   );
 
   blocking_helper_engine u_helper (
@@ -748,6 +773,10 @@ module taccel_top
     .tile_m         (tile_m),
     .tile_n         (tile_n),
     .tile_k         (tile_k),
+    .attn_valid     (attn_valid),
+    .attn_query_row_base(attn_query_row_base),
+    .attn_valid_kv_len  (attn_valid_kv_len),
+    .attn_mode          (attn_mode),
     .scale0_data    (scale_rdata0),
     .scale1_data    (scale_rdata1),
     .scale2_data    (scale_rdata2),

@@ -20,8 +20,9 @@ import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 from utils.dram_model import DramModel
 from utils.insn_builder import (
-    NOP, HALT, SYNC, CONFIG_TILE, SET_SCALE, SET_ADDR_LO, SET_ADDR_HI,
-    LOAD, MATMUL, ILLEGAL_OP, BUF_COPY, REQUANT_PC, SCALE_MUL, DEQUANT_ADD, SOFTMAX_ATTNV,
+    NOP, HALT, SYNC, CONFIG_TILE, CONFIG_ATTN, SET_SCALE, SET_ADDR_LO, SET_ADDR_HI,
+    LOAD, MATMUL, ILLEGAL_OP, BUF_COPY, REQUANT_PC, SCALE_MUL, DEQUANT_ADD,
+    SOFTMAX_ATTNV, MASKED_SOFTMAX, MASKED_SOFTMAX_ATTNV,
     BUF_ABUF, BUF_WBUF, BUF_ACCUM
 )
 
@@ -190,13 +191,50 @@ async def test_load_dispatch_no_stall(dut):
 
 @cocotb.test()
 async def test_illegal_opcode_fault(dut):
-    """Reserved opcode 0x14 -> fault=1, fault_code=1 (FAULT_ILLEGAL_OP)."""
+    """Reserved opcode 0x17 -> fault=1, fault_code=1 (FAULT_ILLEGAL_OP)."""
     dram, _ = await init_dut(dut)
     done, fault, fault_code, _ = await run_program(dut, dram, [ILLEGAL_OP()])
     assert fault == 1,       f"Expected fault=1, got {fault}"
     assert done  == 0,       f"Expected done=0 on fault, got {done}"
     assert fault_code == 1,  f"Expected FAULT_ILLEGAL_OP=1, got {fault_code}"
     dut._log.info(f"Illegal opcode fault_code={fault_code}")
+
+
+@cocotb.test()
+async def test_config_attn_and_masked_sfu_dispatch(dut):
+    """CONFIG_ATTN enables masked SFU opcodes 0x15 and 0x16."""
+    dram, _ = await init_dut(dut)
+    prog = [
+        CONFIG_TILE(1, 1, 1),
+        CONFIG_ATTN(0, 16, 0b11),
+        SET_SCALE(4, 0x3400),
+        SET_SCALE(5, 0x3400),
+        MASKED_SOFTMAX(BUF_ACCUM, 0, BUF_ABUF, 0, sreg=4),
+        SYNC(0b100),
+        SET_SCALE(8, 0x3400),
+        SET_SCALE(9, 0x3400),
+        SET_SCALE(10, 0x3400),
+        SET_SCALE(11, 0x3000),
+        MASKED_SOFTMAX_ATTNV(BUF_ACCUM, 0, BUF_ABUF, 0, BUF_WBUF, 96, sreg=8),
+        SYNC(0b100),
+        HALT(),
+    ]
+    done, fault, _, _ = await run_program(dut, dram, prog, timeout_cycles=30000)
+    assert done == 1
+    assert fault == 0
+
+
+@cocotb.test()
+async def test_masked_sfu_without_config_attn_fault(dut):
+    """Masked SFU ops require a valid CONFIG_ATTN context."""
+    dram, _ = await init_dut(dut)
+    done, fault, fault_code, _ = await run_program(
+        dut, dram,
+        [CONFIG_TILE(1, 1, 1), MASKED_SOFTMAX(BUF_ACCUM, 0, BUF_ABUF, 0, sreg=4)]
+    )
+    assert done == 0
+    assert fault == 1
+    assert fault_code == 4, f"Expected FAULT_NO_CONFIG=4, got {fault_code}"
 
 
 @cocotb.test()

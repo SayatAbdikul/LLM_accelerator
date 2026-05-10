@@ -38,8 +38,11 @@ package taccel_pkg;
     OP_GELU        = 5'h10,
     OP_REQUANT_PC  = 5'h11,
     OP_SOFTMAX_ATTNV = 5'h12,
-    OP_DEQUANT_ADD = 5'h13
-    // 5'h14–5'h1F: reserved — illegal instruction fault
+    OP_DEQUANT_ADD = 5'h13,
+    OP_CONFIG_ATTN = 5'h14,
+    OP_MASKED_SOFTMAX = 5'h15,
+    OP_MASKED_SOFTMAX_ATTNV = 5'h16
+    // 5'h17-5'h1F: reserved — illegal instruction fault
   } opcode_t;
 
   // -------------------------------------------------------------------------
@@ -83,7 +86,7 @@ package taccel_pkg;
   // -------------------------------------------------------------------------
   typedef enum logic [3:0] {
     FAULT_NONE       = 4'h0,
-    FAULT_ILLEGAL_OP = 4'h1,   // reserved opcode 0x14–0x1F
+    FAULT_ILLEGAL_OP = 4'h1,   // reserved opcode 0x17-0x1F / malformed encoding
     FAULT_DRAM_OOB   = 4'h2,   // DRAM address out of bounds
     FAULT_SRAM_OOB   = 4'h3,   // SRAM offset out of bounds
     FAULT_NO_CONFIG  = 4'h4,   // compute instruction without CONFIG_TILE
@@ -163,6 +166,13 @@ package taccel_pkg;
     logic [9:0]  c_tile_m;
     logic [9:0]  c_tile_n;
     logic [9:0]  c_tile_k;
+
+    // ---- ATTN-TYPE: CONFIG_ATTN ----
+    // Bits [58:47]=query_row_base, [46:35]=valid_kv_len,
+    //      [34:33]=mode, [32:0]=reserved zero
+    logic [11:0] attn_query_row_base;
+    logic [11:0] attn_valid_kv_len;
+    logic [1:0]  attn_mode;
 
     // ---- S-TYPE: SET_SCALE ----
     // Bits [58:55]=sreg, [54:53]=src_mode, [52:37]=imm16

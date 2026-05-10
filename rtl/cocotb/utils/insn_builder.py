@@ -30,6 +30,9 @@ A_IMM28_SHIFT     = 29
 C_M_SHIFT         = 49
 C_N_SHIFT         = 39
 C_K_SHIFT         = 29
+ATTN_QUERY_ROW_BASE_SHIFT = 47
+ATTN_VALID_KV_LEN_SHIFT   = 35
+ATTN_MODE_SHIFT           = 33
 SS_SREG_SHIFT     = 55
 SS_SRC_MODE_SHIFT = 53
 SS_IMM16_SHIFT    = 37
@@ -59,6 +62,14 @@ def CONFIG_TILE(M: int, N: int, K: int) -> int:
             ((M - 1) << C_M_SHIFT) |
             ((N - 1) << C_N_SHIFT) |
             ((K - 1) << C_K_SHIFT))
+
+
+def CONFIG_ATTN(query_row_base: int, valid_kv_len: int, mode: int) -> int:
+    assert 0 <= query_row_base <= 4095 and 0 <= valid_kv_len <= 4095 and 0 <= mode <= 3
+    return ((0x14 << OPCODE_SHIFT) |
+            ((query_row_base & 0xFFF) << ATTN_QUERY_ROW_BASE_SHIFT) |
+            ((valid_kv_len & 0xFFF) << ATTN_VALID_KV_LEN_SHIFT) |
+            ((mode & 0x3) << ATTN_MODE_SHIFT))
 
 
 def SET_SCALE(sreg: int, imm16: int, src_mode: int = 0) -> int:
@@ -156,6 +167,11 @@ def SOFTMAX(src1_buf: int, src1_off: int, dst_buf: int, dst_off: int,
     return _r_type(0x0E, src1_buf, src1_off, 0, 0, dst_buf, dst_off, sreg, flags)
 
 
+def MASKED_SOFTMAX(src1_buf: int, src1_off: int, dst_buf: int, dst_off: int,
+                   sreg: int, flags: int = 0) -> int:
+    return _r_type(0x15, src1_buf, src1_off, 0, 0, dst_buf, dst_off, sreg, flags)
+
+
 def LAYERNORM(src1_buf: int, src1_off: int, src2_buf: int, src2_off: int,
               dst_buf: int, dst_off: int, sreg: int, flags: int = 0) -> int:
     return _r_type(0x0F, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags)
@@ -171,11 +187,16 @@ def SOFTMAX_ATTNV(src1_buf: int, src1_off: int, src2_buf: int, src2_off: int,
     return _r_type(0x12, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags)
 
 
+def MASKED_SOFTMAX_ATTNV(src1_buf: int, src1_off: int, src2_buf: int, src2_off: int,
+                         dst_buf: int, dst_off: int, sreg: int, flags: int = 0) -> int:
+    return _r_type(0x16, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags)
+
+
 def DEQUANT_ADD(src1_buf: int, src1_off: int, src2_buf: int, src2_off: int,
                 dst_buf: int, dst_off: int, sreg: int, flags: int = 0) -> int:
     return _r_type(0x13, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags)
 
 
 def ILLEGAL_OP() -> int:
-    """Reserved opcode 0x14 for fault testing."""
-    return 0x14 << OPCODE_SHIFT
+    """Reserved opcode 0x17 for fault testing."""
+    return 0x17 << OPCODE_SHIFT

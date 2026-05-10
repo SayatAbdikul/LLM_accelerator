@@ -5,6 +5,7 @@
 //   - LAYERNORM : ABUF INT8 input, WBUF FP16 gamma/beta, INT8 output
 //   - GELU      : ABUF INT8 or ACCUM INT32 input, INT8 output
 //   - SOFTMAX_ATTNV : fused softmax(QK^T) @ V with INT8 output
+//   - MASKED_SOFTMAX / MASKED_SOFTMAX_ATTNV : attention-mask variants
 //
 // Architectural contract:
 //   - dispatched asynchronously through sfu_dispatch / sfu_busy
@@ -41,6 +42,10 @@ module sfu_engine
   input  logic [9:0]   tile_m,
   input  logic [9:0]   tile_n,
   input  logic [9:0]   tile_k,
+  input  logic         attn_valid,
+  input  logic [11:0]  attn_query_row_base,
+  input  logic [11:0]  attn_valid_kv_len,
+  input  logic [1:0]   attn_mode,
   input  logic [15:0]  scale0_data,
   input  logic [15:0]  scale1_data,
   input  logic [15:0]  scale2_data,
@@ -74,7 +79,7 @@ module sfu_engine
   import "DPI-C" function real sfu_fp32_gelu(input real value_r);
   import "DPI-C" function int sfu_fp32_quantize_i8(input real value_r, input real out_scale_r);
 
-  localparam int SFU_MAX_ROW_ELEMS = 208;
+  localparam int SFU_MAX_ROW_ELEMS = 256;
   localparam real LN_EPS = 1.0e-6;
 
   typedef enum logic [4:0] {
@@ -118,6 +123,10 @@ module sfu_engine
   logic [15:0]  k_elems_q;
   logic [15:0]  ln_gamma_rows_q;
   logic [15:0]  ln_param_rows_q;
+  logic         attn_valid_q;
+  logic [11:0] attn_query_row_base_q;
+  logic [11:0] attn_valid_kv_len_q;
+  logic [1:0]  attn_mode_q;
   logic [3:0]   fault_code_r;
 
   logic [14:0]  row_idx_q;
@@ -161,12 +170,16 @@ module sfu_engine
   logic        dispatch_gelu_accum_w;
   logic        dispatch_gelu_int8_w;
   logic        dispatch_softmax_attnv_w;
+  logic        dispatch_masked_softmax_w;
+  logic        dispatch_masked_softmax_attnv_w;
+  logic        dispatch_attn_context_bad_w;
   logic        dispatch_unsupported_w;
   logic        dispatch_sram_oob_w;
 
   logic [31:0] dispatch_src1_need_rows_w;
   logic [31:0] dispatch_src2_need_rows_w;
   logic [31:0] dispatch_dst_need_rows_w;
+  logic [15:0] dispatch_attn_key_cols_w;
 
   logic [31:0] row_i8_addr_w;
   logic [31:0] row_i32_addr_w;
@@ -290,6 +303,21 @@ module sfu_engine
     end
   endfunction
 
+  function automatic logic attn_visible(
+    input logic [14:0] row_idx,
+    input integer      col_idx
+  );
+    integer abs_query_row;
+    begin
+      abs_query_row = integer'(attn_query_row_base_q) + integer'(row_idx);
+      attn_visible = 1'b1;
+      if (attn_mode_q[1])
+        attn_visible = attn_visible && (col_idx <= abs_query_row);
+      if (attn_mode_q[0])
+        attn_visible = attn_visible && (col_idx < integer'(attn_valid_kv_len_q));
+    end
+  endfunction
+
   assign dispatch_m_rows_w        = ({5'h0, tile_m} + 15'd1) << 4;
   assign dispatch_n_tiles_w       = {1'b0, tile_n} + 11'd1;
   assign dispatch_k_tiles_w       = {1'b0, tile_k} + 11'd1;
@@ -303,10 +331,12 @@ module sfu_engine
   assign dispatch_src2_rows_w     = buf_rows(src2_buf);
   assign dispatch_dst_rows_w      = buf_rows(dst_buf);
 
-  assign dispatch_softmax_accum_w = (opcode == OP_SOFTMAX) &&
+  assign dispatch_softmax_accum_w = ((opcode == OP_SOFTMAX) ||
+                                     (opcode == OP_MASKED_SOFTMAX)) &&
                                     (src1_buf == BUF_ACCUM) &&
                                     (dst_buf != BUF_ACCUM);
-  assign dispatch_softmax_int8_w  = (opcode == OP_SOFTMAX) &&
+  assign dispatch_softmax_int8_w  = ((opcode == OP_SOFTMAX) ||
+                                     (opcode == OP_MASKED_SOFTMAX)) &&
                                     (src1_buf != BUF_ACCUM) &&
                                     (dst_buf != BUF_ACCUM);
   assign dispatch_layernorm_w     = (opcode == OP_LAYERNORM) &&
@@ -323,6 +353,31 @@ module sfu_engine
                                     (src1_buf == BUF_ACCUM) &&
                                     (src2_buf != BUF_ACCUM) &&
                                     (dst_buf != BUF_ACCUM);
+  assign dispatch_masked_softmax_w = (opcode == OP_MASKED_SOFTMAX);
+  assign dispatch_masked_softmax_attnv_w = (opcode == OP_MASKED_SOFTMAX_ATTNV) &&
+                                           (src1_buf == BUF_ACCUM) &&
+                                           (src2_buf != BUF_ACCUM) &&
+                                           (dst_buf != BUF_ACCUM);
+  assign dispatch_attn_key_cols_w = (opcode == OP_MASKED_SOFTMAX_ATTNV) ?
+                                    dispatch_k_elems_w : dispatch_n_elems_w;
+
+  always_comb begin
+    dispatch_attn_context_bad_w = 1'b0;
+    if ((opcode == OP_MASKED_SOFTMAX) ||
+        (opcode == OP_MASKED_SOFTMAX_ATTNV)) begin
+      dispatch_attn_context_bad_w = !attn_valid ||
+                                    (attn_mode == 2'b00) ||
+                                    (attn_valid_kv_len == 12'h000);
+      if (!dispatch_attn_context_bad_w) begin
+        if (attn_mode == 2'b10)
+          dispatch_attn_context_bad_w =
+              ({4'h0, dispatch_attn_key_cols_w} != {8'h00, attn_valid_kv_len});
+        else if (attn_mode[0])
+          dispatch_attn_context_bad_w =
+              ({4'h0, dispatch_attn_key_cols_w} < {8'h00, attn_valid_kv_len});
+      end
+    end
+  end
 
   always_comb begin
     dispatch_unsupported_w = 1'b0;
@@ -332,7 +387,7 @@ module sfu_engine
     dispatch_dst_need_rows_w  = 32'd0;
 
     case (opcode)
-      OP_SOFTMAX: begin
+      OP_SOFTMAX, OP_MASKED_SOFTMAX: begin
         if (sreg == 4'hF)
           dispatch_unsupported_w = 1'b1;
         if (!(dispatch_softmax_accum_w || dispatch_softmax_int8_w))
@@ -377,6 +432,20 @@ module sfu_engine
         if (sreg > 4'd12)
           dispatch_unsupported_w = 1'b1;
         if (!dispatch_softmax_attnv_w)
+          dispatch_unsupported_w = 1'b1;
+        if ((integer'(dispatch_k_elems_w) > SFU_MAX_ROW_ELEMS) ||
+            (integer'(dispatch_n_elems_w) > SFU_MAX_ROW_ELEMS))
+          dispatch_unsupported_w = 1'b1;
+
+        dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_k_chunks_i32_w;
+        dispatch_src2_need_rows_w = dispatch_k_elems_w * dispatch_n_tiles_w;
+        dispatch_dst_need_rows_w  = dispatch_m_rows_w * dispatch_n_tiles_w;
+      end
+
+      OP_MASKED_SOFTMAX_ATTNV: begin
+        if (sreg > 4'd12)
+          dispatch_unsupported_w = 1'b1;
+        if (!dispatch_masked_softmax_attnv_w)
           dispatch_unsupported_w = 1'b1;
         if ((integer'(dispatch_k_elems_w) > SFU_MAX_ROW_ELEMS) ||
             (integer'(dispatch_n_elems_w) > SFU_MAX_ROW_ELEMS))
@@ -477,6 +546,10 @@ module sfu_engine
       k_elems_q      <= 16'h0;
       ln_gamma_rows_q<= 16'h0;
       ln_param_rows_q<= 16'h0;
+      attn_valid_q   <= 1'b0;
+      attn_query_row_base_q <= 12'h0;
+      attn_valid_kv_len_q   <= 12'h0;
+      attn_mode_q           <= 2'b00;
       fault_code_r   <= 4'(FAULT_NONE);
       row_idx_q      <= 15'h0;
       read_idx_q     <= 13'h0;
@@ -528,6 +601,10 @@ module sfu_engine
             k_elems_q       <= dispatch_k_elems_w;
             ln_gamma_rows_q <= dispatch_ln_gamma_rows_w;
             ln_param_rows_q <= dispatch_ln_param_rows_w;
+            attn_valid_q    <= attn_valid;
+            attn_query_row_base_q <= attn_query_row_base;
+            attn_valid_kv_len_q   <= attn_valid_kv_len;
+            attn_mode_q           <= attn_mode;
             scale0_q        <= fp16_to_real(scale0_data);
             scale1_q        <= fp16_to_real(scale1_data);
             scale2_q        <= fp16_to_real(scale2_data);
@@ -546,12 +623,15 @@ module sfu_engine
             if (dispatch_unsupported_w) begin
               fault_code_r <= 4'(FAULT_UNSUPPORTED_OP);
               state        <= F_FAULT;
+            end else if (dispatch_attn_context_bad_w) begin
+              fault_code_r <= 4'(FAULT_NO_CONFIG);
+              state        <= F_FAULT;
             end else if (dispatch_sram_oob_w) begin
               fault_code_r <= 4'(FAULT_SRAM_OOB);
               state        <= F_FAULT;
             end else begin
               case (opcode)
-                OP_SOFTMAX: begin
+                OP_SOFTMAX, OP_MASKED_SOFTMAX: begin
                   if (src1_buf == BUF_ACCUM)
                     state <= F_ROW_I32_REQ;
                   else
@@ -568,7 +648,7 @@ module sfu_engine
                     state <= F_GELU_I8_REQ;
                 end
 
-                OP_SOFTMAX_ATTNV:
+                OP_SOFTMAX_ATTNV, OP_MASKED_SOFTMAX_ATTNV:
                   state <= F_ATTN_QKT_REQ;
 
                 default: begin
@@ -667,28 +747,50 @@ module sfu_engine
         end
 
         F_ROW_COMPUTE: begin
-          if (opcode_q == OP_SOFTMAX) begin
+          if ((opcode_q == OP_SOFTMAX) || (opcode_q == OP_MASKED_SOFTMAX)) begin
             real row_max_r;
             real exp_sum_r;
             real exp_r;
-            row_max_r = row_data_q[0];
-            for (int i = 1; i < SFU_MAX_ROW_ELEMS; i++) begin
-              if ((i < integer'(n_elems_q)) && (row_data_q[i] > row_max_r))
-                row_max_r = row_data_q[i];
-            end
-
-            exp_sum_r = 0.0;
+            logic have_visible;
+            have_visible = 1'b0;
+            row_max_r = 0.0;
             for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
-              if (i < integer'(n_elems_q)) begin
-                exp_r = sfu_fp32_exp(sfu_fp32_sub(row_data_q[i], row_max_r));
-                exp_sum_r = sfu_fp32_add(exp_sum_r, exp_r);
+              if ((i < integer'(n_elems_q)) &&
+                  ((opcode_q == OP_SOFTMAX) || attn_visible(row_idx_q, i))) begin
+                if (!have_visible || (row_data_q[i] > row_max_r))
+                  row_max_r = row_data_q[i];
+                have_visible = 1'b1;
               end
             end
 
-            for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
-              if (i < integer'(n_elems_q)) begin
-                exp_r = sfu_fp32_exp(sfu_fp32_sub(row_data_q[i], row_max_r));
-                out_bytes_q[i] <= quantize_to_i8(sfu_fp32_div(exp_r, exp_sum_r), scale1_q);
+            if (!have_visible) begin
+              fault_code_r <= 4'(FAULT_NO_CONFIG);
+              state        <= F_FAULT;
+            end else begin
+              exp_sum_r = 0.0;
+              for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
+                if ((i < integer'(n_elems_q)) &&
+                    ((opcode_q == OP_SOFTMAX) || attn_visible(row_idx_q, i))) begin
+                  exp_r = sfu_fp32_exp(sfu_fp32_sub(row_data_q[i], row_max_r));
+                  exp_sum_r = sfu_fp32_add(exp_sum_r, exp_r);
+                end
+              end
+
+              if (exp_sum_r == 0.0) begin
+                fault_code_r <= 4'(FAULT_NO_CONFIG);
+                state        <= F_FAULT;
+              end else begin
+                for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
+                  if (i < integer'(n_elems_q)) begin
+                    if ((opcode_q == OP_MASKED_SOFTMAX) && !attn_visible(row_idx_q, i)) begin
+                      out_bytes_q[i] <= 8'h00;
+                    end else begin
+                      exp_r = sfu_fp32_exp(sfu_fp32_sub(row_data_q[i], row_max_r));
+                      out_bytes_q[i] <= quantize_to_i8(sfu_fp32_div(exp_r, exp_sum_r), scale1_q);
+                    end
+                  end
+                end
+                state <= F_ROW_PACK;
               end
             end
           end else begin
@@ -732,8 +834,8 @@ module sfu_engine
                 ln_debug_y_q[i] <= 0.0;
               end
             end
+            state <= F_ROW_PACK;
           end
-          state <= F_ROW_PACK;
         end
 
         F_ROW_PACK: begin
@@ -752,7 +854,8 @@ module sfu_engine
             row_idx_q     <= row_idx_q + 15'd1;
             read_idx_q    <= 13'h0;
             write_chunk_q <= 11'h0;
-            if ((opcode_q == OP_SOFTMAX) && (src1_buf_q == BUF_ACCUM))
+            if (((opcode_q == OP_SOFTMAX) || (opcode_q == OP_MASKED_SOFTMAX)) &&
+                (src1_buf_q == BUF_ACCUM))
               state <= F_ROW_I32_REQ;
             else
               state <= F_ROW_I8_REQ;
@@ -863,27 +966,39 @@ module sfu_engine
         F_ATTN_PREP: begin
           real row_max_r;
           real exp_sum_r;
-          row_max_r = row_data_q[0];
-          for (int i = 1; i < SFU_MAX_ROW_ELEMS; i++) begin
-            if ((i < integer'(k_elems_q)) && (row_data_q[i] > row_max_r))
-              row_max_r = row_data_q[i];
+          logic have_visible;
+          have_visible = 1'b0;
+          row_max_r = 0.0;
+          for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
+            if ((i < integer'(k_elems_q)) &&
+                ((opcode_q == OP_SOFTMAX_ATTNV) || attn_visible(row_idx_q, i))) begin
+              if (!have_visible || (row_data_q[i] > row_max_r))
+                row_max_r = row_data_q[i];
+              have_visible = 1'b1;
+            end
           end
 
           exp_sum_r = 0.0;
           for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
-            if (i < integer'(k_elems_q))
+            if ((i < integer'(k_elems_q)) &&
+                ((opcode_q == OP_SOFTMAX_ATTNV) || attn_visible(row_idx_q, i)))
               exp_sum_r = sfu_fp32_add(
                   exp_sum_r, sfu_fp32_exp(sfu_fp32_sub(row_data_q[i], row_max_r)));
             if (i < integer'(n_elems_q))
               attn_accum_q[i] <= 0.0;
           end
 
-          attn_row_max_q <= row_max_r;
-          attn_exp_sum_q <= exp_sum_r;
-          attn_k_idx_q   <= 16'h0;
-          read_idx_q     <= 13'h0;
-          write_chunk_q  <= 11'h0;
-          state          <= F_ATTN_V_REQ;
+          if (!have_visible || (exp_sum_r == 0.0)) begin
+            fault_code_r <= 4'(FAULT_NO_CONFIG);
+            state        <= F_FAULT;
+          end else begin
+            attn_row_max_q <= row_max_r;
+            attn_exp_sum_q <= exp_sum_r;
+            attn_k_idx_q   <= 16'h0;
+            read_idx_q     <= 13'h0;
+            write_chunk_q  <= 11'h0;
+            state          <= F_ATTN_V_REQ;
+          end
         end
 
         F_ATTN_V_REQ: begin
@@ -897,9 +1012,14 @@ module sfu_engine
 
         F_ATTN_V_LATCH: begin
           real weight_r;
-          weight_r = sfu_fp32_div(
-              sfu_fp32_exp(sfu_fp32_sub(row_data_q[integer'(attn_k_idx_q)], attn_row_max_q)),
-              attn_exp_sum_q);
+          if ((opcode_q == OP_MASKED_SOFTMAX_ATTNV) &&
+              !attn_visible(row_idx_q, integer'(attn_k_idx_q))) begin
+            weight_r = 0.0;
+          end else begin
+            weight_r = sfu_fp32_div(
+                sfu_fp32_exp(sfu_fp32_sub(row_data_q[integer'(attn_k_idx_q)], attn_row_max_q)),
+                attn_exp_sum_q);
+          end
           for (int lane = 0; lane < 16; lane++) begin
             integer idx;
             idx = integer'(read_idx_q) * 16 + lane;

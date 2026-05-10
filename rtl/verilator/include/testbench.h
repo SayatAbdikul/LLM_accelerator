@@ -126,6 +126,10 @@ constexpr int C_M_SHIFT         = 49;
 constexpr int C_N_SHIFT         = 39;
 constexpr int C_K_SHIFT         = 29;
 
+constexpr int ATTN_QUERY_ROW_BASE_SHIFT = 47;
+constexpr int ATTN_VALID_KV_LEN_SHIFT   = 35;
+constexpr int ATTN_MODE_SHIFT           = 33;
+
 constexpr int SS_SREG_SHIFT     = 55;
 constexpr int SS_SRC_MODE_SHIFT = 53;
 constexpr int SS_IMM16_SHIFT    = 37;
@@ -143,6 +147,15 @@ inline uint64_t CONFIG_TILE(int M, int N, int K) {
            (uint64_t(M-1)  << C_M_SHIFT)      |
            (uint64_t(N-1)  << C_N_SHIFT)      |
            (uint64_t(K-1)  << C_K_SHIFT);
+}
+inline uint64_t CONFIG_ATTN(int query_row_base, int valid_kv_len, int mode) {
+    assert(query_row_base >= 0 && query_row_base <= 4095);
+    assert(valid_kv_len >= 0 && valid_kv_len <= 4095);
+    assert(mode >= 0 && mode <= 3);
+    return (uint64_t(0x14) << OPCODE_SHIFT) |
+           (uint64_t(query_row_base & 0xFFF) << ATTN_QUERY_ROW_BASE_SHIFT) |
+           (uint64_t(valid_kv_len & 0xFFF)   << ATTN_VALID_KV_LEN_SHIFT) |
+           (uint64_t(mode & 0x3)             << ATTN_MODE_SHIFT);
 }
 inline uint64_t SET_SCALE(int sreg, uint16_t fp16_val, int src_mode = 0) {
     return (uint64_t(0x04)        << OPCODE_SHIFT)   |
@@ -226,6 +239,10 @@ inline uint64_t SOFTMAX(int src1_buf, int src1_off, int dst_buf, int dst_off,
                         int sreg, int flags = 0) {
     return R_TYPE(0x0E, src1_buf, src1_off, 0, 0, dst_buf, dst_off, sreg, flags);
 }
+inline uint64_t MASKED_SOFTMAX(int src1_buf, int src1_off, int dst_buf, int dst_off,
+                               int sreg, int flags = 0) {
+    return R_TYPE(0x15, src1_buf, src1_off, 0, 0, dst_buf, dst_off, sreg, flags);
+}
 inline uint64_t LAYERNORM(int src1_buf, int src1_off, int src2_buf, int src2_off,
                           int dst_buf, int dst_off, int sreg, int flags = 0) {
     return R_TYPE(0x0F, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags);
@@ -238,13 +255,17 @@ inline uint64_t SOFTMAX_ATTNV(int src1_buf, int src1_off, int src2_buf, int src2
                               int dst_buf, int dst_off, int sreg, int flags = 0) {
     return R_TYPE(0x12, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags);
 }
+inline uint64_t MASKED_SOFTMAX_ATTNV(int src1_buf, int src1_off, int src2_buf, int src2_off,
+                                     int dst_buf, int dst_off, int sreg, int flags = 0) {
+    return R_TYPE(0x16, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags);
+}
 inline uint64_t DEQUANT_ADD(int src1_buf, int src1_off, int src2_buf, int src2_off,
                             int dst_buf, int dst_off, int sreg, int flags = 0) {
     return R_TYPE(0x13, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags);
 }
 
 // Illegal opcode for fault tests
-constexpr uint64_t ILLEGAL_OP() { return uint64_t(0x14) << OPCODE_SHIFT; }
+constexpr uint64_t ILLEGAL_OP() { return uint64_t(0x17) << OPCODE_SHIFT; }
 
 } // namespace insn
 

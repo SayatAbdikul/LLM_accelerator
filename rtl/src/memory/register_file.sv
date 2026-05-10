@@ -1,4 +1,4 @@
-// Register file: scale registers, DRAM address registers, tile config.
+// Register file: scale registers, DRAM address registers, tile/attention config.
 //
 // Scale registers (S0–S15): 16 × FP16
 //   Written by SET_SCALE (imm or from buffer).
@@ -13,6 +13,10 @@
 //   Written by CONFIG_TILE.
 //   tile_valid asserted after first CONFIG_TILE; cleared only on reset.
 //   Compute instructions must check tile_valid and fault if not set.
+//
+// Attention context: written by CONFIG_ATTN after control-side validation.
+//   Holds the active masked-attention query base, valid key/value length, and
+//   mask mode until overwritten or reset.
 //
 // This module is intentionally simple storage. Instruction legality and
 // sequencing are enforced in control, not here.
@@ -59,11 +63,23 @@ module register_file
   input  logic [9:0]  tile_n_in,
   input  logic [9:0]  tile_k_in,
 
+  // --- Attention config write (CONFIG_ATTN) ---
+  input  logic        attn_we,
+  input  logic [11:0] attn_query_row_base_in,
+  input  logic [11:0] attn_valid_kv_len_in,
+  input  logic [1:0]  attn_mode_in,
+
   // --- Tile config read ---
   output logic [9:0]  tile_m,
   output logic [9:0]  tile_n,
   output logic [9:0]  tile_k,
-  output logic        tile_valid      // 0 until first CONFIG_TILE
+  output logic        tile_valid,     // 0 until first CONFIG_TILE
+
+  // --- Attention config read ---
+  output logic        attn_valid,
+  output logic [11:0] attn_query_row_base,
+  output logic [11:0] attn_valid_kv_len,
+  output logic [1:0]  attn_mode
 );
 
   // -------------------------------------------------------------------------
@@ -120,6 +136,23 @@ module register_file
       tile_n     <= tile_n_in;
       tile_k     <= tile_k_in;
       tile_valid <= 1'b1;
+    end
+  end
+
+  // -------------------------------------------------------------------------
+  // Attention context.
+  // -------------------------------------------------------------------------
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      attn_valid          <= 1'b0;
+      attn_query_row_base <= 12'h0;
+      attn_valid_kv_len   <= 12'h0;
+      attn_mode           <= 2'b00;
+    end else if (attn_we) begin
+      attn_valid          <= 1'b1;
+      attn_query_row_base <= attn_query_row_base_in;
+      attn_valid_kv_len   <= attn_valid_kv_len_in;
+      attn_mode           <= attn_mode_in;
     end
   end
 

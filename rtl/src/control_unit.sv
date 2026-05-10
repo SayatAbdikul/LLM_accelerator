@@ -53,8 +53,18 @@ module control_unit
   output logic [9:0]    tile_n_in,
   output logic [9:0]    tile_k_in,
 
+  output logic          attn_we,
+  output logic [11:0]   attn_query_row_base_in,
+  output logic [11:0]   attn_valid_kv_len_in,
+  output logic [1:0]    attn_mode_in,
+
   // --- Register file read-back ---
   input  logic          tile_valid,
+  input  logic [9:0]    tile_n,
+  input  logic [9:0]    tile_k,
+  input  logic          attn_valid,
+  input  logic [11:0]   attn_valid_kv_len,
+  input  logic [1:0]    attn_mode,
 
   // --- Dispatch to execution units (1-cycle pulses) ---
   output logic          dma_dispatch,
@@ -120,8 +130,40 @@ module control_unit
   logic sync_clear_q;   // for SYNC_WAIT: uses latched mask
   logic sync_clear_now; // for ISSUE: uses current insn mask
 
-  assign sync_clear_q   = ~|(sync_mask_q       & {sfu_busy, sys_busy, dma_busy});
-  assign sync_clear_now = ~|(insn.sync_mask & {sfu_busy, sys_busy, dma_busy});
+  assign sync_clear_q   = ((sync_mask_q & {sfu_busy, sys_busy, dma_busy}) == 3'b000);
+  assign sync_clear_now = ((insn.sync_mask & {sfu_busy, sys_busy, dma_busy}) == 3'b000);
+
+  logic [14:0] attn_softmax_key_cols_w;
+  logic [14:0] attn_valid_kv_len_ext_w;
+  logic        config_attn_valid_now;
+  logic        masked_attn_valid_now;
+  logic        is_masked_sfu_op_w;
+
+  assign is_masked_sfu_op_w = (insn.opcode == OP_MASKED_SOFTMAX) ||
+                              (insn.opcode == OP_MASKED_SOFTMAX_ATTNV);
+  assign attn_softmax_key_cols_w =
+      (insn.opcode == OP_MASKED_SOFTMAX_ATTNV) ?
+      (({5'h0, tile_k} + 15'd1) << 4) :
+      (({5'h0, tile_n} + 15'd1) << 4);
+  assign attn_valid_kv_len_ext_w = {3'h0, attn_valid_kv_len};
+
+  assign config_attn_valid_now = tile_valid &&
+                                 (insn.attn_mode != 2'b00) &&
+                                 (insn.attn_valid_kv_len != 12'h000);
+
+  always_comb begin
+    masked_attn_valid_now = tile_valid &&
+                            attn_valid &&
+                            (attn_mode != 2'b00) &&
+                            (attn_valid_kv_len != 12'h000);
+
+    if (masked_attn_valid_now) begin
+      if (attn_mode == 2'b10)
+        masked_attn_valid_now = (attn_softmax_key_cols_w == attn_valid_kv_len_ext_w);
+      else if (attn_mode[0])
+        masked_attn_valid_now = (attn_softmax_key_cols_w >= attn_valid_kv_len_ext_w);
+    end
+  end
 
   // -------------------------------------------------------------------------
   // Helper: legal ISA operations and parameterizations that are not yet
@@ -192,11 +234,17 @@ module control_unit
             fault_code_r <= ext_fault_code;
             state        <= S_FAULT;
           end else if (insn.illegal) begin
-            fault_code_r <= (insn.opcode > 5'h13) ?
-                             4'(FAULT_ILLEGAL_OP) : 4'(FAULT_BAD_BUF);
+            if (insn.opcode > 5'h16) begin
+              fault_code_r <= 4'(FAULT_ILLEGAL_OP);
+              obs_ctrl_fault_code <= 4'(FAULT_ILLEGAL_OP);
+            end else if (insn.opcode == OP_CONFIG_ATTN) begin
+              fault_code_r <= 4'(FAULT_ILLEGAL_OP);
+              obs_ctrl_fault_code <= 4'(FAULT_ILLEGAL_OP);
+            end else begin
+              fault_code_r <= 4'(FAULT_BAD_BUF);
+              obs_ctrl_fault_code <= 4'(FAULT_BAD_BUF);
+            end
             obs_ctrl_fault_pulse  <= 1'b1;
-            obs_ctrl_fault_code   <= (insn.opcode > 5'h13) ?
-                                     4'(FAULT_ILLEGAL_OP) : 4'(FAULT_BAD_BUF);
             obs_ctrl_fault_pc     <= pc_reg;
             obs_ctrl_fault_opcode <= insn.opcode;
             state        <= S_FAULT;
@@ -243,6 +291,23 @@ module control_unit
                 obs_retire_opcode <= insn.opcode;
                 pc_reg <= pc_reg + 56'h1;
                 state  <= S_FETCH;
+              end
+
+              OP_CONFIG_ATTN: begin
+                if (!config_attn_valid_now) begin
+                  fault_code_r <= 4'(FAULT_NO_CONFIG);
+                  obs_ctrl_fault_pulse  <= 1'b1;
+                  obs_ctrl_fault_code   <= 4'(FAULT_NO_CONFIG);
+                  obs_ctrl_fault_pc     <= pc_reg;
+                  obs_ctrl_fault_opcode <= insn.opcode;
+                  state        <= S_FAULT;
+                end else begin
+                  obs_retire_pulse  <= 1'b1;
+                  obs_retire_pc     <= pc_reg;
+                  obs_retire_opcode <= insn.opcode;
+                  pc_reg <= pc_reg + 56'h1;
+                  state  <= S_FETCH;
+                end
               end
 
               OP_SET_SCALE: begin
@@ -339,10 +404,19 @@ module control_unit
               // the serialized Stage D resource slot is clear, then advance PC
               // immediately and rely on SYNC(100) for ordering.
               OP_SOFTMAX,
+              OP_MASKED_SOFTMAX,
               OP_SOFTMAX_ATTNV,
+              OP_MASKED_SOFTMAX_ATTNV,
               OP_LAYERNORM,
               OP_GELU: begin
                 if (!tile_valid) begin
+                  fault_code_r <= 4'(FAULT_NO_CONFIG);
+                  obs_ctrl_fault_pulse  <= 1'b1;
+                  obs_ctrl_fault_code   <= 4'(FAULT_NO_CONFIG);
+                  obs_ctrl_fault_pc     <= pc_reg;
+                  obs_ctrl_fault_opcode <= insn.opcode;
+                  state        <= S_FAULT;
+                end else if (is_masked_sfu_op_w && !masked_attn_valid_now) begin
                   fault_code_r <= 4'(FAULT_NO_CONFIG);
                   obs_ctrl_fault_pulse  <= 1'b1;
                   obs_ctrl_fault_code   <= 4'(FAULT_NO_CONFIG);
@@ -441,6 +515,11 @@ module control_unit
     tile_n_in    = insn.c_tile_n;
     tile_k_in    = insn.c_tile_k;
 
+    attn_we      = 1'b0;
+    attn_query_row_base_in = insn.attn_query_row_base;
+    attn_valid_kv_len_in   = insn.attn_valid_kv_len;
+    attn_mode_in           = insn.attn_mode;
+
     dma_dispatch = 1'b0;
     sys_dispatch = 1'b0;
     sfu_dispatch = 1'b0;
@@ -456,6 +535,9 @@ module control_unit
           case (insn.opcode)
             OP_CONFIG_TILE:
               tile_we = 1'b1;
+
+            OP_CONFIG_ATTN:
+              attn_we = config_attn_valid_now;
 
             OP_SET_SCALE:
               scale_we = 1'b1;
@@ -480,6 +562,9 @@ module control_unit
 
             OP_SOFTMAX, OP_SOFTMAX_ATTNV, OP_LAYERNORM, OP_GELU:
               sfu_dispatch = tile_valid && sfu_ready_now;
+
+            OP_MASKED_SOFTMAX, OP_MASKED_SOFTMAX_ATTNV:
+              sfu_dispatch = masked_attn_valid_now && sfu_ready_now;
 
             default: ;
           endcase

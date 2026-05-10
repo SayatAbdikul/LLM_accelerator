@@ -59,8 +59,9 @@ Debug in strict dependency order. Do NOT move to the next layer until the curren
 - Verify no saturation (wraps, per ISA contract)
 
 **`rtl/src/decode_unit.sv`** — Combinational decoder.
-- Verify all 20 opcodes decode correctly vs `insn_builder.py` / `testbench.h` encoding
-- Verify `illegal` raised for opcodes 0x14–0x1F
+- Verify all 23 opcodes decode correctly vs `insn_builder.py` / `testbench.h` encoding
+- Verify `CONFIG_ATTN` fields decode correctly and reserved bits [32:0] raise `illegal`
+- Verify `illegal` raised for reserved opcodes 0x17–0x1F
 - Verify `illegal` raised for buffer ID `2'b11` in R-type, M-type, B-type only (not A/C/S-type)
 
 ### Layer 1: Memory subsystem

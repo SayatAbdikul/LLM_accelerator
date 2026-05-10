@@ -54,7 +54,8 @@ The current implementation has several constraints that shape the plan:
 - `software/taccel/compiler/codegen.py:_emit_qkt` is the real attention
   integration point. The standalone `_emit_softmax` handler is effectively a
   rename/no-op path and is not where QK attention softmax is emitted.
-- ISA opcodes `0x00..0x13` are implemented. `0x14..0x1F` are currently
+- ISA opcodes `0x00..0x16` are implemented in the current software/golden ISA,
+  with `0x14..0x16` assigned to masked-attention support. `0x17..0x1F` are
   reserved.
 - R-type encoding is fully packed (see `software/docs/isa_spec.md` section 2.2):
 
@@ -1154,11 +1155,10 @@ Deferred RTL:
 - `rtl/src/sfu_engine.sv`
 - `rtl/verilator/run_program.cpp`
 
-Note: existing RTL and Verilator code currently treat `0x14..0x1F` as illegal.
-That is acceptable while RTL is out of scope, but any RTL-side test path must be
-updated before it can run ISA v1.1 binaries. RTL/Verilator CI for ISA v1.1
-programs is explicitly skipped until Stage 6 RTL decode/control/SFU support is
-implemented; existing ISA v1 RTL regression tests still run unchanged.
+Note: current RTL and Verilator code now decode and execute the ISA v1.1
+masked-attention opcodes `0x14..0x16`; `0x17..0x1F` remain illegal/reserved.
+RTL/Verilator CI should keep ISA v1 regressions green while covering the new
+masked-attention decode/control/SFU paths.
 
 ## 9. Verification Checklist
 

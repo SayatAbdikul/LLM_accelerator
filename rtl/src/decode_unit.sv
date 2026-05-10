@@ -29,10 +29,14 @@ module decode_unit
   assign opcode_raw = insn_data[63:59];
 
   // -------------------------------------------------------------------------
-  // Illegal opcode: reserved range 0x14–0x1F
+  // Illegal opcode: reserved range 0x17-0x1F
   // -------------------------------------------------------------------------
   logic illegal_opcode;
-  assign illegal_opcode = (opcode_raw > 5'h13);
+  assign illegal_opcode = (opcode_raw > 5'h16);
+
+  // CONFIG_ATTN has reserved bits [32:0], matching the software decoder.
+  logic illegal_attn_reserved;
+  assign illegal_attn_reserved = (opcode_raw == 5'h14) && (|insn_data[32:0]);
 
   // -------------------------------------------------------------------------
   // Illegal buffer ID check (R-type, M-type, B-type only).
@@ -46,7 +50,8 @@ module decode_unit
       case (opcode_raw)
         // R-type: check src1, src2, dst
         5'h0A, 5'h0B, 5'h0C, 5'h0D, 5'h0E,
-        5'h0F, 5'h10, 5'h11, 5'h12, 5'h13: begin
+        5'h0F, 5'h10, 5'h11, 5'h12, 5'h13,
+        5'h15, 5'h16: begin
           if (insn_data[58:57] == 2'b11 ||
               insn_data[40:39] == 2'b11 ||
               insn_data[22:21] == 2'b11)
@@ -90,13 +95,16 @@ module decode_unit
   //
   //  C-TYPE:  [58:49] M         [48:39] N         [38:29] K
   //
+  //  ATTN-TYPE: [58:47] query_row_base [46:35] valid_kv_len
+  //             [34:33] mode           [32:0]  reserved zero
+  //
   //  S-TYPE SET_SCALE: [58:55] sreg  [54:53] src_mode  [52:37] imm16
   //  S-TYPE SYNC:      [58:56] resource_mask
   // -------------------------------------------------------------------------
   always_comb begin
     // Common
     insn.opcode  = opcode_raw;
-    insn.illegal = illegal_opcode | illegal_buf;
+    insn.illegal = illegal_opcode || illegal_buf || illegal_attn_reserved;
 
     // R-type fields
     insn.src1_buf = insn_data[58:57];
@@ -132,6 +140,11 @@ module decode_unit
     insn.c_tile_m = insn_data[58:49];
     insn.c_tile_n = insn_data[48:39];
     insn.c_tile_k = insn_data[38:29];
+
+    // ATTN-type fields
+    insn.attn_query_row_base = insn_data[58:47];
+    insn.attn_valid_kv_len   = insn_data[46:35];
+    insn.attn_mode           = insn_data[34:33];
 
     // S-type SET_SCALE fields
     insn.s_sreg     = insn_data[58:55];

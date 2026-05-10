@@ -51,6 +51,11 @@ module tb_decode_unit
   output logic [9:0]  c_tile_n,
   output logic [9:0]  c_tile_k,
 
+  // ATTN-type
+  output logic [11:0] attn_query_row_base,
+  output logic [11:0] attn_valid_kv_len,
+  output logic [1:0]  attn_mode,
+
   // S-type SET_SCALE
   output logic [3:0]  s_sreg,
   output logic [1:0]  s_src_mode,
@@ -95,6 +100,9 @@ module tb_decode_unit
   assign c_tile_m    = dec.c_tile_m;
   assign c_tile_n    = dec.c_tile_n;
   assign c_tile_k    = dec.c_tile_k;
+  assign attn_query_row_base = dec.attn_query_row_base;
+  assign attn_valid_kv_len   = dec.attn_valid_kv_len;
+  assign attn_mode           = dec.attn_mode;
   assign s_sreg      = dec.s_sreg;
   assign s_src_mode  = dec.s_src_mode;
   assign s_imm16     = dec.s_imm16;

@@ -240,6 +240,55 @@ static std::vector<int8_t> softmax_ref(const std::vector<int32_t>& src,
     return out;
 }
 
+static bool attn_visible_ref(int row, int col, int query_row_base, int valid_kv_len, int mode) {
+    bool visible = true;
+    if (mode & 0b10)
+        visible = visible && (col <= query_row_base + row);
+    if (mode & 0b01)
+        visible = visible && (col < valid_kv_len);
+    return visible;
+}
+
+static std::vector<int8_t> masked_softmax_ref(const std::vector<int32_t>& src,
+                                              int M, int N,
+                                              int query_row_base,
+                                              int valid_kv_len,
+                                              int mode,
+                                              float in_scale,
+                                              float out_scale) {
+    std::vector<int8_t> out(size_t(M) * size_t(N), 0);
+    for (int r = 0; r < M; ++r) {
+        bool have_visible = false;
+        float row_max = 0.0f;
+        for (int c = 0; c < N; ++c) {
+            if (!attn_visible_ref(r, c, query_row_base, valid_kv_len, mode))
+                continue;
+            float x = static_cast<float>(src[size_t(r) * size_t(N) + size_t(c)]) * in_scale;
+            if (!have_visible || x > row_max)
+                row_max = x;
+            have_visible = true;
+        }
+        if (!have_visible)
+            TEST_FAIL("masked_softmax_ref", "fully masked row");
+
+        std::vector<float> weights(size_t(N), 0.0f);
+        float exp_sum = 0.0f;
+        for (int c = 0; c < N; ++c) {
+            if (!attn_visible_ref(r, c, query_row_base, valid_kv_len, mode))
+                continue;
+            float x = static_cast<float>(src[size_t(r) * size_t(N) + size_t(c)]) * in_scale;
+            weights[size_t(c)] = std::exp(x - row_max);
+            exp_sum += weights[size_t(c)];
+        }
+        for (int c = 0; c < N; ++c) {
+            if (attn_visible_ref(r, c, query_row_base, valid_kv_len, mode))
+                out[size_t(r) * size_t(N) + size_t(c)] =
+                    quantize_ref(weights[size_t(c)] / exp_sum, out_scale);
+        }
+    }
+    return out;
+}
+
 static std::vector<int8_t> softmax_attnv_ref(const std::vector<int32_t>& qkt_i32,
                                              const std::vector<int8_t>& v_i8,
                                              int M, int K, int N,
@@ -263,6 +312,55 @@ static std::vector<int8_t> softmax_attnv_ref(const std::vector<int32_t>& qkt_i32
         for (int n = 0; n < N; ++n) {
             float acc = 0.0f;
             for (int k = 0; k < K; ++k) {
+                float prob = weights[size_t(k)] / exp_sum;
+                float v = static_cast<float>(v_i8[size_t(k) * size_t(N) + size_t(n)]) * v_scale;
+                acc += prob * v;
+            }
+            out[size_t(r) * size_t(N) + size_t(n)] = quantize_ref(acc, out_scale);
+        }
+    }
+    return out;
+}
+
+static std::vector<int8_t> masked_softmax_attnv_ref(const std::vector<int32_t>& qkt_i32,
+                                                    const std::vector<int8_t>& v_i8,
+                                                    int M, int K, int N,
+                                                    int query_row_base,
+                                                    int valid_kv_len,
+                                                    int mode,
+                                                    float qkt_scale,
+                                                    float v_scale,
+                                                    float out_scale) {
+    std::vector<int8_t> out(size_t(M) * size_t(N), 0);
+    for (int r = 0; r < M; ++r) {
+        bool have_visible = false;
+        float row_max = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            if (!attn_visible_ref(r, k, query_row_base, valid_kv_len, mode))
+                continue;
+            float q = static_cast<float>(qkt_i32[size_t(r) * size_t(K) + size_t(k)]) * qkt_scale;
+            if (!have_visible || q > row_max)
+                row_max = q;
+            have_visible = true;
+        }
+        if (!have_visible)
+            TEST_FAIL("masked_softmax_attnv_ref", "fully masked row");
+
+        std::vector<float> weights(size_t(K), 0.0f);
+        float exp_sum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            if (!attn_visible_ref(r, k, query_row_base, valid_kv_len, mode))
+                continue;
+            float q = static_cast<float>(qkt_i32[size_t(r) * size_t(K) + size_t(k)]) * qkt_scale;
+            weights[size_t(k)] = std::exp(q - row_max);
+            exp_sum += weights[size_t(k)];
+        }
+
+        for (int n = 0; n < N; ++n) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                if (!attn_visible_ref(r, k, query_row_base, valid_kv_len, mode))
+                    continue;
                 float prob = weights[size_t(k)] / exp_sum;
                 float v = static_cast<float>(v_i8[size_t(k) * size_t(N) + size_t(n)]) * v_scale;
                 acc += prob * v;
@@ -848,6 +946,137 @@ static void test_softmax_attnv_zero_out_scale() {
     TEST_PASS(name);
 }
 
+static void run_masked_softmax_case(const char* name,
+                                    int query_row_base,
+                                    int valid_kv_len,
+                                    int mode,
+                                    int dst_off) {
+    constexpr int M = 16;
+    constexpr int N = 32;
+    constexpr uint16_t IN_SCALE_BITS = 0x2C00;   // 0.0625
+    constexpr uint16_t OUT_SCALE_BITS = 0x3400;  // 0.25
+    const float in_scale = fp16_to_float(IN_SCALE_BITS);
+    const float out_scale = fp16_to_float(OUT_SCALE_BITS);
+
+    std::vector<int32_t> src(size_t(M) * size_t(N));
+    for (int r = 0; r < M; ++r)
+        for (int c = 0; c < N; ++c)
+            src[size_t(r) * size_t(N) + size_t(c)] = ((r * 7 + c * 3) % 31) - 15;
+
+    auto expected_i8 = masked_softmax_ref(
+        src, M, N, query_row_base, valid_kv_len, mode, in_scale, out_scale);
+    std::vector<uint8_t> expected(expected_i8.size());
+    for (size_t i = 0; i < expected.size(); ++i)
+        expected[i] = uint8_t(expected_i8[i]);
+
+    SimHarness s;
+    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_i32_le(src));
+    s.load({
+        insn::CONFIG_TILE(1, 2, 1),
+        insn::CONFIG_ATTN(query_row_base, valid_kv_len, mode),
+        insn::SET_SCALE(4, IN_SCALE_BITS),
+        insn::SET_SCALE(5, OUT_SCALE_BITS),
+        insn::MASKED_SOFTMAX(BUF_ACCUM_ID, 0, BUF_ABUF_ID, dst_off, 4),
+        insn::SYNC(0b100),
+        insn::HALT(),
+    });
+    s.run(250000);
+    if (s.dut->fault) TEST_FAIL(name, "unexpected fault");
+
+    auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, size_t(dst_off) * 16, expected.size());
+    expect_equal_bytes(name, got, expected);
+    TEST_PASS(name);
+}
+
+static void test_masked_softmax_modes() {
+    run_masked_softmax_case("masked_softmax_padded", 0, 24, 0b01, 1792);
+    run_masked_softmax_case("masked_softmax_pure_causal", 4, 32, 0b10, 1920);
+    run_masked_softmax_case("masked_softmax_causal_padded", 8, 24, 0b11, 2048);
+}
+
+static std::vector<uint8_t> run_masked_attnv_trace_case(uint16_t trace_bits,
+                                                        int dst_off) {
+    constexpr int M = 16;
+    constexpr int K = 16;
+    constexpr int N = 16;
+    constexpr int QUERY_ROW_BASE = 0;
+    constexpr int VALID_KV_LEN = 16;
+    constexpr int MODE = 0b11;
+    constexpr uint16_t QKT_SCALE_BITS = 0x2C00;   // 0.0625
+    constexpr uint16_t V_SCALE_BITS   = 0x3400;   // 0.25
+    constexpr uint16_t OUT_SCALE_BITS = 0x3400;   // 0.25
+
+    std::vector<int32_t> qkt(size_t(M) * size_t(K));
+    std::vector<int8_t> v(size_t(K) * size_t(N));
+    for (int r = 0; r < M; ++r)
+        for (int k = 0; k < K; ++k)
+            qkt[size_t(r) * size_t(K) + size_t(k)] = ((r * 11 + k * 5) % 29) - 14;
+    for (int k = 0; k < K; ++k)
+        for (int n = 0; n < N; ++n)
+            v[size_t(k) * size_t(N) + size_t(n)] = int8_t(((k * 13 + n * 7) % 37) - 18);
+
+    std::vector<uint8_t> v_bytes(v.size());
+    for (size_t i = 0; i < v.size(); ++i)
+        v_bytes[i] = uint8_t(v[i]);
+
+    SimHarness s;
+    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_i32_le(qkt));
+    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, v_bytes);
+    s.load({
+        insn::CONFIG_TILE(1, 1, 1),
+        insn::CONFIG_ATTN(QUERY_ROW_BASE, VALID_KV_LEN, MODE),
+        insn::SET_SCALE(8, QKT_SCALE_BITS),
+        insn::SET_SCALE(9, V_SCALE_BITS),
+        insn::SET_SCALE(10, OUT_SCALE_BITS),
+        insn::SET_SCALE(11, trace_bits),
+        insn::MASKED_SOFTMAX_ATTNV(BUF_ACCUM_ID, 0, BUF_ABUF_ID, 0, BUF_WBUF_ID, dst_off, 8),
+        insn::SYNC(0b100),
+        insn::HALT(),
+    });
+    s.run(250000);
+    if (s.dut->fault) TEST_FAIL("masked_softmax_attnv_trace_case", "unexpected fault");
+    return sram_read_bytes(s.dut.get(), BUF_WBUF_ID, size_t(dst_off) * 16, size_t(M) * size_t(N));
+}
+
+static void test_masked_softmax_attnv_trace_scale_ignored() {
+    const char* name = "masked_softmax_attnv_trace_scale_ignored";
+    constexpr int M = 16;
+    constexpr int K = 16;
+    constexpr int N = 16;
+    constexpr int QUERY_ROW_BASE = 0;
+    constexpr int VALID_KV_LEN = 16;
+    constexpr int MODE = 0b11;
+    constexpr uint16_t QKT_SCALE_BITS = 0x2C00;
+    constexpr uint16_t V_SCALE_BITS   = 0x3400;
+    constexpr uint16_t OUT_SCALE_BITS = 0x3400;
+    const float qkt_scale = fp16_to_float(QKT_SCALE_BITS);
+    const float v_scale = fp16_to_float(V_SCALE_BITS);
+    const float out_scale = fp16_to_float(OUT_SCALE_BITS);
+
+    std::vector<int32_t> qkt(size_t(M) * size_t(K));
+    std::vector<int8_t> v(size_t(K) * size_t(N));
+    for (int r = 0; r < M; ++r)
+        for (int k = 0; k < K; ++k)
+            qkt[size_t(r) * size_t(K) + size_t(k)] = ((r * 11 + k * 5) % 29) - 14;
+    for (int k = 0; k < K; ++k)
+        for (int n = 0; n < N; ++n)
+            v[size_t(k) * size_t(N) + size_t(n)] = int8_t(((k * 13 + n * 7) % 37) - 18);
+
+    auto expected_i8 = masked_softmax_attnv_ref(
+        qkt, v, M, K, N, QUERY_ROW_BASE, VALID_KV_LEN, MODE,
+        qkt_scale, v_scale, out_scale);
+    std::vector<uint8_t> expected(expected_i8.size());
+    for (size_t i = 0; i < expected.size(); ++i)
+        expected[i] = uint8_t(expected_i8[i]);
+
+    auto got_trace_zero = run_masked_attnv_trace_case(0x0000, 2176);
+    auto got_trace_large = run_masked_attnv_trace_case(0x7BFF, 2176);
+    expect_equal_bytes(name, got_trace_zero, expected);
+    expect_equal_bytes(name, got_trace_large, expected);
+    expect_equal_bytes(name, got_trace_zero, got_trace_large);
+    TEST_PASS(name);
+}
+
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
 
@@ -858,6 +1087,8 @@ int main(int argc, char** argv) {
     test_gelu_accum_roundtrip();
     test_softmax_attnv_roundtrip();
     test_softmax_attnv_zero_out_scale();
+    test_masked_softmax_modes();
+    test_masked_softmax_attnv_trace_scale_ignored();
 
     std::printf("\n%d / %d tests passed\n", tests_pass, tests_run);
     if (tests_pass != tests_run) std::exit(1);

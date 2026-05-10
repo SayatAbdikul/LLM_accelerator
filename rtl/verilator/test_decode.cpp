@@ -43,6 +43,9 @@ static const int A_IMM28_SHIFT     = 29;
 static const int C_M_SHIFT         = 49;
 static const int C_N_SHIFT         = 39;
 static const int C_K_SHIFT         = 29;
+static const int ATTN_QUERY_ROW_BASE_SHIFT = 47;
+static const int ATTN_VALID_KV_LEN_SHIFT   = 35;
+static const int ATTN_MODE_SHIFT           = 33;
 static const int SS_SREG_SHIFT     = 55;
 static const int SS_SRC_MODE_SHIFT = 53;
 static const int SS_IMM16_SHIFT    = 37;
@@ -375,11 +378,61 @@ int main(int argc, char** argv) {
     end_test();
 
     // -----------------------------------------------------------------------
-    // Reserved opcode 0x14 → illegal=1
+    // CONFIG_ATTN and masked SFU opcodes are legal in the current ISA.
     // -----------------------------------------------------------------------
-    begin_test("decode_illegal_opcode_0x14");
-    apply(uint64_t(0x14) << OPCODE_SHIFT);
+    begin_test("decode_config_attn");
+    apply((uint64_t(0x14) << OPCODE_SHIFT) |
+          (uint64_t(19)   << ATTN_QUERY_ROW_BASE_SHIFT) |
+          (uint64_t(48)   << ATTN_VALID_KV_LEN_SHIFT) |
+          (uint64_t(0b11) << ATTN_MODE_SHIFT));
     CHK(opcode,  0x14);
+    CHK(illegal, 0);
+    CHK(attn_query_row_base, 19);
+    CHK(attn_valid_kv_len, 48);
+    CHK(attn_mode, 0b11);
+    end_test();
+
+    begin_test("decode_config_attn_reserved_bits");
+    apply((uint64_t(0x14) << OPCODE_SHIFT) | uint64_t(1));
+    CHK(opcode, 0x14);
+    CHK(illegal, 1);
+    end_test();
+
+    begin_test("decode_masked_softmax");
+    apply((uint64_t(0x15) << OPCODE_SHIFT) |
+          (uint64_t(2)    << R_SRC1_BUF_SHIFT) |
+          (uint64_t(17)   << R_SRC1_OFF_SHIFT) |
+          (uint64_t(0)    << R_DST_BUF_SHIFT) |
+          (uint64_t(33)   << R_DST_OFF_SHIFT) |
+          (uint64_t(4)    << R_SREG_SHIFT));
+    CHK(opcode, 0x15);
+    CHK(illegal, 0);
+    CHK(src1_buf, 2);
+    CHK(dst_buf, 0);
+    CHK(sreg, 4);
+    end_test();
+
+    begin_test("decode_masked_softmax_attnv");
+    apply((uint64_t(0x16) << OPCODE_SHIFT) |
+          (uint64_t(2)    << R_SRC1_BUF_SHIFT) |
+          (uint64_t(7)    << R_SRC1_OFF_SHIFT) |
+          (uint64_t(1)    << R_SRC2_BUF_SHIFT) |
+          (uint64_t(8)    << R_SRC2_OFF_SHIFT) |
+          (uint64_t(0)    << R_DST_BUF_SHIFT) |
+          (uint64_t(9)    << R_DST_OFF_SHIFT) |
+          (uint64_t(10)   << R_SREG_SHIFT));
+    CHK(opcode, 0x16);
+    CHK(illegal, 0);
+    CHK(src2_buf, 1);
+    CHK(dst_off, 9);
+    end_test();
+
+    // -----------------------------------------------------------------------
+    // Reserved opcode 0x17 → illegal=1
+    // -----------------------------------------------------------------------
+    begin_test("decode_illegal_opcode_0x17");
+    apply(uint64_t(0x17) << OPCODE_SHIFT);
+    CHK(opcode,  0x17);
     CHK(illegal, 1);
     end_test();
 
@@ -406,6 +459,13 @@ int main(int argc, char** argv) {
     apply((uint64_t(0x13) << OPCODE_SHIFT)    |
           (uint64_t(2)    << R_SRC1_BUF_SHIFT)|
           (uint64_t(0)    << R_SRC2_BUF_SHIFT)|
+          (uint64_t(3)    << R_DST_BUF_SHIFT));
+    CHK(illegal, 1);
+    end_test();
+
+    begin_test("decode_illegal_buf_masked_softmax_dst_0b11");
+    apply((uint64_t(0x15) << OPCODE_SHIFT)    |
+          (uint64_t(2)    << R_SRC1_BUF_SHIFT)|
           (uint64_t(3)    << R_DST_BUF_SHIFT));
     CHK(illegal, 1);
     end_test();
