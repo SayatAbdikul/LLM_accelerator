@@ -1063,16 +1063,20 @@ class NanoGPTFQReference:
             else:
                 x_int8 = _dequant_add_accum_int8(out_accum, out_accum_scale, x_int8, _scale(s, "tok_pos_add") if L == 0 else _scale(s, f"block{L - 1}_residual2"), x_scale)
                 x = x_int8.astype(np.float32) * _arch_scale(x_scale)
-            # Branch B: override `x` with clean-FP32 residual1 so the next LN
-            # gets clean input. Use out_accum * out_accum_scale (the FP32
-            # dequantized accumulator) when available — that's the c_proj
-            # output before INT8 rounding to out_proj_scale. Fall back to
-            # `out_proj` (the INT8-rounded form) otherwise.
+            # Branch B: override `x` with clean-FP32 residual1. Compute the
+            # c_proj output via FP32 matmul of (INT8-rounded concat × QDQ
+            # weight) + ORIGINAL FP32 bias. This avoids the per-channel-vs-
+            # mean bias encoding mismatch in the integer path (where
+            # c_proj_b_i32 is encoded with per-channel weight scales but the
+            # dequant uses mean weight scale, producing a per-channel bias
+            # error that compounds across layers in a clean FP32 add chain).
             if self.fp32_residual_stream:
-                if out_accum is not None and out_accum_scale is not None:
-                    x_fp32_clean = x_fp32_clean + out_accum.astype(np.float32) * np.float32(out_accum_scale)
-                else:
-                    x_fp32_clean = x_fp32_clean + out_proj
+                concat_fp32_for_residual = concat_int8.astype(np.float32) * _arch_scale(concat_scale)
+                out_proj_clean = (
+                    concat_fp32_for_residual @ layer["c_proj_w"].T
+                    + layer["c_proj_b"]
+                )
+                x_fp32_clean = x_fp32_clean + out_proj_clean
                 x = x_fp32_clean
             record(f"block{L}_residual1", x, scale=x_scale, int8=x_int8)
 
@@ -1181,12 +1185,16 @@ class NanoGPTFQReference:
             else:
                 x_int8 = _dequant_add_accum_int8(fc2_accum, fc2_accum_scale, residual1_int8, residual1_scale, x_scale)
                 x = x_int8.astype(np.float32) * _arch_scale(x_scale)
-            # Branch B: same as residual1 — accumulate FP32 add via fc2 path.
+            # Branch B: same as residual1 — clean FP32 c_fc-out matmul with
+            # INT8 GELU input (QDQ form) and original FP32 bias.
             if self.fp32_residual_stream:
-                if fc2_accum is not None and fc2_accum_scale is not None:
-                    x_fp32_clean = x_fp32_clean + fc2_accum.astype(np.float32) * np.float32(fc2_accum_scale)
-                else:
-                    x_fp32_clean = x_fp32_clean + fc2
+                gelu_i8_for_residual = _fp32_to_int8(gelu, gelu_scale)
+                gelu_fp32_for_residual = gelu_i8_for_residual.astype(np.float32) * _arch_scale(gelu_scale)
+                fc2_clean = (
+                    gelu_fp32_for_residual @ layer["proj_w"].T
+                    + layer["proj_b"]
+                )
+                x_fp32_clean = x_fp32_clean + fc2_clean
                 x = x_fp32_clean
             record(f"block{L}_residual2", x, scale=x_scale, int8=x_int8)
 
