@@ -35,6 +35,16 @@ class Stage5PTQPreset:
     quarot_enabled: bool
     quarot_seed: int
     quarot_kind: str  # "random_orthogonal" only in this PR
+    # AWQ (Activation-aware Weight Quantization) — Phase 1 Branch C. When
+    # `awq_enabled` is True, an FP32-equivalent weight-channel scaling is
+    # applied (with the inverse scale folded into the upstream LN's gamma/
+    # bias) so that per-channel weight scales become more uniform after
+    # INT8 quantization. Targets are LN-fed matmuls only: c_attn, c_fc,
+    # lm_head. See `taccel/quantizer/awq.py`. Pure offline weight transform
+    # — no codegen changes; AWQ runs before BC and after rotation.
+    awq_enabled: bool
+    awq_alpha: float
+    awq_target_modules: tuple[str, ...]
 
 
 def _preset(
@@ -58,6 +68,9 @@ def _preset(
     quarot_enabled: bool = False,
     quarot_seed: int = 0xCAFE,
     quarot_kind: str = "random_orthogonal",
+    awq_enabled: bool = False,
+    awq_alpha: float = 0.5,
+    awq_target_modules: Sequence[str] = ("c_attn", "c_fc", "lm_head"),
 ) -> Stage5PTQPreset:
     return Stage5PTQPreset(
         name=name,
@@ -79,6 +92,9 @@ def _preset(
         quarot_enabled=bool(quarot_enabled),
         quarot_seed=int(quarot_seed),
         quarot_kind=str(quarot_kind),
+        awq_enabled=bool(awq_enabled),
+        awq_alpha=float(awq_alpha),
+        awq_target_modules=tuple(str(v) for v in awq_target_modules),
     )
 
 
@@ -466,6 +482,38 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         requant_pc_fc2_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
         bias_correction_blocks=tuple(range(12)),
         quarot_enabled=True,
+    ),
+    # ----------------------------------------------------------------------
+    # AWQ (Activation-aware Weight Quantization) — Phase 1 Branch C presets.
+    #
+    # AWQ scales weight INPUT channels by per-channel activation magnitudes
+    # and folds the inverse scale into the upstream LN's gamma/bias. After
+    # quantization, the per-channel weight scales are more uniform → the
+    # codebase's mean-scale dequant approximation has a smaller error →
+    # PPL improvement without any codegen changes.
+    #
+    # Pure offline weight transform; no calibration mismatch failure mode.
+    # AWQ runs BEFORE bias correction (so BC observes the AWQ'd activation
+    # distribution) and AFTER rotation (which mutates the same weights).
+    # ----------------------------------------------------------------------
+    "awq_baseline": _preset(
+        "awq_baseline",
+        awq_enabled=True,
+    ),
+    "awq_with_bc": _preset(
+        "awq_with_bc",
+        requant_pc_fc2_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        bias_correction_blocks=tuple(range(12)),
+        awq_enabled=True,
+    ),
+    "awq_with_bc_searches": _preset(
+        "awq_with_bc_searches",
+        requant_pc_fc2_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 11),
+        output_aware_lm_head=True,
+        output_aware_include_pairs=True,
+        bias_correction_blocks=tuple(range(12)),
+        awq_enabled=True,
     ),
 }
 

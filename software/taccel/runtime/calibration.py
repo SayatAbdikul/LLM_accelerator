@@ -1158,6 +1158,74 @@ def apply_quarot_rotation_from_token_ids(
     return folded_keys + rotated_keys, diagnostics
 
 
+def apply_awq_from_token_ids(
+    payload: Dict[str, object],
+    token_ids: Sequence[int],
+    *,
+    n_seqs: int = 8,
+    seq_len: int = 64,
+    alpha: float = 0.5,
+    target_modules: Sequence[str] = ("c_attn", "c_fc", "lm_head"),
+) -> tuple[List[str], dict]:
+    """Apply AWQ (Activation-aware Weight Quantization) to
+    ``payload['state_dict']`` in place.
+
+    Pipeline:
+      1. Build calibration sequences from ``token_ids`` (n_seqs × seq_len).
+      2. Run FP32 forward to collect per-input-channel max-abs activation
+         magnitudes for ``block{L}_ln1``, ``block{L}_ln2``, and ``ln_f``.
+      3. For each AWQ fold target (c_attn / c_fc / lm_head), compute per-
+         input-channel scales and mutate the matmul weights + LN gamma/bias.
+      4. Clear the NanoGPTFQReference weight cache.
+
+    Args:
+        payload: model payload with ``state_dict`` and ``model_args``;
+            ``state_dict`` is mutated in place.
+        token_ids: tokenized calibration text.
+        n_seqs: number of calibration sequences.
+        seq_len: tokens per sequence.
+        alpha: AWQ scale exponent (0=inverse-weight, 1=activation-magnitude,
+            0.5=geometric mean — canonical setting).
+        target_modules: which fold targets to apply AWQ to. ``c_attn`` folds
+            inverse scale into ln_1, ``c_fc`` into ln_2, ``lm_head`` into ln_f.
+
+    Returns:
+        ``(modified_keys, diagnostics)``: list of mutated state_dict keys and
+        a diagnostics dict (``alpha``, ``target_modules``, ``n_keys_mutated``,
+        ``n_act_stats_collected``).
+    """
+    from taccel.quantizer.awq import (
+        apply_awq_to_state_dict,
+        compute_per_channel_activation_magnitudes,
+    )
+    from taccel.runtime.fake_quant_reference import clear_weight_component_cache
+
+    state_dict = payload["state_dict"]
+    model_args = payload["model_args"]
+
+    seqs = build_calibration_seqs_from_token_ids(token_ids, n_seqs=n_seqs, seq_len=seq_len)
+    activation_magnitudes = compute_per_channel_activation_magnitudes(
+        state_dict, model_args, seqs
+    )
+
+    mutated_keys = apply_awq_to_state_dict(
+        state_dict,
+        model_args,
+        activation_magnitudes,
+        alpha=alpha,
+        target_modules=target_modules,
+    )
+    clear_weight_component_cache()
+
+    diagnostics = {
+        "alpha": float(alpha),
+        "target_modules": tuple(target_modules),
+        "n_keys_mutated": len(mutated_keys),
+        "n_act_stats_collected": len(activation_magnitudes),
+    }
+    return mutated_keys, diagnostics
+
+
 def apply_bias_correction_from_token_ids(
     payload: Dict[str, object],
     token_ids: Sequence[int],

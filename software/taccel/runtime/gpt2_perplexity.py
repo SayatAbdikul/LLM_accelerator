@@ -10,6 +10,7 @@ from typing import Dict, List, Sequence
 import numpy as np
 
 from .calibration import (
+    apply_awq_from_token_ids,
     apply_bias_correction_from_token_ids,
     apply_fc2_aware_gelu_scale_search_from_token_ids,
     apply_output_aware_attn_scale_search_from_token_ids,
@@ -243,6 +244,22 @@ def evaluate_gpt2_perplexity(
             calibration_token_ids,
             seed=resolved_preset.quarot_seed,
             kind=resolved_preset.quarot_kind,
+        )
+    if resolved_preset.awq_enabled:
+        # AWQ Phase 1 Branch C: scales weight input channels and folds the
+        # inverse into the upstream LN's gamma/bias. Mathematically identity-
+        # preserving in FP32, but reduces per-channel weight scale spread
+        # after INT8 quantization → smaller mean-scale dequant approximation
+        # error. Runs AFTER rotation (which mutates the same weights) and
+        # BEFORE calibration (so the calibration scales reflect the AWQ'd
+        # LN distribution).
+        apply_awq_from_token_ids(
+            payload,
+            calibration_token_ids,
+            n_seqs=calibration_n_seqs,
+            seq_len=calibration_seq_len,
+            alpha=resolved_preset.awq_alpha,
+            target_modules=resolved_preset.awq_target_modules,
         )
     calibration_scales = build_calibration_scales_from_token_ids(
         payload,
