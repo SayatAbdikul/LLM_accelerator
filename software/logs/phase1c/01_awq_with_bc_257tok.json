@@ -1,0 +1,15 @@
+{
+  "calibration_sha256": "bb4597735744a6e4d84493e6e57fe04963dce465c41f7a4dcda5c8c3b90a7e18",
+  "eval_sha256": "4e1fce0451434081dfce26182c4fc7235f295c4133507ef9ae8e573952a5a148",
+  "fake_quant_nll": 10.830591236823238,
+  "fake_quant_perplexity": 50543.581183100876,
+  "fp32_nll": NaN,
+  "fp32_perplexity": NaN,
+  "golden_nll": 10.830591236823238,
+  "golden_perplexity": 50543.581183100876,
+  "ptq_preset": "awq_with_bc",
+  "relative_delta": 0.0,
+  "target_count": 256,
+  "token_count": 257,
+  "tokenizer_dir": "software/tests/fixtures/generated/hf_gpt2"
+}

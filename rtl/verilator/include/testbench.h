@@ -366,6 +366,10 @@ public:
         return mem_[addr];
     }
 
+    size_t size() const {
+        return mem_.size();
+    }
+
     const std::vector<uint64_t>& read_addr_log() const {
         return read_addr_log_;
     }

@@ -20,6 +20,7 @@ VFLAGS        := --cc --exe --build --timing \
                  -Wall -Wno-UNUSED -Wno-UNDRIVEN \
                                   --x-assign fast --x-initial fast
 SYSTOLIC_ARCH_MODE ?= 1
+DRAM_SIZE ?= 16777216
 
 SRC_DIR       := ../src
 INCLUDE_DIR   := $(SRC_DIR)/include
@@ -58,6 +59,7 @@ $(BUILD_DIR)/run_program/Vtaccel_top: $(CONTROL_SV) run_program.cpp
 	mkdir -p $(BUILD_DIR)/run_program
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
+	  -GDRAM_SIZE=$(DRAM_SIZE) \
 	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
 	  --top-module taccel_top \
 	  --Mdir $(BUILD_DIR)/run_program \

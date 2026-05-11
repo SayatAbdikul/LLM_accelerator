@@ -79,7 +79,7 @@ module sfu_engine
   import "DPI-C" function real sfu_fp32_gelu(input real value_r);
   import "DPI-C" function int sfu_fp32_quantize_i8(input real value_r, input real out_scale_r);
 
-  localparam int SFU_MAX_ROW_ELEMS = 256;
+  localparam int SFU_MAX_ROW_ELEMS = 1024;
   localparam real LN_EPS = 1.0e-6;
 
   typedef enum logic [4:0] {

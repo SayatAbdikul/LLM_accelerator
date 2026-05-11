@@ -15,7 +15,10 @@ from typing import Any
 
 import numpy as np
 import torch
-from PIL import Image
+try:
+    from PIL import Image
+except ModuleNotFoundError:
+    Image = None
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -94,6 +97,9 @@ class _LocalDeiTProcessor:
 
 
 def _load_processor(model_name: str):
+    if Image is None:
+        raise ImportError("Pillow is required for image preprocessing in compile mode")
+
     from transformers import AutoImageProcessor
 
     try:
@@ -4424,6 +4430,9 @@ def compare_program_mode(args: argparse.Namespace) -> dict[str, Any]:
 
 def compare_compile_mode(args: argparse.Namespace) -> dict[str, Any]:
     import compare_golden as cg
+
+    if Image is None:
+        raise ImportError("Pillow is required for image preprocessing in compile mode")
 
     runner_path = Path(args.runner).resolve()
     _ensure_runner_built(runner_path, rebuild=args.rebuild_runner)

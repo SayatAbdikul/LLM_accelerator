@@ -39,7 +39,8 @@
 module taccel_top
   import taccel_pkg::*;
 #(
-  parameter int SYSTOLIC_ARCH_MODE = SYS_MODE_DEFAULT
+  parameter int SYSTOLIC_ARCH_MODE = SYS_MODE_DEFAULT,
+  parameter int DRAM_SIZE = 1 << 24
 )
 (
   input  logic        clk,
@@ -797,7 +798,9 @@ module taccel_top
     .sram_b_fault   (sfu_sram_b_en & sram_b_fault)
   );
 
-  dma_engine u_dma (
+  dma_engine #(
+    .DRAM_SIZE       (DRAM_SIZE)
+  ) u_dma (
     .clk             (clk),
     .rst_n           (rst_n),
     // Dispatch

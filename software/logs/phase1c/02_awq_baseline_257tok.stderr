@@ -1,0 +1,4 @@
+[transformers] Disabling PyTorch because PyTorch >= 2.4 is required but found 2.3.0
+[transformers] PyTorch was not found. Models won't be available and only tokenizers, configuration and file/data utilities can be used.
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (2391884 > 1024). Running this sequence through the model will result in indexing errors
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (283287 > 1024). Running this sequence through the model will result in indexing errors

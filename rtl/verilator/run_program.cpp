@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -49,8 +50,11 @@ struct CliOptions {
     std::string accum_write_json_out_path;
     std::string sram_write_json_out_path;
     std::string systolic_hidden_snapshot_json_out_path;
+    std::string dram_dump_out_path;
     std::string patches_raw_path;
     std::string cls_raw_path;
+    uint64_t dram_dump_offset = 0;
+    uint64_t dram_dump_size = 0;
     int patch_rows = 0;
     int patch_cols = 0;
     int num_classes = 1000;
@@ -64,6 +68,8 @@ struct CliOptions {
     int sram_write_end_pc = -1;
     int systolic_hidden_snapshot_pc = -1;
     bool folded_pos_embed = false;
+    bool dram_dump_offset_set = false;
+    bool dram_dump_size_set = false;
     int inject_next_rresp = -1;
     int inject_next_rlast = -1;
     int inject_next_bresp = -1;
@@ -204,6 +210,23 @@ void write_binary_file(const std::string& path, const std::vector<uint8_t>& data
     if (!data.empty()) {
         f.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
     }
+}
+
+std::vector<uint8_t> read_dram_range(const AXI4SlaveModel& dram,
+                                     uint64_t offset,
+                                     uint64_t size) {
+    const uint64_t max_size = uint64_t(std::numeric_limits<size_t>::max());
+    if (offset > max_size || size > max_size || offset > max_size - size) {
+        throw std::runtime_error("DRAM dump is too large for this host");
+    }
+    if (offset + size > uint64_t(dram.size())) {
+        throw std::runtime_error("DRAM dump range exceeds simulated DRAM size");
+    }
+    std::vector<uint8_t> out(static_cast<size_t>(size));
+    for (uint64_t i = 0; i < size; ++i) {
+        out[static_cast<size_t>(i)] = dram.read_byte(static_cast<size_t>(offset + i));
+    }
+    return out;
 }
 
 std::string json_escape(const std::string& in) {
@@ -642,6 +665,9 @@ void print_usage(const char* argv0) {
         << "  --sram-write-json-out <path>  Optional generic SRAM write provenance JSON output\n"
         << "  --systolic-hidden-snapshot-pc <pc> Tagged retire PC for optional hidden systolic snapshot\n"
         << "  --systolic-hidden-snapshot-json-out <path> Optional hidden systolic snapshot JSON output\n"
+        << "  --dram-dump-offset <bytes>   Byte offset for optional DRAM dump\n"
+        << "  --dram-dump-size <bytes>     Byte count for optional DRAM dump\n"
+        << "  --dram-dump-out <path>       Optional raw DRAM dump output\n"
         << "  --patches-raw <path>         Raw INT8 patch rows\n"
         << "  --patch-rows <rows>          Patch row count for raw input\n"
         << "  --patch-cols <cols>          Patch column count before 16-byte padding\n"
@@ -748,6 +774,14 @@ CliOptions parse_args(int argc, char** argv) {
             opts.systolic_hidden_snapshot_pc = std::stoi(need_value("--systolic-hidden-snapshot-pc"));
         } else if (arg == "--systolic-hidden-snapshot-json-out") {
             opts.systolic_hidden_snapshot_json_out_path = need_value("--systolic-hidden-snapshot-json-out");
+        } else if (arg == "--dram-dump-offset") {
+            opts.dram_dump_offset = std::stoull(need_value("--dram-dump-offset"), nullptr, 0);
+            opts.dram_dump_offset_set = true;
+        } else if (arg == "--dram-dump-size") {
+            opts.dram_dump_size = std::stoull(need_value("--dram-dump-size"), nullptr, 0);
+            opts.dram_dump_size_set = true;
+        } else if (arg == "--dram-dump-out") {
+            opts.dram_dump_out_path = need_value("--dram-dump-out");
         } else if (arg == "--patches-raw") {
             opts.patches_raw_path = need_value("--patches-raw");
         } else if (arg == "--patch-rows") {
@@ -846,6 +880,24 @@ CliOptions parse_args(int argc, char** argv) {
             "--systolic-hidden-snapshot-pc and --systolic-hidden-snapshot-json-out must be used together"
         );
     }
+    const bool dram_dump_enabled = !opts.dram_dump_out_path.empty() ||
+                                   opts.dram_dump_offset_set ||
+                                   opts.dram_dump_size_set;
+    if (dram_dump_enabled &&
+        (opts.dram_dump_out_path.empty() ||
+         !opts.dram_dump_offset_set ||
+         !opts.dram_dump_size_set)) {
+        throw std::runtime_error(
+            "--dram-dump-offset, --dram-dump-size, and --dram-dump-out must be used together"
+        );
+    }
+    if (dram_dump_enabled && opts.dram_dump_size == 0) {
+        throw std::runtime_error("--dram-dump-size must be greater than zero");
+    }
+    if (dram_dump_enabled &&
+        opts.dram_dump_offset > std::numeric_limits<uint64_t>::max() - opts.dram_dump_size) {
+        throw std::runtime_error("DRAM dump range overflows uint64");
+    }
     return opts;
 }
 
@@ -865,6 +917,7 @@ int main(int argc, char** argv) {
     std::vector<RetireEvent> retire_events;
     std::vector<SnapshotCapture> snapshot_captures;
     std::vector<uint8_t> snapshot_bytes;
+    std::vector<uint8_t> dram_dump_bytes;
     tbutil::SystolicWindowCollector window_collector(0, 0);
     bool window_trace_enabled = false;
     tbutil::AccumWriteLogCollector accum_write_collector(0, 0);
@@ -1125,6 +1178,13 @@ int main(int argc, char** argv) {
             summary.timeout = true;
             summary.violations.push_back("cycle_budget_exhausted");
         }
+        if (!opts.dram_dump_out_path.empty()) {
+            dram_dump_bytes = read_dram_range(
+                sim.dram,
+                opts.dram_dump_offset,
+                opts.dram_dump_size
+            );
+        }
     } catch (const std::exception& ex) {
         summary.status = "parse_error";
         summary.parse_error = ex.what();
@@ -1172,6 +1232,9 @@ int main(int argc, char** argv) {
     if (!opts.snapshot_manifest_out_path.empty()) {
         write_text_file(opts.snapshot_manifest_out_path, snapshot_manifest_to_json(snapshot_captures));
         write_binary_file(opts.snapshot_data_out_path, snapshot_bytes);
+    }
+    if (!opts.dram_dump_out_path.empty()) {
+        write_binary_file(opts.dram_dump_out_path, dram_dump_bytes);
     }
     if (!opts.systolic_window_json_out_path.empty()) {
         write_text_file(

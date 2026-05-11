@@ -30,7 +30,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image
+try:
+    from PIL import Image
+except ModuleNotFoundError:
+    Image = None
 
 # ─── path setup ──────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -74,6 +77,9 @@ def _scenario_overrides(name: str) -> dict[str, Any]:
 
 
 def _load_processor(model_name: str):
+    if Image is None:
+        raise ImportError("Pillow is required for image preprocessing in batch compare mode")
+
     from transformers import AutoImageProcessor
     try:
         return AutoImageProcessor.from_pretrained(model_name, local_files_only=True)
@@ -176,6 +182,9 @@ def run_single_image(
     Returns a result dict.
     """
     import compare_golden as cg
+
+    if Image is None:
+        return _error_result(img_path, "patch_embed failed: Pillow is required for image preprocessing")
 
     img_work = work_dir / f"img_{idx:04d}"
     img_work.mkdir(parents=True, exist_ok=True)
@@ -384,6 +393,9 @@ def main() -> None:
     args = parse_args()
 
     import compare_golden as cg
+
+    if Image is None:
+        raise SystemExit("Pillow is required for image preprocessing in batch compare mode")
 
     runner_path = Path(args.runner).resolve()
     if not runner_path.exists():
