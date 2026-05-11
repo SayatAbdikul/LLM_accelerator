@@ -450,6 +450,43 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         output_aware_include_pairs=True,
         bias_correction_blocks=tuple(range(12)),
     ),
+    # ----------------------------------------------------------------------
+    # Tier 1 PC expansion experiments — current default plus per-channel
+    # dequant on additional layers (fc1 and/or out_proj), using the same
+    # block selection as fc2 (0,1,2,4,8,9,10,11). Motivated by the weight-
+    # only QDQ diagnostic which showed per-channel dequant is essentially
+    # free in pure FP32 (53.42 vs 53.69 PPL ceiling); the codebase's mean-
+    # scale approximation is what introduces the production gap. Per-channel
+    # dequant on more layers should reduce that approximation error.
+    # ----------------------------------------------------------------------
+    "default_plus_fc1_pc_8": _preset(
+        "default_plus_fc1_pc_8",
+        requant_pc_fc2_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        requant_pc_fc1_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 11),
+        output_aware_lm_head=True,
+        output_aware_include_pairs=True,
+        bias_correction_blocks=tuple(range(12)),
+    ),
+    "default_plus_out_proj_pc_8": _preset(
+        "default_plus_out_proj_pc_8",
+        requant_pc_fc2_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        requant_pc_out_proj_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 11),
+        output_aware_lm_head=True,
+        output_aware_include_pairs=True,
+        bias_correction_blocks=tuple(range(12)),
+    ),
+    "default_plus_fc1_out_proj_pc_8": _preset(
+        "default_plus_fc1_out_proj_pc_8",
+        requant_pc_fc2_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        requant_pc_fc1_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        requant_pc_out_proj_blocks=(0, 1, 2, 4, 8, 9, 10, 11),
+        output_aware_mlp_blocks=(0, 11),
+        output_aware_lm_head=True,
+        output_aware_include_pairs=True,
+        bias_correction_blocks=tuple(range(12)),
+    ),
     # QuaRot Phase 1 presets. The diagnostic
     # (software/tools/diagnose_activation_outliers.py) showed that residual-
     # stream rotation by an orthogonal matrix recovers a substantial fraction
