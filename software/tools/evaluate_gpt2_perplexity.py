@@ -103,21 +103,30 @@ def main(argv=None) -> int:
     if args.json:
         print(json.dumps(out, indent=2, sort_keys=True))
     else:
-        # W8A32 (weight_only_int8) intentionally has no golden bundle path
-        # on the current ISA, so `golden_perplexity` / `relative_delta`
-        # come back as NaN. Surface a W8A32-specific summary instead of
-        # the standard golden/fake_quant comparison.
+        # W8A32 (weight_only_int8) populates `golden_perplexity` via
+        # `WeightOnlyHostRunner` (Phase 3 option (b)), so both golden
+        # and fake_quant come back as real numbers — but they wrap the
+        # same numpy QDQ helper, so `relative_delta` is ~0 by
+        # construction. Print a W8A32-specific banner so users don't
+        # mistake this for a real golden-vs-fake-quant gap.
         is_w8a32 = result.ptq_preset == "weight_only_int8"
         print(f"fp32_perplexity: {result.fp32_perplexity:.6f}")
         if is_w8a32:
             print(f"weight_only_int8 (W8A32) fake_quant_perplexity: {result.fake_quant_perplexity:.6f}")
+            print(f"weight_only_int8 (W8A32) golden_perplexity:     {result.golden_perplexity:.6f}")
+            print(f"relative_delta (W8A32 host-runner vs reference): {result.relative_delta:.6%}")
             if not math.isnan(result.fp32_perplexity):
                 delta = result.fake_quant_perplexity - result.fp32_perplexity
                 ratio = result.fake_quant_perplexity / max(result.fp32_perplexity, 1e-12)
                 print(
                     f"W8A32 vs FP32: Δ {delta:+.4f} PPL ({ratio:.4f}× FP32)"
                 )
-            print("golden_perplexity / relative_delta: nan (no W8A32 bundle path on current ISA)")
+            print(
+                "note: golden path is Phase 3 option (b) — host FP32 "
+                "+ INT8 weight storage. Options (c.1)/(c.2) for INT8 "
+                "MXU-preserving W8A32 require ISA extensions; see "
+                "software/docs/w8a32_deployment_scope.md."
+            )
         else:
             print(f"golden_perplexity: {result.golden_perplexity:.6f}")
             print(f"fake_quant_perplexity: {result.fake_quant_perplexity:.6f}")

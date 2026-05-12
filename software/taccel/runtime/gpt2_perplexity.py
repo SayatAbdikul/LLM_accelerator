@@ -30,6 +30,7 @@ CALIBRATION_PERCENTILE_DEFAULT = 99.9
 from .fake_quant_reference import NanoGPTFQReference
 from .fp32_reference import NanoGPTFP32Reference, build_weight_only_int8_reference
 from .host_runner import HostRunner
+from .weight_only_host_runner import WeightOnlyHostRunner
 from .stage5_ptq import (
     Stage5PTQPreset,
     apply_stage5_ptq_scale_policy,
@@ -189,6 +190,38 @@ def run_weight_only_int8_teacher_forced_logits(
     return ref.incremental_logits_trace(inputs)
 
 
+def run_weight_only_int8_golden_teacher_forced_logits(
+    payload: Dict[str, object],
+    context_tokens: Sequence[int],
+) -> List[np.ndarray]:
+    """W8A32 Phase 3 option (b): host-runtime FP32 with INT8 weight storage.
+
+    Builds a `WeightOnlyHostRunner` (mimicking the deployed `HostRunner`
+    API but bypassing the simulator and the INT8 MXU entirely), then
+    runs prefill + per-token decode through it. The runner internally
+    wraps `build_weight_only_int8_reference` — the same helper the
+    Phase 1 fake-quant path uses — so the resulting per-token logits
+    are bit-identical to `run_weight_only_int8_teacher_forced_logits`.
+
+    The relevant distinction is the **API contract**: this path goes
+    through a runner that takes `(payload, weight_mode)` at
+    construction time and exposes `run_prefill` + `run_decode_step` —
+    mirroring how a deployed W8A32 bundle would be served. The Phase 1
+    function calls the reference's `incremental_logits_trace` directly
+    against the checkpoint; this function goes through the runner that
+    represents the deployment surface. Both produce 53.42 PPL on the
+    257-tok / 256-ctx gate; the difference is documentary.
+
+    Option (c.1) and (c.2) — INT8-MXU-preserving W8A32 with FP32 ABUF
+    or sideband buffer — are NOT covered by this runner. They require
+    ISA / simulator / codegen extensions documented in
+    `software/docs/w8a32_deployment_scope.md`.
+    """
+    inputs, _ = teacher_forced_inputs_and_targets(context_tokens)
+    runner = WeightOnlyHostRunner(payload, weight_mode="per_channel")
+    return runner.run_teacher_forced(inputs)
+
+
 def run_fake_quant_teacher_forced_logits(
     payload: Dict[str, object],
     context_tokens: Sequence[int],
@@ -258,13 +291,24 @@ def evaluate_gpt2_perplexity(
         stage5_default_ptq_preset_name() if ptq_preset is None else ptq_preset
     )
 
-    # W8A32 branch (Phase 1, plan `w8a32-weights-only-plan.md`). FP32
-    # activations, INT8 per-channel weight QDQ. No calibration, no golden
-    # bundle path. The W8A32 preset rejects every W8A8 transform at
-    # construction time, so we can short-circuit the rest of the pipeline.
-    # `golden_perplexity` / `golden_nll` / `relative_delta` are NaN to
-    # signal "no compiled-bundle path is available for W8A32 on the current
-    # ISA"; the deployment scoping doc covers the codegen work needed.
+    # W8A32 branch. The W8A32 preset rejects every W8A8 transform at
+    # construction time, so we short-circuit the rest of the pipeline.
+    #
+    # Phase 1 (commit `cf59efb`) populated `fake_quant_perplexity` via
+    # `run_weight_only_int8_teacher_forced_logits` (NanoGPTFP32Reference
+    # + QDQ weights). Phase 3 option (b) (commit landing this comment)
+    # additionally populates `golden_perplexity` via
+    # `WeightOnlyHostRunner` — a `HostRunner`-API-compatible runner that
+    # mimics the deployment surface for option (b) "host-runtime FP32
+    # with INT8 weight storage". The two paths produce bit-identical
+    # logits by construction (both wrap the same QDQ helper); the
+    # distinction is the API contract.
+    #
+    # Phase 3 options (c.1) and (c.2) — preserving the INT8 MXU via ISA
+    # extensions for FP32 ABUF / sideband FP32 buffer — are documented
+    # in `software/docs/w8a32_deployment_scope.md` and NOT implemented
+    # in this commit; they require 3-5 weeks of ISA / simulator /
+    # codegen work.
     if resolved_preset.weight_only_int8:
         _, targets = teacher_forced_inputs_and_targets(eval_tokens)
         vocab_size = int(payload["model_args"]["vocab_size"])
@@ -278,6 +322,20 @@ def evaluate_gpt2_perplexity(
             for row, target in zip(fake_logits, targets)
         ]
         fake_ppl, fake_nll = perplexity_from_nlls(fake_nlls)
+
+        golden_logits = run_weight_only_int8_golden_teacher_forced_logits(
+            payload, eval_tokens
+        )
+        if len(golden_logits) != len(targets):
+            raise RuntimeError("W8A32 golden logits/targets length mismatch")
+        golden_nlls = [
+            stable_cross_entropy(
+                np.asarray(row, dtype=np.float32), target, vocab_size=vocab_size
+            )
+            for row, target in zip(golden_logits, targets)
+        ]
+        golden_ppl, golden_nll = perplexity_from_nlls(golden_nlls)
+        rel = abs(golden_ppl - fake_ppl) / max(abs(fake_ppl), 1e-12)
 
         fp32_ppl = float("nan")
         fp32_nll = float("nan")
@@ -293,12 +351,12 @@ def evaluate_gpt2_perplexity(
             fp32_ppl, fp32_nll = perplexity_from_nlls(fp32_nlls)
 
         return GPT2PerplexityResult(
-            golden_perplexity=float("nan"),
+            golden_perplexity=golden_ppl,
             fake_quant_perplexity=fake_ppl,
-            relative_delta=float("nan"),
+            relative_delta=float(rel),
             token_count=len(eval_tokens),
             target_count=len(targets),
-            golden_nll=float("nan"),
+            golden_nll=golden_nll,
             fake_quant_nll=fake_nll,
             tokenizer_dir=str(tokenizer_dir),
             calibration_sha256=calibration_sha256,
