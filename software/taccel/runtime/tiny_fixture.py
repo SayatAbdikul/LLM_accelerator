@@ -346,6 +346,7 @@ def build_stage3_tiny_decoder_bundle(
         dequant_add_residual1_blocks=stage5_dequant_add_residual1_blocks(config, resolved_preset),
         dequant_add_residual2_blocks=stage5_dequant_add_residual2_blocks(config, resolved_preset),
         gelu_from_accum_blocks=gelu_from_accum_blocks or None,
+        w8a32_enabled=bool(resolved_preset.weight_only_int8),
     )
     return TinyFixtureBundle(build=build, config=config, logits_size=logits_size)
 

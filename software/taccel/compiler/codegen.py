@@ -63,12 +63,24 @@ class CodeGenerator:
                  requant_pc_scale_tables: Optional[Dict[str, np.ndarray]] = None,
                  model_config: Optional[ModelConfig] = None,
                  stream_name: str = "prefill",
-                 kv_layout: Optional[KVCacheLayout] = None):
+                 kv_layout: Optional[KVCacheLayout] = None,
+                 w8a32_enabled: bool = False):
         """
         Args:
             weight_data: name → (quantized_data, per_channel_scales)
             calibration_scales: tensor_name → per-tensor activation scale
             prescaled_biases: name → INT32 pre-scaled bias array
+            w8a32_enabled: Phase 3 (c.1) W8A32 lowering. When True, the
+                sub-layer ops (LAYERNORM, GELU, SOFTMAX, MASKED_SOFTMAX,
+                VADD) emit FP32 variants via `w8a32_emit.py`. The W8A8
+                optimization blocks (dequant_add residual, requant_pc,
+                gelu_from_accum, fused_softmax_attnv) are force-disabled
+                because they're optimizations of the INT8 round-trip
+                that W8A32 doesn't have. Matmul-output dequant
+                (DEQUANT_ACCUM_FP32) is deferred to M2.5 — for now W8A32
+                matmul still emits REQUANT (INT8 epilogue) and the
+                W8A32 sub-layer ops will see INT8 inputs reinterpreted
+                as FP32. M3+M4 close that loop.
         """
         self.weight_data = weight_data
         self.config = model_config or deit_tiny_config()
@@ -78,6 +90,20 @@ class CodeGenerator:
         self.kv_layout = kv_layout
         self.calibration_scales = calibration_scales
         self.prescaled_biases = prescaled_biases
+        self.w8a32_enabled = bool(w8a32_enabled)
+        if self.w8a32_enabled:
+            # M2 design contract: in W8A32 mode the INT8-round-trip
+            # optimizations are off — they're optimizations of behavior
+            # the W8A32 path doesn't have. Force-disable so downstream
+            # codegen doesn't fall through to an INT8-optimized branch.
+            gelu_from_accum = False
+            gelu_from_accum_blocks = set()
+            dequant_add_residual1_blocks = set()
+            dequant_add_residual2_blocks = set()
+            fused_softmax_attnv_blocks = set()
+            fused_softmax_attnv_accum_out_proj_blocks = set()
+            requant_pc_weight_names = set()
+            requant_pc_scale_tables = {}
         self.gelu_from_accum = gelu_from_accum
         self.gelu_from_accum_blocks = None if gelu_from_accum_blocks is None else set(gelu_from_accum_blocks)
         self.dequant_add_residual1_blocks = (
@@ -123,6 +149,25 @@ class CodeGenerator:
 
         Returns (instructions, dram_data_blob).
         """
+        # Phase 3 (c.1) M2 guardrail: refuse to emit a bundle in W8A32
+        # mode while the matmul-output dequant lowering (M2.5) is still
+        # pending. Without DEQUANT_ACCUM_FP32 the matmul epilogue still
+        # emits REQUANT_PC (INT8 output) but the FP32 sub-layer ops
+        # read those bytes as 4-byte floats — produces a silently
+        # malformed bundle. Loud-fail until M2.5 lands.
+        if self.w8a32_enabled:
+            matmul_ops = {"matmul", "matmul_qkt", "matmul_attn_v"}
+            if any(node.op in matmul_ops for node in graph.nodes):
+                raise NotImplementedError(
+                    "W8A32 codegen is incomplete (M2 ships sub-layer ops "
+                    "only; matmul-output dequant is M2.5). The current "
+                    "graph contains matmul nodes which would emit "
+                    "INT8-output REQUANT_PC instructions that conflict "
+                    "with the FP32 sub-layer ops. evaluate_gpt2_perplexity's "
+                    "W8A32 path uses WeightOnlyHostRunner (Phase 3 (b)) "
+                    "and bypasses the simulator-backed bundle entirely; "
+                    "use that until M2.5 lands."
+                )
         # First pass: lay out weights in DRAM
         self._layout_weights(graph)
 
@@ -2212,6 +2257,14 @@ class CodeGenerator:
 
     def _emit_softmax(self, node: IRNode):
         """C1: softmax already emitted per-strip in _emit_qkt; this node is a rename."""
+        if self.w8a32_enabled:
+            # Phase 3 (c.1) M2: softmax in W8A32 emits SOFTMAX_FP32 (or
+            # MASKED_SOFTMAX_FP32 for causal). Causal detection comes
+            # from the node's attrs — same convention as the INT8 path.
+            from .w8a32_emit import emit_softmax_fp32
+            masked = bool(node.attrs.get("causal", False)) or bool(node.attrs.get("masked", False))
+            emit_softmax_fp32(self, node, masked=masked)
+            return
         in_alloc = self.mem.wbuf.get(node.inputs[0])
         if in_alloc is not None and node.inputs[0] in self.mem.wbuf.allocations:
             alloc = self.mem.wbuf.allocations.pop(node.inputs[0])
@@ -2222,6 +2275,13 @@ class CodeGenerator:
 
     def _emit_gelu(self, node: IRNode):
         """Emit GELU SFU instruction (no-op if inlined with a strip-mined matmul)."""
+        if self.w8a32_enabled:
+            # Phase 3 (c.1) M2: GELU dispatches to the FP32 lowering helper.
+            # W8A32 mode force-disables gelu_from_accum + strip-mined inlining,
+            # so the simple GELU path is what we want here.
+            from .w8a32_emit import emit_gelu_fp32
+            emit_gelu_fp32(self, node)
+            return
         if node.attrs.get("inline_with"):
             # GELU was applied inline in the strip-mined FC1 loop.
             # Propagate DRAM temp tracking and rename the ABUF placeholder.
@@ -2342,6 +2402,11 @@ class CodeGenerator:
 
     def _emit_layernorm(self, node: IRNode):
         """Emit LAYERNORM SFU instruction."""
+        if self.w8a32_enabled:
+            # Phase 3 (c.1) M2: LN dispatches to the FP32 lowering helper.
+            from .w8a32_emit import emit_layernorm_fp32
+            emit_layernorm_fp32(self, node)
+            return
         M_pad = pad_dim(node.output_shape[0])
         N_pad = pad_dim(node.output_shape[1])
         m_tiles = M_pad // TILE
@@ -2447,6 +2512,16 @@ class CodeGenerator:
         Handles the case where one input is DRAM-resident (strip-mined output)
         by loading it into ABUF first.
         """
+        if self.w8a32_enabled:
+            # Phase 3 (c.1) M2: residual stream VADD in W8A32 emits the
+            # non-saturating VADD_FP32. dequant_add residual paths are
+            # force-disabled in the W8A32 constructor, so we won't hit
+            # the DequantAddInsn branch below in this mode.
+            if node.name in self.precomputed_nodes:
+                return
+            from .w8a32_emit import emit_vadd_fp32
+            emit_vadd_fp32(self, node)
+            return
         M_pad = pad_dim(node.output_shape[0])
         N_pad = pad_dim(node.output_shape[1])
         m_tiles = M_pad // TILE
