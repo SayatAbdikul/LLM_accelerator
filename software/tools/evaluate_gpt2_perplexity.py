@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -102,10 +103,25 @@ def main(argv=None) -> int:
     if args.json:
         print(json.dumps(out, indent=2, sort_keys=True))
     else:
+        # W8A32 (weight_only_int8) intentionally has no golden bundle path
+        # on the current ISA, so `golden_perplexity` / `relative_delta`
+        # come back as NaN. Surface a W8A32-specific summary instead of
+        # the standard golden/fake_quant comparison.
+        is_w8a32 = result.ptq_preset == "weight_only_int8"
         print(f"fp32_perplexity: {result.fp32_perplexity:.6f}")
-        print(f"golden_perplexity: {result.golden_perplexity:.6f}")
-        print(f"fake_quant_perplexity: {result.fake_quant_perplexity:.6f}")
-        print(f"relative_delta: {result.relative_delta:.6%}")
+        if is_w8a32:
+            print(f"weight_only_int8 (W8A32) fake_quant_perplexity: {result.fake_quant_perplexity:.6f}")
+            if not math.isnan(result.fp32_perplexity):
+                delta = result.fake_quant_perplexity - result.fp32_perplexity
+                ratio = result.fake_quant_perplexity / max(result.fp32_perplexity, 1e-12)
+                print(
+                    f"W8A32 vs FP32: Δ {delta:+.4f} PPL ({ratio:.4f}× FP32)"
+                )
+            print("golden_perplexity / relative_delta: nan (no W8A32 bundle path on current ISA)")
+        else:
+            print(f"golden_perplexity: {result.golden_perplexity:.6f}")
+            print(f"fake_quant_perplexity: {result.fake_quant_perplexity:.6f}")
+            print(f"relative_delta: {result.relative_delta:.6%}")
         print(f"target_count: {result.target_count}")
     return 0
 

@@ -45,6 +45,17 @@ class Stage5PTQPreset:
     awq_enabled: bool
     awq_alpha: float
     awq_target_modules: tuple[str, ...]
+    # W8A32 mode (Phase 1, plan `w8a32-weights-only-plan.md`). When True the
+    # evaluation pipeline runs `NanoGPTFP32Reference` with per-channel INT8
+    # QDQ weights and FP32 activations everywhere — no calibration, no
+    # golden bundle. The diagnostic at
+    # `software/tools/diagnose_weight_only_qdq_ceiling.py` proved this
+    # achieves 53.42 PPL on `gpt2_converted_nanogpt.pt` at 257-tok / 256-ctx
+    # vs the FP32 ceiling of 53.69 PPL. The W8A8 transforms (quarot, AWQ,
+    # bias correction, output-aware searches, per-channel requant_pc, raw
+    # residual paths) do not compose with W8A32 — the pipeline raises if
+    # any are set alongside this flag.
+    weight_only_int8: bool
 
 
 def _preset(
@@ -71,8 +82,9 @@ def _preset(
     awq_enabled: bool = False,
     awq_alpha: float = 0.5,
     awq_target_modules: Sequence[str] = ("c_attn", "c_fc", "lm_head"),
+    weight_only_int8: bool = False,
 ) -> Stage5PTQPreset:
-    return Stage5PTQPreset(
+    preset = Stage5PTQPreset(
         name=name,
         activation_percentile_nodes=dict(activation_percentile_nodes or {}),
         requant_pc_out_proj_blocks=tuple(int(v) for v in requant_pc_out_proj_blocks),
@@ -95,7 +107,52 @@ def _preset(
         awq_enabled=bool(awq_enabled),
         awq_alpha=float(awq_alpha),
         awq_target_modules=tuple(str(v) for v in awq_target_modules),
+        weight_only_int8=bool(weight_only_int8),
     )
+    if preset.weight_only_int8:
+        # W8A32 is intentionally orthogonal to every W8A8 transform — those
+        # transforms mutate per-tensor activation scales or rotate the
+        # residual stream against an INT8 activation distribution that the
+        # W8A32 path doesn't have. Surface the conflict at preset
+        # construction time so it can't compose silently.
+        offenders = []
+        if preset.activation_percentile_nodes:
+            offenders.append("activation_percentile_nodes")
+        if preset.requant_pc_out_proj_blocks:
+            offenders.append("requant_pc_out_proj_blocks")
+        if preset.requant_pc_fc1_blocks:
+            offenders.append("requant_pc_fc1_blocks")
+        if preset.requant_pc_fc2_blocks:
+            offenders.append("requant_pc_fc2_blocks")
+        if preset.hessian_gelu_blocks:
+            offenders.append("hessian_gelu_blocks")
+        if preset.fc2_aware_gelu_blocks:
+            offenders.append("fc2_aware_gelu_blocks")
+        if preset.output_aware_gelu_blocks:
+            offenders.append("output_aware_gelu_blocks")
+        if preset.output_aware_mlp_blocks:
+            offenders.append("output_aware_mlp_blocks")
+        if preset.output_aware_attn_blocks:
+            offenders.append("output_aware_attn_blocks")
+        if preset.output_aware_lm_head:
+            offenders.append("output_aware_lm_head")
+        if preset.bias_correction_blocks:
+            offenders.append("bias_correction_blocks")
+        if preset.gelu_from_accum_blocks:
+            offenders.append("gelu_from_accum_blocks")
+        if preset.quarot_enabled:
+            offenders.append("quarot_enabled")
+        if preset.awq_enabled:
+            offenders.append("awq_enabled")
+        if offenders:
+            raise ValueError(
+                f"Stage5 preset {name!r}: weight_only_int8=True is "
+                f"incompatible with W8A8 transforms; got "
+                f"{sorted(offenders)} set. W8A32 runs FP32 activations "
+                f"and has no calibration; rotation/AWQ/BC/output-aware "
+                f"searches/per-channel requant only apply to W8A8."
+            )
+    return preset
 
 
 STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
@@ -551,6 +608,28 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         output_aware_include_pairs=True,
         bias_correction_blocks=tuple(range(12)),
         awq_enabled=True,
+    ),
+    # ----------------------------------------------------------------------
+    # W8A32 weight-only preset (plan `w8a32-weights-only-plan.md`, 2026-05-12).
+    #
+    # Per-channel INT8 weight QDQ + FP32 activations everywhere. No
+    # calibration, no golden bundle path. The diagnostic at
+    # `software/tools/diagnose_weight_only_qdq_ceiling.py` proved this
+    # achieves 53.42 PPL on `gpt2_converted_nanogpt.pt` at 257-tok /
+    # 256-ctx vs the 53.69 FP32 ceiling and the 6,174 W8A8 production
+    # baseline. The Phase A campaign
+    # (`software/docs/ptq_phase_a_findings.md`) established that the W8A8
+    # baseline cannot be improved by pure-offline transforms; W8A32 is the
+    # natural pivot when an accelerator deployment can tolerate FP32
+    # activation storage.
+    #
+    # The pipeline branches early on `weight_only_int8=True` and skips
+    # every W8A8 transform; combining is rejected at preset construction
+    # time by `_preset(...)`.
+    # ----------------------------------------------------------------------
+    "weight_only_int8": _preset(
+        "weight_only_int8",
+        weight_only_int8=True,
     ),
 }
 

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import List, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -315,3 +315,135 @@ class NanoGPTFP32Reference:
             logits = ln_f[-1:] @ self.lm_head_w.T
             record("lm_head", logits)
             return logits[0].cpu().numpy().astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# W8A32 helpers — INT8 weight QDQ + FP32 activations everywhere.
+#
+# These were originally housed in `software/tools/diagnose_weight_only_qdq_ceiling.py`
+# (commit `37929dd`, the diagnostic that established the 53.42 PPL ceiling on
+# this codebase). They live here so the eval pipeline and the diagnostic share
+# one source of truth and produce bit-identical logits.
+# ---------------------------------------------------------------------------
+
+
+def _weight_only_qdq_per_channel(arr: np.ndarray) -> np.ndarray:
+    """Symmetric per-row INT8 quantise → dequantise back to FP32.
+
+    One scale per output channel (i.e. per row). No padding, no mean-scale
+    averaging — this is the path the diagnostic proved at 53.42 PPL. The
+    codebase's mean-scale dequant (`_linear_components`) is the opposite
+    extreme; it is catastrophic in pure FP32 (~1.3e+19 PPL) without the
+    activation INT8 clipping that absorbs it in the W8A8 pipeline.
+    """
+    arr = np.asarray(arr, dtype=np.float32)
+    max_abs = np.maximum(np.max(np.abs(arr), axis=1, keepdims=True), 1e-10)
+    scale = max_abs / 127.0
+    q = np.clip(np.round(arr / scale), -128, 127).astype(np.int8)
+    return (q.astype(np.float32) * scale).astype(np.float32)
+
+
+def _weight_only_qdq_mean_scale(arr: np.ndarray) -> np.ndarray:
+    """Codebase's mean-scale dequant approximation, FP32-out.
+
+    Provided only for parity with the diagnostic's `weight_mode="mean_scale"`
+    branch. Not used by the W8A32 production preset — kept here so the
+    diagnostic can still A/B both modes from a single helper.
+    """
+    # Local import to avoid pulling NanoGPTFQReference's module-load weight
+    # cache into the FP32-only path.
+    from .fake_quant_reference import _linear_components
+
+    arr = np.asarray(arr, dtype=np.float32)
+    return _linear_components(arr)[2].astype(np.float32)
+
+
+def _weight_only_qdq_per_tensor_embedding(arr: np.ndarray) -> np.ndarray:
+    """Per-tensor INT8 QDQ of an embedding table.
+
+    Mirrors `_fq_embedding` in `fake_quant_reference.py` (the production INT8
+    embedding path is per-tensor; per-channel doesn't apply because the table
+    is read row-wise as activation input, not used as a matmul weight).
+    """
+    from .fake_quant_reference import _fq_embedding
+
+    arr = np.asarray(arr, dtype=np.float32)
+    return _fq_embedding(arr).astype(np.float32)
+
+
+def _torch_qdq_per_channel(torch, t):
+    arr = t.detach().cpu().to(dtype=torch.float32).numpy()
+    return torch.from_numpy(_weight_only_qdq_per_channel(arr))
+
+
+def _torch_qdq_mean_scale(torch, t):
+    arr = t.detach().cpu().to(dtype=torch.float32).numpy()
+    return torch.from_numpy(_weight_only_qdq_mean_scale(arr))
+
+
+def _torch_qdq_per_tensor_embedding(torch, t):
+    arr = t.detach().cpu().to(dtype=torch.float32).numpy()
+    return torch.from_numpy(_weight_only_qdq_per_tensor_embedding(arr))
+
+
+def build_weight_only_int8_reference(
+    payload: Mapping[str, object],
+    *,
+    weight_mode: str = "per_channel",
+) -> NanoGPTFP32Reference:
+    """Build a `NanoGPTFP32Reference` whose linear weights are INT8 QDQ.
+
+    This is the W8A32 reference path: INT8 weight storage (per-channel
+    scales by default, padded to 16 wide for the matmul tile), FP32
+    activations and FP32 inter-layer storage everywhere else. The
+    diagnostic at `software/tools/diagnose_weight_only_qdq_ceiling.py`
+    proved this achieves 53.42 PPL on `gpt2_converted_nanogpt.pt` at
+    257-tok / 256-ctx, vs an FP32 ceiling of 53.69 PPL.
+
+    Embeddings (`wte`, `wpe`) use the codebase's per-tensor INT8 path to
+    match the deployed bundle's embedding scheme. Linear weights
+    (`lm_head`, per-head Q/K/V, `c_proj`, `fc_w`, `proj_w`) use per-row
+    symmetric INT8 quant with no mean-scale averaging.
+
+    Args:
+        payload: Loaded checkpoint dict with keys `state_dict` and
+            `model_args`. Same shape as `evaluate_gpt2_perplexity` consumes.
+        weight_mode: Either ``"per_channel"`` (W8A32 production path) or
+            ``"mean_scale"`` (diagnostic-only; matches the catastrophic
+            mean-scale approximation isolated in `_linear_components`).
+
+    Returns:
+        A `NanoGPTFP32Reference` ready for `.incremental_logits_trace(...)`.
+    """
+    import torch  # local import keeps the FP32 module CPU-load cheap
+
+    if weight_mode not in ("per_channel", "mean_scale"):
+        raise ValueError(
+            f"weight_mode must be 'per_channel' or 'mean_scale', got {weight_mode!r}"
+        )
+    linear_qdq = (
+        _torch_qdq_per_channel if weight_mode == "per_channel" else _torch_qdq_mean_scale
+    )
+
+    ref = NanoGPTFP32Reference(payload["state_dict"], payload["model_args"])
+    ref.wte = _torch_qdq_per_tensor_embedding(torch, ref.wte)
+    ref.wpe = _torch_qdq_per_tensor_embedding(torch, ref.wpe)
+    ref.lm_head_w = linear_qdq(torch, ref.lm_head_w)
+
+    for layer in ref.layers:
+        new_heads = []
+        for (q_w, k_w, v_w, q_b, k_b, v_b) in layer["heads"]:
+            new_heads.append((
+                linear_qdq(torch, q_w),
+                linear_qdq(torch, k_w),
+                linear_qdq(torch, v_w),
+                q_b,  # biases stay FP32 — W8A32 only quantises weights
+                k_b,
+                v_b,
+            ))
+        layer["heads"] = new_heads
+        layer["c_proj_w"] = linear_qdq(torch, layer["c_proj_w"])
+        layer["fc_w"] = linear_qdq(torch, layer["fc_w"])
+        layer["proj_w"] = linear_qdq(torch, layer["proj_w"])
+        # LN weights/biases stay FP32 (small tensors, not the bottleneck).
+    return ref

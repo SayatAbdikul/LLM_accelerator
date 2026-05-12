@@ -28,7 +28,7 @@ CALIBRATION_SEQ_LEN_LARGE = 128
 CALIBRATION_PERCENTILE_DEFAULT = 99.9
 
 from .fake_quant_reference import NanoGPTFQReference
-from .fp32_reference import NanoGPTFP32Reference
+from .fp32_reference import NanoGPTFP32Reference, build_weight_only_int8_reference
 from .host_runner import HostRunner
 from .stage5_ptq import (
     Stage5PTQPreset,
@@ -164,6 +164,31 @@ def run_fp32_teacher_forced_logits(
     return ref.incremental_logits_trace(inputs)
 
 
+def run_weight_only_int8_teacher_forced_logits(
+    payload: Dict[str, object],
+    context_tokens: Sequence[int],
+) -> List[np.ndarray]:
+    """W8A32 (Phase 1): INT8 weight QDQ + FP32 activations everywhere.
+
+    Builds a `NanoGPTFP32Reference` with weights replaced by their per-row
+    INT8 QDQ form (per-tensor for embeddings, per-channel for linear) via
+    `build_weight_only_int8_reference`. The diagnostic at
+    `software/tools/diagnose_weight_only_qdq_ceiling.py` proved this
+    achieves 53.42 PPL on the production checkpoint at 257-tok / 256-ctx.
+
+    Both this path and the diagnostic share the same helper, so per-token
+    logits are bit-identical across the two paths (covered by
+    `tests/runtime/test_weight_only_int8_perplexity.py`).
+
+    Note: no calibration scales, no `Stage5PTQPreset` knobs. The W8A32
+    preset (`weight_only_int8`) intentionally rejects every W8A8 transform
+    at construction time — see `Stage5PTQPreset._preset` validation.
+    """
+    inputs, _ = teacher_forced_inputs_and_targets(context_tokens)
+    ref = build_weight_only_int8_reference(payload, weight_mode="per_channel")
+    return ref.incremental_logits_trace(inputs)
+
+
 def run_fake_quant_teacher_forced_logits(
     payload: Dict[str, object],
     context_tokens: Sequence[int],
@@ -232,6 +257,56 @@ def evaluate_gpt2_perplexity(
     resolved_preset = resolve_stage5_ptq_preset(
         stage5_default_ptq_preset_name() if ptq_preset is None else ptq_preset
     )
+
+    # W8A32 branch (Phase 1, plan `w8a32-weights-only-plan.md`). FP32
+    # activations, INT8 per-channel weight QDQ. No calibration, no golden
+    # bundle path. The W8A32 preset rejects every W8A8 transform at
+    # construction time, so we can short-circuit the rest of the pipeline.
+    # `golden_perplexity` / `golden_nll` / `relative_delta` are NaN to
+    # signal "no compiled-bundle path is available for W8A32 on the current
+    # ISA"; the deployment scoping doc covers the codegen work needed.
+    if resolved_preset.weight_only_int8:
+        _, targets = teacher_forced_inputs_and_targets(eval_tokens)
+        vocab_size = int(payload["model_args"]["vocab_size"])
+        fake_logits = run_weight_only_int8_teacher_forced_logits(payload, eval_tokens)
+        if len(fake_logits) != len(targets):
+            raise RuntimeError("W8A32 logits/targets length mismatch")
+        fake_nlls = [
+            stable_cross_entropy(
+                np.asarray(row, dtype=np.float32), target, vocab_size=vocab_size
+            )
+            for row, target in zip(fake_logits, targets)
+        ]
+        fake_ppl, fake_nll = perplexity_from_nlls(fake_nlls)
+
+        fp32_ppl = float("nan")
+        fp32_nll = float("nan")
+        if fp32_logits is not None:
+            if len(fp32_logits) != len(targets):
+                raise RuntimeError("FP32 logits/targets length mismatch")
+            fp32_nlls = [
+                stable_cross_entropy(
+                    np.asarray(row, dtype=np.float32), target, vocab_size=vocab_size
+                )
+                for row, target in zip(fp32_logits, targets)
+            ]
+            fp32_ppl, fp32_nll = perplexity_from_nlls(fp32_nlls)
+
+        return GPT2PerplexityResult(
+            golden_perplexity=float("nan"),
+            fake_quant_perplexity=fake_ppl,
+            relative_delta=float("nan"),
+            token_count=len(eval_tokens),
+            target_count=len(targets),
+            golden_nll=float("nan"),
+            fake_quant_nll=fake_nll,
+            tokenizer_dir=str(tokenizer_dir),
+            calibration_sha256=calibration_sha256,
+            eval_sha256=eval_sha256,
+            ptq_preset=resolved_preset.name,
+            fp32_perplexity=float(fp32_ppl),
+            fp32_nll=float(fp32_nll),
+        )
     if resolved_preset.quarot_enabled:
         # QuaRot Phase 1 must run BEFORE any calibration so the 99.9-percentile
         # activation scales are computed against the rotated (near-isotropic)

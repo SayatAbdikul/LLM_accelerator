@@ -33,8 +33,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from taccel.runtime.fake_quant_reference import _linear_components
-from taccel.runtime.fp32_reference import NanoGPTFP32Reference
+from taccel.runtime.fp32_reference import (
+    NanoGPTFP32Reference,
+    build_weight_only_int8_reference,
+)
 from taccel.runtime.gpt2_perplexity import (
     perplexity_from_nlls,
     stable_cross_entropy,
@@ -43,65 +45,8 @@ from taccel.runtime.gpt2_perplexity import (
 )
 
 
-def _qdq_torch(t, *, mode: str = "per_channel"):
-    """Return INT8 QDQ form of a 2-D weight as a torch.float32 tensor.
-
-    mode="per_channel": properly per-channel-quant + per-channel-dequant.
-        Tests the cost of clean INT8 weight quantization.
-    mode="mean_scale": codebase's mean-scale dequant (matches integer matmul
-        in production, but the approximation is masked there by activation
-        quant + integer accumulator). Catastrophic in FP32 matmul.
-    """
-    arr = t.detach().cpu().to(dtype=torch.float32).numpy()
-    if mode == "mean_scale":
-        qdq = _linear_components(arr)[2]
-        return torch.from_numpy(qdq.astype(np.float32))
-    elif mode == "per_channel":
-        # Per-channel (per-row) symmetric INT8 quant + per-channel dequant.
-        max_abs = np.maximum(np.max(np.abs(arr), axis=1, keepdims=True), 1e-10)
-        scale = max_abs / 127.0
-        q = np.clip(np.round(arr / scale), -128, 127).astype(np.int8)
-        qdq = q.astype(np.float32) * scale
-        return torch.from_numpy(qdq.astype(np.float32))
-    else:
-        raise ValueError(f"unknown mode: {mode}")
-
-
-def _qdq_per_tensor_torch(t):
-    """Return per-tensor INT8 QDQ form (used for embeddings; no per-channel)."""
-    from taccel.runtime.fake_quant_reference import _fq_embedding
-    arr = t.detach().cpu().to(dtype=torch.float32).numpy()
-    return torch.from_numpy(_fq_embedding(arr).astype(np.float32))
-
-
-def build_weight_only_qdq_reference(payload, *, weight_mode: str = "per_channel"):
-    """Build NanoGPTFP32Reference and overwrite linear weights with QDQ forms."""
-    ref = NanoGPTFP32Reference(payload["state_dict"], payload["model_args"])
-
-    # Embeddings (per-tensor INT8 like the deployed bundle)
-    ref.wte = _qdq_per_tensor_torch(ref.wte)
-    ref.wpe = _qdq_per_tensor_torch(ref.wpe)
-    ref.lm_head_w = _qdq_torch(ref.lm_head_w, mode=weight_mode)
-
-    # Per-layer linear weights
-    for layer in ref.layers:
-        # Per-head Q/K/V weights
-        new_heads = []
-        for (q_w, k_w, v_w, q_b, k_b, v_b) in layer["heads"]:
-            new_heads.append((
-                _qdq_torch(q_w, mode=weight_mode),
-                _qdq_torch(k_w, mode=weight_mode),
-                _qdq_torch(v_w, mode=weight_mode),
-                q_b,  # bias stays FP32
-                k_b,
-                v_b,
-            ))
-        layer["heads"] = new_heads
-        layer["c_proj_w"] = _qdq_torch(layer["c_proj_w"], mode=weight_mode)
-        layer["fc_w"] = _qdq_torch(layer["fc_w"], mode=weight_mode)
-        layer["proj_w"] = _qdq_torch(layer["proj_w"], mode=weight_mode)
-        # LN weights and biases stay FP32 (small tensors, not the bottleneck)
-    return ref
+# Re-exported for callers that imported the old name from this module.
+build_weight_only_qdq_reference = build_weight_only_int8_reference
 
 
 def main(argv=None) -> int:
