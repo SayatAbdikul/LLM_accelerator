@@ -22,6 +22,9 @@ from .instructions import (
     MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn, SoftmaxInsn, LayernormInsn, GeluInsn,
     SoftmaxAttnVInsn, MaskedSoftmaxInsn, MaskedSoftmaxAttnVInsn, DequantAddInsn,
     LoadInsn, StoreInsn, SetAddrLoInsn, SetAddrHiInsn,
+    # W8A32 R-type extension (M1)
+    DequantAccumFp32Insn, QuantFp32Int8Insn, VaddFp32Insn,
+    LayernormFp32Insn, GeluFp32Insn, SoftmaxFp32Insn, MaskedSoftmaxFp32Insn,
 )
 
 # Map opcode to concrete R-type class
@@ -38,6 +41,14 @@ _R_TYPE_CLASSES = {
     Opcode.MASKED_SOFTMAX: MaskedSoftmaxInsn,
     Opcode.MASKED_SOFTMAX_ATTNV: MaskedSoftmaxAttnVInsn,
     Opcode.DEQUANT_ADD: DequantAddInsn,
+    # W8A32 R-type extension (M1)
+    Opcode.DEQUANT_ACCUM_FP32: DequantAccumFp32Insn,
+    Opcode.QUANT_FP32_INT8: QuantFp32Int8Insn,
+    Opcode.VADD_FP32: VaddFp32Insn,
+    Opcode.LAYERNORM_FP32: LayernormFp32Insn,
+    Opcode.GELU_FP32: GeluFp32Insn,
+    Opcode.SOFTMAX_FP32: SoftmaxFp32Insn,
+    Opcode.MASKED_SOFTMAX_FP32: MaskedSoftmaxFp32Insn,
 }
 
 _M_TYPE_CLASSES = {

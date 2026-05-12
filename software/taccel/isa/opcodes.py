@@ -7,16 +7,35 @@ Architecture overview
 Three execution units operate behind an in-order issue stage:
   - DMA   : LOAD / STORE (DRAM ↔ SRAM)
   - Systolic : MATMUL (INT8×INT8 → INT32, 16×16 tiled)
-  - SFU   : SOFTMAX / LAYERNORM / GELU (FP32 datapath, INT8 I/O)
+  - SFU   : SOFTMAX / LAYERNORM / GELU (FP32 datapath, INT8 I/O *and* FP32 I/O)
 
 The programmer inserts SYNC instructions with a 3-bit resource mask to
 enforce ordering between units.  Without SYNC, the hardware may overlap
 execution of independent units (e.g. a LOAD can overlap a MATMUL).
 
+W8A32 extension (Phase 3 (c.1), milestone M1, 2026-05-12)
+---------------------------------------------------------
+Seven new R-type opcodes (0x17–0x1D) extend the ISA to support FP32
+inter-layer activations while preserving INT8 MXU matmul:
+  - DEQUANT_ACCUM_FP32: per-channel dequant of INT32 ACCUM → FP32 ABUF
+  - QUANT_FP32_INT8:    per-tensor INT8 quant of FP32 ABUF → INT8 ABUF
+  - VADD_FP32:          element-wise FP32 add (residual stream)
+  - LAYERNORM_FP32:     LayerNorm with FP32 I/O
+  - GELU_FP32:          GELU with FP32 I/O
+  - SOFTMAX_FP32:       row-wise softmax with FP32 I/O
+  - MASKED_SOFTMAX_FP32: causal softmax with FP32 I/O
+
+There is no buffer dtype tag — ABUF bytes are reinterpreted as INT8
+(1 byte/elem) or FP32 (4 bytes/elem) based on the opcode. Codegen owns
+the dtype layout. A 16x16 FP32 tile occupies 64 16-byte buffer units
+versus 16 units for the corresponding INT8 tile.
+
 Reserved fields / opcodes
 -------------------------
-- Opcodes 0x17–0x1F are reserved.  Decoding a reserved opcode raises an
-  illegal-instruction fault and the processor halts.
+- Opcodes 0x1E–0x1F are reserved (down from 0x14–0x1F before M1, and
+  from 0x17-0x1F before the masked-attention extension). Decoding a
+  reserved opcode raises an illegal-instruction fault and the
+  processor halts.
 - CONFIG_ATTN reserved bits [32:0] must be zero.
 - M-TYPE stride_log2 [6:3] is reserved and must be zero.
 - M-TYPE flags [2:0] are reserved and must be zero.
@@ -48,6 +67,15 @@ class Opcode(IntEnum):
     CONFIG_ATTN = 0x14
     MASKED_SOFTMAX = 0x15
     MASKED_SOFTMAX_ATTNV = 0x16
+    # W8A32 extension (M1, 2026-05-12): FP32-I/O variants for inter-layer
+    # activations. All R-type; ABUF bytes reinterpreted as FP32.
+    DEQUANT_ACCUM_FP32 = 0x17
+    QUANT_FP32_INT8 = 0x18
+    VADD_FP32 = 0x19
+    LAYERNORM_FP32 = 0x1A
+    GELU_FP32 = 0x1B
+    SOFTMAX_FP32 = 0x1C
+    MASKED_SOFTMAX_FP32 = 0x1D
 
 
 class InsnFormat(IntEnum):
@@ -84,6 +112,14 @@ OPCODE_FORMAT = {
     Opcode.CONFIG_ATTN: InsnFormat.ATTN_TYPE,
     Opcode.MASKED_SOFTMAX: InsnFormat.R_TYPE,
     Opcode.MASKED_SOFTMAX_ATTNV: InsnFormat.R_TYPE,
+    # W8A32 R-type extension
+    Opcode.DEQUANT_ACCUM_FP32: InsnFormat.R_TYPE,
+    Opcode.QUANT_FP32_INT8: InsnFormat.R_TYPE,
+    Opcode.VADD_FP32: InsnFormat.R_TYPE,
+    Opcode.LAYERNORM_FP32: InsnFormat.R_TYPE,
+    Opcode.GELU_FP32: InsnFormat.R_TYPE,
+    Opcode.SOFTMAX_FP32: InsnFormat.R_TYPE,
+    Opcode.MASKED_SOFTMAX_FP32: InsnFormat.R_TYPE,
 }
 
 # Buffer IDs (2-bit, shared across R-type, M-type, B-type)

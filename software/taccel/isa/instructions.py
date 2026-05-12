@@ -108,6 +108,57 @@ class DequantAddInsn(RTypeInsn):
     opcode: Opcode = field(default=Opcode.DEQUANT_ADD, init=False)
 
 
+# --- W8A32 R-type instructions (Phase 3 (c.1), milestone M1) ---
+#
+# These mirror the existing R-type contract (same field layout, same
+# encoding). The only difference is dtype interpretation:
+#   - DEQUANT_ACCUM_FP32: src1=ACCUM (INT32), src2=WBUF or sreg (FP16
+#     per-channel scale table or scalar), dst=ABUF (FP32 written, 4 bytes/elem)
+#   - QUANT_FP32_INT8:    src1=ABUF (FP32 read), src2=unused, dst=ABUF (INT8 written)
+#   - VADD_FP32:          src1=ABUF (FP32), src2=ABUF (FP32), dst=ABUF (FP32)
+#   - LAYERNORM_FP32:     src1=ABUF (FP32 input), src2=WBUF (FP16 gamma+beta),
+#                          dst=ABUF (FP32 output)
+#   - GELU_FP32:          src1=ABUF (FP32), src2=unused, dst=ABUF (FP32)
+#   - SOFTMAX_FP32:       src1=ABUF (FP32), src2=unused, dst=ABUF (FP32)
+#   - MASKED_SOFTMAX_FP32: src1=ABUF (FP32), src2=unused, dst=ABUF (FP32);
+#                          consumes CONFIG_ATTN context like MASKED_SOFTMAX
+
+
+@dataclass
+class DequantAccumFp32Insn(RTypeInsn):
+    opcode: Opcode = field(default=Opcode.DEQUANT_ACCUM_FP32, init=False)
+
+
+@dataclass
+class QuantFp32Int8Insn(RTypeInsn):
+    opcode: Opcode = field(default=Opcode.QUANT_FP32_INT8, init=False)
+
+
+@dataclass
+class VaddFp32Insn(RTypeInsn):
+    opcode: Opcode = field(default=Opcode.VADD_FP32, init=False)
+
+
+@dataclass
+class LayernormFp32Insn(RTypeInsn):
+    opcode: Opcode = field(default=Opcode.LAYERNORM_FP32, init=False)
+
+
+@dataclass
+class GeluFp32Insn(RTypeInsn):
+    opcode: Opcode = field(default=Opcode.GELU_FP32, init=False)
+
+
+@dataclass
+class SoftmaxFp32Insn(RTypeInsn):
+    opcode: Opcode = field(default=Opcode.SOFTMAX_FP32, init=False)
+
+
+@dataclass
+class MaskedSoftmaxFp32Insn(RTypeInsn):
+    opcode: Opcode = field(default=Opcode.MASKED_SOFTMAX_FP32, init=False)
+
+
 # --- M-type instructions ---
 @dataclass
 class MTypeInsn(Instruction):

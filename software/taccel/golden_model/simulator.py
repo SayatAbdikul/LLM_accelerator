@@ -33,6 +33,9 @@ from ..isa.instructions import (
     MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn,
     SoftmaxInsn, LayernormInsn, GeluInsn, SoftmaxAttnVInsn,
     ConfigAttnInsn, MaskedSoftmaxInsn, MaskedSoftmaxAttnVInsn, DequantAddInsn,
+    # W8A32 extension (M1)
+    DequantAccumFp32Insn, QuantFp32Int8Insn, VaddFp32Insn,
+    LayernormFp32Insn, GeluFp32Insn, SoftmaxFp32Insn, MaskedSoftmaxFp32Insn,
 )
 from .state import MachineState
 from . import memory as mem
@@ -515,6 +518,24 @@ class Simulator:
             execute_layernorm(self.state, insn)
         elif op == Opcode.GELU:
             execute_gelu(self.state, insn)
+        # ----- W8A32 extension (Phase 3 (c.1), M1) -----
+        elif op == Opcode.DEQUANT_ACCUM_FP32:
+            self._exec_dequant_accum_fp32(insn)
+        elif op == Opcode.QUANT_FP32_INT8:
+            self._exec_quant_fp32_int8(insn)
+        elif op == Opcode.VADD_FP32:
+            self._exec_vadd_fp32(insn)
+        elif op == Opcode.LAYERNORM_FP32:
+            self._exec_layernorm_fp32(insn)
+        elif op == Opcode.GELU_FP32:
+            self._exec_gelu_fp32(insn)
+        elif op == Opcode.SOFTMAX_FP32:
+            self._exec_softmax_fp32(insn)
+        elif op == Opcode.MASKED_SOFTMAX_FP32:
+            if self.state.tile_config is None:
+                raise ConfigError("CONFIG_TILE not set")
+            self._validate_attn_context_for_key_cols((self.state.tile_config[1] + 1) * 16)
+            self._exec_masked_softmax_fp32(insn)
         else:
             raise IllegalOpcodeError(self.state.pc, b'\x00' * 8)
 
@@ -739,4 +760,236 @@ class Simulator:
         result = np.clip(np.round(accum * accum_rescale + skip * skip_rescale), -128, 127).astype(np.int8)
 
         mem.write_int8_tile(self.state, insn.dst_buf, insn.dst_off, result)
+        self.state.cycle_count += M * N
+
+    # =======================================================================
+    # W8A32 extension handlers (Phase 3 (c.1), milestone M1, 2026-05-12)
+    #
+    # The seven _exec_*_fp32 handlers below implement the new R-type opcodes
+    # 0x17-0x1D. Buffer addressing follows the same 16-byte-unit contract as
+    # the INT8 variants; the difference is dtype interpretation:
+    #   - FP32 reads/writes use `mem.read_fp32_tile` / `mem.write_fp32_tile`
+    #   - FP16 per-channel / vector parameters use `mem.read_fp16_vector`
+    #   - ACCUM stays INT32-only (the MXU's contract is unchanged)
+    # =======================================================================
+
+    def _exec_dequant_accum_fp32(self, insn):
+        """DEQUANT_ACCUM_FP32: ACCUM[INT32] x per-col FP16 scales -> ABUF[FP32].
+
+        Mirrors `_exec_requant_pc` but writes FP32 to ABUF instead of clipping to
+        INT8. src1 must be ACCUM; src2 points at N FP16 scales (one per output
+        column) in WBUF or ABUF; dst is ABUF written as FP32.
+        """
+        if self.state.tile_config is None:
+            raise ConfigError("CONFIG_TILE not set")
+        if insn.src1_buf != BUF_ACCUM:
+            raise IllegalBufferError(insn.src1_buf)
+        if insn.src2_buf == BUF_ACCUM:
+            raise IllegalBufferError(insn.src2_buf)
+        if insn.dst_buf == BUF_ACCUM:
+            raise IllegalBufferError(insn.dst_buf)
+
+        m_tiles = self.state.tile_config[0] + 1
+        n_tiles = self.state.tile_config[1] + 1
+        M = m_tiles * 16
+        N = n_tiles * 16
+
+        src = mem.read_int32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
+        scales = mem.read_fp16_vector(self.state, insn.src2_buf, insn.src2_off, N).reshape(1, N)
+        result = (src.astype(np.float32) * scales).astype(np.float32)
+
+        mem.write_fp32_tile(self.state, insn.dst_buf, insn.dst_off, result)
+        self.state.cycle_count += M * N
+
+    def _exec_quant_fp32_int8(self, insn):
+        """QUANT_FP32_INT8: ABUF[FP32] -> ABUF[INT8] using sreg scale.
+
+        For just-in-time activation quant before the next INT8 MATMUL. The
+        scale register holds 1/act_scale as FP16 (i.e. the value to multiply
+        by, not the divisor). Output: clip(round(src / act_scale), -128, 127).
+        """
+        if self.state.tile_config is None:
+            raise ConfigError("CONFIG_TILE not set")
+        if insn.src1_buf == BUF_ACCUM:
+            raise IllegalBufferError(insn.src1_buf)
+        if insn.dst_buf == BUF_ACCUM:
+            raise IllegalBufferError(insn.dst_buf)
+
+        m_tiles = self.state.tile_config[0] + 1
+        n_tiles = self.state.tile_config[1] + 1
+        M = m_tiles * 16
+        N = n_tiles * 16
+
+        scale = np.float32(self.state.scale_regs[insn.sreg])
+        src = mem.read_fp32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
+        result = np.clip(np.round(src * scale), -128, 127).astype(np.int8)
+        mem.write_int8_tile(self.state, insn.dst_buf, insn.dst_off, result)
+        self.state.cycle_count += M * N
+
+    def _exec_vadd_fp32(self, insn):
+        """VADD_FP32: ABUF[FP32] + ABUF[FP32] -> ABUF[FP32].
+
+        Used for the W8A32 residual stream: no saturation, no INT8 clip.
+        Both sources and dst live in ABUF interpreted as FP32.
+        """
+        if self.state.tile_config is None:
+            raise ConfigError("CONFIG_TILE not set")
+        if insn.src1_buf == BUF_ACCUM or insn.src2_buf == BUF_ACCUM:
+            raise IllegalBufferError(BUF_ACCUM)
+        if insn.dst_buf == BUF_ACCUM:
+            raise IllegalBufferError(insn.dst_buf)
+
+        m_tiles = self.state.tile_config[0] + 1
+        n_tiles = self.state.tile_config[1] + 1
+        M = m_tiles * 16
+        N = n_tiles * 16
+
+        src1 = mem.read_fp32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
+        src2 = mem.read_fp32_tile(self.state, insn.src2_buf, insn.src2_off, M, N)
+        result = (src1 + src2).astype(np.float32)
+        mem.write_fp32_tile(self.state, insn.dst_buf, insn.dst_off, result)
+        self.state.cycle_count += M * N
+
+    def _exec_layernorm_fp32(self, insn):
+        """LAYERNORM_FP32: row-wise LayerNorm with FP32 I/O.
+
+        src1: ABUF FP32 input, shape [M, N].
+        src2: gamma+beta vector in WBUF/ABUF stored as 2N FP16 values
+              (first N gamma, next N beta), widened to FP32 like the
+              INT8 LAYERNORM op does.
+        dst:  ABUF FP32 output, same shape as input.
+
+        Uses the same Welford-style mean/variance + eps=1e-6 convention
+        as the existing INT8 LAYERNORM (see `sfu.py`). The only
+        difference is no INT8 output quantisation step.
+        """
+        if self.state.tile_config is None:
+            raise ConfigError("CONFIG_TILE not set")
+        if insn.src1_buf == BUF_ACCUM or insn.src2_buf == BUF_ACCUM:
+            raise IllegalBufferError(BUF_ACCUM)
+        if insn.dst_buf == BUF_ACCUM:
+            raise IllegalBufferError(insn.dst_buf)
+
+        m_tiles = self.state.tile_config[0] + 1
+        n_tiles = self.state.tile_config[1] + 1
+        M = m_tiles * 16
+        N = n_tiles * 16
+
+        src = mem.read_fp32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
+        gamma_beta = mem.read_fp16_vector(self.state, insn.src2_buf, insn.src2_off, 2 * N)
+        gamma = gamma_beta[:N].reshape(1, N)
+        beta = gamma_beta[N:].reshape(1, N)
+
+        mean = src.mean(axis=-1, keepdims=True).astype(np.float32)
+        var = src.var(axis=-1, keepdims=True).astype(np.float32)
+        eps = np.float32(1e-6)
+        normalized = (src - mean) / np.sqrt(var + eps)
+        result = (normalized * gamma + beta).astype(np.float32)
+        mem.write_fp32_tile(self.state, insn.dst_buf, insn.dst_off, result)
+        self.state.cycle_count += M * N
+
+    def _exec_gelu_fp32(self, insn):
+        """GELU_FP32: GELU activation with FP32 I/O.
+
+        Uses the same GELU approximation as the FQ reference (tanh-based
+        gelu_new for split_qkv_bias models, plain erf-based gelu otherwise).
+        For the W8A32 path we standardise on the tanh GELU (the GPT-2
+        production checkpoint uses split_qkv_bias=True) — if downstream
+        codegen needs the plain GELU, add a flag here.
+        """
+        if self.state.tile_config is None:
+            raise ConfigError("CONFIG_TILE not set")
+        if insn.src1_buf == BUF_ACCUM:
+            raise IllegalBufferError(insn.src1_buf)
+        if insn.dst_buf == BUF_ACCUM:
+            raise IllegalBufferError(insn.dst_buf)
+
+        m_tiles = self.state.tile_config[0] + 1
+        n_tiles = self.state.tile_config[1] + 1
+        M = m_tiles * 16
+        N = n_tiles * 16
+
+        src = mem.read_fp32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
+        # gelu_new (tanh): xf * 0.5 * (1 + tanh(sqrt(2/pi) * (xf + 0.044715 * xf^3)))
+        xf = src.astype(np.float32)
+        sqrt_2_over_pi = np.float32(np.sqrt(2.0 / np.pi))
+        inner = sqrt_2_over_pi * (xf + np.float32(0.044715) * xf ** 3)
+        result = (xf * np.float32(0.5) * (np.float32(1.0) + np.tanh(inner))).astype(np.float32)
+        mem.write_fp32_tile(self.state, insn.dst_buf, insn.dst_off, result)
+        self.state.cycle_count += M * N
+
+    def _exec_softmax_fp32(self, insn):
+        """SOFTMAX_FP32: row-wise softmax with FP32 I/O.
+
+        Standard numerically-stable softmax: y = exp(x - max(x)) / sum.
+        Used for Q@K^T attention scores in the W8A32 path. Causal
+        attention uses the MASKED_SOFTMAX_FP32 variant.
+        """
+        if self.state.tile_config is None:
+            raise ConfigError("CONFIG_TILE not set")
+        if insn.src1_buf == BUF_ACCUM:
+            raise IllegalBufferError(insn.src1_buf)
+        if insn.dst_buf == BUF_ACCUM:
+            raise IllegalBufferError(insn.dst_buf)
+
+        m_tiles = self.state.tile_config[0] + 1
+        n_tiles = self.state.tile_config[1] + 1
+        M = m_tiles * 16
+        N = n_tiles * 16
+
+        src = mem.read_fp32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
+        row_max = src.max(axis=-1, keepdims=True)
+        exp_row = np.exp((src - row_max).astype(np.float32))
+        result = (exp_row / exp_row.sum(axis=-1, keepdims=True)).astype(np.float32)
+        mem.write_fp32_tile(self.state, insn.dst_buf, insn.dst_off, result)
+        self.state.cycle_count += M * N
+
+    def _exec_masked_softmax_fp32(self, insn):
+        """MASKED_SOFTMAX_FP32: causal-masked softmax with FP32 I/O.
+
+        Consumes CONFIG_ATTN context (set via the existing ConfigAttn path)
+        to determine the valid key columns per query row. Used in the
+        prefill stream for self-attention.
+
+        For a query row q and key cols 0..N-1, columns > (q + query_row_base)
+        are masked to -inf before the softmax. valid_kv_len further bounds
+        the maximum key column considered.
+        """
+        if self.state.tile_config is None:
+            raise ConfigError("CONFIG_TILE not set")
+        if insn.src1_buf == BUF_ACCUM:
+            raise IllegalBufferError(insn.src1_buf)
+        if insn.dst_buf == BUF_ACCUM:
+            raise IllegalBufferError(insn.dst_buf)
+
+        m_tiles = self.state.tile_config[0] + 1
+        n_tiles = self.state.tile_config[1] + 1
+        M = m_tiles * 16
+        N = n_tiles * 16
+
+        ctx = self.state.attn_context
+        query_row_base = int(ctx["query_row_base"])
+        valid_kv_len = int(ctx["valid_kv_len"])
+
+        src = mem.read_fp32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
+        result = np.zeros_like(src, dtype=np.float32)
+        for i in range(M):
+            row = src[i].astype(np.float32).copy()
+            # Causal mask: keys 0..(i + query_row_base) are valid,
+            # bounded above by valid_kv_len - 1.
+            keep_through = min(i + query_row_base, valid_kv_len - 1)
+            if keep_through < 0:
+                # Defensive — pathological config; emit zeros so we don't
+                # propagate NaN out of an all-masked row.
+                result[i] = 0.0
+                continue
+            if keep_through + 1 < N:
+                row[keep_through + 1:] = -np.inf
+            row_max = float(row.max())
+            exp_row = np.exp((row - row_max).astype(np.float32))
+            if keep_through + 1 < N:
+                exp_row[keep_through + 1:] = 0.0
+            denom = float(exp_row.sum())
+            result[i] = exp_row / denom if denom > 0.0 else 0.0
+        mem.write_fp32_tile(self.state, insn.dst_buf, insn.dst_off, result.astype(np.float32))
         self.state.cycle_count += M * N
