@@ -148,6 +148,29 @@ class CodeGenerator:
         # Track node outputs that live in DRAM temp (from strip-mined spills)
         # Maps output_name → DRAM byte offset of the spilled data
         self.dram_temp_outputs: Dict[str, int] = {}
+        # M4-A: when an FP32 tile in `dram_temp_outputs` was spilled because
+        # of ABUF pressure (not because the producer was strip-mined or
+        # large-weight-tiled), we mark its byte size here so reload knows
+        # the FP32 stride. INT8 reloads use M_pad * N_pad bytes; FP32
+        # reloads use M_pad * N_pad * 4 bytes.
+        self.dram_temp_fp32_outputs: Dict[str, int] = {}
+        # M4-A: exposed to per-emitter helpers (see `w8a32_emit.py`).
+        # `last_uses` maps output_name → final node index that consumes it.
+        # `current_node_idx` is the index of the node currently being emitted.
+        # Set by `generate()` immediately before each `_emit_node` call.
+        self.last_uses: Dict[str, int] = {}
+        self.current_node_idx: int = -1
+        # M4-A: spill an FP32 residual tile to DRAM only when its byte
+        # size exceeds this threshold. Tiny fixtures (d_model=16, 1 KB
+        # tiles) skip spill so existing test instruction counts are
+        # preserved; real GPT-2 (d_model=768, 48 KB tiles) triggers spill.
+        # 16 KB picks the boundary at d_model ≈ 256 → only spills when
+        # ABUF residency actually matters.
+        self.fp32_spill_threshold_bytes: int = 16384
+        # Default to 0 so unit tests that bypass _layout_weights (and
+        # would set dram_temp_start to a non-zero offset) don't crash
+        # in _spill_fp32_tile_to_dram. _layout_weights overwrites this.
+        self.dram_temp_start: int = 0
         # Optional trace metadata keyed by program counter. Each event tells the
         # simulator how to decode a node output back into FP32 for diagnostics.
         self.trace_manifest: Dict[int, List[Dict[str, Any]]] = {}
@@ -183,9 +206,15 @@ class CodeGenerator:
 
         # Compute last-use index for each node output so we can free ABUF
         last_uses = graph.compute_last_uses()
+        # M4-A: expose to per-emitter helpers (`w8a32_emit.emit_layernorm_fp32`
+        # spills FP32 residuals after reading them, and `emit_vadd_fp32`
+        # reloads them from `dram_temp_outputs` and aliases the output
+        # in-place into the sublayer input — both rely on this state).
+        self.last_uses = last_uses
 
         # Second pass: emit instructions
         for idx, node in enumerate(graph.nodes):
+            self.current_node_idx = idx
             # Compact ABUF before each layernorm to prevent fragmentation.
             # Strip-mined MLP ops leave holes; compacting before each LN gives
             # subsequent head matmuls a contiguous free region.
@@ -201,6 +230,12 @@ class CodeGenerator:
                     # Also free per-head sub-allocations (e.g. k_head0, q_head1)
                     for h in range(self.config.n_head):
                         self.mem.abuf.free(f"{inp_name}_head{h}")
+                    # M4-A: if this tile was spilled to FP32 DRAM-temp and
+                    # the consumer reloaded it, drop the dram_temp_outputs
+                    # entry so we don't leak the symbol.
+                    if inp_name in self.dram_temp_fp32_outputs:
+                        del self.dram_temp_fp32_outputs[inp_name]
+                        self.dram_temp_outputs.pop(inp_name, None)
 
         self.instructions.append(HaltInsn())
         return self.instructions, bytes(self.dram_blob)
@@ -2677,6 +2712,55 @@ class CodeGenerator:
             self.mem.abuf.free(input_name)
         alloc = self.mem.abuf.alloc(input_name, M_pad * N_pad)
         self._emit_dma_load(BUF_ABUF, alloc.offset_units, M_pad * N_pad, 3, dram_off)
+        self._emit(SyncInsn(resource_mask=0b001))
+        return alloc
+
+    def _spill_fp32_tile_to_dram(self, name: str, alloc: Allocation,
+                                  M_pad: int, N_pad: int) -> int:
+        """M4-A: spill an FP32 ABUF tile to DRAM-temp, free its ABUF slot.
+
+        Used by `emit_layernorm_fp32` to evict the LN input (residual)
+        after LN has read it but before consumers (the next residual
+        VADD) need it back. Without this, real GPT-2's 48 KB residual
+        FP32 tile would pin ABUF across the entire per-head attention
+        loop and force a peak occupancy > 128 KB.
+
+        Returns the DRAM byte offset where the FP32 tile lives. The
+        consumer (typically `emit_vadd_fp32`) reloads it via
+        `_load_dram_to_abuf_fp32` and the spilled `dram_temp_outputs`
+        entry is cleaned up in the generate loop's post-emit free.
+        """
+        size_bytes = M_pad * N_pad * 4  # FP32
+        dram_off = self.dram_temp_start + self.mem.alloc_dram_temp(
+            f"fp32_spill_{name}", size_bytes
+        )
+        # DMA store ABUF → DRAM. addr_reg=2 matches the existing
+        # strip-mined spill convention (avoids clashing with addr_reg=1
+        # used by VADD producers and addr_reg=3 used by loads).
+        self._emit_dma_store(BUF_ABUF, alloc.offset_units, size_bytes, 2, dram_off)
+        self._emit(SyncInsn(resource_mask=0b010))
+        self.dram_temp_outputs[name] = dram_off
+        self.dram_temp_fp32_outputs[name] = size_bytes
+        # Free the ABUF slot. The spilled name will re-allocate when
+        # the consumer reloads.
+        self.mem.abuf.free(name)
+        return dram_off
+
+    def _load_dram_to_abuf_fp32(self, input_name: str,
+                                 M_pad: int, N_pad: int) -> Allocation:
+        """M4-A: FP32 counterpart to `_load_dram_to_abuf` (4 bytes/elem).
+
+        Reads `M_pad * N_pad * 4` bytes from `dram_temp_outputs[input_name]`
+        back into ABUF. Caller is responsible for marking the dram_temp
+        slot consumed (the generate loop's post-emit free does this when
+        `dram_temp_fp32_outputs[input_name]` is set).
+        """
+        dram_off = self.dram_temp_outputs[input_name]
+        if self.mem.abuf.get(input_name) is not None:
+            self.mem.abuf.free(input_name)
+        size_bytes = M_pad * N_pad * 4
+        alloc = self.mem.abuf.alloc(input_name, size_bytes)
+        self._emit_dma_load(BUF_ABUF, alloc.offset_units, size_bytes, 3, dram_off)
         self._emit(SyncInsn(resource_mask=0b001))
         return alloc
 

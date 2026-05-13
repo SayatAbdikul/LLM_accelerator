@@ -158,7 +158,14 @@ def emit_layernorm_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
         cg._emit_dma_load(BUF_WBUF, beta_off_units, N_pad * 2, 1, beta_dram)
         cg._emit(SyncInsn(resource_mask=0b001))
 
-    in_alloc = _abuf_alloc_fp32(cg, node.inputs[0], M_pad, N_pad)
+    in_name = node.inputs[0]
+    # M4-A: if this LN input was previously spilled to DRAM-temp (by an
+    # earlier LN at a block boundary), reload it via the FP32 helper so
+    # the LN reads it directly from ABUF.
+    if in_name in cg.dram_temp_fp32_outputs and cg.mem.abuf.get(in_name) is None:
+        in_alloc = cg._load_dram_to_abuf_fp32(in_name, M_pad, N_pad)
+    else:
+        in_alloc = _abuf_alloc_fp32(cg, in_name, M_pad, N_pad)
     out_alloc = _abuf_alloc_fp32(cg, node.name, M_pad, N_pad)
     cg._emit(
         LayernormFp32Insn(
@@ -187,6 +194,21 @@ def emit_layernorm_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
 
     if gb_alloc is not None:
         cg.mem.wbuf.free(f"gb_{node.name}")
+
+    # M4-A: spill the LN input (residual) to DRAM-temp if it has future
+    # uses and is big enough to matter. This frees ABUF for the per-head
+    # attention sub-block. The consumer (next residual VADD) reloads it
+    # via `_load_dram_to_abuf_fp32`. Skip for tiny fixtures (≤ 16 KB
+    # tiles) so existing tests' instruction counts stay unchanged.
+    tile_bytes = M_pad * N_pad * FP32_BYTES_PER_ELEM
+    last_use_idx = cg.last_uses.get(in_name, -1)
+    has_future_use = last_use_idx > cg.current_node_idx
+    if (
+        has_future_use
+        and tile_bytes >= cg.fp32_spill_threshold_bytes
+        and in_name not in cg.dram_temp_fp32_outputs
+    ):
+        cg._spill_fp32_tile_to_dram(in_name, in_alloc, M_pad, N_pad)
 
 
 def emit_gelu_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
@@ -327,16 +349,64 @@ def emit_vadd_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
     Two FP32 sources read from ABUF, FP32 destination written to ABUF.
     Unlike the INT8 VADD, FP32 add does not saturate and does not
     consume per-tensor activation scales.
+
+    M4-A
+    ----
+    Two ABUF residency optimizations:
+
+    1. **Reload from FP32 DRAM-temp.** If either input was spilled by
+       an earlier `emit_layernorm_fp32` (block boundary residual), DMA-
+       load it back into ABUF first. The reload uses the FP32 stride
+       (4 bytes/elem) — `_load_dram_to_abuf_fp32` does this.
+
+    2. **In-place output aliasing.** Write the FP32 sum into one of the
+       input slots (either is safe since both inputs' last use is this
+       node by the residual-VADD IR contract). The simulator's
+       `_exec_vadd_fp32` reads both sources fully before writing dst,
+       so `dst_off == src{1,2}_off` is well-defined.
+
+       Selection rule: prefer the input whose last use is at this node
+       AND was reloaded from DRAM (since that slot is freshly allocated
+       and dead after this op). Fall back to inputs[1] (matches the INT8
+       `_emit_vadd` convention — see codegen.py:2779). This keeps the
+       INT8 and W8A32 paths' ABUF layouts isomorphic for downstream ops.
+
+    Without (1) the 48 KB residual reload would silently miss the spilled
+    DRAM bytes; without (2) the peak ABUF would still exceed 128 KB at
+    `block0_residual1` (tok_pos_add 48 KB + block0_attn_out 48 KB + new
+    block0_residual1 48 KB = 144 KB).
     """
     M_pad = pad_dim(node.output_shape[0])
     N_pad = pad_dim(node.output_shape[1])
     m_tiles = M_pad // TILE
     n_tiles = N_pad // TILE
+
+    in0_name = node.inputs[0]
+    in1_name = node.inputs[1]
+    # Reload spilled FP32 inputs first. CONFIG_TILE goes AFTER the loads
+    # so the simulator's DMA path runs without an active tile context
+    # (matches the INT8 VADD pattern at codegen.py:2776-2785).
+    in0_reloaded = False
+    in1_reloaded = False
+    if in0_name in cg.dram_temp_fp32_outputs and cg.mem.abuf.get(in0_name) is None:
+        cg._load_dram_to_abuf_fp32(in0_name, M_pad, N_pad)
+        in0_reloaded = True
+    if in1_name in cg.dram_temp_fp32_outputs and cg.mem.abuf.get(in1_name) is None:
+        cg._load_dram_to_abuf_fp32(in1_name, M_pad, N_pad)
+        in1_reloaded = True
+
     cg._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=0))
 
-    src1_alloc = _abuf_alloc_fp32(cg, node.inputs[0], M_pad, N_pad)
-    src2_alloc = _abuf_alloc_fp32(cg, node.inputs[1], M_pad, N_pad)
-    out_alloc = _abuf_alloc_fp32(cg, node.name, M_pad, N_pad)
+    src1_alloc = _abuf_alloc_fp32(cg, in0_name, M_pad, N_pad)
+    src2_alloc = _abuf_alloc_fp32(cg, in1_name, M_pad, N_pad)
+
+    # In-place aliasing: rewrite the result into one of the inputs' slots.
+    # Pick inputs[0] when it was just reloaded from DRAM (its slot is
+    # freshly allocated and dead after this VADD), else fall back to
+    # inputs[1] matching the INT8 convention.
+    alias_input_name = in0_name if in0_reloaded else in1_name
+    alias_input_alloc = src1_alloc if in0_reloaded else src2_alloc
+
     cg._emit(
         VaddFp32Insn(
             src1_buf=BUF_ABUF,
@@ -344,10 +414,28 @@ def emit_vadd_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
             src2_buf=BUF_ABUF,
             src2_off=src2_alloc.offset_units,
             dst_buf=BUF_ABUF,
-            dst_off=out_alloc.offset_units,
+            dst_off=alias_input_alloc.offset_units,
         )
     )
     cg._emit(SyncInsn(resource_mask=0b100))
+
+    # Rename the aliased input's ABUF allocation to the output node name.
+    # After this, `cg.mem.abuf.get(node.name)` returns the (renamed)
+    # allocation, and `cg.mem.abuf.get(alias_input_name)` returns None.
+    # The post-emit free in generate() then skips alias_input_name (no
+    # double-free) and frees the *other* input normally.
+    aliased = cg.mem.abuf.allocations.pop(alias_input_name, None)
+    if aliased is not None:
+        aliased.name = node.name
+        cg.mem.abuf.allocations[node.name] = aliased
+        out_alloc = aliased
+    else:
+        # Defensive: alias_input_name wasn't actually in ABUF (e.g. the
+        # name was already aliased upstream). Fall back to allocating a
+        # fresh slot for node.name and writing the result there. This
+        # branch shouldn't trigger under the current IR contract but
+        # keeps the helper robust against future graph rewriters.
+        out_alloc = _abuf_alloc_fp32(cg, node.name, M_pad, N_pad)
 
     out_scale = cg.calibration_scales.get(node.name, 1.0 / 127.0)
     cg._record_trace_event(

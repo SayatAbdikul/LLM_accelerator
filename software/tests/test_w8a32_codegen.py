@@ -2582,3 +2582,235 @@ def test_stage3_w8a32_bundle_deterministic_across_runs():
     a = _run()
     b = _run()
     np.testing.assert_array_equal(a, b)
+
+
+# ---------------------------------------------------------------------------
+# M4-A: ABUF residency (in-place VADD aliasing + FP32 DRAM-temp spill).
+#
+# Real GPT-2 124M with d_model=768 hit MemoryError at `tok_pos_add`
+# because the 48 KB FP32 residual + 48 KB other FP32 tile + 48 KB output
+# = 144 KB > 128 KB ABUF. M4-A introduces:
+#
+#   1. `emit_vadd_fp32` writes its result in-place into one of the input
+#      slots and renames the ABUF allocation (matches the INT8 path).
+#   2. `emit_layernorm_fp32` spills its FP32 input to DRAM-temp after
+#      reading it when the input has future uses AND the tile is ≥ the
+#      `fp32_spill_threshold_bytes` (16 KB). The next `emit_vadd_fp32`
+#      reloads via `_load_dram_to_abuf_fp32`.
+#
+# Tiny fixtures (d_model=16, 1 KB tile) stay below the threshold and
+# emit the original instruction stream unchanged — verified by the
+# pre-M4 test suite still passing.
+# ---------------------------------------------------------------------------
+
+
+def test_emit_layernorm_fp32_does_not_spill_below_threshold():
+    """LN with d_model=16 (1 KB FP32 tile) stays under the 16 KB spill
+    threshold and produces no DMA_STORE in the instruction stream.
+    Existing tiny-fixture tests rely on this — adding the spill code
+    must not perturb their byte counts."""
+    cg = _fresh_codegen(w8a32=True)
+    cg.last_uses = {"res": 10}  # residual has future uses
+    cg.current_node_idx = 0
+    node = IRNode(
+        op="layernorm", name="ln", inputs=["res", "gamma", "beta"],
+        output_shape=(16, 16), attrs={},
+    )
+    emit_layernorm_fp32(cg, node)
+    opcodes = [insn.opcode for insn in cg.instructions]
+    assert Opcode.LAYERNORM_FP32 in opcodes
+    assert Opcode.STORE not in opcodes  # no spill
+    assert "res" not in cg.dram_temp_fp32_outputs
+
+
+def test_emit_layernorm_fp32_spills_large_tile_above_threshold():
+    """LN with d_model=256 (16 KB FP32 tile = 16*256*4) triggers spill.
+    The instruction stream must contain a DMA_STORE after the LN
+    output is computed; the input's ABUF allocation is freed; and
+    `dram_temp_fp32_outputs['res']` records the byte size."""
+    cg = _fresh_codegen(w8a32=True)
+    cg.last_uses = {"res": 10}
+    cg.current_node_idx = 0
+    node = IRNode(
+        op="layernorm", name="ln", inputs=["res", "gamma", "beta"],
+        output_shape=(16, 256), attrs={},
+    )
+    emit_layernorm_fp32(cg, node)
+    opcodes = [insn.opcode for insn in cg.instructions]
+    assert Opcode.LAYERNORM_FP32 in opcodes
+    assert Opcode.STORE in opcodes  # spill happened
+    assert "res" in cg.dram_temp_fp32_outputs
+    assert cg.dram_temp_fp32_outputs["res"] == 16 * 256 * 4
+    # ABUF slot for "res" must be released so subsequent ops can re-use it.
+    assert cg.mem.abuf.get("res") is None
+    # The LN output stays in ABUF (it's the next op's input).
+    assert cg.mem.abuf.get("ln") is not None
+
+
+def test_emit_layernorm_fp32_skips_spill_when_input_has_no_future_use():
+    """If `last_uses[in_name] <= current_node_idx`, the input is dead
+    after this LN and spill is pointless. Skip the DMA_STORE."""
+    cg = _fresh_codegen(w8a32=True)
+    cg.last_uses = {"res": 0}  # last use is THIS node (current_node_idx=0)
+    cg.current_node_idx = 0
+    node = IRNode(
+        op="layernorm", name="ln", inputs=["res", "gamma", "beta"],
+        output_shape=(16, 256), attrs={},
+    )
+    emit_layernorm_fp32(cg, node)
+    opcodes = [insn.opcode for insn in cg.instructions]
+    assert Opcode.LAYERNORM_FP32 in opcodes
+    assert Opcode.STORE not in opcodes  # no spill
+    assert "res" not in cg.dram_temp_fp32_outputs
+
+
+def test_emit_layernorm_fp32_spill_threshold_is_configurable():
+    """The codegen's `fp32_spill_threshold_bytes` lets callers tighten
+    or relax the spill heuristic for tests or specific deployments."""
+    cg = _fresh_codegen(w8a32=True)
+    cg.fp32_spill_threshold_bytes = 1024  # tighten: every ≥1KB tile spills
+    cg.last_uses = {"res": 10}
+    cg.current_node_idx = 0
+    node = IRNode(
+        op="layernorm", name="ln", inputs=["res", "gamma", "beta"],
+        output_shape=(16, 16), attrs={},  # 1 KB tile, at the new threshold
+    )
+    emit_layernorm_fp32(cg, node)
+    assert Opcode.STORE in [insn.opcode for insn in cg.instructions]
+    assert "res" in cg.dram_temp_fp32_outputs
+
+
+def test_emit_vadd_fp32_aliases_output_in_place_into_input2():
+    """VADD writes its result into src2's ABUF slot and renames the
+    allocation to node.name. After this, `mem.abuf.get("b")` returns
+    None and `mem.abuf.get("vadd_out")` returns the (renamed) slot.
+    Matches the INT8 `_emit_vadd` convention at codegen.py:2779."""
+    cg = _fresh_codegen(w8a32=True)
+    cg.last_uses = {}
+    cg.current_node_idx = 0
+    node = IRNode(
+        op="vadd", name="vadd_out", inputs=["a", "b"],
+        output_shape=(16, 16), attrs={},
+    )
+    emit_vadd_fp32(cg, node)
+    # The VADD_FP32 instruction's dst_off must equal src2_off (in-place).
+    vadd_insn = next(i for i in cg.instructions if i.opcode == Opcode.VADD_FP32)
+    assert vadd_insn.dst_off == vadd_insn.src2_off
+    # The output node owns src2's ABUF slot now; the original src2
+    # name is no longer in the allocations table.
+    assert cg.mem.abuf.get("b") is None
+    assert cg.mem.abuf.get("vadd_out") is not None
+
+
+def test_emit_vadd_fp32_reloads_spilled_fp32_residual_before_adding():
+    """When inputs[0] is in `dram_temp_fp32_outputs`, the VADD emitter
+    DMA-loads it back to ABUF before computing the sum. The sequence is:
+    LOAD (reload src1) → SYNC → CONFIG_TILE → VADD_FP32 → SYNC."""
+    cg = _fresh_codegen(w8a32=True)
+    cg.last_uses = {"a": 10, "b": 10}
+    cg.current_node_idx = 5
+
+    # Simulate that "a" was previously spilled by an earlier LN.
+    # Pre-populate dram_temp_outputs as if the LN had spilled it.
+    M_pad, N_pad = 16, 256
+    cg.dram_temp_outputs["a"] = 0x10000  # fake DRAM offset
+    cg.dram_temp_fp32_outputs["a"] = M_pad * N_pad * 4
+
+    # "b" is freshly produced in ABUF.
+    cg.mem.abuf.alloc("b", M_pad * N_pad * 4)
+
+    node = IRNode(
+        op="vadd", name="vadd_out", inputs=["a", "b"],
+        output_shape=(M_pad, N_pad), attrs={},
+    )
+    emit_vadd_fp32(cg, node)
+
+    opcodes = [insn.opcode for insn in cg.instructions]
+    # LOAD appears before CONFIG_TILE (the reload happens before the VADD
+    # context is set, matching the INT8 _emit_vadd ordering).
+    load_idx = opcodes.index(Opcode.LOAD) if Opcode.LOAD in opcodes else -1
+    config_idx = opcodes.index(Opcode.CONFIG_TILE)
+    vadd_idx = opcodes.index(Opcode.VADD_FP32)
+    assert load_idx != -1, "expected DMA_LOAD reload for spilled src1"
+    assert load_idx < config_idx < vadd_idx
+    # Reload picked the alias target (in0 was reloaded → out aliases src1's slot).
+    vadd_insn = cg.instructions[vadd_idx]
+    assert vadd_insn.dst_off == vadd_insn.src1_off
+
+
+def test_codegen_generate_loop_drops_dram_temp_fp32_outputs_after_last_use():
+    """When a spilled tile's last_use index is reached, the generate()
+    loop must clear `dram_temp_fp32_outputs[name]` so the entry doesn't
+    leak symbols. Test by running a tiny graph that LN-spills then
+    VADD-reloads its residual."""
+    cg = _fresh_codegen(w8a32=True)
+    cg.fp32_spill_threshold_bytes = 1024  # force spill on tiny tile
+
+    # Build a graph: residual (provided externally) → LN(residual) → VADD(residual, ln_out).
+    # We use embed_lookup to produce "residual" — that emitter loads
+    # from DRAM. With model_config=deit_tiny_config we have a patch_cls
+    # encoder; for this test we just pre-place "residual" in ABUF and
+    # skip _emit_node for the producer.
+    graph = IRGraph()
+    graph.add_node(IRNode(op="layernorm", name="ln_out",
+                          inputs=["residual", "gamma", "beta"],
+                          output_shape=(16, 16), attrs={}))
+    graph.add_node(IRNode(op="vadd", name="new_residual",
+                          inputs=["residual", "ln_out"],
+                          output_shape=(16, 16), attrs={}))
+
+    # Bootstrap: pretend the residual was produced upstream.
+    cg.mem.abuf.alloc("residual", 16 * 16 * 4)
+    # `residual` is an external input (no producer node), so the graph's
+    # compute_last_uses() doesn't track it. We splice it in manually
+    # mirroring what the real generate() would record if the residual
+    # was produced by an upstream `embed_lookup` or `vadd` node.
+    cg.last_uses = dict(graph.compute_last_uses())
+    cg.last_uses["residual"] = 1
+    assert cg.last_uses["residual"] == 1, "vadd is residual's last use"
+
+    # Manually run the inner loop of generate() — we want to skip the
+    # weight layout step which would error on missing gamma/beta data.
+    for idx, node in enumerate(graph.nodes):
+        cg.current_node_idx = idx
+        cg._emit_node(node)
+        for inp_name, last_idx in cg.last_uses.items():
+            if last_idx == idx:
+                if cg.mem.abuf.get(inp_name) is not None:
+                    cg.mem.abuf.free(inp_name)
+                if inp_name in cg.dram_temp_fp32_outputs:
+                    del cg.dram_temp_fp32_outputs[inp_name]
+                    cg.dram_temp_outputs.pop(inp_name, None)
+
+    # After processing both nodes, the spilled "residual" entry is gone.
+    assert "residual" not in cg.dram_temp_fp32_outputs
+    assert "residual" not in cg.dram_temp_outputs
+
+
+def test_emit_layernorm_fp32_reloads_already_spilled_input():
+    """If an earlier emitter spilled the same FP32 tile name (e.g. the
+    block-boundary residual carrying across multiple layers), the next
+    LN must reload it via DMA_LOAD before running LN. This covers the
+    multi-block case in real GPT-2."""
+    cg = _fresh_codegen(w8a32=True)
+    cg.last_uses = {"res": 10}
+    cg.current_node_idx = 5
+
+    # Pre-spill state: "res" lives only in DRAM-temp.
+    M_pad, N_pad = 16, 256
+    cg.dram_temp_outputs["res"] = 0x20000
+    cg.dram_temp_fp32_outputs["res"] = M_pad * N_pad * 4
+
+    node = IRNode(
+        op="layernorm", name="ln2",
+        inputs=["res", "gamma", "beta"],
+        output_shape=(M_pad, N_pad), attrs={},
+    )
+    emit_layernorm_fp32(cg, node)
+
+    opcodes = [insn.opcode for insn in cg.instructions]
+    # LOAD (reload) precedes LAYERNORM_FP32.
+    assert Opcode.LOAD in opcodes
+    load_idx = opcodes.index(Opcode.LOAD)
+    ln_idx = opcodes.index(Opcode.LAYERNORM_FP32)
+    assert load_idx < ln_idx
