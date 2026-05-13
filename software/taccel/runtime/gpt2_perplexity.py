@@ -216,7 +216,16 @@ def run_weight_only_int8_simulator_teacher_forced_logits(
     inputs, _ = teacher_forced_inputs_and_targets(context_tokens)
     if not inputs:
         return []
-    bundle = build_stage3_tiny_decoder_bundle(payload, ptq_preset="weight_only_int8")
+    # smoke_decode_steps controls the decode-stream graph's seq_len.
+    # For teacher-forced perplexity we run `len(inputs) - 1` decode
+    # steps, each at incrementally higher position; the runtime
+    # CONFIG_ATTN patch sets valid_kv_len = position + 1. The decode
+    # graph's softmax must have at least `len(inputs)` key columns.
+    bundle = build_stage3_tiny_decoder_bundle(
+        payload,
+        ptq_preset="weight_only_int8",
+        smoke_decode_steps=len(inputs) - 1,
+    )
     runner = HostRunner(bundle.build.bundle, logits_dtype=np.float32)
     # Teacher-forced: prefill on token 0, then decode for tokens 1..N-1.
     logits_list: List[np.ndarray] = []

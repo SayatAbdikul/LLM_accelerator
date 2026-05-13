@@ -361,13 +361,16 @@ class CodeGenerator:
                     * np.float32(k_scale)
                     * np.float32(inv_sqrt_d_head)
                 )
-                key_len = int(
-                    node.attrs.get(
-                        "key_len",
-                        node.output_shape[1] if len(node.output_shape) > 1 else node.output_shape[0],
-                    )
+                # M4-G: stage at the MAX sequence length (model_config or
+                # kv_layout) so prefill (key_len=1) and decode (key_len=seq)
+                # share an identical DRAM blob. The DMA at runtime reads
+                # only `valid_kv_len * 2` bytes anyway; the extra padding is
+                # a small constant (~50 KB at max_seq_len=1024) per QKT.
+                N_pad = pad_dim(
+                    int(self.kv_layout.max_seq_len)
+                    if self.kv_layout is not None
+                    else int(self.config.max_seq_len)
                 )
-                N_pad = pad_dim(key_len)
                 pc_fp16 = np.full(N_pad, np.float16(composite_fp32), dtype=np.float16)
                 sym = f"{node.name}__qkt_pc_scale"
                 self.dram_layout[sym] = offset
@@ -3155,8 +3158,46 @@ class CodeGenerator:
             src_buf = int(node.attrs["src_buf"])
             src_off = int(node.attrs["src_off_units"]) + row_byte_offset // UNIT
         elif source_name in self.dram_temp_outputs:
-            # Strip-mined producers leave their full output in DRAM temp. Load the
-            # requested row window back into ABUF before storing to the logits region.
+            # Strip-mined / W8A32-tiled producers leave their full output in
+            # DRAM temp. Load the requested row window back into ABUF before
+            # storing to the logits region.
+            #
+            # M4-G: for W8A32 lm_head at GPT-2 vocab=50257, one row is
+            # 50272*4 ≈ 200 KB, which exceeds ABUF (128 KB). Stream the
+            # row in column chunks small enough to fit. Each chunk:
+            # load FP32 chunk from DRAM-temp into ABUF, DMA_STORE to its
+            # slot in the logits region, free the staging slot.
+            if size_bytes > ABUF_SIZE:
+                # Pick a chunk size ≤ 32 KB (8192 FP32 cols at most;
+                # corresponds to a quarter of ABUF for breathing room).
+                chunk_bytes = 32 * 1024
+                if elem_bytes > 1:
+                    chunk_bytes = max(chunk_bytes - (chunk_bytes % elem_bytes), elem_bytes)
+                offset = 0
+                while offset < size_bytes:
+                    cur = min(chunk_bytes, size_bytes - offset)
+                    chunk_name = f"{node.name}_staging_off{offset}"
+                    chunk_alloc = self.mem.abuf.alloc(chunk_name, cur)
+                    self._emit_dma_load(
+                        BUF_ABUF,
+                        chunk_alloc.offset_units,
+                        cur,
+                        addr_reg,
+                        self.dram_temp_outputs[source_name] + row_byte_offset + offset,
+                    )
+                    self._emit(SyncInsn(resource_mask=0b001))
+                    self._emit_dma_store(
+                        BUF_ABUF,
+                        chunk_alloc.offset_units,
+                        cur,
+                        addr_reg,
+                        offset,
+                        relocation_symbol=symbol,
+                    )
+                    self._emit(SyncInsn(resource_mask=0b001))
+                    self.mem.abuf.free(chunk_name)
+                    offset += cur
+                return
             staging_name = f"{node.name}_staging"
             staging = self.mem.abuf.alloc(staging_name, size_bytes)
             self._emit_dma_load(
