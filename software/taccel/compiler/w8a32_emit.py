@@ -306,13 +306,33 @@ def emit_softmax_fp32(cg: "CodeGenerator", node: "IRNode", *, masked: bool = Fal
             # correctly under either 0b10 or 0b11 — 0b11 just signals
             # that key_pad > valid_kv_len.
             attn_mode = 0b11
-        cg._emit(
-            ConfigAttnInsn(
+        # M4-D: when this softmax sits in a decode stream that patches
+        # CONFIG_ATTN at runtime, capture the PC and register a
+        # RuntimeConfigAttnSite so HostRunner._patch_decode_attention_
+        # context(position=N) can rewrite (query_row_base, valid_kv_len)
+        # per decode step. Mirrors codegen._emit_config_attn_for_qkt.
+        if runtime_config_attn:
+            from ..assembler.assembler import RuntimeConfigAttnSite
+            pc = len(cg.instructions)
+            cg._emit(ConfigAttnInsn(
                 query_row_base=0,
-                valid_kv_len=key_len,
+                valid_kv_len=1,
                 mode=attn_mode,
+            ))
+            cg.runtime_config_attn_sites.append(RuntimeConfigAttnSite(
+                stream=cg.stream_name,
+                local_pc=pc,
+                absolute_pc=0,
+                mode=attn_mode,
+            ))
+        else:
+            cg._emit(
+                ConfigAttnInsn(
+                    query_row_base=0,
+                    valid_kv_len=key_len,
+                    mode=attn_mode,
+                )
             )
-        )
 
     in_alloc = _abuf_alloc_fp32(cg, node.inputs[0], M_pad, N_pad)
     out_alloc = _abuf_alloc_fp32(cg, node.name, M_pad, N_pad)

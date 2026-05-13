@@ -3174,3 +3174,100 @@ def test_emit_matmul_w8a32_tiled_end_to_end_on_simulator():
         f"tiled-matmul max e2e error {err.max():.6f} exceeds bound {bound:.6f}; "
         f"out[0,0]={out_fp32[0,0]}, expected[0,0]={expected_fp32[0,0]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# M4-D: decode-stream CONFIG_ATTN runtime patching.
+#
+# `inject_kv_cache_nodes(decode=True)` marks each masked softmax with
+# `runtime_config_attn=True`; `emit_softmax_fp32` then registers a
+# `RuntimeConfigAttnSite` so `HostRunner._patch_decode_attention_context`
+# can rewrite `(query_row_base=position, valid_kv_len=position+1)` per
+# decode step. Pre-M4-D the W8A32 decode stream emitted CONFIG_ATTN with
+# static prefill values that never changed; multi-step decode produced
+# position-incorrect attention masks.
+# ---------------------------------------------------------------------------
+
+
+def test_emit_softmax_fp32_registers_runtime_config_attn_site_for_decode():
+    """When `node.attrs['runtime_config_attn']=True`, the W8A32 softmax
+    emitter must append a `RuntimeConfigAttnSite` to the codegen's
+    `runtime_config_attn_sites`. The site's local_pc points at the
+    emitted ConfigAttnInsn and mode matches the masked-softmax mode."""
+    cg = _fresh_codegen(w8a32=True)
+    cg.stream_name = "decode"
+    node = IRNode(
+        op="softmax",
+        name="block0_head0_softmax",
+        inputs=["scaled"],
+        output_shape=(16, 32),
+        attrs={
+            "masked": True,
+            "key_len": 32,
+            "runtime_config_attn": True,
+        },
+    )
+    emit_softmax_fp32(cg, node, masked=True)
+
+    assert len(cg.runtime_config_attn_sites) == 1
+    site = cg.runtime_config_attn_sites[0]
+    assert site.stream == "decode"
+    assert site.mode == 0b11
+    # local_pc points at the ConfigAttnInsn we just emitted.
+    assert cg.instructions[site.local_pc].opcode == Opcode.CONFIG_ATTN
+
+
+def test_emit_softmax_fp32_skips_site_registration_for_prefill():
+    """When `runtime_config_attn` is False, the softmax emitter must NOT
+    add a runtime site — the prefill-causal context is static."""
+    cg = _fresh_codegen(w8a32=True)
+    cg.stream_name = "prefill"
+    node = IRNode(
+        op="softmax",
+        name="block0_head0_softmax",
+        inputs=["scaled"],
+        output_shape=(16, 16),
+        attrs={"masked": True, "key_len": 16},
+    )
+    emit_softmax_fp32(cg, node, masked=True)
+    assert len(cg.runtime_config_attn_sites) == 0
+
+
+def test_inject_kv_cache_marks_decode_masked_softmax_with_runtime_config_attn():
+    """`inject_kv_cache_nodes(decode=True)` propagates the runtime-
+    config-attn marker from QKT to its consumer softmax. Without this
+    the W8A32 decode-stream softmax can't tell it's in a decode graph."""
+    from taccel.compiler.decoder_bundle import inject_kv_cache_nodes
+    from taccel.compiler.frontend.nanogpt_adapter import load_nanogpt
+
+    payload = _one_layer_gpt2_payload()
+    frontend = load_nanogpt(
+        config=payload["model_args"],
+        state_dict=payload["state_dict"],
+        variant="forward_1token",
+    )
+    config = frontend.config
+    decode_graph = inject_kv_cache_nodes(frontend.graph, config, decode=True, seq_len=4)
+    softmax_nodes = [n for n in decode_graph.nodes if n.op == "softmax"]
+    assert len(softmax_nodes) >= 1
+    for sm in softmax_nodes:
+        if sm.attrs.get("masked"):
+            assert sm.attrs.get("runtime_config_attn") is True, (
+                f"decode-stream masked softmax '{sm.name}' missing runtime_config_attn"
+            )
+
+
+def test_stage3_w8a32_decode_bundle_registers_runtime_config_attn_sites():
+    """End-to-end: the W8A32 tiny decoder bundle's decode codegen
+    emits at least one RuntimeConfigAttnSite (one per decode-stream
+    masked softmax). HostRunner can then patch them per decode step."""
+    from taccel.runtime.tiny_fixture import build_stage3_tiny_decoder_bundle
+
+    payload = _one_layer_gpt2_payload()
+    bundle = build_stage3_tiny_decoder_bundle(payload, ptq_preset="weight_only_int8")
+    decode_sites = [
+        s for s in bundle.build.bundle.runtime_config_attn_sites
+        if s.stream == "decode"
+    ]
+    # 1 layer × 1 head × 1 masked softmax = at least 1 decode site.
+    assert len(decode_sites) >= 1

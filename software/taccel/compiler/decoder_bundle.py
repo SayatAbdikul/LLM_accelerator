@@ -122,6 +122,16 @@ def inject_kv_cache_nodes(graph: IRGraph, config: ModelConfig, *,
             copied.attrs["query_len"] = int(copied.output_shape[0])
             copied.attrs["key_len"] = int(seq_len)
             copied.output_shape = (int(copied.output_shape[0]), int(seq_len))
+            # M4-D: the W8A32 path emits CONFIG_ATTN from inside
+            # `emit_softmax_fp32` (not the INT8 path's per-strip-inside-
+            # `_emit_qkt` location). For the decode stream, that CONFIG_ATTN
+            # must be patched per decode step. Mark the masked softmax so
+            # the emitter registers a `RuntimeConfigAttnSite`. (Pre-M4-D,
+            # the softmax emitted CONFIG_ATTN with static prefill values
+            # that never changed; multi-step decode masked against the
+            # wrong context.)
+            if copied.op == "softmax" and bool(copied.attrs.get("masked")):
+                copied.attrs["runtime_config_attn"] = True
         if decode and copied.op == "matmul_attn_v" and layer is not None and head is not None:
             replacement = value_loads.get((int(layer), int(head)))
             if replacement is not None and len(copied.inputs) >= 2:
