@@ -233,6 +233,17 @@ def _emit_attention_block(graph: IRGraph, prev: str, block_idx: int, seq_len: in
             f"block{block_idx}_head{head_idx}_softmax",
             [scaled],
             (seq_len, seq_len),
+            # `masked` + `key_len` are the M3-C contract additions: in the
+            # W8A32 path `emit_softmax_fp32` reads these to decide whether
+            # to emit a CONFIG_ATTN before the masked-softmax instruction.
+            # The INT8 path keys off `matmul_qkt`'s `masked` attr instead
+            # (it emits CONFIG_ATTN per Q strip inside _emit_qkt) and is
+            # unaffected by these softmax attrs.
+            masked=True,
+            key_len=seq_len,
+            # `causal_identity` stays — it's a decode-step shortcut that
+            # marks softmax of a 1-row Q strip as trivially the identity
+            # vector; orthogonal to the masked/key_len attention context.
             causal_identity=(seq_len == 1),
         )
         head_outputs.append(

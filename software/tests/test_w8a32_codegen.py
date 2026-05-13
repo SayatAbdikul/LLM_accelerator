@@ -294,23 +294,35 @@ def test_int8_gelu_emission_unchanged_when_w8a32_disabled():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("blocked_op", ["matmul_qkt", "matmul_attn_v"])
-def test_w8a32_generate_refuses_attention_matmuls_until_m3(blocked_op):
-    """M2.5-B guardrail: attention-internal matmul ops still raise. The
-    plain `matmul` op was unblocked in M2.5-B (lowered through
-    `emit_matmul_w8a32`); QKT and ATTN_V remain INT8-output until M3."""
-    cg = _fresh_codegen(w8a32=True)
-    graph = IRGraph()
-    graph.add_node(
-        IRNode(
-            op=blocked_op,
-            name=blocked_op,
-            inputs=["x", "w"],
-            output_shape=(16, 16),
-            attrs={},
+def test_w8a32_generate_accepts_all_matmul_kinds_after_m3_b():
+    """M3-B empties the W8A32 graph-level guardrail. Every matmul kind
+    (`matmul`, `matmul_qkt`, `matmul_attn_v`) is now lowered through
+    its respective emitter. The remaining gaps (masked-softmax
+    CONFIG_ATTN handling, pad-row zero-fill) are M3-C and surface as
+    per-emitter NotImplementedError or simulator-time ConfigError,
+    not as graph-level rejection."""
+    for op_name in ("matmul", "matmul_qkt", "matmul_attn_v"):
+        cg = _fresh_codegen(w8a32=True)
+        node_attrs: dict = {}
+        if op_name == "matmul_qkt":
+            node_attrs = {"head_idx": 0, "scale": 0.25}
+        elif op_name == "matmul_attn_v":
+            node_attrs = {"head_idx": 0}
+        graph = IRGraph()
+        graph.add_node(
+            IRNode(
+                op=op_name,
+                name=op_name,
+                inputs=["x", "w"],
+                output_shape=(16, 16),
+                attrs=node_attrs,
+                weight_name="w",
+            )
         )
-    )
-    with pytest.raises(NotImplementedError, match="M3"):
+        # The codegen must not raise NotImplementedError at the graph
+        # boundary. For matmul (no weight_data) the emitter returns early
+        # without producing instructions; for QKT/attn_v the static
+        # composite scale staging + emitter run to completion.
         cg.generate(graph)
 
 
@@ -1441,3 +1453,1132 @@ def test_emit_embedding_lookup_w8a32_end_to_end_matches_state_dict():
         + wpe_fp32[pos_ids, :].astype(np.float32)
     )
     np.testing.assert_array_equal(out_fp32, expected)
+
+
+# ---------------------------------------------------------------------------
+# M3-A: matmul_qkt W8A32 lowering (Q @ K^T with static composite dequant)
+# ---------------------------------------------------------------------------
+
+
+from taccel.compiler.w8a32_emit import emit_matmul_qkt_w8a32  # noqa: E402
+
+
+def _qkt_w8a32_codegen(
+    *,
+    seq_len: int = 16,
+    d_head: int = 16,
+    q_scale: float = 0.05,
+    k_scale: float = 0.07,
+    inv_sqrt_d_head: float = None,
+) -> tuple[CodeGenerator, IRGraph, IRNode]:
+    """Build a CodeGenerator + 1-node IR graph for an isolated matmul_qkt."""
+    from taccel.compiler.model_config import ModelConfig
+
+    if inv_sqrt_d_head is None:
+        inv_sqrt_d_head = float(d_head ** -0.5)
+    config = ModelConfig(
+        model_kind="decoder", n_layer=1, n_head=1, d_model=d_head,
+        d_head=d_head, mlp_dim=d_head, vocab_size=16,
+        max_seq_len=seq_len, embedding_kind="token_pos",
+    )
+    cg = CodeGenerator(
+        weight_data={},
+        calibration_scales={
+            "q_in": q_scale,
+            "k_in": k_scale,
+            "qkt_out": 1.0,
+        },
+        prescaled_biases={},
+        fp32_biases={},
+        model_config=config,
+        stream_name="prefill",
+        w8a32_enabled=True,
+    )
+    graph = IRGraph()
+    node = IRNode(
+        op="matmul_qkt",
+        name="qkt_out",
+        inputs=["q_in", "k_in"],
+        output_shape=(seq_len, seq_len),
+        attrs={
+            "head_idx": 0,
+            "scale": inv_sqrt_d_head,
+            "query_len": seq_len,
+            "key_len": seq_len,
+        },
+    )
+    graph.add_node(node)
+    return cg, graph, node
+
+
+def test_emit_matmul_qkt_w8a32_emits_full_quant_matmul_dequant_sequence():
+    """M3-A: the QKT lowering must emit QUANT_FP32_INT8 ×2, BUF_COPY
+    (transpose=1), MATMUL, DEQUANT_ACCUM_FP32 in order. No M2.5-A
+    DEQUANT_ACCUM_FP32_SCALED here — the static composite fold uses M1's
+    non-scaled DEQUANT variant."""
+    cg, graph, _ = _qkt_w8a32_codegen()
+    insns, _ = cg.generate(graph)
+    opcodes = [insn.opcode for insn in insns]
+
+    quant_indices = [i for i, op in enumerate(opcodes) if op == Opcode.QUANT_FP32_INT8]
+    bufcopy_indices = [i for i, op in enumerate(opcodes) if op == Opcode.BUF_COPY]
+    matmul_indices = [i for i, op in enumerate(opcodes) if op == Opcode.MATMUL]
+    dequant_indices = [i for i, op in enumerate(opcodes) if op == Opcode.DEQUANT_ACCUM_FP32]
+
+    assert len(quant_indices) == 2, f"expected 2 QUANT_FP32_INT8, got {len(quant_indices)}"
+    assert len(bufcopy_indices) >= 1
+    assert len(matmul_indices) == 1
+    assert len(dequant_indices) == 1
+
+    # Ordering: both quants before the bufcopy transpose, bufcopy before
+    # matmul, matmul before dequant.
+    assert quant_indices[0] < quant_indices[1] < bufcopy_indices[0]
+    assert bufcopy_indices[0] < matmul_indices[0] < dequant_indices[0]
+
+    # The BUF_COPY for the K transpose has transpose=1.
+    transpose_bufcopies = [
+        insn for insn in insns
+        if insn.opcode == Opcode.BUF_COPY and insn.transpose == 1
+    ]
+    assert len(transpose_bufcopies) >= 1, (
+        "expected at least one BUF_COPY with transpose=1 (K-transpose)"
+    )
+
+    # No M2.5-A SCALED variant in the sequence — QKT uses the M1 dequant.
+    assert Opcode.DEQUANT_ACCUM_FP32_SCALED not in opcodes
+    # And no MAX_ABS_REDUCE_FP32 (QKT uses static scales for Q and K).
+    assert Opcode.MAX_ABS_REDUCE_FP32 not in opcodes
+
+
+def test_emit_matmul_qkt_w8a32_pc_scale_bytes_bit_exact_fp16_composite():
+    """M3-A correctness signal: the PC scale vector staged at DRAM
+    must match `np.float16(q_scale * k_scale * inv_sqrt_d_head)`
+    replicated N_pad times, bit-for-bit. Any drift in the FP32→FP16
+    cast order between codegen and reference here would silently
+    skew the entire QK^T result."""
+    q_scale = 0.05
+    k_scale = 0.07
+    inv_sqrt_d_head = 1.0 / np.sqrt(16.0)  # d_head=16
+    cg, graph, node = _qkt_w8a32_codegen(
+        q_scale=q_scale, k_scale=k_scale, inv_sqrt_d_head=inv_sqrt_d_head,
+    )
+    cg.generate(graph)
+
+    sym = f"{node.name}__qkt_pc_scale"
+    assert sym in cg.dram_layout, f"PC scale symbol '{sym}' not staged"
+
+    offset = cg.dram_layout[sym]
+    n_pad = 16  # pad_dim(16) == 16
+    pc_bytes = cg.dram_blob[offset:offset + n_pad * 2]
+    staged = np.frombuffer(pc_bytes, dtype=np.float16)
+
+    expected_value_fp16 = np.float16(
+        np.float32(q_scale) * np.float32(k_scale) * np.float32(inv_sqrt_d_head)
+    )
+    expected = np.full(n_pad, expected_value_fp16, dtype=np.float16)
+    np.testing.assert_array_equal(staged, expected)
+
+
+def test_emit_scale_mul_renames_abuf_alloc_in_w8a32_mode():
+    """M3-A: _emit_scale_mul must rename the ABUF allocation (not just
+    WBUF) when the source is in ABUF — the W8A32 QKT writes its FP32
+    scores tile to ABUF, so the scale_mul rename has to happen there.
+    Calibration scale propagation stays the same."""
+    cg = _fresh_codegen(w8a32=True)
+    # Pre-populate an ABUF allocation as if a prior op had written there.
+    cg.mem.abuf.alloc("source_node", 16 * 16 * 4)  # FP32 16×16
+    cg.calibration_scales["source_node"] = 0.123
+
+    scale_mul_node = IRNode(
+        op="scale_mul",
+        name="scaled_node",
+        inputs=["source_node"],
+        output_shape=(16, 16),
+        attrs={"scale": 0.125},
+    )
+    cg._emit_scale_mul(scale_mul_node)
+
+    # The ABUF allocation under the old name is gone; the new name owns it.
+    assert "source_node" not in cg.mem.abuf.allocations
+    assert "scaled_node" in cg.mem.abuf.allocations
+
+    # Calibration scale propagates.
+    assert cg.calibration_scales["scaled_node"] == cg.calibration_scales["source_node"] == 0.123
+
+    # No instructions emitted (scale_mul is metadata-only).
+    assert cg.instructions == []
+
+
+def test_emit_matmul_qkt_w8a32_zero_fills_k_pad_rows_when_key_len_short():
+    """M3-C: when `key_len < N_pad`, the QKT lowering emits a DMA from
+    `__zero_pad__` to zero K's FP32 pad rows in ABUF before the K-QUANT
+    step. Without this, LN(zero_row) = β contaminates K's padding rows
+    and downstream attention scores would include β-derived garbage in
+    the masked-out columns. Replaces the M3-A `rejects_pad_row` test
+    which was the temporary deferral guard."""
+    config_seq_len = 16
+    key_len_short = 12  # pad_dim(12) == 16, so N_pad > key_len
+    cg, graph, node = _qkt_w8a32_codegen(seq_len=config_seq_len)
+    node.attrs["key_len"] = key_len_short
+    node.output_shape = (config_seq_len, key_len_short)
+    # Must not raise — M3-C handles the pad-row case.
+    insns, _ = cg.generate(graph)
+
+    # K pad-row zero-fill DMA: at least one LOAD reads from
+    # `__zero_pad__`'s DRAM offset with addr_reg=3 (the standard
+    # zero-pad source convention from the INT8 path). Verifying via
+    # the addr_reg=3 LOAD instruction is the lightest-touch check.
+    load_ar3_indices = [
+        i for i, insn in enumerate(insns)
+        if insn.opcode == Opcode.LOAD and insn.addr_reg == 3
+    ]
+    assert len(load_ar3_indices) >= 1, (
+        "expected at least one LOAD with addr_reg=3 (K pad-row zero-fill DMA)"
+    )
+
+    # The xfer_len for the pad-row LOAD = pad_rows * K_pad * 4 bytes.
+    # pad_rows = N_pad - key_len = 16 - 12 = 4. K_pad = pad_dim(d_head) = 16.
+    # FP32 byte size = 4 * 16 * 4 = 256 bytes = 16 units.
+    pad_row_loads = [insns[i] for i in load_ar3_indices]
+    assert any(insn.xfer_len == 16 for insn in pad_row_loads), (
+        f"expected pad-row LOAD xfer_len=16 (4 pad rows × 16 d_head × 4 bytes / 16); "
+        f"got xfer_lens={[insn.xfer_len for insn in pad_row_loads]}"
+    )
+
+
+def test_w8a32_generate_accepts_matmul_qkt_after_m3_a():
+    """Counterpart: a graph with only matmul_qkt (no matmul_attn_v) must
+    now compile in W8A32 mode. The guardrail narrowed in M3-A."""
+    cg, graph, _ = _qkt_w8a32_codegen()
+    insns, _ = cg.generate(graph)
+    # Bundle compiles; emitted instructions contain the M3-A epilogue.
+    opcodes = {insn.opcode for insn in insns}
+    assert Opcode.DEQUANT_ACCUM_FP32 in opcodes
+    assert Opcode.MATMUL in opcodes
+
+
+def test_emit_matmul_qkt_w8a32_end_to_end_matches_fp32_reference():
+    """M3-A end-to-end correctness signal: compile a single matmul_qkt
+    fragment in W8A32 mode, seed FP32 Q and K directly in ABUF,
+    execute on the simulator, and assert the FP32 scores tile matches
+    the reference `(Q @ K.T) * inv_sqrt_d_head` within INT8
+    quantization noise.
+
+    This is the bit-end-to-end signal that emit_matmul_qkt_w8a32
+    composes correctly with the M1 DEQUANT_ACCUM_FP32 and the QUANT/
+    BUF_COPY transpose mechanics."""
+    from taccel.golden_model import memory as mem
+    from taccel.golden_model.simulator import Simulator
+    from taccel.golden_model.state import MachineState
+    from taccel.isa.opcodes import BUF_ABUF
+
+    seq_len = 16
+    d_head = 16
+    inv_sqrt_d_head = 1.0 / np.sqrt(d_head)
+
+    rng = np.random.default_rng(33)
+    q_fp32 = rng.standard_normal((seq_len, d_head)).astype(np.float32) * 0.4
+    k_fp32 = rng.standard_normal((seq_len, d_head)).astype(np.float32) * 0.5
+
+    # Pick calibration scales generously to cover the actual max(|Q|), max(|K|).
+    q_scale = float(np.abs(q_fp32).max() / 127.0)
+    k_scale = float(np.abs(k_fp32).max() / 127.0)
+
+    cg, graph, _ = _qkt_w8a32_codegen(
+        seq_len=seq_len, d_head=d_head,
+        q_scale=q_scale, k_scale=k_scale, inv_sqrt_d_head=inv_sqrt_d_head,
+    )
+    insns, dram_blob = cg.generate(graph)
+
+    sim = Simulator(MachineState(dram_data=bytes(dram_blob)))
+    # Seed FP32 Q and K under the input names the codegen allocated for.
+    # `_qkt_w8a32_codegen` lets emit_matmul_qkt_w8a32 allocate these via
+    # `_abuf_alloc_fp32` since they aren't pre-allocated.
+    q_alloc = cg.mem.abuf.allocations["q_in"]
+    k_alloc = cg.mem.abuf.allocations["k_in"]
+    mem.write_fp32_tile(sim.state, BUF_ABUF, q_alloc.offset_units, q_fp32)
+    mem.write_fp32_tile(sim.state, BUF_ABUF, k_alloc.offset_units, k_fp32)
+
+    for insn in insns:
+        sim._execute(insn)
+
+    out_alloc = cg.mem.abuf.allocations["qkt_out"]
+    out_fp32 = mem.read_fp32_tile(sim.state, BUF_ABUF, out_alloc.offset_units, seq_len, seq_len)
+
+    expected = (q_fp32 @ k_fp32.T).astype(np.float32) * np.float32(inv_sqrt_d_head)
+    err = np.abs(out_fp32 - expected)
+
+    # Error bound: dominated by INT8 quantization of Q and K. Each output
+    # entry is a sum of d_head=16 partial products, each with INT8 round
+    # error bounded by 0.5 * (|q| * k_step + |k| * q_step). Plus FP16
+    # round-off on the composite PC scale.
+    q_step = q_scale
+    k_step = k_scale
+    per_term = (
+        float(np.abs(q_fp32).max()) * k_step
+        + float(np.abs(k_fp32).max()) * q_step
+    )
+    fp16_rel = 2.0 ** -10
+    bound = (
+        d_head * per_term * abs(inv_sqrt_d_head) * 1.0
+        + float(np.abs(expected).max()) * fp16_rel
+        + 1e-3
+    )
+    assert err.max() <= bound, (
+        f"max e2e error {err.max():.6f} exceeds bound {bound:.6f}; "
+        f"out[0,0]={out_fp32[0,0]}, expected[0,0]={expected[0,0]}"
+    )
+
+
+def test_qkt_scale_mul_softmax_chain_w8a32_pipes_through_abuf_alias():
+    """M3-A integration: a graph containing matmul_qkt → scale_mul →
+    softmax must produce a softmax that reads its input from the QKT
+    output ABUF region (via the scale_mul rename). The contract is:
+
+      qkt:       emit_matmul_qkt_w8a32 allocates `abuf[qkt_node]`.
+      scale_mul: _emit_scale_mul renames `abuf[qkt_node]` → `abuf[scale_mul_node]`.
+      softmax:   emit_softmax_fp32's `_abuf_alloc_fp32(input)` returns the
+                 EXISTING alloc under `scale_mul_node` (no fresh alloc).
+
+    Without the M3-A `_emit_scale_mul` ABUF branch the softmax would
+    silently allocate a fresh region and read uninitialized FP32 bytes.
+    This test guards against future refactors of `_abuf_alloc_fp32`
+    that drop the "return existing if any" behavior.
+
+    By the time `generate()` returns, the codegen's last-use allocator
+    has freed `qkt_scaled` (softmax was its last consumer), so we check
+    the contract via the trace manifest: the QKT trace event records the
+    offset where QKT wrote; the SOFTMAX_FP32 instruction's `src1_off`
+    must match that offset.
+    """
+    seq_len = 16
+    d_head = 16
+    inv_sqrt_d_head = 1.0 / np.sqrt(d_head)
+
+    cg, graph, qkt_node = _qkt_w8a32_codegen(
+        seq_len=seq_len, d_head=d_head, inv_sqrt_d_head=inv_sqrt_d_head,
+    )
+    # Extend the graph with the post-QKT chain — non-masked softmax so we
+    # don't have to set up CONFIG_ATTN (M3-B will handle that).
+    graph.add_node(IRNode(
+        op="scale_mul",
+        name="qkt_scaled",
+        inputs=["qkt_out"],
+        output_shape=(seq_len, seq_len),
+        attrs={"scale": inv_sqrt_d_head},
+    ))
+    graph.add_node(IRNode(
+        op="softmax",
+        name="qkt_softmax",
+        inputs=["qkt_scaled"],
+        output_shape=(seq_len, seq_len),
+        attrs={"causal": False},  # non-masked — avoids CONFIG_ATTN dependency
+    ))
+    insns, _ = cg.generate(graph)
+
+    # QKT trace event tells us where QKT wrote its output ABUF tile.
+    qkt_offset = None
+    for events in cg.trace_manifest.values():
+        for event in events:
+            if event["node_name"] == "qkt_out" and event["dtype"] == "fp32":
+                qkt_offset = event["offset_units"]
+    assert qkt_offset is not None, "no qkt_out trace event found"
+
+    # SOFTMAX_FP32 must read from that same offset — proving the scale_mul
+    # rename + softmax-input lookup chain pointed at the QKT region.
+    softmax_insns = [
+        insn for insn in insns if insn.opcode == Opcode.SOFTMAX_FP32
+    ]
+    assert len(softmax_insns) == 1
+    assert softmax_insns[0].src1_off == qkt_offset, (
+        f"SOFTMAX_FP32 reads from offset {softmax_insns[0].src1_off}, "
+        f"expected {qkt_offset} (QKT's output offset, via scale_mul rename). "
+        f"Likely cause: _emit_scale_mul didn't rename the ABUF alloc, so "
+        f"emit_softmax_fp32 allocated a fresh region and reads garbage."
+    )
+
+    # And the softmax output stays in ABUF (its own fresh alloc).
+    assert "qkt_softmax" in cg.mem.abuf.allocations
+
+
+# ---------------------------------------------------------------------------
+# M3-B: matmul_attn_v W8A32 lowering — softmax(QK^T) @ V
+# ---------------------------------------------------------------------------
+
+
+from taccel.compiler.w8a32_emit import emit_matmul_attn_v_w8a32  # noqa: E402
+
+
+def _attn_v_w8a32_codegen(
+    *,
+    seq_len: int = 16,
+    d_head: int = 16,
+    sm_scale: float = 1.0 / 127.0,
+    v_scale: float = 0.07,
+) -> tuple[CodeGenerator, IRGraph, IRNode]:
+    """Build a CodeGenerator + 1-node IR graph for an isolated matmul_attn_v."""
+    from taccel.compiler.model_config import ModelConfig
+
+    config = ModelConfig(
+        model_kind="decoder", n_layer=1, n_head=1, d_model=d_head,
+        d_head=d_head, mlp_dim=d_head, vocab_size=16,
+        max_seq_len=seq_len, embedding_kind="token_pos",
+    )
+    cg = CodeGenerator(
+        weight_data={},
+        calibration_scales={
+            "sm_in": sm_scale,
+            "v_in": v_scale,
+            "attn_v_out": 1.0,
+        },
+        prescaled_biases={},
+        fp32_biases={},
+        model_config=config,
+        stream_name="prefill",
+        w8a32_enabled=True,
+    )
+    graph = IRGraph()
+    node = IRNode(
+        op="matmul_attn_v",
+        name="attn_v_out",
+        inputs=["sm_in", "v_in"],
+        output_shape=(seq_len, d_head),
+        attrs={
+            "head_idx": 0,
+            "query_len": seq_len,
+            "key_len": seq_len,
+        },
+    )
+    graph.add_node(node)
+    return cg, graph, node
+
+
+def test_emit_matmul_attn_v_w8a32_emits_full_quant_matmul_dequant_sequence():
+    """M3-B opcode contract: QUANT_FP32_INT8 ×2 (softmax then V),
+    BUF_COPY with transpose=0 (V is K-major, no transpose needed —
+    contrasts M3-A QKT which has transpose=1 for K^T), single MATMUL,
+    single DEQUANT_ACCUM_FP32. No M2.5-A SCALED variant; no
+    MAX_ABS_REDUCE_FP32 (static composite scale, same architecture
+    as M3-A)."""
+    cg, graph, _ = _attn_v_w8a32_codegen()
+    insns, _ = cg.generate(graph)
+    opcodes = [insn.opcode for insn in insns]
+
+    quant_indices = [i for i, op in enumerate(opcodes) if op == Opcode.QUANT_FP32_INT8]
+    bufcopy_indices = [i for i, op in enumerate(opcodes) if op == Opcode.BUF_COPY]
+    matmul_indices = [i for i, op in enumerate(opcodes) if op == Opcode.MATMUL]
+    dequant_indices = [i for i, op in enumerate(opcodes) if op == Opcode.DEQUANT_ACCUM_FP32]
+
+    assert len(quant_indices) == 2
+    assert len(bufcopy_indices) >= 1
+    assert len(matmul_indices) == 1
+    assert len(dequant_indices) == 1
+
+    # Ordering: both quants before the bufcopy, bufcopy before matmul,
+    # matmul before dequant.
+    assert quant_indices[0] < quant_indices[1] < bufcopy_indices[0]
+    assert bufcopy_indices[0] < matmul_indices[0] < dequant_indices[0]
+
+    # V BUF_COPY is NON-transpose (transpose=0). This is the key
+    # structural difference vs M3-A QKT's BUF_COPY (which is transpose=1
+    # for K^T).
+    v_bufcopies = [
+        insn for insn in insns
+        if insn.opcode == Opcode.BUF_COPY and insn.transpose == 0
+    ]
+    assert len(v_bufcopies) >= 1, (
+        "expected at least one BUF_COPY with transpose=0 (V move to WBUF)"
+    )
+
+    assert Opcode.DEQUANT_ACCUM_FP32_SCALED not in opcodes
+    assert Opcode.MAX_ABS_REDUCE_FP32 not in opcodes
+
+
+def test_emit_matmul_attn_v_w8a32_pc_scale_bytes_bit_exact_fp16_composite():
+    """M3-B correctness signal: the PC scale vector staged at DRAM must
+    match `np.float16(sm_scale * v_scale)` (FP32 × FP32 → FP16)
+    replicated N_pad times. Cast order locked, same as M3-A.
+
+    Unlike M3-A QKT, no `1/√d_head` factor — that's already applied by
+    `emit_matmul_qkt_w8a32` upstream and the softmax-output values are
+    in [0, 1] regardless of input scale."""
+    sm_scale = 1.0 / 127.0
+    v_scale = 0.07
+    cg, graph, node = _attn_v_w8a32_codegen(sm_scale=sm_scale, v_scale=v_scale)
+    cg.generate(graph)
+
+    sym = f"{node.name}__attn_v_pc_scale"
+    assert sym in cg.dram_layout, f"PC scale symbol '{sym}' not staged"
+
+    offset = cg.dram_layout[sym]
+    n_pad = 16  # pad_dim(16) == 16
+    pc_bytes = cg.dram_blob[offset:offset + n_pad * 2]
+    staged = np.frombuffer(pc_bytes, dtype=np.float16)
+
+    expected_value_fp16 = np.float16(np.float32(sm_scale) * np.float32(v_scale))
+    expected = np.full(n_pad, expected_value_fp16, dtype=np.float16)
+    np.testing.assert_array_equal(staged, expected)
+
+
+def test_emit_matmul_attn_v_w8a32_zero_fills_v_pad_rows_when_key_len_short():
+    """M3-C: when `key_len < Kseq_pad`, the attn_v lowering zero-fills
+    V's FP32 pad rows before the V-QUANT step. Same architectural
+    reason as the QKT K-pad case (LN-derived β contaminates padded V
+    rows). Replaces the M3-B `rejects_pad_row` test."""
+    cg, graph, node = _attn_v_w8a32_codegen()
+    short_key_len = 12  # pad_dim(12) = 16
+    node.attrs["key_len"] = short_key_len
+    # Must not raise — M3-C handles the pad-row case.
+    insns, _ = cg.generate(graph)
+
+    # Same check pattern as the QKT pad-row test: at least one LOAD
+    # with addr_reg=3 (the __zero_pad__ DMA convention).
+    load_ar3_indices = [
+        i for i, insn in enumerate(insns)
+        if insn.opcode == Opcode.LOAD and insn.addr_reg == 3
+    ]
+    assert len(load_ar3_indices) >= 1, (
+        "expected at least one LOAD with addr_reg=3 (V pad-row zero-fill DMA)"
+    )
+
+    # V pad-row LOAD: pad_rows = Kseq_pad - key_len = 16 - 12 = 4.
+    # N_pad = pad_dim(d_head) = 16. FP32 byte size = 4*16*4 = 256B = 16 units.
+    pad_row_loads = [insns[i] for i in load_ar3_indices]
+    assert any(insn.xfer_len == 16 for insn in pad_row_loads), (
+        f"expected V pad-row LOAD xfer_len=16; "
+        f"got xfer_lens={[insn.xfer_len for insn in pad_row_loads]}"
+    )
+
+
+def test_emit_matmul_attn_v_w8a32_end_to_end_matches_fp32_reference():
+    """M3-B end-to-end correctness signal: compile a `matmul_qkt →
+    softmax (non-masked) → matmul_attn_v` fragment in W8A32 mode,
+    seed FP32 Q, K, V directly in ABUF, execute on the simulator,
+    and assert the FP32 attn_v output matches the numpy reference
+    `softmax(Q @ K.T / √d_head) @ V` within INT8 quantization noise.
+
+    This is the integration signal that M3-A's QKT, M2's softmax_fp32,
+    and M3-B's attn_v all compose correctly through the codegen +
+    simulator pipeline. Non-masked softmax avoids the M3-C
+    CONFIG_ATTN gap; the math is otherwise identical to causal."""
+    from taccel.compiler.model_config import ModelConfig
+    from taccel.golden_model import memory as mem
+    from taccel.golden_model.simulator import Simulator
+    from taccel.golden_model.state import MachineState
+    from taccel.isa.opcodes import BUF_ABUF
+
+    seq_len = 16
+    d_head = 16
+    inv_sqrt_d_head = 1.0 / np.sqrt(d_head)
+
+    rng = np.random.default_rng(57)
+    q_fp32 = rng.standard_normal((seq_len, d_head)).astype(np.float32) * 0.3
+    k_fp32 = rng.standard_normal((seq_len, d_head)).astype(np.float32) * 0.4
+    v_fp32 = rng.standard_normal((seq_len, d_head)).astype(np.float32) * 0.5
+
+    # Generous calibration scales to cover max(|·|) of each input.
+    q_scale = float(np.abs(q_fp32).max() / 127.0)
+    k_scale = float(np.abs(k_fp32).max() / 127.0)
+    v_scale = float(np.abs(v_fp32).max() / 127.0)
+    sm_scale = 1.0 / 127.0  # softmax output in [0, 1] → 1/127 maps to INT8
+
+    config = ModelConfig(
+        model_kind="decoder", n_layer=1, n_head=1, d_model=d_head,
+        d_head=d_head, mlp_dim=d_head, vocab_size=16,
+        max_seq_len=seq_len, embedding_kind="token_pos",
+    )
+
+    graph = IRGraph()
+    graph.add_node(IRNode(
+        op="matmul_qkt",
+        name="qkt",
+        inputs=["q_in", "k_in"],
+        output_shape=(seq_len, seq_len),
+        attrs={
+            "head_idx": 0,
+            "scale": inv_sqrt_d_head,
+            "query_len": seq_len,
+            "key_len": seq_len,
+        },
+    ))
+    graph.add_node(IRNode(
+        op="scale_mul",
+        name="qkt_scaled",
+        inputs=["qkt"],
+        output_shape=(seq_len, seq_len),
+        attrs={"scale": inv_sqrt_d_head},
+    ))
+    graph.add_node(IRNode(
+        op="softmax",
+        name="sm",
+        inputs=["qkt_scaled"],
+        output_shape=(seq_len, seq_len),
+        attrs={"causal": False},
+    ))
+    graph.add_node(IRNode(
+        op="matmul_attn_v",
+        name="attn_v",
+        inputs=["sm", "v_in"],
+        output_shape=(seq_len, d_head),
+        attrs={"head_idx": 0, "query_len": seq_len, "key_len": seq_len},
+    ))
+
+    cg = CodeGenerator(
+        weight_data={},
+        calibration_scales={
+            "q_in": q_scale,
+            "k_in": k_scale,
+            "v_in": v_scale,
+            "qkt": 1.0,
+            "qkt_scaled": 1.0,
+            "sm": sm_scale,
+            "attn_v": 1.0,
+        },
+        prescaled_biases={},
+        fp32_biases={},
+        model_config=config,
+        stream_name="prefill",
+        w8a32_enabled=True,
+    )
+    # Pre-allocate FP32 inputs (q_in, k_in, v_in) before generate() so
+    # they live in the allocator's "active" set throughout. Without this,
+    # `emit_matmul_attn_v_w8a32`'s lazy `v_in` alloc could land on a
+    # region freed by an earlier int8-scratch (the codegen's free
+    # tracking lets the region be reused, but the EMITTED QUANT
+    # instruction still writes there at execution time, corrupting V's
+    # pre-seeded FP32 bytes). In real graphs V comes from a per-head V
+    # projection's `emit_matmul_w8a32`, which keeps V's region live
+    # throughout the QKT/softmax/attn_v window.
+    fp32_bytes = seq_len * d_head * 4
+    cg.mem.abuf.alloc("q_in", fp32_bytes)
+    cg.mem.abuf.alloc("k_in", fp32_bytes)
+    cg.mem.abuf.alloc("v_in", fp32_bytes)
+    insns, dram_blob = cg.generate(graph)
+
+    sim = Simulator(MachineState(dram_data=bytes(dram_blob)))
+    # Seed FP32 Q, K, V at their respective input ABUF allocs.
+    q_alloc = cg.mem.abuf.allocations["q_in"]
+    k_alloc = cg.mem.abuf.allocations["k_in"]
+    v_alloc = cg.mem.abuf.allocations["v_in"]
+    mem.write_fp32_tile(sim.state, BUF_ABUF, q_alloc.offset_units, q_fp32)
+    mem.write_fp32_tile(sim.state, BUF_ABUF, k_alloc.offset_units, k_fp32)
+    mem.write_fp32_tile(sim.state, BUF_ABUF, v_alloc.offset_units, v_fp32)
+
+    for insn in insns:
+        sim._execute(insn)
+
+    # The attn_v output replaces qkt's ABUF region via the scale_mul →
+    # softmax → attn_v rename + free chain. Pull the recorded
+    # offset from the attn_v trace event (the live alloc may have
+    # been freed by last-use cleanup; the trace event captures the
+    # write site).
+    attn_v_offset = None
+    for events in cg.trace_manifest.values():
+        for event in events:
+            if event["node_name"] == "attn_v" and event["dtype"] == "fp32":
+                attn_v_offset = event["offset_units"]
+    assert attn_v_offset is not None
+    out_fp32 = mem.read_fp32_tile(
+        sim.state, BUF_ABUF, attn_v_offset, seq_len, d_head
+    )
+
+    # Numpy reference: softmax(Q @ K.T / √d_head) @ V.
+    scores = (q_fp32 @ k_fp32.T).astype(np.float32) * np.float32(inv_sqrt_d_head)
+    row_max = scores.max(axis=-1, keepdims=True)
+    exp = np.exp((scores - row_max).astype(np.float32))
+    sm_ref = (exp / exp.sum(axis=-1, keepdims=True)).astype(np.float32)
+    expected = (sm_ref @ v_fp32).astype(np.float32)
+
+    err = np.abs(out_fp32 - expected)
+    # Composite error bound: INT8 quant on Q/K (QKT path) + INT8 quant on
+    # softmax/V (attn_v path) + FP16 round-off on both composite PC scales.
+    # Observed err.max() ≈ 0.013 (4.7% relative for |expected|.max() ≈ 0.27)
+    # with seed=57; bound 0.05 gives ~4× headroom for seed variation while
+    # catching a 4× regression in INT8 round-trip precision. Bit-exact PC
+    # scale staging tests are the structural correctness signal; this e2e
+    # is integration coverage.
+    bound = 0.05
+    assert err.max() <= bound, (
+        f"max e2e error {err.max():.6f} exceeds bound {bound:.6f}; "
+        f"out[0,0]={out_fp32[0,0]}, expected[0,0]={expected[0,0]}"
+    )
+    # Sanity: outputs are real-valued (no inf, no nan).
+    assert np.all(np.isfinite(out_fp32))
+    # Sanity: outputs are at the right rough scale (V range × probability range).
+    assert np.abs(out_fp32).max() <= 2.0 * np.abs(v_fp32).max()
+
+
+# ---------------------------------------------------------------------------
+# M3-C: CONFIG_ATTN for masked softmax + pad-row zero-fill in W8A32
+# ---------------------------------------------------------------------------
+
+
+def test_emit_softmax_fp32_masked_emits_config_attn_before_masked_softmax():
+    """M3-C: when `node.attrs['masked']` is True, `emit_softmax_fp32`
+    emits ConfigAttnInsn(query_row_base=0, valid_kv_len=key_len, mode=0b10)
+    immediately before MaskedSoftmaxFp32Insn. In W8A32 mode softmax runs
+    over the FULL M_pad × N_pad tile in one instruction, so
+    `query_row_base=0` always — not the per-strip dance the INT8 path
+    does in `_emit_qkt`."""
+    cg = _fresh_codegen(w8a32=True)
+    key_len = 16
+    node = IRNode(
+        op="softmax",
+        name="masked_sm",
+        inputs=["sm_in"],
+        output_shape=(16, key_len),
+        attrs={"masked": True, "key_len": key_len},
+    )
+    emit_softmax_fp32(cg, node, masked=True)
+    opcodes = [insn.opcode for insn in cg.instructions]
+
+    # The CONFIG_ATTN must appear before MASKED_SOFTMAX_FP32.
+    config_attn_indices = [i for i, op in enumerate(opcodes) if op == Opcode.CONFIG_ATTN]
+    masked_sm_indices = [i for i, op in enumerate(opcodes) if op == Opcode.MASKED_SOFTMAX_FP32]
+    assert len(config_attn_indices) == 1, (
+        f"expected exactly one CONFIG_ATTN, got {len(config_attn_indices)}"
+    )
+    assert len(masked_sm_indices) == 1
+    assert config_attn_indices[0] < masked_sm_indices[0]
+    # And the CONFIG_ATTN immediately precedes the masked softmax (with
+    # any number of non-CONFIG_ATTN ops in between is fine, but in this
+    # simple fragment the gap is just CONFIG_TILE).
+    config_attn = cg.instructions[config_attn_indices[0]]
+    assert config_attn.query_row_base == 0
+    assert config_attn.valid_kv_len == key_len
+    assert config_attn.mode == 0b10  # prefill causal (N_pad == key_len)
+
+
+def test_emit_softmax_fp32_unmasked_does_not_emit_config_attn():
+    """M3-C counterpart: non-masked softmax still emits SOFTMAX_FP32
+    without any CONFIG_ATTN setup."""
+    cg = _fresh_codegen(w8a32=True)
+    node = IRNode(
+        op="softmax",
+        name="plain_sm",
+        inputs=["sm_in"],
+        output_shape=(16, 16),
+        attrs={"causal": False},
+    )
+    emit_softmax_fp32(cg, node, masked=False)
+    opcodes = [insn.opcode for insn in cg.instructions]
+    assert Opcode.CONFIG_ATTN not in opcodes
+    assert Opcode.SOFTMAX_FP32 in opcodes
+    assert Opcode.MASKED_SOFTMAX_FP32 not in opcodes
+
+
+def test_emit_softmax_fp32_picks_up_masked_attr_from_ir_node():
+    """M3-C: even when the `masked` keyword is False, an IR node with
+    `attrs['masked']=True` triggers the CONFIG_ATTN emission. This is
+    the path the codegen-dispatch `_emit_softmax` takes for graphs
+    coming through the nanogpt frontend, which sets the attr but does
+    not pass the keyword."""
+    cg = _fresh_codegen(w8a32=True)
+    node = IRNode(
+        op="softmax",
+        name="ir_masked_sm",
+        inputs=["sm_in"],
+        output_shape=(16, 16),
+        attrs={"masked": True, "key_len": 16},
+    )
+    emit_softmax_fp32(cg, node, masked=False)  # keyword False
+    opcodes = [insn.opcode for insn in cg.instructions]
+    assert Opcode.CONFIG_ATTN in opcodes
+    assert Opcode.MASKED_SOFTMAX_FP32 in opcodes
+
+
+def test_zero_pad_blob_is_4x_in_w8a32_mode():
+    """M3-C: the `__zero_pad__` DRAM blob grows 4× in W8A32 mode so the
+    FP32 pad-row zero-fill DMAs (embedding + K + V) read enough zeros.
+    INT8 mode is unchanged.
+
+    Both modes still store all-zero bytes — the test only checks the
+    size delta."""
+    from taccel.compiler.model_config import ModelConfig
+
+    config = ModelConfig(
+        model_kind="decoder",
+        n_layer=1, n_head=1, d_model=16, d_head=16, mlp_dim=16,
+        vocab_size=16, max_seq_len=16, embedding_kind="token_pos",
+    )
+    # Token/pos embedding kind: _zero_pad_size = (TILE - 1) * d_model
+    # = 15 * 16 = 240 bytes (INT8), 960 bytes (W8A32).
+    int8_cg = CodeGenerator(
+        weight_data={}, calibration_scales={}, prescaled_biases={},
+        model_config=config, stream_name="prefill", w8a32_enabled=False,
+    )
+    int8_cg.generate(IRGraph())
+    int8_zero_pad_off = int8_cg.dram_layout["__zero_pad__"]
+    next_sym_off = int8_cg.dram_layout["__input_patches__"]
+    int8_size = next_sym_off - int8_zero_pad_off
+
+    w8a32_cg = CodeGenerator(
+        weight_data={}, calibration_scales={}, prescaled_biases={},
+        model_config=config, stream_name="prefill", w8a32_enabled=True,
+    )
+    w8a32_cg.generate(IRGraph())
+    w8a32_zero_pad_off = w8a32_cg.dram_layout["__zero_pad__"]
+    w8a32_next_sym_off = w8a32_cg.dram_layout["__input_patches__"]
+    w8a32_size = w8a32_next_sym_off - w8a32_zero_pad_off
+
+    assert int8_size == 15 * 16, f"INT8 __zero_pad__ size {int8_size} != 240"
+    assert w8a32_size == int8_size * 4, (
+        f"W8A32 __zero_pad__ size {w8a32_size} != 4 × INT8 ({4 * int8_size})"
+    )
+
+    # Contents are zeros in both modes.
+    int8_zero_bytes = bytes(int8_cg.dram_blob[int8_zero_pad_off:int8_zero_pad_off + int8_size])
+    w8a32_zero_bytes = bytes(w8a32_cg.dram_blob[w8a32_zero_pad_off:w8a32_zero_pad_off + w8a32_size])
+    assert int8_zero_bytes == bytes(int8_size)
+    assert w8a32_zero_bytes == bytes(w8a32_size)
+
+
+def test_emit_embedding_lookup_w8a32_emits_pad_row_zero_fill_when_seq_short():
+    """M3-C: re-enable the pad-row zero-fill that M3-prep deferred. In
+    W8A32 mode, when seq_len < pad_dim(seq_len), `_emit_embedding_lookup`
+    must emit a DMA from `__zero_pad__` to zero the FP32 padding rows."""
+    from taccel.compiler.model_config import ModelConfig
+
+    d_model = 16
+    seq_len = 12  # pad_dim(12) = 16 → pad_rows = 4
+    vocab = 16
+    config = ModelConfig(
+        model_kind="decoder",
+        n_layer=1, n_head=1, d_model=d_model, d_head=d_model, mlp_dim=d_model,
+        vocab_size=vocab, max_seq_len=seq_len, embedding_kind="token_pos",
+    )
+    rng = np.random.default_rng(0)
+    wte_fp32 = rng.standard_normal((vocab, d_model)).astype(np.float32)
+    cg = CodeGenerator(
+        weight_data={"transformer.wte.weight": (wte_fp32, None)},
+        calibration_scales={"tok_embed": 1.0 / 127.0},
+        prescaled_biases={},
+        model_config=config,
+        stream_name="prefill",
+        w8a32_enabled=True,
+    )
+    graph = IRGraph()
+    graph.add_node(IRNode(
+        op="embed_lookup",
+        name="tok_embed",
+        inputs=[],
+        output_shape=(seq_len, d_model),
+        attrs={
+            "table": "transformer.wte.weight",
+            "token_ids": [0] * seq_len,
+            "seq_len": seq_len,
+        },
+    ))
+    insns, _ = cg.generate(graph)
+
+    # Pad-row zero-fill: LOAD with addr_reg=3 (the `__zero_pad__`
+    # convention) and xfer_len = pad_rows * d_model_pad * 4 / 16.
+    # pad_rows = 16 - 12 = 4; d_model_pad = 16; FP32 byte size = 4*16*4 = 256B = 16 units.
+    pad_loads = [
+        insn for insn in insns
+        if insn.opcode == Opcode.LOAD and insn.addr_reg == 3 and insn.xfer_len == 16
+    ]
+    assert len(pad_loads) >= 1, (
+        f"expected at least one embedding pad-row zero-fill LOAD "
+        f"(addr_reg=3, xfer_len=16 units); insns: "
+        f"{[(insn.opcode.name, getattr(insn,'addr_reg',None), getattr(insn,'xfer_len',None)) for insn in insns if insn.opcode == Opcode.LOAD]}"
+    )
+
+
+def test_int8_zero_pad_size_unchanged_when_w8a32_disabled():
+    """Regression: the INT8 path's `__zero_pad__` blob stays at the
+    original 1-byte/elem size (no W8A32 growth). Touches the same code
+    path as test_zero_pad_blob_is_4x_in_w8a32_mode but inverted."""
+    from taccel.compiler.model_config import ModelConfig
+
+    config = ModelConfig(
+        model_kind="decoder",
+        n_layer=1, n_head=1, d_model=16, d_head=16, mlp_dim=16,
+        vocab_size=16, max_seq_len=16, embedding_kind="token_pos",
+    )
+    cg = CodeGenerator(
+        weight_data={}, calibration_scales={}, prescaled_biases={},
+        model_config=config, stream_name="prefill", w8a32_enabled=False,
+    )
+    cg.generate(IRGraph())
+    zero_pad_off = cg.dram_layout["__zero_pad__"]
+    next_off = cg.dram_layout["__input_patches__"]
+    # 15 * 16 = 240 bytes (TILE - 1) * d_model.
+    assert next_off - zero_pad_off == 15 * 16
+
+
+def test_masked_attention_fragment_w8a32_end_to_end():
+    """M3-C end-to-end correctness signal: compile a small attention
+    fragment with `masked=True` softmax + seq_len < N_pad pad rows,
+    execute on the simulator, and assert the FP32 output matches the
+    numpy reference where K/V padding rows are zero and attention
+    scores for padded columns are masked to -∞.
+
+    seq_len=8 (pads to 16, so pad_rows=8). Tests the full M3-C chain:
+      - K pad-row zero-fill in emit_matmul_qkt_w8a32
+      - V pad-row zero-fill in emit_matmul_attn_v_w8a32
+      - CONFIG_ATTN + MASKED_SOFTMAX_FP32 in emit_softmax_fp32
+
+    Pre-allocate Q/K/V inputs as in M3-B's e2e test to avoid the
+    lazy-allocator aliasing bug.
+    """
+    from taccel.compiler.model_config import ModelConfig
+    from taccel.golden_model import memory as mem
+    from taccel.golden_model.simulator import Simulator
+    from taccel.golden_model.state import MachineState
+    from taccel.isa.opcodes import BUF_ABUF
+
+    seq_len = 8
+    d_head = 16
+    n_pad = 16  # pad_dim(seq_len) = pad_dim(8) = 16
+    inv_sqrt_d_head = 1.0 / np.sqrt(d_head)
+
+    rng = np.random.default_rng(91)
+    # Build full N_pad-sized FP32 tiles. Pad rows (rows 8..15) are
+    # seeded with LARGE values (×10 the normal scale) so if the
+    # codegen's K/V pad-row zero-fill DMA is broken (wrong offset,
+    # wrong size, or missing entirely), those β-derived contributions
+    # would dominate the attention output and the bound check would
+    # clearly fail. Without this, small random pad-row values would
+    # contribute too little to distinguish a working from a broken
+    # zero-fill — the test would pass even if the zero-fill regressed.
+    q_fp32 = rng.standard_normal((n_pad, d_head)).astype(np.float32) * 0.3
+    k_fp32 = rng.standard_normal((n_pad, d_head)).astype(np.float32) * 0.4
+    v_fp32 = rng.standard_normal((n_pad, d_head)).astype(np.float32) * 0.5
+    # Amplify K and V padding rows specifically — Q's padding rows are
+    # never read (queries only emit for seq_len rows).
+    k_fp32[seq_len:] = rng.standard_normal((n_pad - seq_len, d_head)).astype(np.float32) * 10.0
+    v_fp32[seq_len:] = rng.standard_normal((n_pad - seq_len, d_head)).astype(np.float32) * 10.0
+
+    q_scale = float(np.abs(q_fp32[:seq_len]).max() / 127.0)
+    k_scale = float(np.abs(k_fp32[:seq_len]).max() / 127.0)
+    v_scale = float(np.abs(v_fp32[:seq_len]).max() / 127.0)
+    sm_scale = 1.0 / 127.0
+
+    config = ModelConfig(
+        model_kind="decoder", n_layer=1, n_head=1, d_model=d_head,
+        d_head=d_head, mlp_dim=d_head, vocab_size=16,
+        max_seq_len=n_pad, embedding_kind="token_pos",
+    )
+
+    graph = IRGraph()
+    graph.add_node(IRNode(
+        op="matmul_qkt",
+        name="qkt",
+        inputs=["q_in", "k_in"],
+        output_shape=(seq_len, seq_len),
+        attrs={
+            "head_idx": 0,
+            "scale": inv_sqrt_d_head,
+            "query_len": seq_len,
+            "key_len": seq_len,
+            "masked": True,  # propagates to softmax via attrs below
+        },
+    ))
+    graph.add_node(IRNode(
+        op="scale_mul",
+        name="qkt_scaled",
+        inputs=["qkt"],
+        output_shape=(seq_len, seq_len),
+        attrs={"scale": inv_sqrt_d_head},
+    ))
+    graph.add_node(IRNode(
+        op="softmax",
+        name="sm",
+        inputs=["qkt_scaled"],
+        output_shape=(seq_len, seq_len),
+        # M3-C IR contract additions:
+        attrs={"masked": True, "key_len": seq_len, "causal_identity": False},
+    ))
+    graph.add_node(IRNode(
+        op="matmul_attn_v",
+        name="attn_v",
+        inputs=["sm", "v_in"],
+        output_shape=(seq_len, d_head),
+        attrs={"head_idx": 0, "query_len": seq_len, "key_len": seq_len},
+    ))
+
+    cg = CodeGenerator(
+        weight_data={},
+        calibration_scales={
+            "q_in": q_scale, "k_in": k_scale, "v_in": v_scale,
+            "qkt": 1.0, "qkt_scaled": 1.0, "sm": sm_scale, "attn_v": 1.0,
+        },
+        prescaled_biases={},
+        fp32_biases={},
+        model_config=config,
+        stream_name="prefill",
+        w8a32_enabled=True,
+    )
+    # Pre-allocate inputs (see M3-B docstring caveat).
+    fp32_bytes = n_pad * d_head * 4
+    cg.mem.abuf.alloc("q_in", fp32_bytes)
+    cg.mem.abuf.alloc("k_in", fp32_bytes)
+    cg.mem.abuf.alloc("v_in", fp32_bytes)
+    insns, dram_blob = cg.generate(graph)
+
+    sim = Simulator(MachineState(dram_data=bytes(dram_blob)))
+    mem.write_fp32_tile(
+        sim.state, BUF_ABUF, cg.mem.abuf.allocations["q_in"].offset_units, q_fp32,
+    )
+    mem.write_fp32_tile(
+        sim.state, BUF_ABUF, cg.mem.abuf.allocations["k_in"].offset_units, k_fp32,
+    )
+    mem.write_fp32_tile(
+        sim.state, BUF_ABUF, cg.mem.abuf.allocations["v_in"].offset_units, v_fp32,
+    )
+
+    for insn in insns:
+        sim._execute(insn)
+
+    # Pull the attn_v trace event for the architectural output offset.
+    attn_v_offset = next(
+        e["offset_units"]
+        for events in cg.trace_manifest.values()
+        for e in events
+        if e["node_name"] == "attn_v" and e["dtype"] == "fp32"
+    )
+    out_fp32 = mem.read_fp32_tile(
+        sim.state, BUF_ABUF, attn_v_offset, seq_len, d_head,
+    )
+
+    # Numpy reference: K and V pad rows (rows ≥ seq_len) are zeroed by
+    # the codegen's pad-row zero-fill, so the reference uses k_fp32 and
+    # v_fp32 with those rows masked. The attention scores for padded
+    # columns (j ≥ seq_len) are masked to -∞ by MASKED_SOFTMAX_FP32, so
+    # only the seq_len × seq_len block contributes.
+    k_eff = k_fp32.copy()
+    k_eff[seq_len:] = 0.0
+    v_eff = v_fp32.copy()
+    v_eff[seq_len:] = 0.0
+
+    # Real-units scores tile, then mask the padded query/key rows.
+    scores = (q_fp32 @ k_eff.T).astype(np.float32) * np.float32(inv_sqrt_d_head)
+    # Causal masking (prefill mode 0b10): for query row q, valid keys
+    # are 0..q (inclusive). Cols > q within the valid_kv range get -∞;
+    # cols ≥ seq_len always get -∞.
+    masked_scores = scores.copy()
+    for q in range(n_pad):
+        # Mask cols > q (causal) AND cols ≥ seq_len (valid_kv_len bound).
+        masked_scores[q, q + 1:] = -np.inf
+        masked_scores[q, seq_len:] = -np.inf
+    row_max = masked_scores.max(axis=-1, keepdims=True)
+    exp = np.exp((masked_scores - row_max).astype(np.float32))
+    # Rows with all -∞ produce NaN; clamp to zero (only relevant for
+    # the padded query rows which we don't compare anyway).
+    exp_sum = exp.sum(axis=-1, keepdims=True)
+    sm_ref = np.where(exp_sum > 0, exp / exp_sum, np.zeros_like(exp)).astype(np.float32)
+    expected = (sm_ref @ v_eff).astype(np.float32)
+
+    # Compare only the architectural seq_len × d_head region.
+    err = np.abs(out_fp32 - expected[:seq_len, :d_head])
+    bound = 0.05  # same envelope as M3-B's e2e
+    assert err.max() <= bound, (
+        f"max e2e error {err.max():.6f} exceeds bound {bound:.6f}; "
+        f"out[0,0]={out_fp32[0,0]}, expected[0,0]={expected[0,0]}"
+    )
+    assert np.all(np.isfinite(out_fp32))
+
+
+# ---------------------------------------------------------------------------
+# M3-D: Stage 3 tiny GPT-2 W8A32 bundle smoke test
+# ---------------------------------------------------------------------------
+
+
+def test_stage3_w8a32_bundle_compiles_executes_and_produces_finite_logits():
+    """M3-D smoke test: the full Stage 3 tiny GPT-2 fixture compiles
+    and executes end-to-end through the simulator-backed bundle in
+    W8A32 mode. Verifies the substrate landed by M2.5-A → M3-C is
+    sufficient for a real model graph — no NotImplementedError, no
+    simulator-time exception, finite logits in the architectural shape.
+
+    Numerical comparison to NanoGPTFQReference is intentionally NOT
+    done: that reference uses FP32 activations + INT8 weight QDQ
+    (`WeightOnlyHostRunner` semantics), while the W8A32 codegen
+    quantizes activations per matmul (M2.5-A dynamic scaling +
+    M3-A/M3-B static-composite QKT/attn_v re-quant). The two
+    deployment strategies produce different numerical results for the
+    same `weight_only_int8` preset name. A like-for-like reference
+    requires a W8A8-semantics path that mirrors the codegen's
+    quantization, deferred to a future milestone (M3-E or beyond).
+    """
+    from taccel.runtime.host_runner import HostRunner
+    from taccel.runtime.tiny_fixture import build_stage3_tiny_decoder_bundle
+
+    payload = _one_layer_gpt2_payload()
+    bundle = build_stage3_tiny_decoder_bundle(payload, ptq_preset="weight_only_int8")
+    runner = HostRunner(bundle.build.bundle, logits_dtype=np.float32)
+
+    # Prefill on a single token; logits should be the architectural
+    # vocab-wide distribution for that token.
+    logits = runner.run_prefill([3])
+
+    vocab = int(payload["model_args"]["vocab_size"])
+    # pad_dim(vocab) FP32 entries in the logits region.
+    from taccel.compiler.tiler import pad_dim as _pad_dim
+    assert logits.shape == (_pad_dim(vocab),), (
+        f"logits shape {logits.shape} != ({_pad_dim(vocab)},)"
+    )
+
+    # Finite (no NaN/inf from numerical pathologies in the FP32 path).
+    assert np.all(np.isfinite(logits)), (
+        f"logits contain non-finite values: {logits}"
+    )
+
+    # Non-trivial: not all-zero (would indicate the bundle ran but the
+    # data didn't flow through), and not pathologically large (would
+    # indicate FP32 overflow somewhere upstream propagating to the
+    # architectural row).
+    assert np.abs(logits).max() > 1e-6, "logits are all (approximately) zero"
+    assert np.abs(logits).max() < 100.0, (
+        f"logits magnitude {np.abs(logits).max()} suggests FP32 overflow upstream"
+    )
+
+    # Argmax is a real vocab index (within [0, vocab)).
+    top_token = int(np.argmax(logits[:vocab]))
+    assert 0 <= top_token < vocab
+
+
+def test_stage3_w8a32_bundle_executes_decode_step():
+    """M3-D smoke: decode step also runs end-to-end. The decode stream
+    is a separate program with KV-cache LOADs and runtime CONFIG_ATTN
+    patching; this exercises the M3-A/B/C primitives in the decode
+    code path (which the M3-A/B/C unit tests only touched in prefill)."""
+    from taccel.runtime.host_runner import HostRunner
+    from taccel.runtime.tiny_fixture import build_stage3_tiny_decoder_bundle
+
+    payload = _one_layer_gpt2_payload()
+    bundle = build_stage3_tiny_decoder_bundle(payload, ptq_preset="weight_only_int8")
+    runner = HostRunner(bundle.build.bundle, logits_dtype=np.float32)
+    # Prime the KV cache via prefill.
+    _ = runner.run_prefill([3])
+    # Then take one decode step.
+    decode_logits = runner.run_decode_step(token_id=5, position=1)
+
+    vocab = int(payload["model_args"]["vocab_size"])
+    from taccel.compiler.tiler import pad_dim as _pad_dim
+    assert decode_logits.shape == (_pad_dim(vocab),)
+    assert np.all(np.isfinite(decode_logits))
+    assert np.abs(decode_logits).max() > 1e-6
+
+
+def test_stage3_w8a32_bundle_deterministic_across_runs():
+    """M3-D smoke: the same payload + same token sequence produces
+    identical logits across rebuilds. Each `_run()` rebuilds the bundle
+    from scratch — calibration, quantization, codegen, DRAM staging,
+    simulator execution — so bit-exact equality verifies determinism
+    across the FULL build+execute pipeline, not just simulator-state
+    cleanliness."""
+    from taccel.runtime.host_runner import HostRunner
+    from taccel.runtime.tiny_fixture import build_stage3_tiny_decoder_bundle
+
+    payload = _one_layer_gpt2_payload()
+
+    def _run():
+        bundle = build_stage3_tiny_decoder_bundle(payload, ptq_preset="weight_only_int8")
+        runner = HostRunner(bundle.build.bundle, logits_dtype=np.float32)
+        return runner.run_prefill([3])
+
+    a = _run()
+    b = _run()
+    np.testing.assert_array_equal(a, b)

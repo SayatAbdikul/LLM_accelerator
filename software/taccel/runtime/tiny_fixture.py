@@ -399,13 +399,16 @@ def quantize_fixture_payload(
         fp32_biases["lm_head.bias"] = _fp32_bias(
             state_dict, "lm_head.bias", output_dim=config.vocab_size,
         )
+    # M3-D: in W8A32 mode lm_head produces FP32 (4 bytes/elem), so the
+    # logits DRAM region grows 4×. INT8 path unchanged.
+    logits_elem_bytes = 4 if w8a32_enabled else 1
     return (
         weight_data,
         prescaled_biases,
         fp32_biases,
         calibration_scales,
         config,
-        pad_dim(config.vocab_size),
+        pad_dim(config.vocab_size) * logits_elem_bytes,
     )
 
 

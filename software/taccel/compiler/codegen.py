@@ -168,24 +168,16 @@ class CodeGenerator:
 
         Returns (instructions, dram_data_blob).
         """
-        # Phase 3 (c.1) M2.5-B guardrail: in W8A32 mode the `matmul` op
-        # is now lowered by `emit_matmul_w8a32`, but attention internals
-        # (`matmul_qkt`, `matmul_attn_v`) still emit INT8-output paths
-        # that conflict with the FP32 sub-layer ops. Block those nodes
-        # at the bundle boundary so the user gets a clear "M3" message
-        # instead of a silently malformed bundle.
-        if self.w8a32_enabled:
-            blocked_ops = {"matmul_qkt", "matmul_attn_v"}
-            if any(node.op in blocked_ops for node in graph.nodes):
-                raise NotImplementedError(
-                    "W8A32 codegen does not yet support attention-internal "
-                    "matmuls (`matmul_qkt`, `matmul_attn_v`) — those still "
-                    "emit INT8-output paths that conflict with the FP32 "
-                    "sub-layer ops produced by M2 and the FP32 matmul "
-                    "output produced by M2.5-B. Use the W8A8 path or the "
-                    "WeightOnlyHostRunner (Phase 3 (b)) for graphs that "
-                    "contain attention until M3 lands."
-                )
+        # Phase 3 (c.1) M3-B: all W8A32 matmul ops are now lowered.
+        # - `matmul`         → emit_matmul_w8a32       (M2.5-B)
+        # - `matmul_qkt`     → emit_matmul_qkt_w8a32   (M3-A)
+        # - `matmul_attn_v`  → emit_matmul_attn_v_w8a32 (M3-B)
+        # The graph-level guardrail is empty. Per-emitter NotImplementedError
+        # still fires for unsupported shapes (strip-mining, pad-row
+        # zero-fill, masked-softmax CONFIG_ATTN — the last two are M3-C
+        # scoped). Real GPT-2 graphs with masked softmax will hit the
+        # ConfigError("CONFIG_ATTN not set") at simulator-execution time
+        # until M3-C extends emit_softmax_fp32.
         # First pass: lay out weights in DRAM
         self._layout_weights(graph)
 
@@ -304,16 +296,97 @@ class CodeGenerator:
                 self.dram_blob.extend(blob)
                 offset += len(blob)
 
+            # W8A32 (M3-A): stage a per-matmul_qkt FP16 PC scale vector.
+            # emit_matmul_qkt_w8a32 uses DEQUANT_ACCUM_FP32 (the M1 variant —
+            # no act_scale slot) to multiply the INT32 ACCUM by a single
+            # composite factor `q_scale * k_scale * inv_sqrt_d_head` (static,
+            # calibration-based). This folds the SCALE_MUL IR node into the
+            # QKT epilogue — the same architecture the INT8 path uses (see
+            # `qkt_in_scale` in _emit_qkt). Q and K themselves still benefit
+            # from M2.5-A dynamic activation scaling in their parent Q/K
+            # projection matmuls; only the QKT re-quant boundary is static.
+            DEFAULT_ACT_SCALE = 6.0 / 127.0
+            for node in graph.nodes:
+                if node.op != "matmul_qkt":
+                    continue
+                q_input, k_input = node.inputs[0], node.inputs[1]
+                q_scale = float(self.calibration_scales.get(q_input, DEFAULT_ACT_SCALE))
+                k_scale = float(self.calibration_scales.get(k_input, DEFAULT_ACT_SCALE))
+                inv_sqrt_d_head = float(
+                    node.attrs.get("scale", self.config.d_head ** -0.5)
+                )
+                # Order of casts matters for FP16 bit-exactness — the
+                # codegen and `test_emit_matmul_qkt_w8a32_pc_scale_bytes_
+                # bit_exact_fp16_composite` test fixture both go FP32 ×
+                # FP32 × FP32 → FP16. Don't refactor to a Python-float
+                # (FP64) intermediate: it would shift the FP16 rounding
+                # by 0-1 ULP for some values and silently break the test.
+                composite_fp32 = (
+                    np.float32(q_scale)
+                    * np.float32(k_scale)
+                    * np.float32(inv_sqrt_d_head)
+                )
+                key_len = int(
+                    node.attrs.get(
+                        "key_len",
+                        node.output_shape[1] if len(node.output_shape) > 1 else node.output_shape[0],
+                    )
+                )
+                N_pad = pad_dim(key_len)
+                pc_fp16 = np.full(N_pad, np.float16(composite_fp32), dtype=np.float16)
+                sym = f"{node.name}__qkt_pc_scale"
+                self.dram_layout[sym] = offset
+                blob = pc_fp16.tobytes()
+                self.dram_blob.extend(blob)
+                offset += len(blob)
+
+            # W8A32 (M3-B): stage a per-matmul_attn_v FP16 PC scale vector.
+            # emit_matmul_attn_v_w8a32 uses DEQUANT_ACCUM_FP32 (M1, no
+            # _SCALED) with a constant composite scale `sm_scale × v_scale`
+            # — the softmax output's static calibration scale times V's
+            # output scale from its parent emit_matmul_w8a32. No
+            # 1/√d_head factor here (already applied by emit_matmul_qkt_w8a32
+            # in its dequant epilogue, so the softmax input is already
+            # the correctly-scaled attention scores).
+            for node in graph.nodes:
+                if node.op != "matmul_attn_v":
+                    continue
+                sm_input, v_input = node.inputs[0], node.inputs[1]
+                sm_scale = float(self.calibration_scales.get(sm_input, DEFAULT_ACT_SCALE))
+                v_scale = float(self.calibration_scales.get(v_input, DEFAULT_ACT_SCALE))
+                # Cast order matches the test fixture: FP32 × FP32 → FP16.
+                composite_fp32 = np.float32(sm_scale) * np.float32(v_scale)
+                # N_pad = d_head_pad (the attention output column count).
+                head_dim = int(node.output_shape[1])
+                N_pad = pad_dim(head_dim)
+                pc_fp16 = np.full(N_pad, np.float16(composite_fp32), dtype=np.float16)
+                sym = f"{node.name}__attn_v_pc_scale"
+                self.dram_layout[sym] = offset
+                blob = pc_fp16.tobytes()
+                self.dram_blob.extend(blob)
+                offset += len(blob)
+
         # Zero-pad blob: used to mask attention padding rows (K and V) before QKT.
         # Padding rows 197-207 are zero in the input but LN(zero_row) = beta (non-zero),
         # which propagates through QKV projections. Zeroing K/V rows 197-207 eliminates
         # the beta-derived attention contribution from padding tokens.
         # Size: padding rows × row width. DeiT attention uses d_head; Stage 1
         # token embeddings use d_model for short fixed-sequence tests.
+        #
+        # W8A32 (M3-C): the same `__zero_pad__` symbol is used by the FP32
+        # path's pad-row zero-fill (embedding lookup + K/V padding in the
+        # QKT/attn_v emitters). Each FP32 element is 4 bytes/elem vs 1
+        # byte/elem for INT8, so allocate 4× the size in W8A32 mode. The
+        # INT8 path reads only the first N bytes it needs; the extra
+        # padding is harmless. M3-prep skipped the embedding pad-row
+        # zero-fill because no consumer existed; M3-C restores it for the
+        # masked-softmax attention path.
         if self.config.embedding_kind == "patch_cls":
             _zero_pad_size = (pad_dim(self.config.max_seq_len) - self.config.max_seq_len) * self.config.d_head
         else:
             _zero_pad_size = (TILE - 1) * self.config.d_model
+        if self.w8a32_enabled:
+            _zero_pad_size *= 4
         self.dram_layout["__zero_pad__"] = offset
         self.dram_blob.extend(bytes(_zero_pad_size))
         offset += _zero_pad_size
@@ -1834,7 +1907,20 @@ class CodeGenerator:
         Instead process 16-row strips: each [16,208] INT32 = 13KB ≤ 64KB.
         SOFTMAX each strip from ACCUM directly to INT8 → WBUF immediately.
         After all strips, WBUF holds [208,208] INT8 = 43KB for downstream softmax.
+
+        W8A32 mode (M3-A): dispatches to `emit_matmul_qkt_w8a32` which
+        re-quantizes the FP32 Q and K (produced by the upstream per-head
+        Q/K projection matmuls under `emit_matmul_w8a32`) to INT8 with
+        static calibration scales, does INT8 MATMUL, and dequants to FP32
+        scores via DEQUANT_ACCUM_FP32 with a composite PC scale that folds
+        `1/√d_head` into the dequant factor. The downstream `scale_mul`
+        IR node becomes a no-op (rename) and `softmax` flows through
+        MASKED_SOFTMAX_FP32 (M2 path).
         """
+        if self.w8a32_enabled:
+            from .w8a32_emit import emit_matmul_qkt_w8a32
+            emit_matmul_qkt_w8a32(self, node)
+            return
         head_idx = node.attrs["head_idx"]
         query_len = int(node.attrs.get("query_len", node.output_shape[0]))
         key_len = int(node.attrs.get("key_len", node.output_shape[1] if len(node.output_shape) > 1 else query_len))
@@ -2169,7 +2255,17 @@ class CodeGenerator:
         attn scores are in WBUF (from softmax in-place).
         V_h is in ABUF. MATMUL src1=WBUF[attn], src2=ABUF[V].
         After matmul, free both attn (WBUF) and V (ABUF via last-use).
+
+        W8A32 mode (M3-B): dispatches to `emit_matmul_attn_v_w8a32`.
+        Both inputs are FP32 in ABUF by that point (softmax output FP32
+        from emit_softmax_fp32; V FP32 from the per-head V projection's
+        emit_matmul_w8a32). Re-quant statically, INT8 MATMUL, DEQUANT
+        to FP32 attn_v tile. No transpose (V is already K-major).
         """
+        if self.w8a32_enabled:
+            from .w8a32_emit import emit_matmul_attn_v_w8a32
+            emit_matmul_attn_v_w8a32(self, node)
+            return
         if self._block_selected(node.name, self.fused_softmax_attnv_blocks):
             return
 
@@ -2308,13 +2404,25 @@ class CodeGenerator:
         )
 
     def _emit_scale_mul(self, node: IRNode):
-        """C1: scale_mul is metadata-only; scaling is folded into QKT softmax input scale."""
-        in_alloc = self.mem.wbuf.get(node.inputs[0])
-        if in_alloc is not None:
+        """C1: scale_mul is metadata-only; scaling is folded into the QKT
+        epilogue (INT8 path: via SOFTMAX's input scale; W8A32 path
+        (M3-A): via DEQUANT_ACCUM_FP32's composite PC scale vector).
+        Either way this node is a rename — propagate the allocation
+        from `node.inputs[0]` to `node.name`."""
+        # INT8 path: QKT writes its softmax output to WBUF (INT8).
+        in_wbuf = self.mem.wbuf.get(node.inputs[0])
+        if in_wbuf is not None:
             # Rename in-place: pop the old key and re-insert under the new name
             # without touching the free list (free() would double-book the region).
             alloc = self.mem.wbuf.allocations.pop(node.inputs[0])
             self.mem.wbuf.allocations[node.name] = alloc
+        else:
+            # W8A32 path (M3-A): QKT writes its FP32 scores tile to ABUF.
+            # Same rename mechanism, just in the ABUF allocator.
+            in_abuf = self.mem.abuf.get(node.inputs[0])
+            if in_abuf is not None:
+                alloc = self.mem.abuf.allocations.pop(node.inputs[0])
+                self.mem.abuf.allocations[node.name] = alloc
 
         # Propagate scale metadata for downstream rename nodes.
         self.calibration_scales[node.name] = self.calibration_scales.get(
@@ -2766,14 +2874,14 @@ class CodeGenerator:
             )
             self._emit(SyncInsn(resource_mask=0b001))
         pad_rows = pad_dim(seq_len) - seq_len
-        # The INT8 path zero-fills pad rows from `__zero_pad__` because
-        # the attention QKT path masks K/V padding via LN+QKV downstream.
-        # In W8A32 mode QKT is still guardrailed (M3) and sub-layer ops
-        # produce row-independent outputs, so leaving pad rows
-        # uninitialized is safe. The trace-capture path also slices to
-        # logical_rows × logical_cols, so pad-row garbage stays
-        # invisible to diagnostics.
-        if pad_rows and not use_fp32:
+        # Both the INT8 and W8A32 paths now zero-fill pad rows (M3-prep
+        # initially skipped this for W8A32 mode because attention was
+        # still guardrailed; M3-C re-enables it because masked softmax in
+        # the FP32 path requires K/V padding rows to be zero so
+        # LN(zero_row)=β doesn't contaminate attention scores). The
+        # `__zero_pad__` blob is sized 4× in W8A32 mode (see
+        # `_layout_weights`), so `pad_rows * row_bytes` always fits.
+        if pad_rows:
             zero_pad_dram = self._dram_offset_required("__zero_pad__", "zeroing embedding padding rows")
             self._emit_dma_load(
                 BUF_ABUF,
@@ -2907,7 +3015,15 @@ class CodeGenerator:
         self._emit(SyncInsn(resource_mask=0b001))
 
     def _emit_logits_store(self, node: IRNode):
-        """Store a one-row INT8 logits tensor to the ProgramBundle logits region."""
+        """Store a logits tensor to the ProgramBundle logits region.
+
+        INT8 path: 1 byte/elem, store_rows × cols_pad bytes.
+
+        W8A32 path (M3-D): lm_head produces FP32 (4 bytes/elem), so the
+        DMA store moves 4× more bytes and row strides are 4× wider.
+        Detected via `cg.w8a32_enabled`; the IR contract is unchanged
+        (logits_store always describes the logical shape).
+        """
         if not node.inputs:
             raise ValueError(f"{node.name} requires a source tensor input")
         source_name = node.inputs[0]
@@ -2931,10 +3047,15 @@ class CodeGenerator:
         if store_rows <= 0:
             raise ValueError(f"{node.name} store_rows must be positive")
 
-        size_bytes = int(node.attrs.get("xfer_bytes", store_rows * cols_pad))
+        # M3-D: W8A32 lm_head output is FP32 (4 bytes/elem) — both the
+        # DMA xfer size and the row stride scale by 4.
+        elem_bytes = 4 if self.w8a32_enabled else 1
+        size_bytes = int(node.attrs.get(
+            "xfer_bytes", store_rows * cols_pad * elem_bytes,
+        ))
         addr_reg = int(node.attrs.get("addr_reg", 3))
         symbol = str(node.attrs.get("symbol", f"{self.stream_name}_logits_offset"))
-        row_byte_offset = row_index * cols_pad
+        row_byte_offset = row_index * cols_pad * elem_bytes
 
         staging_name = None
         if "src_buf" in node.attrs and "src_off_units" in node.attrs:

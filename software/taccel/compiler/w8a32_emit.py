@@ -64,7 +64,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from ..isa.instructions import (
+    BufCopyInsn,
+    ConfigAttnInsn,
     ConfigTileInsn,
+    DequantAccumFp32Insn,
     DequantAccumFp32ScaledInsn,
     GeluFp32Insn,
     LayernormFp32Insn,
@@ -72,12 +75,28 @@ from ..isa.instructions import (
     MatmulInsn,
     MaxAbsReduceFp32Insn,
     QuantFp32Int8Insn,
+    SetScaleInsn,
     SoftmaxFp32Insn,
     SyncInsn,
     VaddFp32Insn,
 )
 from ..isa.opcodes import ABUF_SIZE, ACCUM_SIZE, BUF_ABUF, BUF_ACCUM, BUF_WBUF, WBUF_SIZE
 from .tiler import TILE, pad_dim
+
+
+def _fp16_to_uint16(val) -> int:
+    """Convert FP32/python float to its FP16 bit pattern (uint16, little-endian).
+
+    Mirror of `codegen._fp16_to_uint16` — duplicated to keep w8a32_emit a
+    self-contained import surface (codegen imports w8a32_emit, not the
+    other way around).
+    """
+    fp16 = np.float16(val)
+    return int(np.frombuffer(fp16.tobytes(), dtype=np.uint16)[0])
+
+
+# Size of one 16-byte addressing unit (matches `taccel/isa/opcodes.UNIT`).
+UNIT = 16
 
 if TYPE_CHECKING:
     from .codegen import CodeGenerator
@@ -209,10 +228,23 @@ def emit_gelu_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
 def emit_softmax_fp32(cg: "CodeGenerator", node: "IRNode", *, masked: bool = False) -> None:
     """W8A32 SOFTMAX_FP32 / MASKED_SOFTMAX_FP32 lowering.
 
-    For non-masked softmax the W8A32 path is straightforward. For the
-    causal-masked variant the CONFIG_ATTN context must already be set
-    by the caller (typically through the same path that emits
-    MASKED_SOFTMAX in the INT8 codegen).
+    Non-masked variant: emits CONFIG_TILE + SOFTMAX_FP32.
+
+    Masked variant (M3-C): emits CONFIG_TILE + ConfigAttnInsn +
+    MASKED_SOFTMAX_FP32. The CONFIG_ATTN context is set ONCE with
+    `query_row_base=0` because in W8A32 mode the softmax runs over
+    the FULL M_pad × N_pad attention scores tile in a single
+    instruction — NOT per-strip like the INT8 `_emit_qkt` path.
+    `valid_kv_len` comes from `node.attrs["key_len"]` (M3-C IR contract
+    addition); `mode = 0b10` for the standard prefill-causal case
+    (key_pad == key_len), `mode = 0b11` for runtime-config-attn graphs.
+
+    The `masked` keyword (legacy from M2's INT8-mode dispatch) stays
+    as a convenience. When `node.attrs.get("masked")` is set, this
+    helper picks up the IR-level value automatically; the keyword arg
+    is OR'd with it. The `key_len` defaults to `node.output_shape[1]`
+    when not explicitly set (matches the IR contract from
+    `nanogpt_adapter.py`).
     """
     M_pad = pad_dim(node.output_shape[0])
     N_pad = pad_dim(node.output_shape[1])
@@ -220,9 +252,49 @@ def emit_softmax_fp32(cg: "CodeGenerator", node: "IRNode", *, masked: bool = Fal
     n_tiles = N_pad // TILE
     cg._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=0))
 
+    # Pick up the IR-level `masked` attr; OR with the keyword for
+    # direct-caller convenience (the M2 dispatch in `_emit_softmax`
+    # passes `masked=True` explicitly via the keyword).
+    ir_masked = bool(node.attrs.get("masked", False))
+    is_masked = bool(masked) or ir_masked
+
+    if is_masked:
+        # CONFIG_ATTN context for the masked-softmax. In W8A32 mode the
+        # softmax processes all M_pad query rows in one go, so
+        # query_row_base=0 always — contrast the INT8 path's per-strip
+        # CONFIG_ATTN emission inside _emit_qkt.
+        key_len = int(node.attrs.get("key_len", node.output_shape[1]))
+        runtime_config_attn = bool(node.attrs.get("runtime_config_attn", False))
+        # Mode picking mirrors codegen._attention_mask_mode_for_qkt's
+        # logic from the softmax's perspective: prefill-causal when
+        # N_pad == key_len (no key padding); runtime-config-attn for
+        # decode streams that patch the context at runtime.
+        if runtime_config_attn:
+            # Decode-stream graphs that patch the context at runtime.
+            attn_mode = 0b11
+        elif N_pad == key_len:
+            # Standard prefill-causal: no key padding.
+            attn_mode = 0b10
+        else:
+            # Static-but-padded key_len (N_pad > key_len): mode 0b11
+            # with a static `valid_kv_len` matches the INT8 path's
+            # convention (see codegen._attention_mask_mode_for_qkt).
+            # Not "runtime-patched" in spite of the mode bits; the
+            # simulator's masked-softmax handles static valid_kv_len
+            # correctly under either 0b10 or 0b11 — 0b11 just signals
+            # that key_pad > valid_kv_len.
+            attn_mode = 0b11
+        cg._emit(
+            ConfigAttnInsn(
+                query_row_base=0,
+                valid_kv_len=key_len,
+                mode=attn_mode,
+            )
+        )
+
     in_alloc = _abuf_alloc_fp32(cg, node.inputs[0], M_pad, N_pad)
     out_alloc = _abuf_alloc_fp32(cg, node.name, M_pad, N_pad)
-    cls = MaskedSoftmaxFp32Insn if masked else SoftmaxFp32Insn
+    cls = MaskedSoftmaxFp32Insn if is_masked else SoftmaxFp32Insn
     cg._emit(
         cls(
             src1_buf=BUF_ABUF,
@@ -513,4 +585,464 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
         N,
         "fp32",
         out_scale,
+    )
+
+
+# ---------------------------------------------------------------------------
+# M3-A: matmul_qkt W8A32 lowering — Q @ K^T with static composite dequant
+# ---------------------------------------------------------------------------
+
+
+def emit_matmul_qkt_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
+    """W8A32 lowering for `matmul_qkt` (per-head Q @ K^T attention matmul).
+
+    Q and K live in ABUF as FP32 (the per-head Q/K projection matmuls
+    that produced them were lowered through `emit_matmul_w8a32`, so
+    each already benefits from M2.5-A dynamic activation scaling at
+    *its* re-quant boundary). For QKT we re-quantize Q and K to INT8
+    using static calibration scales, INT8-matmul, then dequant via the
+    M1 `DEQUANT_ACCUM_FP32` op (no _SCALED variant — only one factor
+    needed) with a pre-folded composite PC scale:
+
+        wt_scale_pc[j] = q_scale × k_scale × (1/√d_head)    (all j)
+
+    The SCALE_MUL IR node downstream of `matmul_qkt` becomes a no-op
+    (the `1/√d_head` factor is already in the QKT epilogue). The
+    `softmax` IR node lowers to `MASKED_SOFTMAX_FP32` (or
+    `SOFTMAX_FP32`) via the existing M2 dispatch.
+
+    Static QKT scaling is NOT a regression from M2.5-A — the upstream
+    Q and K projection matmuls used dynamic scaling for their inputs;
+    only the QKT re-quant boundary is static. This matches the
+    architecture of the INT8 path's QKT (qkt_in_scale is also static
+    there).
+
+    Strip-mining over Q's M dimension matches the INT8 path: 16-row
+    Q strips, each producing a (16, N_pad) tile in ACCUM that's
+    immediately dequant'd to a (16, N_pad) FP32 strip of the output.
+
+    Scope (M3-A):
+      - K padding zeros are NOT emitted in W8A32 mode. The tiny
+        fixture has key_len == N_pad so this never matters. Real
+        GPT-2 graphs hit the NotImplementedError below until M3-B
+        adds the pad-row zero-fill at the right (FP32) byte size.
+      - Per-head per-strip CONFIG_ATTN setup (causal masking) is NOT
+        emitted by this helper — the MASKED_SOFTMAX_FP32 downstream
+        handles its own attention masking via its CONFIG_ATTN context.
+        For W8A32 mode the masking happens at softmax-time, not at
+        QKT-time, since the FP32 scores tile is mask-able directly.
+    """
+    head_idx = node.attrs["head_idx"]
+    query_len = int(node.attrs.get("query_len", node.output_shape[0]))
+    key_len = int(
+        node.attrs.get(
+            "key_len",
+            node.output_shape[1] if len(node.output_shape) > 1 else query_len,
+        )
+    )
+    head_dim = cg.config.d_head
+    inv_sqrt_d_head = float(node.attrs.get("scale", head_dim ** -0.5))
+    M_pad = pad_dim(query_len)
+    N_pad = pad_dim(key_len)
+    K_pad = pad_dim(head_dim)
+    num_strips = M_pad // TILE
+    m_tiles = M_pad // TILE
+    n_tiles = N_pad // TILE
+    k_tiles = K_pad // TILE
+
+    # FP32 Q and K input allocs from the upstream per-head Q/K matmuls.
+    q_fp32_alloc = cg.mem.abuf.get(node.inputs[0]) or _abuf_alloc_fp32(
+        cg, node.inputs[0], M_pad, K_pad
+    )
+    k_fp32_alloc = cg.mem.abuf.get(node.inputs[1]) or _abuf_alloc_fp32(
+        cg, node.inputs[1], N_pad, K_pad
+    )
+
+    # ----- M3-C: zero K's FP32 pad rows before quantization -----
+    # If key_len < N_pad, K has padding rows (e.g. seq_len=14 → N_pad=16
+    # has 2 padding rows). LN(zero_row) = β (non-zero) propagates into
+    # K's padding rows during the per-head K projection, so the FP32 K
+    # tile holds β-derived junk there. The downstream masked-softmax-FP32
+    # will mask those columns to -∞, but the K-QUANT runs first and
+    # would consume that junk; the safer (and matching-INT8) approach is
+    # to zero the FP32 pad rows BEFORE quantization so K's INT8 also
+    # has zero pad rows. `__zero_pad__` is sized 4× in W8A32 mode (see
+    # codegen._layout_weights), so the FP32 byte size fits.
+    if N_pad > key_len:
+        pad_rows = N_pad - key_len
+        k_row_units_fp32 = (K_pad * FP32_BYTES_PER_ELEM) // UNIT
+        k_pad_units = k_fp32_alloc.offset_units + key_len * k_row_units_fp32
+        zero_pad_dram = cg._dram_offset_required(
+            "__zero_pad__", f"zeroing K padding rows for '{node.name}'"
+        )
+        cg._emit_dma_load(
+            BUF_ABUF,
+            k_pad_units,
+            pad_rows * K_pad * FP32_BYTES_PER_ELEM,
+            3,
+            zero_pad_dram,
+        )
+        cg._emit(SyncInsn(resource_mask=0b001))
+
+    # Static calibration scales for the QKT re-quant boundary.
+    DEFAULT_ACT_SCALE = 6.0 / 127.0
+    q_scale = float(cg.calibration_scales.get(node.inputs[0], DEFAULT_ACT_SCALE))
+    k_scale = float(cg.calibration_scales.get(node.inputs[1], DEFAULT_ACT_SCALE))
+
+    # ----- Stage 1: QUANT_FP32_INT8(Q) into an ABUF scratch -----
+    cg._emit(ConfigTileInsn(M=m_tiles - 1, N=k_tiles - 1, K=0))
+    sreg_q = cg._alloc_sreg()
+    cg._emit(
+        SetScaleInsn(
+            sreg=sreg_q, src_mode=0,
+            imm16=_fp16_to_uint16(1.0 / max(q_scale, 1e-12)),
+        )
+    )
+    q_int8_alloc = cg.mem.abuf.alloc(f"{node.name}__q_int8", M_pad * K_pad)
+    cg._emit(
+        QuantFp32Int8Insn(
+            src1_buf=BUF_ABUF, src1_off=q_fp32_alloc.offset_units,
+            src2_buf=BUF_ABUF, src2_off=0,
+            dst_buf=BUF_ABUF, dst_off=q_int8_alloc.offset_units,
+            sreg=sreg_q,
+        )
+    )
+    cg._emit(SyncInsn(resource_mask=0b100))
+
+    # ----- Stage 2: QUANT_FP32_INT8(K) into an ABUF scratch -----
+    cg._emit(ConfigTileInsn(M=n_tiles - 1, N=k_tiles - 1, K=0))
+    sreg_k = cg._alloc_sreg()
+    cg._emit(
+        SetScaleInsn(
+            sreg=sreg_k, src_mode=0,
+            imm16=_fp16_to_uint16(1.0 / max(k_scale, 1e-12)),
+        )
+    )
+    k_int8_alloc = cg.mem.abuf.alloc(f"{node.name}__k_int8", N_pad * K_pad)
+    cg._emit(
+        QuantFp32Int8Insn(
+            src1_buf=BUF_ABUF, src1_off=k_fp32_alloc.offset_units,
+            src2_buf=BUF_ABUF, src2_off=0,
+            dst_buf=BUF_ABUF, dst_off=k_int8_alloc.offset_units,
+            sreg=sreg_k,
+        )
+    )
+    cg._emit(SyncInsn(resource_mask=0b100))
+
+    # ----- Stage 3: BUF_COPY transpose K_int8 (ABUF) → K^T (WBUF) -----
+    # Same mechanism as the INT8 _emit_qkt path: 1-byte/elem transpose,
+    # source has N_pad // TILE row-tiles of TILE rows each.
+    length_units = (N_pad * K_pad) // UNIT
+    kt_wbuf = cg.mem.wbuf.alloc(f"kt_head{head_idx}_{node.name}", K_pad * N_pad)
+    cg._emit(
+        BufCopyInsn(
+            src_buf=BUF_ABUF, src_off=k_int8_alloc.offset_units,
+            dst_buf=BUF_WBUF, dst_off=kt_wbuf.offset_units,
+            length=length_units,
+            src_rows=N_pad // TILE,
+            transpose=1,
+        )
+    )
+    cg._emit(SyncInsn(resource_mask=0b001))
+
+    # ----- Stage 4: DMA-load the staged FP16 PC scale vector -----
+    # Vector entries are all `q_scale * k_scale * inv_sqrt_d_head` cast
+    # to FP16 — staged at DRAM-layout time in `_layout_weights`.
+    pc_scale_sym = f"{node.name}__qkt_pc_scale"
+    pc_scale_dram = cg._dram_offset_required(
+        pc_scale_sym,
+        f"loading W8A32 QKT composite PC scale for '{node.name}'",
+    )
+    pc_scale_bytes = N_pad * 2  # FP16
+    pc_scale_alloc = cg.mem.wbuf.alloc(f"_qkt_pc_{node.name}", pc_scale_bytes)
+    cg._emit_dma_load(
+        BUF_WBUF, pc_scale_alloc.offset_units, pc_scale_bytes, 0, pc_scale_dram,
+    )
+    cg._emit(SyncInsn(resource_mask=0b001))
+
+    # ----- Stage 5: FP32 output tile (M_pad × N_pad × 4 bytes) -----
+    out_alloc = _abuf_alloc_fp32(cg, node.name, M_pad, N_pad)
+
+    # ----- Stage 6: per-strip MATMUL + DEQUANT_ACCUM_FP32 -----
+    out_row_units = (N_pad * FP32_BYTES_PER_ELEM) // UNIT
+    for s in range(num_strips):
+        # CONFIG_TILE for one Q strip: M=1 tile (16 rows), N=full N_pad, K=full K_pad.
+        cg._emit(ConfigTileInsn(M=0, N=n_tiles - 1, K=k_tiles - 1))
+        q_strip_off = q_int8_alloc.offset_units + (s * TILE * K_pad) // UNIT
+        cg._emit(
+            MatmulInsn(
+                src1_buf=BUF_ABUF, src1_off=q_strip_off,
+                src2_buf=BUF_WBUF, src2_off=kt_wbuf.offset_units,
+                dst_buf=BUF_ACCUM, dst_off=0,
+                flags=0,
+            )
+        )
+        cg._emit(SyncInsn(resource_mask=0b010))
+
+        # DEQUANT_ACCUM_FP32 (M1, no _SCALED): accum × wt_scale_pc.
+        # Reuses the MATMUL's CONFIG_TILE (M and N are what DEQUANT reads).
+        strip_out_off = out_alloc.offset_units + s * TILE * out_row_units
+        cg._emit(
+            DequantAccumFp32Insn(
+                src1_buf=BUF_ACCUM, src1_off=0,
+                src2_buf=BUF_WBUF, src2_off=pc_scale_alloc.offset_units,
+                dst_buf=BUF_ABUF, dst_off=strip_out_off,
+            )
+        )
+        cg._emit(SyncInsn(resource_mask=0b100))
+
+    # Cleanup.
+    cg.mem.abuf.free(f"{node.name}__q_int8")
+    cg.mem.abuf.free(f"{node.name}__k_int8")
+    cg.mem.wbuf.free(f"kt_head{head_idx}_{node.name}")
+    cg.mem.wbuf.free(f"_qkt_pc_{node.name}")
+
+    # Trace event: FP32 scores tile. The recorded scale is the composite
+    # `q_scale * k_scale * inv_sqrt_d_head` so downstream tooling can
+    # recover an INT8-equivalent representation if it wants, but the
+    # tile itself is real-units FP32.
+    composite_scale = q_scale * k_scale * inv_sqrt_d_head
+    cg._record_trace_event(
+        node.name,
+        BUF_ABUF,
+        out_alloc.offset_units,
+        M_pad,
+        N_pad,
+        query_len,
+        key_len,
+        "fp32",
+        composite_scale,
+    )
+
+
+# ---------------------------------------------------------------------------
+# M3-B: matmul_attn_v W8A32 lowering — softmax(QK^T) @ V with static dequant
+# ---------------------------------------------------------------------------
+
+
+def emit_matmul_attn_v_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
+    """W8A32 lowering for `matmul_attn_v` (softmax(QK^T) @ V per head).
+
+    Both inputs live in ABUF as FP32 by the time this emitter fires:
+      - softmax output: produced by `emit_softmax_fp32` (M2) — FP32
+        normalized probabilities in (M=seq_len, K=seq_len).
+      - V tile: produced by the per-head V projection's
+        `emit_matmul_w8a32` — FP32 in (K=seq_len, N=d_head).
+
+    V is already laid out as [K, N] (no transpose needed — the MATMUL
+    expects src2 in WBUF as [K, N] which is exactly V's shape). So the
+    sequence is structurally similar to `emit_matmul_qkt_w8a32` minus
+    the transpose step:
+
+        FP32 softmax → QUANT_FP32_INT8 (S[s]=1/sm_scale) → INT8 ABUF scratch
+        FP32 V       → QUANT_FP32_INT8 (S[s]=1/v_scale)  → INT8 ABUF scratch
+        INT8 V       → BUF_COPY (no transpose)            → WBUF
+        Composite PC scale (sm_scale × v_scale)           → WBUF
+        MATMUL softmax_int8 @ V_wbuf                       → INT32 ACCUM
+        DEQUANT_ACCUM_FP32 (M1, no _SCALED)                → FP32 attn_v in ABUF
+
+    Static calibration scales here — same architecture as the M3-A QKT
+    re-quant boundary. No 1/√d_head factor in the composite (that was
+    already applied by emit_matmul_qkt_w8a32 in its dequant epilogue;
+    the softmax input is the correctly-scaled attention scores, and
+    softmax output values are in [0, 1] regardless of input scale).
+
+    Scope (M3-B):
+      - V pad-row zero-fill is NOT emitted in W8A32 mode. The tiny
+        fixture has key_len == Kseq_pad so this never matters. Real
+        GPT-2 graphs hit the NotImplementedError below until M3-C
+        adds the pad-row zero-fill at the right FP32 byte size. The
+        INT8 path zero-fills V's padding rows (lines 2249-2258 of
+        codegen.py) because LN(zero_row) = β contaminates attention
+        otherwise.
+
+    Synthetic-fragment caveat (test fixtures only):
+      In real graphs every input to attn_v is produced by an earlier
+      `matmul` node whose `emit_matmul_w8a32` already allocated its
+      ABUF region under `node.name`. Tests that build a synthetic
+      `matmul_attn_v` fragment with graph-input names like `sm`/`v_in`
+      MUST pre-allocate those inputs in `cg.mem.abuf` before
+      `generate()`. Otherwise the lazy `_abuf_alloc_fp32` here may
+      land them on a region that an earlier emit step's freed scratch
+      occupied — the emitted scratch-QUANT instruction still writes
+      there at execution time and corrupts the pre-seeded input
+      bytes. The end-to-end test in `test_w8a32_codegen.py` does this
+      pre-allocation explicitly; see the comment around the
+      `cg.mem.abuf.alloc("v_in", ...)` calls there.
+    """
+    if node.op != "matmul_attn_v":
+        raise NotImplementedError(
+            f"emit_matmul_attn_v_w8a32 only handles op='matmul_attn_v' "
+            f"(got {node.op!r})."
+        )
+
+    head_idx = node.attrs["head_idx"]
+    query_len = int(node.attrs.get("query_len", node.output_shape[0]))
+    key_len = int(node.attrs.get("key_len", node.attrs.get("attn_key_len", query_len)))
+    head_dim = int(node.output_shape[1])
+    M_pad = pad_dim(query_len)
+    Kseq_pad = pad_dim(key_len)
+    N_pad = pad_dim(head_dim)
+    m_tiles = M_pad // TILE
+    n_tiles = N_pad // TILE
+    k_tiles = Kseq_pad // TILE
+
+    sm_fp32_alloc = cg.mem.abuf.get(node.inputs[0]) or _abuf_alloc_fp32(
+        cg, node.inputs[0], M_pad, Kseq_pad
+    )
+    v_fp32_alloc = cg.mem.abuf.get(node.inputs[1]) or _abuf_alloc_fp32(
+        cg, node.inputs[1], Kseq_pad, N_pad
+    )
+
+    # ----- M3-C: zero V's FP32 pad rows before quantization -----
+    # Same reasoning as K's pad-row zero-fill in emit_matmul_qkt_w8a32:
+    # LN(zero_row) = β contaminates V's padding rows downstream of the V
+    # projection. Zeroing the FP32 pad rows before V-QUANT ensures the
+    # attention output (softmax × V) doesn't include padded-position
+    # contributions. (Softmax probabilities for padded columns are
+    # already 0 — the MASKED_SOFTMAX_FP32 op masks them to -∞ before the
+    # exp — so this V pad-row zero-fill is a defense-in-depth measure
+    # that matches the INT8 path's behavior (see codegen._emit_attn_v
+    # lines 2249-2258).
+    if Kseq_pad > key_len:
+        pad_rows = Kseq_pad - key_len
+        v_row_units_fp32 = (N_pad * FP32_BYTES_PER_ELEM) // UNIT
+        v_pad_units = v_fp32_alloc.offset_units + key_len * v_row_units_fp32
+        zero_pad_dram = cg._dram_offset_required(
+            "__zero_pad__", f"zeroing V padding rows for '{node.name}'"
+        )
+        cg._emit_dma_load(
+            BUF_ABUF,
+            v_pad_units,
+            pad_rows * N_pad * FP32_BYTES_PER_ELEM,
+            3,
+            zero_pad_dram,
+        )
+        cg._emit(SyncInsn(resource_mask=0b001))
+
+    # Static calibration scales for the attn_v re-quant boundary.
+    DEFAULT_ACT_SCALE = 6.0 / 127.0
+    sm_scale = float(cg.calibration_scales.get(node.inputs[0], 1.0 / 127.0))
+    v_scale = float(cg.calibration_scales.get(node.inputs[1], DEFAULT_ACT_SCALE))
+
+    # ----- Stage 1: QUANT_FP32_INT8(softmax) into an ABUF scratch -----
+    cg._emit(ConfigTileInsn(M=m_tiles - 1, N=k_tiles - 1, K=0))
+    sreg_sm = cg._alloc_sreg()
+    cg._emit(
+        SetScaleInsn(
+            sreg=sreg_sm, src_mode=0,
+            imm16=_fp16_to_uint16(1.0 / max(sm_scale, 1e-12)),
+        )
+    )
+    sm_int8_alloc = cg.mem.abuf.alloc(f"{node.name}__sm_int8", M_pad * Kseq_pad)
+    cg._emit(
+        QuantFp32Int8Insn(
+            src1_buf=BUF_ABUF, src1_off=sm_fp32_alloc.offset_units,
+            src2_buf=BUF_ABUF, src2_off=0,
+            dst_buf=BUF_ABUF, dst_off=sm_int8_alloc.offset_units,
+            sreg=sreg_sm,
+        )
+    )
+    cg._emit(SyncInsn(resource_mask=0b100))
+
+    # ----- Stage 2: QUANT_FP32_INT8(V) into an ABUF scratch -----
+    cg._emit(ConfigTileInsn(M=k_tiles - 1, N=n_tiles - 1, K=0))
+    sreg_v = cg._alloc_sreg()
+    cg._emit(
+        SetScaleInsn(
+            sreg=sreg_v, src_mode=0,
+            imm16=_fp16_to_uint16(1.0 / max(v_scale, 1e-12)),
+        )
+    )
+    v_int8_alloc = cg.mem.abuf.alloc(f"{node.name}__v_int8", Kseq_pad * N_pad)
+    cg._emit(
+        QuantFp32Int8Insn(
+            src1_buf=BUF_ABUF, src1_off=v_fp32_alloc.offset_units,
+            src2_buf=BUF_ABUF, src2_off=0,
+            dst_buf=BUF_ABUF, dst_off=v_int8_alloc.offset_units,
+            sreg=sreg_v,
+        )
+    )
+    cg._emit(SyncInsn(resource_mask=0b100))
+
+    # ----- Stage 3: BUF_COPY V_int8 (ABUF) → V (WBUF), no transpose -----
+    # V's natural layout is [K, N] = [seq_len, d_head], which is what
+    # MATMUL expects for src2. No transpose needed.
+    length_units = (Kseq_pad * N_pad) // UNIT
+    v_wbuf = cg.mem.wbuf.alloc(f"v_head{head_idx}_{node.name}", Kseq_pad * N_pad)
+    cg._emit(
+        BufCopyInsn(
+            src_buf=BUF_ABUF, src_off=v_int8_alloc.offset_units,
+            dst_buf=BUF_WBUF, dst_off=v_wbuf.offset_units,
+            length=length_units,
+            src_rows=0,
+            transpose=0,
+        )
+    )
+    cg._emit(SyncInsn(resource_mask=0b001))
+
+    # ----- Stage 4: DMA-load the staged FP16 PC scale vector -----
+    pc_scale_sym = f"{node.name}__attn_v_pc_scale"
+    pc_scale_dram = cg._dram_offset_required(
+        pc_scale_sym,
+        f"loading W8A32 attn_v composite PC scale for '{node.name}'",
+    )
+    pc_scale_bytes = N_pad * 2  # FP16
+    pc_scale_alloc = cg.mem.wbuf.alloc(f"_attn_v_pc_{node.name}", pc_scale_bytes)
+    cg._emit_dma_load(
+        BUF_WBUF, pc_scale_alloc.offset_units, pc_scale_bytes, 0, pc_scale_dram,
+    )
+    cg._emit(SyncInsn(resource_mask=0b001))
+
+    # ----- Stage 5: FP32 output tile (M_pad × N_pad × 4 bytes) -----
+    out_alloc = _abuf_alloc_fp32(cg, node.name, M_pad, N_pad)
+
+    # ----- Stage 6: MATMUL + DEQUANT_ACCUM_FP32 -----
+    # The attn_v matmul is small enough on tiny fixtures (seq_len=16,
+    # d_head=16, so the M_pad × N_pad × 4 = 1024B output fits in any
+    # ACCUM region) that we don't strip-mine — single MATMUL covering
+    # the full output. Real GPT-2 graphs hit the M3-C sizing-guard
+    # path; M3-B's NotImplementedError above ensures we don't silently
+    # produce a malformed bundle there.
+    cg._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=k_tiles - 1))
+    cg._emit(
+        MatmulInsn(
+            src1_buf=BUF_ABUF, src1_off=sm_int8_alloc.offset_units,
+            src2_buf=BUF_WBUF, src2_off=v_wbuf.offset_units,
+            dst_buf=BUF_ACCUM, dst_off=0,
+            flags=0,
+        )
+    )
+    cg._emit(SyncInsn(resource_mask=0b010))
+
+    # DEQUANT_ACCUM_FP32: accum × wt_scale_pc → FP32 attn_v in ABUF.
+    cg._emit(
+        DequantAccumFp32Insn(
+            src1_buf=BUF_ACCUM, src1_off=0,
+            src2_buf=BUF_WBUF, src2_off=pc_scale_alloc.offset_units,
+            dst_buf=BUF_ABUF, dst_off=out_alloc.offset_units,
+        )
+    )
+    cg._emit(SyncInsn(resource_mask=0b100))
+
+    # Cleanup.
+    cg.mem.abuf.free(f"{node.name}__sm_int8")
+    cg.mem.abuf.free(f"{node.name}__v_int8")
+    cg.mem.wbuf.free(f"v_head{head_idx}_{node.name}")
+    cg.mem.wbuf.free(f"_attn_v_pc_{node.name}")
+
+    # Trace event: FP32 attn_v tile. The recorded scale is the composite
+    # `sm_scale × v_scale` (= 1.0 in real units, the FP32 tile is already
+    # in real units — the scale is for INT8-equivalent recovery tooling).
+    composite_scale = sm_scale * v_scale
+    cg._record_trace_event(
+        node.name,
+        BUF_ABUF,
+        out_alloc.offset_units,
+        M_pad,
+        N_pad,
+        query_len,
+        head_dim,
+        "fp32",
+        composite_scale,
     )
