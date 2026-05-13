@@ -572,15 +572,18 @@ def test_emit_matmul_w8a32_rejects_dequant_add_residual():
         cg.generate(graph)
 
 
-def test_emit_matmul_w8a32_rejects_strip_mine_threshold():
-    """If the FP32 output exceeds ABUF_SIZE (or weight exceeds WBUF), the
-    lowering raises NotImplementedError instead of silently bailing into
-    a strip-mined path. Use an M, K so the FP32 output tile would exceed
-    ABUF (128 KB)."""
-    # M_pad * N_pad * 4 > 128 KB. With N_pad=16: M > 128KB/(16*4) = 2048.
+def test_emit_matmul_w8a32_rejects_large_input_streaming():
+    """M4-C: the large-weight-tiled path handles output > ABUF and
+    weight > WBUF via N-tile + K-tile decomposition with DRAM-temp
+    output spill. The remaining unhandled case is fc2-style **large
+    input** (M_pad × K_pad × 4 > ABUF_SIZE) where K-tile streaming
+    from DRAM-temp is deferred. This test pins the deferral so we
+    notice when it lands."""
     cg, graph, _ = _matmul_w8a32_codegen(weight_shape=(16, 16))
-    graph.nodes[0].output_shape = (4096, 16)  # FP32 output: 4096*16*4 = 256KB > ABUF
-    with pytest.raises(NotImplementedError, match="strip-mined"):
+    # Make the input too large for ABUF (input = M_pad * K_pad * 4).
+    # With K_pad=16, we need M_pad * 64 > 128KB → M_pad > 2048.
+    graph.nodes[0].output_shape = (4096, 16)
+    with pytest.raises(NotImplementedError, match="K-tile activation streaming"):
         cg.generate(graph)
 
 
@@ -2955,3 +2958,219 @@ def test_decoder_bundle_kv_cache_size_scales_4x_in_w8a32():
     assert fp32_bundle.build.bundle.kv_cache_size == 4 * int8_bundle.build.bundle.kv_cache_size
     assert fp32_bundle.build.kv_layout.elem_bytes == 4
     assert int8_bundle.build.kv_layout.elem_bytes == 1
+
+
+# ---------------------------------------------------------------------------
+# M4-C: emit_matmul_w8a32_large_weight_tiled — N-tile + K-tile decomposition.
+#
+# When weight > WBUF (256 KB) or output FP32 tile > ABUF (128 KB), the
+# simple lowering can't fit a single MATMUL. M4-C emits one MAX_ABS +
+# QUANT on the full activation, then per-N-tile K-accumulation via
+# MATMUL flags=0/1, single DEQUANT_SCALED with the N-tile FP16 PC slice,
+# and DMA-stores each FP32 N-tile to its slot in the full M_pad × N_pad
+# DRAM-temp output region. `dram_temp_outputs[node.name]` is set so
+# downstream consumers can reload (emit_vadd_fp32 already does this
+# from M4-A; logits_store / GELU DRAM-temp support is the next slice).
+# ---------------------------------------------------------------------------
+
+
+def _matmul_w8a32_codegen_large(
+    *,
+    weight_shape=(64, 4096),
+    bias_name: str | None = None,
+):
+    """Build a CG + 1-node IR graph whose weight exceeds WBUF.
+
+    Default: K=64, N=4096 → weight = 64*4096 = 262144 bytes = WBUF.
+    Increase one dim by 1 to spill past it. Bias optional.
+    """
+    K, N = weight_shape
+    rng = np.random.default_rng(123)
+    w_int8 = rng.integers(-128, 128, size=(K, N), dtype=np.int8)
+    w_scales = (np.abs(rng.standard_normal(N)) * 0.001 + 1e-4).astype(np.float16)
+    weight_data = {"w_large": (w_int8, w_scales)}
+
+    fp32_biases: dict[str, np.ndarray] = {}
+    if bias_name is not None:
+        fp32_biases[bias_name] = rng.standard_normal(N).astype(np.float32)
+
+    cg = CodeGenerator(
+        weight_data=weight_data,
+        calibration_scales={"x_fp32": 1.0, "y_large": 1.0},
+        prescaled_biases={},
+        fp32_biases=fp32_biases,
+        model_config=deit_tiny_config(),
+        stream_name="prefill",
+        w8a32_enabled=True,
+    )
+
+    graph = IRGraph()
+    attrs: dict = {}
+    if bias_name is not None:
+        attrs["bias"] = bias_name
+    node = IRNode(
+        op="matmul",
+        name="y_large",
+        inputs=["x_fp32", "w_large"],
+        output_shape=(16, N),  # M_pad=16; teacher-forced semantics
+        attrs=attrs,
+    )
+    graph.add_node(node)
+    return cg, graph, node
+
+
+def test_emit_matmul_w8a32_dispatches_to_tiled_when_weight_exceeds_wbuf():
+    """A 768 × 3072 INT8 weight is 2.4 MB > 256 KB WBUF, forcing the
+    tiled path. The instruction stream must contain multiple MATMUL
+    insns (one per K-tile per N-tile) and the output must end up in
+    `cg.dram_temp_outputs[node.name]`, not in ABUF."""
+    cg, graph, _ = _matmul_w8a32_codegen_large(weight_shape=(768, 3072))
+    insns, _ = cg.generate(graph)
+    opcodes = [insn.opcode for insn in insns]
+    # The tiled emitter has at least one MAX_ABS + QUANT + multiple
+    # MATMULs + multiple DEQUANT_SCALEDs.
+    assert opcodes.count(Opcode.MAX_ABS_REDUCE_FP32) == 1
+    assert opcodes.count(Opcode.QUANT_FP32_INT8) == 1
+    assert opcodes.count(Opcode.MATMUL) > 1
+    assert opcodes.count(Opcode.DEQUANT_ACCUM_FP32_SCALED) > 1
+    assert "y_large" in cg.dram_temp_outputs
+    assert "y_large" in cg.dram_temp_fp32_outputs
+    # Per-row × per-N-tile DMA_STOREs land in the FP32 output region.
+    assert opcodes.count(Opcode.STORE) > 0
+
+
+def test_emit_matmul_w8a32_tiled_first_k_uses_flag_0_subsequent_flag_1():
+    """Per N-tile: the first MATMUL must use flags=0 (reset ACCUM); all
+    subsequent K-tiles for the same N-tile must use flags=1 (accumulate).
+    This is the hardware K-accumulation contract."""
+    # 768 × 3072 forces multiple K-tiles per N-tile (K_pad=768 vs k_tile=512).
+    cg, graph, _ = _matmul_w8a32_codegen_large(weight_shape=(768, 3072))
+    insns, _ = cg.generate(graph)
+    matmul_flags = [insn.flags for insn in insns if insn.opcode == Opcode.MATMUL]
+    # First K-tile of each N-tile is flags=0; subsequent K-tiles are flags=1.
+    # The exact pattern depends on _large_weight_tile_plan but the
+    # overall ratio is: per N-tile, exactly one flags=0 + (K_pad/k_tile - 1) flags=1.
+    assert matmul_flags[0] == 0  # first MATMUL ever
+    # At least one flags=1 must appear (K_pad > k_tile).
+    assert 1 in matmul_flags
+
+
+def test_emit_matmul_w8a32_tiled_stages_dram_weight_tiles():
+    """The codegen's `_layout_weights` automatically stages per-tile
+    INT8 weight blobs in DRAM when `weight.size > WBUF_SIZE`. The
+    tiled emitter dispatches via `_large_weight_tile_symbol(...)`
+    DRAM lookups and must find them all."""
+    cg, graph, _ = _matmul_w8a32_codegen_large(weight_shape=(768, 3072))
+    cg.generate(graph)
+    # Every tile in the plan must have a DRAM offset registered.
+    K_pad, N_pad = 768, 3072
+    for k_start, k_len, n_start, n_len in cg._large_weight_tile_plan(K_pad, N_pad):
+        sym = cg._large_weight_tile_symbol("w_large", k_start, k_len, n_start, n_len)
+        assert sym in cg.dram_layout, f"missing weight tile DRAM offset for {sym}"
+
+
+def test_emit_matmul_w8a32_tiled_with_bias_adds_per_n_tile_vadd():
+    """When a bias is set, each N-tile epilogue must include a VADD_FP32
+    instruction (added per-N-tile, with the bias slice loaded just-in-
+    time). The simple path emits one VADD_FP32; the tiled path emits
+    one per N-tile."""
+    cg, graph, _ = _matmul_w8a32_codegen_large(
+        weight_shape=(768, 3072), bias_name="b_large",
+    )
+    insns, _ = cg.generate(graph)
+    n_vadd = sum(1 for i in insns if i.opcode == Opcode.VADD_FP32)
+    # 3072 N elements / 512 N-tile = 6 N-tiles → 6 VADD_FP32 ops.
+    assert n_vadd == 6
+
+
+def test_emit_matmul_w8a32_tiled_output_size_in_dram_temp_is_full_fp32():
+    """`dram_temp_fp32_outputs[node.name]` records M_pad × N_pad × 4
+    bytes, matching the full FP32 output that consumers reload."""
+    cg, graph, _ = _matmul_w8a32_codegen_large(weight_shape=(768, 3072))
+    cg.generate(graph)
+    assert cg.dram_temp_fp32_outputs["y_large"] == 16 * 3072 * 4
+
+
+def test_emit_matmul_w8a32_tiled_end_to_end_on_simulator():
+    """End-to-end correctness: compile a 1-matmul fragment whose weight
+    exceeds WBUF, run through the simulator, read the FP32 output back
+    from DRAM-temp, and verify it matches the numpy FP32 reference
+    within INT8 quantization noise.
+
+    Uses 32×512 weight (16 KB; well under WBUF) but forces the tiled
+    path by setting `stage4_weight_tiled` so the dispatch fires. This
+    lets the test stay fast (one MATMUL per tile, but ≥2 tiles by N
+    or K boundary). Real-scale 768×3072 exists as a separate slow
+    test if needed."""
+    from taccel.golden_model import memory as mem
+    from taccel.golden_model.simulator import Simulator
+    from taccel.golden_model.state import MachineState
+    from taccel.isa.opcodes import BUF_ABUF
+
+    K, N = 32, 512
+    rng = np.random.default_rng(11)
+    fp32_input = rng.standard_normal((16, K)).astype(np.float32) * 1.2
+    weight_fp32 = rng.standard_normal((K, N)).astype(np.float32) * 0.1
+
+    # Per-column INT8 quant for weights.
+    max_per_col = np.maximum(np.max(np.abs(weight_fp32), axis=0), 1e-8)
+    w_scales = (max_per_col / 127.0).astype(np.float16)
+    w_int8 = np.clip(
+        np.round(weight_fp32 / w_scales.astype(np.float32).reshape(1, -1)),
+        -128, 127,
+    ).astype(np.int8)
+
+    cg = CodeGenerator(
+        weight_data={"w_e2e_large": (w_int8, w_scales)},
+        calibration_scales={"x_e2e": 1.0, "y_e2e_large": 1.0},
+        prescaled_biases={},
+        fp32_biases={},
+        model_config=deit_tiny_config(),
+        stream_name="prefill",
+        w8a32_enabled=True,
+    )
+    graph = IRGraph()
+    graph.add_node(IRNode(
+        op="matmul",
+        name="y_e2e_large",
+        inputs=["x_e2e", "w_e2e_large"],
+        output_shape=(16, N),
+        attrs={"stage4_weight_tiled": True},  # force tiled dispatch
+    ))
+    insns, dram_blob = cg.generate(graph)
+
+    sim = Simulator(MachineState(dram_data=bytes(dram_blob)))
+    # Pad input to (16, 32) and seed ABUF.
+    in_alloc = cg.mem.abuf.allocations["x_e2e"]
+    mem.write_fp32_tile(sim.state, BUF_ABUF, in_alloc.offset_units, fp32_input)
+
+    for insn in insns:
+        sim._execute(insn)
+
+    # Read back full FP32 output from DRAM-temp.
+    out_dram_off = cg.dram_temp_outputs["y_e2e_large"]
+    out_size = cg.dram_temp_fp32_outputs["y_e2e_large"]
+    out_bytes = bytes(sim.state.dram[out_dram_off:out_dram_off + out_size])
+    out_fp32 = np.frombuffer(out_bytes, dtype=np.float32).reshape(16, N)
+
+    expected_fp32 = (fp32_input @ weight_fp32).astype(np.float32)
+    err = np.abs(out_fp32 - expected_fp32)
+
+    # Error bound: INT8 quantization noise dominates. Per-output-element
+    # error ≤ K * (|x|_max * weight_step + |w|_max * act_step).
+    act_step = float(np.abs(fp32_input).max()) / 127.0
+    weight_step = float(w_scales.astype(np.float32).max())
+    per_term = (
+        float(np.abs(fp32_input).max()) * weight_step
+        + float(np.abs(weight_fp32).max()) * act_step
+    )
+    fp16_rel = 2.0 ** -10
+    bound = (
+        K * per_term * 1.0
+        + float(np.abs(expected_fp32).max()) * fp16_rel
+        + 1e-3
+    )
+    assert err.max() <= bound, (
+        f"tiled-matmul max e2e error {err.max():.6f} exceeds bound {bound:.6f}; "
+        f"out[0,0]={out_fp32[0,0]}, expected[0,0]={expected_fp32[0,0]}"
+    )

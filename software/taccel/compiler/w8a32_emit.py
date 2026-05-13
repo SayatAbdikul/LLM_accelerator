@@ -493,11 +493,17 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
             "activation scale in M2.5-A makes the prescaled-INT32 skip "
             "path incompatible."
         )
-    if node.attrs.get("gelu_from_accum") or node.attrs.get("stage4_weight_tiled"):
+    if node.attrs.get("gelu_from_accum"):
         raise NotImplementedError(
             f"W8A32 matmul lowering does not support fused gelu-from-accum "
-            f"or Stage 4 weight tiling (node '{node.name}')."
+            f"(node '{node.name}'). The FP32 sub-layer ops keep GELU in a "
+            "separate emit_gelu_fp32 call."
         )
+    # M4-C: `stage4_weight_tiled` is now honored — it forces the
+    # large-weight-tiled lowering even when the weight would fit the
+    # simple path's WBUF threshold. Useful for tests that exercise the
+    # tiled path on small fixtures.
+    force_tiled = bool(node.attrs.get("stage4_weight_tiled"))
 
     M, N = node.output_shape
     weight_name = node.inputs[1]
@@ -516,21 +522,28 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     N_pad = pad_dim(N)
     K_pad = pad_dim(K)
 
-    # Sizing guardrail — mirror the same thresholds used by _emit_matmul
-    # to decide between simple/strip-mined/large-weight-tiled. If we'd
-    # need a non-simple lowering, raise rather than silently producing a
-    # bad bundle.
+    # Sizing thresholds — when any of accum / output / weight overflows
+    # the simple lowering's buffer, dispatch to the M4-C large-weight-
+    # tiled emitter (or raise for fc2-style large-input cases that we
+    # defer to a follow-up milestone).
     output_bytes = M_pad * N_pad * FP32_BYTES_PER_ELEM
     accum_bytes = M_pad * N_pad * 4  # INT32
     weight_bytes = int(w_q.size)
-    if output_bytes > ABUF_SIZE or accum_bytes > ACCUM_SIZE or weight_bytes > WBUF_SIZE:
+    input_bytes = M_pad * K_pad * FP32_BYTES_PER_ELEM
+    if input_bytes > ABUF_SIZE and node.inputs[0] not in cg.dram_temp_fp32_outputs:
         raise NotImplementedError(
-            f"W8A32 matmul '{node.name}' exceeds the simple-matmul "
-            f"sizing thresholds (output {output_bytes}B vs ABUF "
-            f"{ABUF_SIZE}, accum {accum_bytes}B vs ACCUM {ACCUM_SIZE}, "
-            f"weight {weight_bytes}B vs WBUF {WBUF_SIZE}); strip-mined "
-            "and large-weight-tiled W8A32 lowerings are M3."
+            f"W8A32 matmul '{node.name}' input '{node.inputs[0]}' is "
+            f"{input_bytes}B (> ABUF {ABUF_SIZE}) and not in DRAM-temp. "
+            "K-tile activation streaming from DRAM-temp is deferred."
         )
+    if (
+        force_tiled
+        or output_bytes > ABUF_SIZE
+        or accum_bytes > ACCUM_SIZE
+        or weight_bytes > WBUF_SIZE
+    ):
+        emit_matmul_w8a32_large_weight_tiled(cg, node)
+        return
 
     # Per-channel FP16 weight-scale vector staging symbol — set up by
     # `CodeGenerator.generate()` at DRAM-staging time when w8a32_enabled.
@@ -667,6 +680,296 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
         node.name,
         BUF_ABUF,
         out_alloc.offset_units,
+        M_pad,
+        N_pad,
+        M,
+        N,
+        "fp32",
+        out_scale,
+    )
+
+
+# ---------------------------------------------------------------------------
+# M4-C: large-weight-tiled W8A32 matmul (out_proj, fc1, lm_head).
+# ---------------------------------------------------------------------------
+
+
+def emit_matmul_w8a32_large_weight_tiled(
+    cg: "CodeGenerator", node: "IRNode",
+) -> None:
+    """W8A32 matmul lowering when the weight blob exceeds WBUF or the
+    output tile exceeds ABUF.
+
+    Algorithm
+    ---------
+    The full activation tile (`M_pad × K_pad × 4 FP32`) is in ABUF
+    (caller already verified `input_bytes <= ABUF_SIZE`). One global
+    MAX_ABS_REDUCE + QUANT yields a single INT8 activation scratch.
+    The weight is decomposed into `(n_tile, k_tile)` blocks via
+    `_large_weight_tile_plan`; for each N-tile the K-tiles accumulate
+    into INT32 ACCUM via `MatmulInsn(flags=0/1)` (exactly mirroring the
+    INT8 path's K-accumulation), then ONE DEQUANT_ACCUM_FP32_SCALED
+    epilogue with the N-tile's FP16 PC scale slice produces an FP32
+    N-tile output in ABUF. Optional FP32 bias VADD applies to that
+    tile. The FP32 N-tile is then DMA-stored to its slot in a
+    pre-allocated DRAM-temp region holding the full `M_pad × N_pad × 4`
+    output, row-strided so downstream consumers see a row-major FP32
+    tensor.
+
+    `cg.dram_temp_outputs[node.name]` is set so consumers (residual
+    VADD via `emit_vadd_fp32` from M4-A, plus future GELU/logits_store
+    DRAM-temp paths) can reload tile-by-tile.
+
+    What this lowering does NOT handle
+    ----------------------------------
+    - **fc2-style large-input matmuls** where `M_pad × K_pad × 4 >
+      ABUF_SIZE`. The caller (`emit_matmul_w8a32`) raises
+      NotImplementedError before reaching this helper. Two-pass max_abs
+      + per-K-tile QUANT streaming is the planned follow-up.
+    - **Fused gelu-from-accum / dequant-add residual** — both are
+      force-disabled in W8A32 mode by the CodeGenerator constructor;
+      this helper relies on that guarantee.
+
+    Mathematically identical to the simple `emit_matmul_w8a32`: one
+    dynamic activation scale, one INT32 K-accumulation per N-tile, one
+    DEQUANT epilogue. The like-for-like Python reference (M4-E) needs
+    no per-K-tile case.
+    """
+    # ----- Resolve inputs / sizing -----
+    M, N = node.output_shape
+    weight_name = node.inputs[1]
+    weight_data = cg.weight_data.get(weight_name)
+    if weight_data is None:
+        return
+    w_q, w_scales = weight_data
+    if w_q.ndim != 2:
+        raise NotImplementedError(
+            f"large-weight-tiled W8A32 expects 2-D weight for '{weight_name}', "
+            f"got shape {w_q.shape}."
+        )
+    K = int(w_q.shape[0])
+    M_pad = pad_dim(M)
+    N_pad = pad_dim(N)
+    K_pad = pad_dim(K)
+    m_tiles = M_pad // TILE
+    k_tiles = K_pad // TILE
+    input_name = node.inputs[0]
+
+    # ----- ABUF: full FP32 activation tile in ABUF + INT8 scratch -----
+    in_alloc = _abuf_alloc_fp32(cg, input_name, M_pad, K_pad)
+    int8_scratch = cg.mem.abuf.alloc(f"{node.name}__quant_int8", M_pad * K_pad)
+    sreg = cg._alloc_sreg_pair()
+
+    # ----- Stage 1: MAX_ABS_REDUCE on the full activation -----
+    cg._emit(ConfigTileInsn(M=m_tiles - 1, N=k_tiles - 1, K=0))
+    cg._emit(MaxAbsReduceFp32Insn(
+        src1_buf=BUF_ABUF, src1_off=in_alloc.offset_units,
+        src2_buf=BUF_ABUF, src2_off=0,
+        dst_buf=BUF_ABUF, dst_off=0,
+        sreg=sreg,
+    ))
+    cg._emit(SyncInsn(resource_mask=0b100))
+
+    # ----- Stage 2: QUANT full activation → INT8 -----
+    cg._emit(QuantFp32Int8Insn(
+        src1_buf=BUF_ABUF, src1_off=in_alloc.offset_units,
+        src2_buf=BUF_ABUF, src2_off=0,
+        dst_buf=BUF_ABUF, dst_off=int8_scratch.offset_units,
+        sreg=sreg,
+    ))
+    cg._emit(SyncInsn(resource_mask=0b100))
+
+    # ----- DRAM-temp output region (full M_pad × N_pad FP32) -----
+    output_bytes = M_pad * N_pad * FP32_BYTES_PER_ELEM
+    dram_temp_off = cg.dram_temp_start + cg.mem.alloc_dram_temp(
+        f"{node.name}_w8a32_out_fp32", output_bytes
+    )
+
+    # ----- Per-N-tile DRAM addresses -----
+    pc_scale_sym = f"{weight_name}__w8a32_pc_scale"
+    pc_scale_dram_full = cg._dram_offset_required(
+        pc_scale_sym,
+        f"loading W8A32 per-channel weight scales for '{weight_name}'",
+    )
+    bias_name = node.attrs.get("bias")
+    bias_dram_full = None
+    if bias_name is not None:
+        if bias_name not in cg.fp32_biases:
+            raise KeyError(
+                f"large-weight-tiled W8A32 '{node.name}' references bias "
+                f"'{bias_name}' but no FP32 bias was staged."
+            )
+        bias_dram_full = cg._dram_offset_required(
+            f"{bias_name}__fp32",
+            f"loading W8A32 FP32 bias for '{node.name}'",
+        )
+
+    # ----- Iterate the (n_tile, k_tile) plan -----
+    # _large_weight_tile_plan groups K-tiles within each N-tile in
+    # contiguous runs; we collect them per N-tile so K-accumulation
+    # via MATMUL flags=0 (first) / flags=1 (subsequent) is correct.
+    tile_plan = cg._large_weight_tile_plan(K_pad, N_pad)
+    n_tile_groups: list = []
+    for k_start, k_len, n_start, n_len in tile_plan:
+        if not n_tile_groups or n_tile_groups[-1][0] != (n_start, n_len):
+            n_tile_groups.append(((n_start, n_len), []))
+        n_tile_groups[-1][1].append((k_start, k_len))
+
+    for (n_start, n_len), k_tile_list in n_tile_groups:
+        n_tile_units = n_len // TILE
+
+        # Per-N-tile output FP32 tile in ABUF.
+        out_tile_alloc = cg.mem.abuf.alloc(
+            f"{node.name}_out_tile_n{n_start}", M_pad * n_len * 4
+        )
+
+        # K-accumulate INT32 ACCUM across all K-tiles for this N-tile.
+        for k_idx, (k_start, k_len) in enumerate(k_tile_list):
+            weight_tile_name = cg._large_weight_tile_symbol(
+                weight_name, k_start, k_len, n_start, n_len
+            )
+            weight_dram = cg._dram_offset_required(
+                weight_tile_name,
+                f"loading W8A32 weight tile for '{weight_name}'",
+            )
+            w_alloc = cg.mem.wbuf.alloc(
+                f"_w_{node.name}_k{k_start}_n{n_start}", k_len * n_len
+            )
+            cg._emit_dma_load(BUF_WBUF, w_alloc.offset_units, k_len * n_len, 0, weight_dram)
+            cg._emit(SyncInsn(resource_mask=0b001))
+
+            # MATMUL src1 reads the K-slice of the INT8 activation. The
+            # INT8 activation is laid out [M_pad, K_pad] row-major; the
+            # k_start byte-offset into the row is the column offset
+            # times 1 byte/elem.
+            cg._emit(ConfigTileInsn(
+                M=m_tiles - 1, N=n_tile_units - 1, K=(k_len // TILE) - 1,
+            ))
+            # `src1_off` in units; INT8 row stride = K_pad bytes = K_pad/16 units.
+            # The K-strip starts at column k_start, byte offset k_start within row.
+            src1_off_units = int8_scratch.offset_units + (k_start // UNIT)
+            # MATMUL uses K from the CONFIG_TILE; the src1 row stride is
+            # baked into the M dimension. We DON'T need explicit row
+            # striding here because MATMUL reads [M, K] contiguously from
+            # src1_off — BUT we're feeding a STRIDED view of a wider
+            # INT8 tile (full K_pad row), and MATMUL expects K_pad/k_len
+            # to match. Fix: copy the K-strip to a contiguous scratch.
+            # See note below.
+            #
+            # For now, instead of striding within the full INT8 row, we
+            # materialize a CONTIGUOUS [M_pad × k_len] INT8 scratch for
+            # each K-tile via a row-by-row BufCopy. M_pad row copies of
+            # k_len bytes each — cheap compared to the MATMUL itself.
+            #
+            # If k_len == K_pad (single K-tile, no decomposition), we
+            # skip this restaging.
+            if k_len == K_pad:
+                src1_off_for_matmul = int8_scratch.offset_units
+            else:
+                k_strip_scratch = cg.mem.abuf.alloc(
+                    f"{node.name}__quant_int8_k{k_start}_n{n_start}",
+                    M_pad * k_len,
+                )
+                row_units_full = K_pad // UNIT
+                row_units_strip = k_len // UNIT
+                col_off_units_in_full = k_start // UNIT
+                for r in range(M_pad):
+                    cg._emit(BufCopyInsn(
+                        src_buf=BUF_ABUF,
+                        src_off=int8_scratch.offset_units + r * row_units_full + col_off_units_in_full,
+                        dst_buf=BUF_ABUF,
+                        dst_off=k_strip_scratch.offset_units + r * row_units_strip,
+                        length=row_units_strip,
+                    ))
+                cg._emit(SyncInsn(resource_mask=0b001))
+                src1_off_for_matmul = k_strip_scratch.offset_units
+
+            cg._emit(MatmulInsn(
+                src1_buf=BUF_ABUF, src1_off=src1_off_for_matmul,
+                src2_buf=BUF_WBUF, src2_off=w_alloc.offset_units,
+                dst_buf=BUF_ACCUM, dst_off=0,
+                flags=0 if k_idx == 0 else 1,
+            ))
+            cg._emit(SyncInsn(resource_mask=0b010))
+
+            cg.mem.wbuf.free(w_alloc.name)
+            if k_len != K_pad:
+                cg.mem.abuf.free(f"{node.name}__quant_int8_k{k_start}_n{n_start}")
+
+        # Per-N-tile FP16 PC scale slice (load only n_len entries).
+        pc_scale_slice_alloc = cg.mem.wbuf.alloc(
+            f"_w8a32_pc_{node.name}_n{n_start}", n_len * 2
+        )
+        cg._emit_dma_load(
+            BUF_WBUF, pc_scale_slice_alloc.offset_units, n_len * 2, 0,
+            pc_scale_dram_full + n_start * 2,
+        )
+        cg._emit(SyncInsn(resource_mask=0b001))
+
+        # DEQUANT_ACCUM_FP32_SCALED → FP32 N-tile output in ABUF.
+        cg._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tile_units - 1, K=0))
+        cg._emit(DequantAccumFp32ScaledInsn(
+            src1_buf=BUF_ACCUM, src1_off=0,
+            src2_buf=BUF_WBUF, src2_off=pc_scale_slice_alloc.offset_units,
+            dst_buf=BUF_ABUF, dst_off=out_tile_alloc.offset_units,
+            sreg=sreg + 1,
+        ))
+        cg._emit(SyncInsn(resource_mask=0b100))
+        cg.mem.wbuf.free(pc_scale_slice_alloc.name)
+
+        # Optional FP32 bias VADD on this N-tile.
+        if bias_dram_full is not None:
+            bias_tile_alloc = cg.mem.abuf.alloc(
+                f"{node.name}__bias_tile_n{n_start}", M_pad * n_len * 4
+            )
+            tile_row_bytes = n_len * 4
+            tile_row_units = tile_row_bytes // UNIT
+            for r in range(M_pad):
+                cg._emit_dma_load(
+                    BUF_ABUF,
+                    bias_tile_alloc.offset_units + r * tile_row_units,
+                    tile_row_bytes, 0,
+                    bias_dram_full + n_start * 4,
+                )
+            cg._emit(SyncInsn(resource_mask=0b001))
+
+            cg._emit(VaddFp32Insn(
+                src1_buf=BUF_ABUF, src1_off=out_tile_alloc.offset_units,
+                src2_buf=BUF_ABUF, src2_off=bias_tile_alloc.offset_units,
+                dst_buf=BUF_ABUF, dst_off=out_tile_alloc.offset_units,
+            ))
+            cg._emit(SyncInsn(resource_mask=0b100))
+            cg.mem.abuf.free(bias_tile_alloc.name)
+
+        # DMA-store the FP32 N-tile to its slot in the full output
+        # DRAM-temp. Each row of n_len × 4 bytes goes to
+        # `dram_temp_off + r * N_pad * 4 + n_start * 4`.
+        out_row_bytes = n_len * 4
+        out_row_units = out_row_bytes // UNIT
+        full_row_bytes_in_dram = N_pad * 4
+        for r in range(M_pad):
+            cg._emit_dma_store(
+                BUF_ABUF,
+                out_tile_alloc.offset_units + r * out_row_units,
+                out_row_bytes, 2,
+                dram_temp_off + r * full_row_bytes_in_dram + n_start * 4,
+            )
+        cg._emit(SyncInsn(resource_mask=0b010))
+
+        cg.mem.abuf.free(out_tile_alloc.name)
+
+    # Free the INT8 scratch and register the output in dram_temp_outputs.
+    cg.mem.abuf.free(int8_scratch.name)
+    cg.dram_temp_outputs[node.name] = dram_temp_off
+    cg.dram_temp_fp32_outputs[node.name] = output_bytes
+
+    # Trace event (registers the DRAM-temp location for downstream
+    # diagnostics).
+    out_scale = cg.calibration_scales.get(node.name, 1.0 / 127.0)
+    cg._record_trace_event(
+        node.name,
+        BUF_ABUF,  # Placeholder buffer; actual data is in DRAM-temp.
+        0,
         M_pad,
         N_pad,
         M,
