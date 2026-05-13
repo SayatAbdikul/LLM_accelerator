@@ -3000,7 +3000,16 @@ class CodeGenerator:
         if "xfer_bytes" in node.attrs:
             return int(node.attrs["xfer_bytes"])
         tokens = int(node.attrs.get("tokens", 1 if decode_default else node.attrs.get("seq_len", 1)))
-        return tokens * self.config.d_head
+        # M4-B: W8A32 stores FP32 K/V tiles (4 bytes/elem) in the KV cache.
+        # The KV cache layout's `elem_bytes` is the source of truth; falling
+        # back to `w8a32_enabled` keeps decoder bundles whose `kv_layout`
+        # wasn't built with explicit `elem_bytes` working as expected.
+        elem_bytes = 1
+        if self.kv_layout is not None:
+            elem_bytes = int(self.kv_layout.elem_bytes)
+        elif self.w8a32_enabled:
+            elem_bytes = 4
+        return tokens * self.config.d_head * elem_bytes
 
     def _kv_source_location(self, node: IRNode) -> Tuple[int, int]:
         if "src_buf" in node.attrs and "src_off_units" in node.attrs:

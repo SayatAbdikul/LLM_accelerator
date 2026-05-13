@@ -2814,3 +2814,144 @@ def test_emit_layernorm_fp32_reloads_already_spilled_input():
     load_idx = opcodes.index(Opcode.LOAD)
     ln_idx = opcodes.index(Opcode.LAYERNORM_FP32)
     assert load_idx < ln_idx
+
+
+# ---------------------------------------------------------------------------
+# M4-B: KV cache W8A32 FP32 contract.
+#
+# K and V tiles produced by `emit_matmul_w8a32` are FP32 (4 bytes/elem)
+# after the DEQUANT_ACCUM_FP32_SCALED epilogue. Pre-M4 the KV cache
+# layout assumed 1 byte/elem (INT8), which made `kv_store` write only
+# 1/4 of each row and `kv_load` read at the wrong byte stride. M4-B
+# plumbs `elem_bytes=4` through:
+#
+#   - `build_kv_cache_layout(... elem_bytes=4)` → head_span and
+#     kv_cache_size scale by 4; KVCacheLayout records elem_bytes.
+#   - `_kv_transfer_bytes` consults `cg.kv_layout.elem_bytes` (or falls
+#     back to `cg.w8a32_enabled`) so kv_store/kv_load DMA the right
+#     number of bytes.
+#   - `decoder_bundle.build_decoder_program_bundle(w8a32_enabled=True)`
+#     sets `bundle.embedding_row_bytes = d_model * 4` and
+#     `bundle.kv_step_bytes = d_head * 4` so `HostRunner._patch_embeddings`
+#     and `_patch_kv_bases` patch the correct byte offsets at runtime.
+# ---------------------------------------------------------------------------
+
+
+def test_kv_cache_layout_default_elem_bytes_is_int8():
+    """build_kv_cache_layout() with no `elem_bytes` defaults to 1
+    (INT8 path) — required for existing W8A8 deployments."""
+    from taccel.compiler.kv_cache import build_kv_cache_layout
+    layout = build_kv_cache_layout(deit_tiny_config(), max_seq_len=16)
+    assert layout.elem_bytes == 1
+    # head_span unchanged from pre-M4 INT8 path: seq_len * d_head * 1.
+    cfg = deit_tiny_config()
+    assert layout.entries[0].span_bytes == 16 * cfg.d_head
+
+
+def test_kv_cache_layout_w8a32_elem_bytes_four_scales_strides():
+    """W8A32 layout's head_span is 4× the INT8 layout's — the FP32 K/V
+    tile takes 4× the bytes per token row."""
+    from taccel.compiler.kv_cache import build_kv_cache_layout
+    cfg = deit_tiny_config()
+    int8 = build_kv_cache_layout(cfg, max_seq_len=16, elem_bytes=1)
+    fp32 = build_kv_cache_layout(cfg, max_seq_len=16, elem_bytes=4)
+    assert fp32.elem_bytes == 4
+    assert fp32.entries[0].span_bytes == 4 * int8.entries[0].span_bytes
+    assert fp32.kv_cache_size == 4 * int8.kv_cache_size
+
+
+def test_kv_cache_layout_rejects_other_elem_bytes():
+    """Only INT8 (1) and FP32 (4) element types are supported."""
+    from taccel.compiler.kv_cache import build_kv_cache_layout
+    with pytest.raises(ValueError, match="elem_bytes"):
+        build_kv_cache_layout(deit_tiny_config(), elem_bytes=2)
+
+
+def test_kv_transfer_bytes_uses_layout_elem_bytes_in_w8a32():
+    """`_kv_transfer_bytes` reads elem_bytes from the codegen's KV layout
+    and multiplies the token count by `d_head * elem_bytes`."""
+    from taccel.compiler.kv_cache import build_kv_cache_layout
+    from taccel.compiler.ir import IRNode
+
+    cfg = deit_tiny_config()
+    layout = build_kv_cache_layout(cfg, max_seq_len=16, elem_bytes=4)
+    cg = CodeGenerator(
+        weight_data={}, calibration_scales={}, prescaled_biases={},
+        model_config=cfg, stream_name="prefill",
+        kv_layout=layout, w8a32_enabled=True,
+    )
+    # 5-token kv_store should DMA 5 * d_head * 4 bytes.
+    node = IRNode(op="kv_store", name="ks", inputs=["k"],
+                  output_shape=(5, cfg.d_head), attrs={"tokens": 5})
+    bytes_xfer = cg._kv_transfer_bytes(node, decode_default=False)
+    assert bytes_xfer == 5 * cfg.d_head * 4
+
+
+def test_kv_transfer_bytes_int8_path_unchanged():
+    """Without W8A32 (elem_bytes=1), kv_transfer_bytes stays at the
+    pre-M4 INT8 stride. Important: legacy W8A8 ProgramBundles must
+    produce byte-identical instruction streams after M4-B."""
+    from taccel.compiler.kv_cache import build_kv_cache_layout
+    from taccel.compiler.ir import IRNode
+
+    cfg = deit_tiny_config()
+    layout = build_kv_cache_layout(cfg, max_seq_len=16)
+    cg = CodeGenerator(
+        weight_data={}, calibration_scales={}, prescaled_biases={},
+        model_config=cfg, stream_name="prefill",
+        kv_layout=layout, w8a32_enabled=False,
+    )
+    node = IRNode(op="kv_store", name="ks", inputs=["k"],
+                  output_shape=(5, cfg.d_head), attrs={"tokens": 5})
+    bytes_xfer = cg._kv_transfer_bytes(node, decode_default=False)
+    assert bytes_xfer == 5 * cfg.d_head
+
+
+def test_kv_transfer_bytes_falls_back_to_w8a32_flag_when_layout_missing():
+    """If a CodeGenerator is built without an explicit kv_layout (e.g.
+    isolated emitter unit tests), the W8A32 flag still drives the FP32
+    stride. This keeps existing tests that build CGs directly from
+    breaking on the M4-B contract change."""
+    from taccel.compiler.ir import IRNode
+
+    cfg = deit_tiny_config()
+    cg = CodeGenerator(
+        weight_data={}, calibration_scales={}, prescaled_biases={},
+        model_config=cfg, stream_name="prefill",
+        kv_layout=None, w8a32_enabled=True,
+    )
+    node = IRNode(op="kv_store", name="ks", inputs=["k"],
+                  output_shape=(1, cfg.d_head), attrs={"tokens": 1})
+    assert cg._kv_transfer_bytes(node, decode_default=True) == cfg.d_head * 4
+
+
+def test_decoder_bundle_sets_w8a32_kv_step_and_embedding_row_bytes():
+    """`build_decoder_program_bundle(w8a32_enabled=True)` produces a
+    bundle whose runtime-patch strides are 4× the INT8 strides. The
+    HostRunner's per-token offset arithmetic depends on these fields
+    being correct."""
+    from taccel.runtime.tiny_fixture import build_stage3_tiny_decoder_bundle
+
+    payload = _one_layer_gpt2_payload()
+    int8_bundle = build_stage3_tiny_decoder_bundle(payload, ptq_preset="control")
+    fp32_bundle = build_stage3_tiny_decoder_bundle(payload, ptq_preset="weight_only_int8")
+
+    d_model = int(payload["model_args"]["n_embd"])
+    d_head = d_model // int(payload["model_args"]["n_head"])
+    assert int8_bundle.build.bundle.embedding_row_bytes == d_model
+    assert int8_bundle.build.bundle.kv_step_bytes == d_head
+    assert fp32_bundle.build.bundle.embedding_row_bytes == d_model * 4
+    assert fp32_bundle.build.bundle.kv_step_bytes == d_head * 4
+
+
+def test_decoder_bundle_kv_cache_size_scales_4x_in_w8a32():
+    """The KV cache region in DRAM is 4× larger in W8A32 mode (FP32
+    K/V tiles vs INT8). The bundle's reserved kv_cache_size grows."""
+    from taccel.runtime.tiny_fixture import build_stage3_tiny_decoder_bundle
+
+    payload = _one_layer_gpt2_payload()
+    int8_bundle = build_stage3_tiny_decoder_bundle(payload, ptq_preset="control")
+    fp32_bundle = build_stage3_tiny_decoder_bundle(payload, ptq_preset="weight_only_int8")
+    assert fp32_bundle.build.bundle.kv_cache_size == 4 * int8_bundle.build.bundle.kv_cache_size
+    assert fp32_bundle.build.kv_layout.elem_bytes == 4
+    assert int8_bundle.build.kv_layout.elem_bytes == 1

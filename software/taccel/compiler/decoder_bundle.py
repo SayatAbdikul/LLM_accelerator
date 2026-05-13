@@ -198,7 +198,14 @@ def build_decoder_program_bundle(
     fp32_biases: Optional[Dict[str, np.ndarray]] = None,
 ) -> DecoderBundleBuild:
     """Build a ProgramBundle from already-formed decoder IR graphs."""
-    kv_layout = build_kv_cache_layout(model_config, max_seq_len=max_seq_len)
+    # M4-B: in W8A32 mode the K/V tiles produced by `emit_matmul_w8a32`
+    # are FP32 (4 bytes/elem) after the DEQUANT_ACCUM_FP32_SCALED epilogue.
+    # The KV cache, kv_step_bytes runtime patch, and embedding row stride
+    # all scale by `elem_bytes` to keep byte arithmetic consistent.
+    elem_bytes = 4 if w8a32_enabled else 1
+    kv_layout = build_kv_cache_layout(
+        model_config, max_seq_len=max_seq_len, elem_bytes=elem_bytes,
+    )
     prefill_graph = _copy_graph_with_logits_store(prefill_graph, stream_name="prefill")
     decode_graph = _copy_graph_with_logits_store(decode_graph, stream_name="decode")
     if logits_size == 0:
@@ -277,8 +284,13 @@ def build_decoder_program_bundle(
         temp_size=temp_size,
         logits_size=logits_size,
         kv_cache_size=kv_layout.kv_cache_size,
-        embedding_row_bytes=model_config.d_model,
-        kv_step_bytes=model_config.d_head,
+        # M4-B: both byte strides scale by elem_bytes in W8A32 mode.
+        # `embedding_row_bytes` is consumed by `HostRunner._patch_embeddings`
+        # to compute `token_id * row_bytes` for the runtime patch site.
+        # `kv_step_bytes` is consumed by `HostRunner._patch_kv_bases` to
+        # compute `position * step_bytes` for kv_base sites.
+        embedding_row_bytes=model_config.d_model * elem_bytes,
+        kv_step_bytes=model_config.d_head * elem_bytes,
         symbol_offsets=symbol_offsets,
         symbol_regions=symbol_regions,
         relocation_sites=prefill_codegen.relocation_sites + decode_codegen.relocation_sites,
