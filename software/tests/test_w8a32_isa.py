@@ -1,7 +1,15 @@
-"""W8A32 ISA extension (Phase 3 (c.1), milestone M1) — encoding tests.
+"""W8A32 ISA extension (Phase 3 (c.1), milestones M1 + M2.5-A) — encoding tests.
 
-The W8A32 path adds 7 new R-type opcodes (0x17-0x1D) for FP32-I/O
-sub-layer ops alongside the existing INT8 ones. This test suite covers:
+The W8A32 path adds 9 new R-type opcodes that consume the previously
+reserved slots 0x17-0x1F:
+
+  M1 (0x17-0x1D): FP32-I/O sub-layer ops (dequant, quant, vadd, LN, GELU,
+  softmax, masked softmax) alongside the existing INT8 ones.
+  M2.5-A (0x1E-0x1F): dynamic per-matmul activation scaling primitives
+  (DEQUANT_ACCUM_FP32_SCALED and MAX_ABS_REDUCE_FP32). After M2.5-A the
+  entire 5-bit opcode space is in use — no reserved slots remain.
+
+This test suite covers:
 
   1. Each new opcode is registered in `OPCODE_FORMAT` as R_TYPE.
   2. Each new instruction class encodes to 8 bytes and decodes back to
@@ -9,8 +17,8 @@ sub-layer ops alongside the existing INT8 ones. This test suite covers:
   3. The dispatch class table in `_R_TYPE_CLASSES` covers every new
      opcode (regression: decoding a valid opcode must not return an
      unrelated class).
-  4. The reserved range narrowed correctly — opcodes 0x1E and 0x1F
-     still raise illegal-opcode at decode time.
+  4. The 5-bit opcode space is fully assigned: every value 0x00-0x1F
+     decodes to an `Opcode` whose value matches the encoded bits.
 
 The simulator-level dispatch and FP32 memory helpers are exercised in
 `test_w8a32_simulator.py`.
@@ -22,9 +30,11 @@ import pytest
 from taccel.isa.encoding import _R_TYPE_CLASSES, decode, encode
 from taccel.isa.instructions import (
     DequantAccumFp32Insn,
+    DequantAccumFp32ScaledInsn,
     GeluFp32Insn,
     LayernormFp32Insn,
     MaskedSoftmaxFp32Insn,
+    MaxAbsReduceFp32Insn,
     QuantFp32Int8Insn,
     SoftmaxFp32Insn,
     VaddFp32Insn,
@@ -39,6 +49,7 @@ from taccel.isa.opcodes import (
 )
 
 
+# --- M1 opcodes (0x17-0x1D) ------------------------------------------------
 W8A32_OPCODES = (
     Opcode.DEQUANT_ACCUM_FP32,
     Opcode.QUANT_FP32_INT8,
@@ -61,25 +72,53 @@ W8A32_CLASSES = (
 )
 
 
+# --- M2.5-A opcodes (0x1E-0x1F) --------------------------------------------
+M2_5A_OPCODES = (
+    Opcode.DEQUANT_ACCUM_FP32_SCALED,
+    Opcode.MAX_ABS_REDUCE_FP32,
+)
+
+
+M2_5A_CLASSES = (
+    (Opcode.DEQUANT_ACCUM_FP32_SCALED, DequantAccumFp32ScaledInsn),
+    (Opcode.MAX_ABS_REDUCE_FP32, MaxAbsReduceFp32Insn),
+)
+
+
+# Convenience aggregate for tests that don't care which milestone a given
+# opcode came from.
+ALL_NEW_OPCODES = W8A32_OPCODES + M2_5A_OPCODES
+ALL_NEW_CLASSES = W8A32_CLASSES + M2_5A_CLASSES
+
+
 def test_w8a32_opcodes_are_contiguous_0x17_to_0x1d():
-    """The seven new W8A32 opcodes consume reserved slots 0x17-0x1D in
-    contiguous order, with 0x1E-0x1F left reserved."""
+    """The seven M1 W8A32 opcodes consume reserved slots 0x17-0x1D in
+    contiguous order. (M2.5-A extends to 0x1E-0x1F — covered by its own
+    test below.)"""
     expected_values = [0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D]
     actual_values = [int(op) for op in W8A32_OPCODES]
     assert actual_values == expected_values
 
 
-@pytest.mark.parametrize("op", W8A32_OPCODES)
+def test_m2_5a_opcodes_are_contiguous_0x1e_to_0x1f():
+    """The two M2.5-A opcodes consume the last reserved slots 0x1E-0x1F.
+    After this commit the entire 5-bit opcode space is in use."""
+    expected_values = [0x1E, 0x1F]
+    actual_values = [int(op) for op in M2_5A_OPCODES]
+    assert actual_values == expected_values
+
+
+@pytest.mark.parametrize("op", ALL_NEW_OPCODES)
 def test_w8a32_opcode_is_r_type(op):
     assert OPCODE_FORMAT[op] == InsnFormat.R_TYPE
 
 
-@pytest.mark.parametrize("op,cls", W8A32_CLASSES)
+@pytest.mark.parametrize("op,cls", ALL_NEW_CLASSES)
 def test_w8a32_class_registered_in_decoder(op, cls):
     assert _R_TYPE_CLASSES[op] is cls
 
 
-@pytest.mark.parametrize("cls", [pair[1] for pair in W8A32_CLASSES])
+@pytest.mark.parametrize("cls", [pair[1] for pair in ALL_NEW_CLASSES])
 def test_w8a32_instruction_encode_decode_roundtrip(cls):
     """Encode an instruction with non-default field values, decode it
     back, and verify all fields survive the round-trip exactly."""
@@ -127,15 +166,37 @@ def test_dequant_accum_fp32_with_accum_src1_encodes_and_decodes():
     assert decoded.dst_buf == BUF_ABUF
 
 
-@pytest.mark.parametrize("reserved_opcode_value", [0x1E, 0x1F])
-def test_reserved_opcodes_after_m1_still_illegal(reserved_opcode_value):
-    """After M1 the reserved range narrows from 0x17-0x1F to 0x1E-0x1F.
-    Decoding either remaining reserved opcode must still raise."""
-    # Build a raw 8-byte instruction with opcode at bits [63:59].
-    word = reserved_opcode_value << 59
-    raw = word.to_bytes(8, byteorder="big")
-    with pytest.raises(ValueError):
-        decode(raw)
+@pytest.mark.parametrize("opcode_value", list(range(32)))
+def test_every_5_bit_opcode_decodes_after_m2_5a(opcode_value):
+    """After M2.5-A no opcodes are reserved — every value 0x00-0x1F must
+    decode to an `Opcode` instance whose `.opcode` attribute matches the
+    encoded bits. This is the positive replacement for the post-M1
+    reserved-range test (`test_reserved_opcodes_after_m1_still_illegal`,
+    deleted now that 0x1E and 0x1F are real opcodes).
+
+    Constructing a raw word with `opcode << 59` and all other bits zero
+    is a valid encoding for every format family: R-TYPE buffers all
+    decode to BUF_ABUF=0 with zero offsets, CONFIG_ATTN's reserved-bits
+    check passes (all zeros), S-TYPE NOP/HALT/SYNC/SET_SCALE have no
+    decode-time constraints, etc.
+    """
+    # 1) IntEnum lookup — every 5-bit value must be a known Opcode member.
+    op = Opcode(opcode_value)
+    assert int(op) == opcode_value
+
+    # 2) Every Opcode must have a registered InsnFormat.
+    assert op in OPCODE_FORMAT, (
+        f"Opcode {op.name} (0x{opcode_value:02X}) is not in OPCODE_FORMAT"
+    )
+
+    # 3) The full decode pipeline must succeed and return an instruction
+    #    whose `.opcode` field matches the encoded bits — the post-M2.5-A
+    #    "no reserved slots" invariant.
+    raw = (opcode_value << 59).to_bytes(8, byteorder="big")
+    decoded = decode(raw)
+    assert int(decoded.opcode) == opcode_value, (
+        f"decode produced opcode {int(decoded.opcode):#x} for raw 0x{opcode_value:02X}"
+    )
 
 
 def test_pre_m1_opcodes_unchanged():

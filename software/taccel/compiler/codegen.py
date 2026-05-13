@@ -64,7 +64,8 @@ class CodeGenerator:
                  model_config: Optional[ModelConfig] = None,
                  stream_name: str = "prefill",
                  kv_layout: Optional[KVCacheLayout] = None,
-                 w8a32_enabled: bool = False):
+                 w8a32_enabled: bool = False,
+                 fp32_biases: Optional[Dict[str, np.ndarray]] = None):
         """
         Args:
             weight_data: name → (quantized_data, per_channel_scales)
@@ -72,15 +73,29 @@ class CodeGenerator:
             prescaled_biases: name → INT32 pre-scaled bias array
             w8a32_enabled: Phase 3 (c.1) W8A32 lowering. When True, the
                 sub-layer ops (LAYERNORM, GELU, SOFTMAX, MASKED_SOFTMAX,
-                VADD) emit FP32 variants via `w8a32_emit.py`. The W8A8
-                optimization blocks (dequant_add residual, requant_pc,
-                gelu_from_accum, fused_softmax_attnv) are force-disabled
-                because they're optimizations of the INT8 round-trip
-                that W8A32 doesn't have. Matmul-output dequant
-                (DEQUANT_ACCUM_FP32) is deferred to M2.5 — for now W8A32
-                matmul still emits REQUANT (INT8 epilogue) and the
-                W8A32 sub-layer ops will see INT8 inputs reinterpreted
-                as FP32. M3+M4 close that loop.
+                VADD) emit FP32 variants via `w8a32_emit.py`. After
+                M2.5-B (this milestone), `matmul` nodes also lower
+                through `emit_matmul_w8a32` — MAX_ABS_REDUCE_FP32 +
+                QUANT_FP32_INT8 prelude, INT8 MATMUL, then
+                DEQUANT_ACCUM_FP32_SCALED epilogue with optional FP32
+                bias VADD. `matmul_qkt` and `matmul_attn_v` (attention
+                internals) and the cross-cutting fused paths
+                (gelu-from-accum, dequant-add residual, strip-mined,
+                large-weight-tiled, fused-out-proj-accum) still raise
+                — those are M3. The W8A8 optimization blocks
+                (dequant_add residual, requant_pc, gelu_from_accum,
+                fused_softmax_attnv) are force-disabled because
+                they're optimizations of the INT8 round-trip that
+                W8A32 doesn't have.
+            fp32_biases: Optional map of bias_name → FP32 1-D vector.
+                Used only when `w8a32_enabled=True`. The codegen stages
+                each FP32 bias to DRAM under the symbol
+                `f"{bias_name}__fp32"` so `emit_matmul_w8a32` can
+                DMA-load it for the post-DEQUANT FP32 bias VADD. The
+                INT8 path's `prescaled_biases` (INT32, prescaled by
+                input_act_scale × mean_w_scale) is incompatible with
+                M2.5-A's dynamic activation scale — hence this parallel
+                FP32 artifact.
         """
         self.weight_data = weight_data
         self.config = model_config or deit_tiny_config()
@@ -90,6 +105,10 @@ class CodeGenerator:
         self.kv_layout = kv_layout
         self.calibration_scales = calibration_scales
         self.prescaled_biases = prescaled_biases
+        # FP32 biases for the W8A32 path (M2.5-B). Empty dict when not provided
+        # so emit_matmul_w8a32 raises a clear error if a bias is referenced
+        # without a corresponding FP32 staging entry.
+        self.fp32_biases: Dict[str, np.ndarray] = dict(fp32_biases or {})
         self.w8a32_enabled = bool(w8a32_enabled)
         if self.w8a32_enabled:
             # M2 design contract: in W8A32 mode the INT8-round-trip
@@ -149,24 +168,23 @@ class CodeGenerator:
 
         Returns (instructions, dram_data_blob).
         """
-        # Phase 3 (c.1) M2 guardrail: refuse to emit a bundle in W8A32
-        # mode while the matmul-output dequant lowering (M2.5) is still
-        # pending. Without DEQUANT_ACCUM_FP32 the matmul epilogue still
-        # emits REQUANT_PC (INT8 output) but the FP32 sub-layer ops
-        # read those bytes as 4-byte floats — produces a silently
-        # malformed bundle. Loud-fail until M2.5 lands.
+        # Phase 3 (c.1) M2.5-B guardrail: in W8A32 mode the `matmul` op
+        # is now lowered by `emit_matmul_w8a32`, but attention internals
+        # (`matmul_qkt`, `matmul_attn_v`) still emit INT8-output paths
+        # that conflict with the FP32 sub-layer ops. Block those nodes
+        # at the bundle boundary so the user gets a clear "M3" message
+        # instead of a silently malformed bundle.
         if self.w8a32_enabled:
-            matmul_ops = {"matmul", "matmul_qkt", "matmul_attn_v"}
-            if any(node.op in matmul_ops for node in graph.nodes):
+            blocked_ops = {"matmul_qkt", "matmul_attn_v"}
+            if any(node.op in blocked_ops for node in graph.nodes):
                 raise NotImplementedError(
-                    "W8A32 codegen is incomplete (M2 ships sub-layer ops "
-                    "only; matmul-output dequant is M2.5). The current "
-                    "graph contains matmul nodes which would emit "
-                    "INT8-output REQUANT_PC instructions that conflict "
-                    "with the FP32 sub-layer ops. evaluate_gpt2_perplexity's "
-                    "W8A32 path uses WeightOnlyHostRunner (Phase 3 (b)) "
-                    "and bypasses the simulator-backed bundle entirely; "
-                    "use that until M2.5 lands."
+                    "W8A32 codegen does not yet support attention-internal "
+                    "matmuls (`matmul_qkt`, `matmul_attn_v`) — those still "
+                    "emit INT8-output paths that conflict with the FP32 "
+                    "sub-layer ops produced by M2 and the FP32 matmul "
+                    "output produced by M2.5-B. Use the W8A8 path or the "
+                    "WeightOnlyHostRunner (Phase 3 (b)) for graphs that "
+                    "contain attention until M3 lands."
                 )
         # First pass: lay out weights in DRAM
         self._layout_weights(graph)
@@ -248,6 +266,43 @@ class CodeGenerator:
             blob = bias_i32.tobytes()
             self.dram_blob.extend(blob)
             offset += len(blob)
+
+        # W8A32 (M2.5-B): stage raw FP32 biases under the symbol
+        # `f"{name}__fp32"`. emit_matmul_w8a32 DMA-loads these to ABUF and
+        # VADD_FP32s them onto the post-DEQUANT FP32 matmul output. The
+        # INT32 prescaled version above is unusable in W8A32 because the
+        # dynamic activation scale (max_abs/127) is only known at runtime.
+        for name, bias_fp32 in self.fp32_biases.items():
+            sym = f"{name}__fp32"
+            self.dram_layout[sym] = offset
+            blob = np.asarray(bias_fp32, dtype=np.float32).tobytes()
+            self.dram_blob.extend(blob)
+            offset += len(blob)
+
+        # W8A32 (M2.5-B): stage an FP16 per-channel weight-scale vector
+        # for every 2-D quantized weight. DEQUANT_ACCUM_FP32_SCALED reads
+        # an FP16 PC vector from WBUF (loaded from DRAM at runtime). For
+        # per-tensor-quant weights the scales vector is constant across
+        # channels; we still stage N_pad entries so the WBUF DMA load is
+        # uniform across weight kinds. Padding cols beyond N_out get
+        # zero scales — the MATMUL output for padding cols is undefined
+        # in any case (the activation columns there are zero-padded).
+        if self.w8a32_enabled:
+            for name, (data, scales) in self.weight_data.items():
+                if not (isinstance(data, np.ndarray) and data.ndim == 2):
+                    continue
+                if scales is None:
+                    continue
+                N_pad = pad_dim(int(data.shape[1]))
+                pc_fp16 = np.zeros(N_pad, dtype=np.float16)
+                scales_fp16 = np.asarray(scales, dtype=np.float16).reshape(-1)
+                n_take = min(len(scales_fp16), N_pad)
+                pc_fp16[:n_take] = scales_fp16[:n_take]
+                sym = f"{name}__w8a32_pc_scale"
+                self.dram_layout[sym] = offset
+                blob = pc_fp16.tobytes()
+                self.dram_blob.extend(blob)
+                offset += len(blob)
 
         # Zero-pad blob: used to mask attention padding rows (K and V) before QKT.
         # Padding rows 197-207 are zero in the input but LN(zero_row) = beta (non-zero),
@@ -555,6 +610,17 @@ class CodeGenerator:
 
     def _emit_matmul(self, node: IRNode):
         """Emit a standard linear matmul with optional bias."""
+        # Phase 3 (c.1) M2.5-B: in W8A32 mode the simple-matmul path is
+        # rewritten to use MAX_ABS_REDUCE_FP32 + QUANT_FP32_INT8 + MATMUL +
+        # DEQUANT_ACCUM_FP32_SCALED. Sizing guardrails inside the helper
+        # raise NotImplementedError for the strip-mined / large-weight
+        # cases (those are M3). Other paths (qkt, attn_v) are still
+        # blocked by the `generate()` guardrail.
+        if self.w8a32_enabled:
+            from .w8a32_emit import emit_matmul_w8a32
+            emit_matmul_w8a32(self, node)
+            return
+
         M, N = node.output_shape
         weight_name = node.inputs[1]
         weight_data = self.weight_data.get(weight_name)
@@ -2632,7 +2698,18 @@ class CodeGenerator:
             self.mem.abuf.allocations[node.name] = alloc
 
     def _emit_embedding_lookup(self, node: IRNode, *, default_table: str):
-        """Emit fixed-row token/position embedding loads for Stage 1 tests."""
+        """Emit fixed-row token/position embedding loads for Stage 1 tests.
+
+        In W8A32 mode (M3-prep), token/position embedding tables are
+        stored as raw FP32 in DRAM (see `tiny_fixture._fp32_embedding`)
+        and this emitter loads `d_model_pad × 4` bytes per row so the
+        next op (typically `tok_pos_add` lowered as VADD_FP32, then
+        `ln1` lowered as LAYERNORM_FP32) reads real-units FP32 from
+        ABUF. The pad-row zero-fill is skipped in W8A32 mode — its
+        only consumer is the M3 attention QKT path which the W8A32
+        guardrail still blocks; sub-layer ops produce row-independent
+        outputs so the garbage stays out of valid rows.
+        """
         table_name = node.attrs.get("table", default_table)
         if table_name not in self.dram_layout:
             return
@@ -2640,6 +2717,18 @@ class CodeGenerator:
         d_model_pad = pad_dim(d_model)
         if d_model_pad != d_model:
             raise ValueError("Stage 1 embedding lookup requires d_model to be 16-aligned")
+
+        # M3-prep: token/position embeddings emit FP32 in W8A32 mode.
+        # The DeiT path uses embedding_kind="patch_cls" and never sets
+        # w8a32_enabled today (CodeGenerator init force-disables W8A8
+        # opts for W8A32 but doesn't touch the DeiT compiler entry);
+        # the embedding-kind guard makes the intent explicit.
+        use_fp32 = (
+            self.w8a32_enabled
+            and self.config.embedding_kind == "token_pos"
+        )
+        elem_bytes = 4 if use_fp32 else 1
+        row_bytes = d_model_pad * elem_bytes
 
         runtime_patch = bool(node.attrs.get("runtime_patch", False))
         if runtime_patch:
@@ -2655,13 +2744,13 @@ class CodeGenerator:
         if len(row_indices) != seq_len:
             raise ValueError(f"{node.name} expected {seq_len} row indices, got {len(row_indices)}")
 
-        out_alloc = self.mem.abuf.alloc(node.name, pad_dim(seq_len) * d_model_pad)
+        out_alloc = self.mem.abuf.alloc(node.name, pad_dim(seq_len) * row_bytes)
         table_dram = self._dram_offset_required(table_name, f"loading embedding table '{table_name}'")
-        row_units = d_model_pad // UNIT
+        row_units = row_bytes // UNIT
         for row_idx, table_row in enumerate(row_indices):
             runtime_kind = None
             runtime_base = None
-            dram_addr = table_dram + int(table_row) * d_model_pad
+            dram_addr = table_dram + int(table_row) * row_bytes
             if runtime_patch:
                 runtime_kind = "token_embed" if node.op == "embed_lookup" else "pos_embed"
                 runtime_base = table_name
@@ -2669,7 +2758,7 @@ class CodeGenerator:
             self._emit_dma_load(
                 BUF_ABUF,
                 out_alloc.offset_units + row_idx * row_units,
-                d_model_pad,
+                row_bytes,
                 0,
                 dram_addr,
                 runtime_patch_kind=runtime_kind,
@@ -2677,12 +2766,19 @@ class CodeGenerator:
             )
             self._emit(SyncInsn(resource_mask=0b001))
         pad_rows = pad_dim(seq_len) - seq_len
-        if pad_rows:
+        # The INT8 path zero-fills pad rows from `__zero_pad__` because
+        # the attention QKT path masks K/V padding via LN+QKV downstream.
+        # In W8A32 mode QKT is still guardrailed (M3) and sub-layer ops
+        # produce row-independent outputs, so leaving pad rows
+        # uninitialized is safe. The trace-capture path also slices to
+        # logical_rows × logical_cols, so pad-row garbage stays
+        # invisible to diagnostics.
+        if pad_rows and not use_fp32:
             zero_pad_dram = self._dram_offset_required("__zero_pad__", "zeroing embedding padding rows")
             self._emit_dma_load(
                 BUF_ABUF,
                 out_alloc.offset_units + seq_len * row_units,
-                pad_rows * d_model_pad,
+                pad_rows * row_bytes,
                 3,
                 zero_pad_dram,
             )
@@ -2695,7 +2791,7 @@ class CodeGenerator:
             d_model_pad,
             seq_len,
             d_model,
-            "int8",
+            "fp32" if use_fp32 else "int8",
             self.calibration_scales.get(node.name, 6.0 / 127.0),
         )
 

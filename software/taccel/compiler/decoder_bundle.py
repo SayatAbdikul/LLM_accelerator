@@ -195,6 +195,7 @@ def build_decoder_program_bundle(
     dequant_add_residual2_blocks: Optional[set[int]] = None,
     gelu_from_accum_blocks: Optional[set[int]] = None,
     w8a32_enabled: bool = False,
+    fp32_biases: Optional[Dict[str, np.ndarray]] = None,
 ) -> DecoderBundleBuild:
     """Build a ProgramBundle from already-formed decoder IR graphs."""
     kv_layout = build_kv_cache_layout(model_config, max_seq_len=max_seq_len)
@@ -235,6 +236,7 @@ def build_decoder_program_bundle(
         requant_pc_weight_names=requant_pc_weight_names,
         requant_pc_scale_tables=requant_pc_scale_tables,
         w8a32_enabled=w8a32_enabled,
+        fp32_biases=fp32_biases,
     )
     decode_codegen = CodeGenerator(
         weight_data,
@@ -250,6 +252,7 @@ def build_decoder_program_bundle(
         requant_pc_weight_names=requant_pc_weight_names,
         requant_pc_scale_tables=requant_pc_scale_tables,
         w8a32_enabled=w8a32_enabled,
+        fp32_biases=fp32_biases,
     )
     prefill_instructions, prefill_data = prefill_codegen.generate(prefill_graph)
     decode_instructions, decode_data = decode_codegen.generate(decode_graph)

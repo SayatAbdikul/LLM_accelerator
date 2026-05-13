@@ -25,6 +25,8 @@ from .instructions import (
     # W8A32 R-type extension (M1)
     DequantAccumFp32Insn, QuantFp32Int8Insn, VaddFp32Insn,
     LayernormFp32Insn, GeluFp32Insn, SoftmaxFp32Insn, MaskedSoftmaxFp32Insn,
+    # W8A32 R-type extension (M2.5-A)
+    DequantAccumFp32ScaledInsn, MaxAbsReduceFp32Insn,
 )
 
 # Map opcode to concrete R-type class
@@ -49,6 +51,9 @@ _R_TYPE_CLASSES = {
     Opcode.GELU_FP32: GeluFp32Insn,
     Opcode.SOFTMAX_FP32: SoftmaxFp32Insn,
     Opcode.MASKED_SOFTMAX_FP32: MaskedSoftmaxFp32Insn,
+    # W8A32 R-type extension (M2.5-A)
+    Opcode.DEQUANT_ACCUM_FP32_SCALED: DequantAccumFp32ScaledInsn,
+    Opcode.MAX_ABS_REDUCE_FP32: MaxAbsReduceFp32Insn,
 }
 
 _M_TYPE_CLASSES = {

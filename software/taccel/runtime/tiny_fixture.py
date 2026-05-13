@@ -125,6 +125,17 @@ def _quantize_embedding(tensor, scale: Optional[float] = None) -> np.ndarray:
     return np.clip(np.round(arr / np.float32(scale)), -128, 127).astype(np.int8)
 
 
+def _fp32_embedding(tensor) -> np.ndarray:
+    """Raw FP32 embedding table for the W8A32 path (M3-prep).
+
+    The codegen DMA-loads `d_model_pad * 4` bytes per row in W8A32 mode
+    and the resulting ABUF tile is interpreted as FP32 by the next
+    sub-layer op. No quantization, no scale — the embedding output is
+    real-units FP32 throughout.
+    """
+    return _to_numpy(tensor).astype(np.float32)
+
+
 def _quantize_linear_weight(tensor, *, per_channel: bool = True) -> Tuple[np.ndarray, np.ndarray]:
     """Quantize a PyTorch-layout [out, in] weight into TACCEL [K, N] layout."""
     q, scales = quantize_tensor(_to_numpy(tensor).astype(np.float32), per_channel=per_channel)
@@ -170,6 +181,30 @@ def _prescale_bias(
     return np.pad(bias_i32, (0, output_pad - bias_i32.size), constant_values=0).astype(np.int32)
 
 
+def _fp32_bias(
+    state_dict: Dict[str, object],
+    name: str,
+    *,
+    output_dim: int,
+) -> np.ndarray:
+    """Return raw FP32 bias for the W8A32 path (M2.5-C), padded to N_pad.
+
+    The W8A32 matmul lowering (`emit_matmul_w8a32`) adds the bias in
+    FP32 *after* the DEQUANT epilogue, so the bias is staged unscaled —
+    just the original FP32 values from the state dict, padded to the
+    matmul output width. Missing biases yield zeros (same fallback as
+    `_prescale_bias`).
+    """
+    output_pad = pad_dim(int(output_dim))
+    if name in state_dict:
+        arr = _to_numpy(state_dict[name]).astype(np.float32)
+    else:
+        arr = np.zeros(int(output_dim), dtype=np.float32)
+    if arr.size != int(output_dim):
+        raise ValueError(f"{name!r} has {arr.size} values, expected {output_dim}")
+    return np.pad(arr, (0, output_pad - arr.size), constant_values=0).astype(np.float32)
+
+
 def model_config_from_fixture_payload(payload: Dict[str, object]) -> ModelConfig:
     cfg = payload["model_args"]
     d_model = int(cfg["n_embd"])
@@ -193,8 +228,39 @@ def quantize_fixture_payload(
     payload: Dict[str, object],
     calibration_scales: Optional[Dict[str, float]] = None,
     per_tensor_fc1_blocks: Optional[set[int]] = None,
+    w8a32_enabled: bool = False,
 ):
-    """Return codegen-ready weights, zero biases, scales, config, and logits size.
+    """Return codegen-ready weights, biases, FP32 biases, scales, config, and logits size.
+
+    Returns a 6-tuple:
+      (weight_data, prescaled_biases, fp32_biases, calibration_scales,
+       config, logits_size)
+
+    `fp32_biases` holds raw FP32 bias values (padded to N_pad) for
+    every matmul bias the W8A32 lowering will need to consume:
+
+      M2.5-C (always staged, since these resolve through
+      `emit_matmul_w8a32` once the matmul lowering exists):
+        - `transformer.h.{layer}.attn.c_proj.bias` (out_proj)
+        - `transformer.h.{layer}.mlp.c_fc.bias`     (fc1)
+        - `transformer.h.{layer}.mlp.c_proj.bias`   (fc2)
+        - `lm_head.bias` (when present)
+
+      M3-prep (staged for the attention-internal per-head matmuls; sit
+      behind the matmul_qkt/matmul_attn_v guardrail until M3 lifts it,
+      but the staging is a hidden M3 blocker so we resolve it now):
+        - `transformer.h.{layer}.attn.c_attn.bias_h{H}_{proj}`
+          for proj ∈ {query, key, value}, h ∈ [0, n_head).
+
+    `w8a32_enabled` (M3-prep, default False): when True, the token and
+    position embedding tables are stored as raw FP32 (4 bytes/elem)
+    instead of being quantized to INT8. The codegen's
+    `_emit_embedding_lookup` reads `d_model_pad * 4` bytes per row in
+    that mode so the next op (a sub-layer FP32 op) sees real-units
+    FP32 in ABUF. Required for W8A32 graphs with embeddings — without
+    it, LN reads INT8 bytes as FP32 = garbage. Full GPT-2 124M still
+    streams its embeddings via `runtime_patch` and isn't affected by
+    this change (tiny fixture only).
 
     When *calibration_scales* is None the function runs calibration internally
     so both the compiler and the NanoGPTFQReference share the same per-node scales.
@@ -205,18 +271,38 @@ def quantize_fixture_payload(
     state_dict = payload["state_dict"]
     config = model_config_from_fixture_payload(payload)
     per_tensor_fc1_blocks = set(int(v) for v in (per_tensor_fc1_blocks or set()))
-    # Token and position embeddings are added by a raw INT8 VADD in the
-    # generated program.  Both tables therefore must share the output scale used
-    # for tok_pos_add; otherwise q_token + q_pos is not a representation of
-    # token + position in any single real scale.
-    embedding_add_scale = float(calibration_scales.get("tok_pos_add", 6.0 / 127.0))
-    weight_data = {
-        "transformer.wte.weight": (_quantize_embedding(state_dict["transformer.wte.weight"], embedding_add_scale), None),
-        "transformer.wpe.weight": (_quantize_embedding(state_dict["transformer.wpe.weight"], embedding_add_scale), None),
-        "transformer.ln_f.weight": (_fp16_vector(state_dict["transformer.ln_f.weight"]), None),
-        "transformer.ln_f.bias": (_fp16_vector(state_dict["transformer.ln_f.bias"]), None),
-    }
+    # Token and position embeddings: INT8 path shares the tok_pos_add
+    # output scale across both tables (otherwise q_token + q_pos isn't
+    # a representation of token + position in any single real scale).
+    # W8A32 path stores them as raw FP32 — no quantization step, no
+    # cross-table scale constraint. The split below picks one or the
+    # other based on `w8a32_enabled` (M3-prep).
+    if w8a32_enabled:
+        # M3-prep: in W8A32 mode the embedding output must be FP32 so
+        # the first sub-layer op (LN or VADD) reads real units. Store
+        # the raw FP32 table; the codegen DMAs 4 bytes/elem per row.
+        weight_data = {
+            "transformer.wte.weight": (_fp32_embedding(state_dict["transformer.wte.weight"]), None),
+            "transformer.wpe.weight": (_fp32_embedding(state_dict["transformer.wpe.weight"]), None),
+            "transformer.ln_f.weight": (_fp16_vector(state_dict["transformer.ln_f.weight"]), None),
+            "transformer.ln_f.bias": (_fp16_vector(state_dict["transformer.ln_f.bias"]), None),
+        }
+    else:
+        # INT8 path (W8A8 default): both embedding tables share the
+        # output scale used for tok_pos_add; otherwise q_token + q_pos
+        # is not a representation of token + position in any single
+        # real scale.
+        embedding_add_scale = float(calibration_scales.get("tok_pos_add", 6.0 / 127.0))
+        weight_data = {
+            "transformer.wte.weight": (_quantize_embedding(state_dict["transformer.wte.weight"], embedding_add_scale), None),
+            "transformer.wpe.weight": (_quantize_embedding(state_dict["transformer.wpe.weight"], embedding_add_scale), None),
+            "transformer.ln_f.weight": (_fp16_vector(state_dict["transformer.ln_f.weight"]), None),
+            "transformer.ln_f.bias": (_fp16_vector(state_dict["transformer.ln_f.bias"]), None),
+        }
     prescaled_biases: Dict[str, np.ndarray] = {}
+    # M2.5-C: raw FP32 biases for the W8A32 simple-matmul lowering.
+    # Populated for non-attention matmuls only — see the docstring.
+    fp32_biases: Dict[str, np.ndarray] = {}
 
     for layer in range(config.n_layer):
         for ln in ("ln_1", "ln_2"):
@@ -240,6 +326,16 @@ def quantize_fixture_payload(
                         output_dim=config.d_head,
                         act_scale=calibration_scales.get(f"block{layer}_ln1", 6.0 / 127.0),
                         weight_scales=weight_data[name][1],
+                    )
+                    # M3-prep: stage the FP32 sibling for the per-head
+                    # Q/K/V matmul that emit_matmul_w8a32 will eventually
+                    # consume. Currently behind the matmul_qkt/matmul_attn_v
+                    # guardrail (matmul_qkt/attn_v themselves are M3); the
+                    # per-head Q/K/V matmuls upstream are `op="matmul"`
+                    # nodes and will be lowered by emit_matmul_w8a32 once
+                    # M3 lifts the graph-level guardrail.
+                    fp32_biases[bias_name] = _fp32_bias(
+                        state_dict, bias_name, output_dim=config.d_head,
                     )
         weight_data[f"transformer.h.{layer}.attn.c_proj.weight"] = _quantize_linear_weight(
             state_dict[f"transformer.h.{layer}.attn.c_proj.weight"],
@@ -279,6 +375,13 @@ def quantize_fixture_payload(
                 act_scale=calibration_scales.get(act_name, 6.0 / 127.0),
                 weight_scales=weight_data[weight_name][1],
             )
+            # M2.5-C: same families, FP32 unscaled — consumed by
+            # emit_matmul_w8a32 when w8a32_enabled. The bias names map
+            # 1:1 onto the IR node's `attrs["bias"]` values emitted by
+            # the nanogpt frontend (out_proj, fc1, fc2 per layer).
+            fp32_biases[bias_name] = _fp32_bias(
+                state_dict, bias_name, output_dim=output_dim,
+            )
 
     weight_data["lm_head.weight"] = _quantize_linear_weight(state_dict["lm_head.weight"])
     # `lm_head.bias` is created by `taccel.quantizer.ln_fold.fold_layernorm_for_quarot`
@@ -292,7 +395,18 @@ def quantize_fixture_payload(
             act_scale=calibration_scales.get("ln_f", 6.0 / 127.0),
             weight_scales=weight_data["lm_head.weight"][1],
         )
-    return weight_data, prescaled_biases, calibration_scales, config, pad_dim(config.vocab_size)
+        # M2.5-C: same key, FP32 unscaled.
+        fp32_biases["lm_head.bias"] = _fp32_bias(
+            state_dict, "lm_head.bias", output_dim=config.vocab_size,
+        )
+    return (
+        weight_data,
+        prescaled_biases,
+        fp32_biases,
+        calibration_scales,
+        config,
+        pad_dim(config.vocab_size),
+    )
 
 
 def build_stage3_tiny_decoder_bundle(
@@ -313,10 +427,18 @@ def build_stage3_tiny_decoder_bundle(
     else:
         calibration_scales = dict(calibration_scales)
     gelu_from_accum_blocks = stage5_gelu_from_accum_blocks(resolved_preset)
-    weight_data, prescaled_biases, calibration_scales, config, logits_size = quantize_fixture_payload(
+    (
+        weight_data,
+        prescaled_biases,
+        fp32_biases,
+        calibration_scales,
+        config,
+        logits_size,
+    ) = quantize_fixture_payload(
         payload,
         calibration_scales=calibration_scales,
         per_tensor_fc1_blocks=gelu_from_accum_blocks,
+        w8a32_enabled=bool(resolved_preset.weight_only_int8),
     )
     validate_stage5_ptq_preset_for_model(config, resolved_preset)
     calibration_scales = apply_stage5_ptq_scale_policy(calibration_scales, config, resolved_preset)
@@ -347,6 +469,7 @@ def build_stage3_tiny_decoder_bundle(
         dequant_add_residual2_blocks=stage5_dequant_add_residual2_blocks(config, resolved_preset),
         gelu_from_accum_blocks=gelu_from_accum_blocks or None,
         w8a32_enabled=bool(resolved_preset.weight_only_int8),
+        fp32_biases=fp32_biases,
     )
     return TinyFixtureBundle(build=build, config=config, logits_size=logits_size)
 

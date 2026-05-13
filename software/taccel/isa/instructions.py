@@ -159,6 +159,34 @@ class MaskedSoftmaxFp32Insn(RTypeInsn):
     opcode: Opcode = field(default=Opcode.MASKED_SOFTMAX_FP32, init=False)
 
 
+# --- W8A32 R-type instructions (M2.5-A, dynamic activation scale primitives) ---
+#
+# DEQUANT_ACCUM_FP32_SCALED is the M2.5 variant of DEQUANT_ACCUM_FP32 — same
+# inputs but additionally multiplies by an FP16 scalar from scale_regs[sreg].
+# The scalar is the activation scale (max_abs/127) emitted by the matmul
+# prelude's MAX_ABS_REDUCE_FP32. M1's DEQUANT_ACCUM_FP32 (0x17) stays
+# bit-identical to its shipped contract — this is a NEW opcode (0x1E), not
+# a modification of the existing one.
+#
+# MAX_ABS_REDUCE_FP32 scans an FP32 ABUF tile, computes max(|x|), and
+# writes derived FP16 scales to a register pair:
+#   scale_regs[sreg]   = 127.0 / max_abs       (QUANT input scale)
+#   scale_regs[sreg+1] = max_abs / 127.0       (DEQUANT activation scale)
+# Eps-guarded: if max_abs == 0, the eps clamp (1e-10) keeps scale_regs[sreg]
+# finite. The sreg+1 store requires `0 <= sreg <= 14` (i.e. sreg+1 <= 15),
+# enforced at execution time like DEQUANT_ADD's sreg-pair contract.
+
+
+@dataclass
+class DequantAccumFp32ScaledInsn(RTypeInsn):
+    opcode: Opcode = field(default=Opcode.DEQUANT_ACCUM_FP32_SCALED, init=False)
+
+
+@dataclass
+class MaxAbsReduceFp32Insn(RTypeInsn):
+    opcode: Opcode = field(default=Opcode.MAX_ABS_REDUCE_FP32, init=False)
+
+
 # --- M-type instructions ---
 @dataclass
 class MTypeInsn(Instruction):

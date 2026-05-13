@@ -8,6 +8,16 @@ import numpy as np
 import pytest
 
 from taccel.assembler.assembler import Assembler, ProgramBinary
+from taccel.compiler.codegen import CodeGenerator
+from taccel.compiler.ir import IRGraph, IRNode
+from taccel.compiler.model_config import ModelConfig
+from taccel.isa.encoding import encode
+from taccel.isa.instructions import (
+    BufCopyInsn,
+    ConfigAttnInsn,
+    HaltInsn,
+    MaskedSoftmaxInsn,
+)
 from taccel.isa.opcodes import BUF_ABUF, BUF_ACCUM, BUF_WBUF
 
 
@@ -144,6 +154,97 @@ def test_compare_program_mode_smoke_passes(tmp_path: Path):
     assert summary["pass"] is True
     assert summary["runner_exit_code"] == 0
     assert summary["mismatch_count"] == 0
+
+
+def _compiler_generated_masked_qkt_program() -> ProgramBinary:
+    graph = IRGraph()
+    graph.add_node(IRNode(
+        op="matmul_qkt",
+        name="block0_head0_qkt",
+        inputs=["q", "k"],
+        output_shape=(16, 16),
+        attrs={"head_idx": 0, "scale": 0.125, "masked": True},
+    ))
+    codegen = CodeGenerator(
+        weight_data={},
+        calibration_scales={
+            "q": 1.0 / 127.0,
+            "k": 1.0 / 127.0,
+            "block0_head0_qkt": 1.0 / 127.0,
+            "block0_head0_softmax": 1.0 / 127.0,
+        },
+        prescaled_biases={},
+        model_config=ModelConfig(
+            model_kind="decoder",
+            n_layer=1,
+            n_head=2,
+            d_model=128,
+            d_head=64,
+            mlp_dim=512,
+            vocab_size=256,
+            max_seq_len=16,
+            embedding_kind="token_pos",
+        ),
+    )
+    instructions, data = codegen.generate(graph)
+
+    assert any(isinstance(insn, ConfigAttnInsn) for insn in instructions)
+    assert any(isinstance(insn, MaskedSoftmaxInsn) for insn in instructions)
+
+    # Make the compiler fragment's masked-softmax output architecturally visible
+    # to compare_program_mode, which compares the ACCUM logits window.
+    instructions = instructions[:-1] + [
+        BufCopyInsn(
+            src_buf=BUF_WBUF,
+            src_off=64,
+            dst_buf=BUF_ACCUM,
+            dst_off=0,
+            length=16,
+            src_rows=0,
+            transpose=0,
+        ),
+        HaltInsn(),
+    ]
+    insn_bytes = b"".join(encode(insn) for insn in instructions)
+    return ProgramBinary(
+        instructions=insn_bytes,
+        data=data,
+        entry_point=0,
+        insn_count=len(instructions),
+    )
+
+
+def test_compare_program_mode_compiler_masked_qkt_fragment_passes(tmp_path: Path):
+    program = _compiler_generated_masked_qkt_program()
+    program_path = tmp_path / "masked_qkt_program.bin"
+    program_path.write_bytes(program.to_bytes())
+    summary_path = tmp_path / "masked_qkt_compare_summary.json"
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(COMPARE_SCRIPT),
+            "--summary-out",
+            str(summary_path),
+            "--runner",
+            str(RUNNER),
+            "--num-classes",
+            "8",
+            "--max-cycles",
+            "100000",
+            "program",
+            "--program",
+            str(program_path),
+        ],
+        check=False,
+    )
+    summary = json.loads(summary_path.read_text())
+
+    assert proc.returncode == 0
+    assert summary["pass"] is True
+    assert summary["runner_exit_code"] == 0
+    assert summary["mismatch_count"] == 0
+    assert summary["rtl"]["status"] == "halted"
 
 
 def test_runner_snapshot_captures_int8_rows(tmp_path: Path):

@@ -1,5 +1,13 @@
 # TACCEL ISA Specification
 
+> Historical snapshot from 2026-04-08. The current ISA source of truth is
+> `software/docs/isa_spec.md`; it defines `CONFIG_ATTN` (`0x14`),
+> `MASKED_SOFTMAX` (`0x15`), `MASKED_SOFTMAX_ATTNV` (`0x16`), the W8A32 M1
+> sub-layer ops at `0x17-0x1D`, and the W8A32 M2.5-A dynamic-scale
+> primitives `DEQUANT_ACCUM_FP32_SCALED` (`0x1E`) and `MAX_ABS_REDUCE_FP32`
+> (`0x1F`). After M2.5-A no opcodes are reserved — the entire 5-bit
+> opcode space is in use.
+
 ## Overview
 
 TACCEL uses a fixed-width 64-bit ISA for a transformer accelerator with three
@@ -73,8 +81,12 @@ program order.
 
 ### Illegal Instructions
 
-Opcodes `0x14` through `0x1F` are reserved. Decoding them is an illegal
-instruction fault. Invalid buffer IDs and missing tile state may also fault.
+In this historical snapshot, opcodes `0x14` through `0x1F` were reserved.
+The current ISA is defined in `software/docs/isa_spec.md`; it assigns
+`0x14..0x16` to masked-attention instructions, `0x17..0x1D` to W8A32 M1
+FP32 sub-layer ops, and `0x1E..0x1F` to the M2.5-A dynamic-scale
+primitives. After M2.5-A no opcodes are reserved. Invalid buffer IDs
+and missing tile state may also fault.
 
 ## Instruction Formats
 

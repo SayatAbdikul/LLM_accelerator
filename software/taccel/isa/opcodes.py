@@ -13,17 +13,35 @@ The programmer inserts SYNC instructions with a 3-bit resource mask to
 enforce ordering between units.  Without SYNC, the hardware may overlap
 execution of independent units (e.g. a LOAD can overlap a MATMUL).
 
-W8A32 extension (Phase 3 (c.1), milestone M1, 2026-05-12)
----------------------------------------------------------
-Seven new R-type opcodes (0x17–0x1D) extend the ISA to support FP32
-inter-layer activations while preserving INT8 MXU matmul:
-  - DEQUANT_ACCUM_FP32: per-channel dequant of INT32 ACCUM → FP32 ABUF
-  - QUANT_FP32_INT8:    per-tensor INT8 quant of FP32 ABUF → INT8 ABUF
-  - VADD_FP32:          element-wise FP32 add (residual stream)
-  - LAYERNORM_FP32:     LayerNorm with FP32 I/O
-  - GELU_FP32:          GELU with FP32 I/O
-  - SOFTMAX_FP32:       row-wise softmax with FP32 I/O
-  - MASKED_SOFTMAX_FP32: causal softmax with FP32 I/O
+W8A32 extension (Phase 3 (c.1), milestones M1 + M2.5-A, 2026-05-12)
+------------------------------------------------------------------
+Nine new R-type opcodes (0x17–0x1F) extend the ISA to support FP32
+inter-layer activations + dynamic per-matmul activation scaling while
+preserving INT8 MXU matmul:
+
+  M1 (commit `47141fb`):
+    0x17 DEQUANT_ACCUM_FP32:    per-channel dequant of INT32 ACCUM → FP32 ABUF
+    0x18 QUANT_FP32_INT8:       per-tensor INT8 quant of FP32 ABUF → INT8 ABUF
+    0x19 VADD_FP32:             element-wise FP32 add (residual stream)
+    0x1A LAYERNORM_FP32:        LayerNorm with FP32 I/O
+    0x1B GELU_FP32:             GELU with FP32 I/O
+    0x1C SOFTMAX_FP32:          row-wise softmax with FP32 I/O
+    0x1D MASKED_SOFTMAX_FP32:   causal softmax with FP32 I/O
+
+  M2.5-A (this commit):
+    0x1E DEQUANT_ACCUM_FP32_SCALED:
+       like DEQUANT_ACCUM_FP32 but additionally multiplies by an FP16
+       scalar from a scale register. Used by W8A32 matmul-output
+       lowering to apply the dynamic per-matmul activation scale
+       (max_abs/127) on top of the static per-channel weight scales.
+       M1's 0x17 op stays bit-identical to its M1 contract — 0x1E is
+       a separate opcode that adds the scalar multiply.
+    0x1F MAX_ABS_REDUCE_FP32:
+       scans an FP32 ABUF tile, computes max(|x|), and writes derived
+       FP16 scales to a register pair: scale_regs[sreg] = 127/max_abs
+       (for QUANT_FP32_INT8 input scaling), scale_regs[sreg+1] =
+       max_abs/127 (for DEQUANT_ACCUM_FP32_SCALED output scaling).
+       Eps-guarded for all-zero tiles.
 
 There is no buffer dtype tag — ABUF bytes are reinterpreted as INT8
 (1 byte/elem) or FP32 (4 bytes/elem) based on the opcode. Codegen owns
@@ -32,10 +50,10 @@ versus 16 units for the corresponding INT8 tile.
 
 Reserved fields / opcodes
 -------------------------
-- Opcodes 0x1E–0x1F are reserved (down from 0x14–0x1F before M1, and
-  from 0x17-0x1F before the masked-attention extension). Decoding a
-  reserved opcode raises an illegal-instruction fault and the
-  processor halts.
+- After M2.5-A, the entire 5-bit opcode space (0x00–0x1F) is in use.
+  No opcodes are reserved. Future ISA extensions must reuse a slot
+  via a CONFIG-style prefix, expand the opcode field, or relocate an
+  existing rarely-used encoding.
 - CONFIG_ATTN reserved bits [32:0] must be zero.
 - M-TYPE stride_log2 [6:3] is reserved and must be zero.
 - M-TYPE flags [2:0] are reserved and must be zero.
@@ -76,6 +94,11 @@ class Opcode(IntEnum):
     GELU_FP32 = 0x1B
     SOFTMAX_FP32 = 0x1C
     MASKED_SOFTMAX_FP32 = 0x1D
+    # W8A32 extension (M2.5-A, 2026-05-12): dynamic per-matmul activation
+    # scaling primitives. M1's 0x17 stays bit-identical to its shipped
+    # contract; 0x1E is the separate "scaled" variant.
+    DEQUANT_ACCUM_FP32_SCALED = 0x1E
+    MAX_ABS_REDUCE_FP32 = 0x1F
 
 
 class InsnFormat(IntEnum):
@@ -112,7 +135,7 @@ OPCODE_FORMAT = {
     Opcode.CONFIG_ATTN: InsnFormat.ATTN_TYPE,
     Opcode.MASKED_SOFTMAX: InsnFormat.R_TYPE,
     Opcode.MASKED_SOFTMAX_ATTNV: InsnFormat.R_TYPE,
-    # W8A32 R-type extension
+    # W8A32 R-type extension (M1)
     Opcode.DEQUANT_ACCUM_FP32: InsnFormat.R_TYPE,
     Opcode.QUANT_FP32_INT8: InsnFormat.R_TYPE,
     Opcode.VADD_FP32: InsnFormat.R_TYPE,
@@ -120,6 +143,9 @@ OPCODE_FORMAT = {
     Opcode.GELU_FP32: InsnFormat.R_TYPE,
     Opcode.SOFTMAX_FP32: InsnFormat.R_TYPE,
     Opcode.MASKED_SOFTMAX_FP32: InsnFormat.R_TYPE,
+    # W8A32 R-type extension (M2.5-A)
+    Opcode.DEQUANT_ACCUM_FP32_SCALED: InsnFormat.R_TYPE,
+    Opcode.MAX_ABS_REDUCE_FP32: InsnFormat.R_TYPE,
 }
 
 # Buffer IDs (2-bit, shared across R-type, M-type, B-type)

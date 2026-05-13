@@ -139,8 +139,8 @@ def test_gelu_from_accum_quantizes_fc1_with_uniform_weight_scale():
         "block0_ln2": 0.01,
         "block0_gelu": 0.01,
     }
-    per_channel_weights, _, _, _, _ = quantize_fixture_payload(payload, calibration_scales=scales)
-    per_tensor_weights, _, _, _, _ = quantize_fixture_payload(
+    per_channel_weights, _, _, _, _, _ = quantize_fixture_payload(payload, calibration_scales=scales)
+    per_tensor_weights, _, _, _, _, _ = quantize_fixture_payload(
         payload,
         calibration_scales=scales,
         per_tensor_fc1_blocks={0},

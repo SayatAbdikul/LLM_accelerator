@@ -75,7 +75,15 @@ All instructions are 64 bits, big-endian.  Bits [63:59] hold the 5-bit opcode.
 | CONFIG_ATTN  | 0x14   | ATTN-TYPE | Set masked-attention context       |
 | MASKED_SOFTMAX | 0x15 | R-TYPE | Row-wise softmax with attention mask |
 | MASKED_SOFTMAX_ATTNV | 0x16 | R-TYPE | Fused masked softmax(QK^T) @ V |
-| 0x17–0x1F    | —      | —      | **Reserved** — illegal instruction fault |
+| DEQUANT_ACCUM_FP32 | 0x17 | R-TYPE | INT32 ACCUM → FP32 ABUF, per-channel FP16 scale |
+| QUANT_FP32_INT8 | 0x18 | R-TYPE | FP32 ABUF → INT8 ABUF, sreg-held FP16 scale |
+| VADD_FP32    | 0x19   | R-TYPE | Element-wise FP32 add (residual stream) |
+| LAYERNORM_FP32 | 0x1A | R-TYPE | LayerNorm with FP32 I/O              |
+| GELU_FP32    | 0x1B   | R-TYPE | GELU with FP32 I/O                   |
+| SOFTMAX_FP32 | 0x1C   | R-TYPE | Row-wise softmax with FP32 I/O       |
+| MASKED_SOFTMAX_FP32 | 0x1D | R-TYPE | Causal softmax with FP32 I/O   |
+| DEQUANT_ACCUM_FP32_SCALED | 0x1E | R-TYPE | M1's dequant × dynamic FP16 activation scale |
+| MAX_ABS_REDUCE_FP32 | 0x1F | R-TYPE | max(\|x\|) over FP32 tile → FP16 scale pair (127/max, max/127) |
 
 ### 2.2 R-TYPE (Compute)
 
@@ -101,6 +109,15 @@ SREG usage by opcode:
 - `SOFTMAX_ATTNV`: `S[sreg]` through `S[sreg+3]`.
 - `REQUANT_PC`: current implementation ignores `sreg`; encode `sreg=0` for
   portability and read scales from `src2`.
+- `QUANT_FP32_INT8` (M1): `S[sreg]` only — FP16-stored multiplier
+  `1/act_scale` (i.e. value to multiply by, not divisor).
+- `DEQUANT_ACCUM_FP32_SCALED` (M2.5-A): `S[sreg]` only — FP16-stored
+  activation dequant factor `max_abs/127` written by the matmul prelude.
+- `MAX_ABS_REDUCE_FP32` (M2.5-A): writes `S[sreg]` AND `S[sreg+1]`. Encoding
+  requires `0 ≤ sreg ≤ 14`; `sreg = 15` would alias `S[16]` and faults at
+  execution time.
+- `DEQUANT_ACCUM_FP32`, `VADD_FP32`, `LAYERNORM_FP32`, `GELU_FP32`,
+  `SOFTMAX_FP32`, `MASKED_SOFTMAX_FP32` (M1): sreg unused; encode `sreg=0`.
 
 ### 2.3 M-TYPE (Memory)
 
@@ -238,11 +255,12 @@ different units.  SYNC with mask 0b000 is a NOP.
 
 | Condition                    | Behaviour                        |
 |------------------------------|----------------------------------|
-| Illegal opcode (0x14–0x1F)  | Halt, set fault status register  |
+| Illegal opcode (none — 0x00–0x1F all assigned after M2.5-A) | Halt, set fault status register |
 | DRAM out of bounds           | Halt, set fault status register  |
 | SRAM out of bounds           | Halt, set fault status register  |
 | Missing CONFIG_TILE          | Halt, set fault status register  |
 | Reserved buffer ID (0b11)   | Halt, set fault status register  |
+| `MAX_ABS_REDUCE_FP32` `sreg ≥ 15` | Halt, set fault status register |
 
 ---
 

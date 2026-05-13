@@ -36,6 +36,8 @@ from ..isa.instructions import (
     # W8A32 extension (M1)
     DequantAccumFp32Insn, QuantFp32Int8Insn, VaddFp32Insn,
     LayernormFp32Insn, GeluFp32Insn, SoftmaxFp32Insn, MaskedSoftmaxFp32Insn,
+    # W8A32 extension (M2.5-A)
+    DequantAccumFp32ScaledInsn, MaxAbsReduceFp32Insn,
 )
 from .state import MachineState
 from . import memory as mem
@@ -422,6 +424,23 @@ class Simulator:
                 dequant = raw_view.astype(np.float32) * scale
                 raw_event["raw_available"] = True
                 raw_event["raw"] = raw_view.tolist()
+            elif event["dtype"] == "fp32":
+                # W8A32 path (M2.5-D): the source tile already holds
+                # FP32-dequantized values, so no `* scale` step is
+                # needed. The recorded `scale` stays in raw_event /
+                # node_meta as a hint for downstream tooling that wants
+                # to recover an INT8-equivalent representation, but the
+                # FP32 tile IS the real-units view. ACCUM is INT32-only
+                # by the hardware contract; FP32 events must therefore
+                # come from ABUF or WBUF (mem.read_fp32_tile enforces).
+                raw_tile = mem.read_fp32_tile(self.state, buf_id, offset_units, mem_rows, mem_cols)
+                raw_view = raw_tile[:logical_rows, :logical_cols]
+                # The FP32 path does not need INT8 padding-zero fixups
+                # (the sub-layer / matmul emitters write architecturally
+                # valid FP32 over the full M_pad × N_pad tile).
+                dequant = raw_view.astype(np.float32)
+                raw_event["raw_available"] = True
+                raw_event["raw"] = raw_view.tolist()
             else:
                 raw_tile = mem.read_int8_tile(self.state, buf_id, offset_units, mem_rows, mem_cols)
                 raw_view = raw_tile[:logical_rows, :logical_cols]
@@ -436,7 +455,12 @@ class Simulator:
             self.trace_tensors[node_name][row_start:row_start + logical_rows, :logical_cols] = dequant
             if source != "virtual":
                 if node_name not in self.trace_raw_tensors:
-                    raw_dtype = np.int32 if event["dtype"] == "int32" else np.int8
+                    if event["dtype"] == "int32":
+                        raw_dtype = np.int32
+                    elif event["dtype"] == "fp32":
+                        raw_dtype = np.float32
+                    else:
+                        raw_dtype = np.int8
                     self.trace_raw_tensors[node_name] = np.zeros((full_rows, full_cols), dtype=raw_dtype)
                 self.trace_raw_tensors[node_name][row_start:row_start + logical_rows, :logical_cols] = raw_view
             self.trace_raw_events.append(raw_event)
@@ -536,6 +560,11 @@ class Simulator:
                 raise ConfigError("CONFIG_TILE not set")
             self._validate_attn_context_for_key_cols((self.state.tile_config[1] + 1) * 16)
             self._exec_masked_softmax_fp32(insn)
+        # ----- W8A32 extension (M2.5-A): dynamic activation scale primitives -----
+        elif op == Opcode.DEQUANT_ACCUM_FP32_SCALED:
+            self._exec_dequant_accum_fp32_scaled(insn)
+        elif op == Opcode.MAX_ABS_REDUCE_FP32:
+            self._exec_max_abs_reduce_fp32(insn)
         else:
             raise IllegalOpcodeError(self.state.pc, b'\x00' * 8)
 
@@ -992,4 +1021,90 @@ class Simulator:
             denom = float(exp_row.sum())
             result[i] = exp_row / denom if denom > 0.0 else 0.0
         mem.write_fp32_tile(self.state, insn.dst_buf, insn.dst_off, result.astype(np.float32))
+        self.state.cycle_count += M * N
+
+    # =======================================================================
+    # W8A32 M2.5-A handlers: dynamic per-matmul activation scaling primitives
+    # =======================================================================
+
+    def _exec_dequant_accum_fp32_scaled(self, insn):
+        """DEQUANT_ACCUM_FP32_SCALED: M1's dequant + a dynamic activation scale.
+
+        Math:
+          output[i,j] = src1[i,j] (INT32) * per_channel_wt_scale[j] (FP16->FP32)
+                                          * scale_regs[sreg] (FP16->FP32)
+
+        Used by the W8A32 matmul-output lowering. The static per-channel
+        weight scale table in `src2` is the same shape and FP16 format as
+        DEQUANT_ACCUM_FP32 reads — only the additional `* scale_regs[sreg]`
+        factor differs. That factor is the activation scale (max_abs / 127)
+        that the matmul prelude wrote via MAX_ABS_REDUCE_FP32.
+
+        M1's DEQUANT_ACCUM_FP32 (0x17) is unchanged — this is a separate
+        opcode (0x1E) so the M1 contract is preserved verbatim.
+        """
+        if self.state.tile_config is None:
+            raise ConfigError("CONFIG_TILE not set")
+        if insn.src1_buf != BUF_ACCUM:
+            raise IllegalBufferError(insn.src1_buf)
+        if insn.src2_buf == BUF_ACCUM:
+            raise IllegalBufferError(insn.src2_buf)
+        if insn.dst_buf == BUF_ACCUM:
+            raise IllegalBufferError(insn.dst_buf)
+
+        m_tiles = self.state.tile_config[0] + 1
+        n_tiles = self.state.tile_config[1] + 1
+        M = m_tiles * 16
+        N = n_tiles * 16
+
+        src = mem.read_int32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
+        wt_scales = mem.read_fp16_vector(self.state, insn.src2_buf, insn.src2_off, N).reshape(1, N)
+        act_scale = np.float32(self.state.scale_regs[insn.sreg])
+        result = (src.astype(np.float32) * wt_scales * act_scale).astype(np.float32)
+
+        mem.write_fp32_tile(self.state, insn.dst_buf, insn.dst_off, result)
+        self.state.cycle_count += M * N
+
+    def _exec_max_abs_reduce_fp32(self, insn):
+        """MAX_ABS_REDUCE_FP32: compute max(|x|) over an FP32 tile;
+        write 127/max_abs to scale_regs[sreg], max_abs/127 to scale_regs[sreg+1].
+
+        Used as the prelude to W8A32 matmul: the result drives
+        QUANT_FP32_INT8 (via sreg, multiplier 127/max_abs) and the
+        downstream DEQUANT_ACCUM_FP32_SCALED (via sreg+1, multiplier
+        max_abs/127). Two scale registers consumed per call,
+        matching the DEQUANT_ADD sreg-pair convention.
+
+        All-zero tile guard: if max_abs is 0, the inverse 127/0 is
+        infinity. We clamp max_abs to an eps large enough that the
+        inverse `127/eps` is still FP16-representable. FP16 max is
+        ~65504, so eps must be >= 127/65504 ≈ 1.94e-3. We use
+        `2**-9 = 1/512` (gives `127*512 = 65024`, safely under FP16
+        max). Downstream QUANT_FP32_INT8 produces all zeros anyway for
+        an all-zero source, so the clamp value does not affect
+        correctness for the zero case — it only has to stay finite.
+        """
+        if self.state.tile_config is None:
+            raise ConfigError("CONFIG_TILE not set")
+        if insn.src1_buf == BUF_ACCUM:
+            raise IllegalBufferError(insn.src1_buf)
+        if insn.sreg >= 15:
+            raise ConfigError("MAX_ABS_REDUCE_FP32 sreg+1 out of range (must be 0..14)")
+
+        m_tiles = self.state.tile_config[0] + 1
+        n_tiles = self.state.tile_config[1] + 1
+        M = m_tiles * 16
+        N = n_tiles * 16
+
+        src = mem.read_fp32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
+        max_abs = float(np.max(np.abs(src.astype(np.float32))))
+        # Eps-clamp so 127/max_abs fits in FP16 (max ≈ 65504). 2**-9 = 1/512
+        # gives 127*512 = 65024 inverse, safely FP16-representable.
+        MAX_ABS_EPS = 2.0 ** -9
+        max_abs_eps = max(max_abs, MAX_ABS_EPS)
+        inv_scale = np.float16(127.0 / max_abs_eps)
+        fwd_scale = np.float16(max_abs_eps / 127.0)
+        self.state.scale_regs[insn.sreg] = inv_scale
+        self.state.scale_regs[insn.sreg + 1] = fwd_scale
+        # Reduce over M*N elements; charge linear cycles.
         self.state.cycle_count += M * N
