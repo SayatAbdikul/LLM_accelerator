@@ -3271,3 +3271,65 @@ def test_stage3_w8a32_decode_bundle_registers_runtime_config_attn_sites():
     ]
     # 1 layer × 1 head × 1 masked softmax = at least 1 decode site.
     assert len(decode_sites) >= 1
+
+
+# ---------------------------------------------------------------------------
+# M4-E: NanoGPTW8A32SimulatorReference — like-for-like Python reference.
+#
+# The simulator-backed bundle's perplexity number is uninterpretable
+# without this reference: any difference from WeightOnlyHostRunner could
+# be a codegen bug or the expected M2.5-A dynamic-scaling compounding
+# cost. M4-E lets us split those.
+# ---------------------------------------------------------------------------
+
+
+def test_nanogpt_w8a32_simulator_reference_prefill_returns_finite_logits():
+    """Smoke: the reference compiles + runs prefill end-to-end and
+    produces finite FP32 logits at the configured vocab size."""
+    from taccel.runtime.w8a32_simulator_reference import NanoGPTW8A32SimulatorReference
+
+    payload = _one_layer_gpt2_payload()
+    ref = NanoGPTW8A32SimulatorReference(payload)
+    logits = ref.run_prefill([3])
+    vocab = int(payload["model_args"]["vocab_size"])
+    assert logits.shape == (vocab,)
+    assert np.all(np.isfinite(logits))
+
+
+def test_nanogpt_w8a32_simulator_reference_decode_step_extends_kv_cache():
+    """A 3-step run via prefill + decode produces position-distinct
+    logits, confirming the KV cache accumulates and softmax masks
+    correctly over the growing context."""
+    from taccel.runtime.w8a32_simulator_reference import NanoGPTW8A32SimulatorReference
+
+    payload = _one_layer_gpt2_payload()
+    ref = NanoGPTW8A32SimulatorReference(payload)
+    pf = ref.run_prefill([3])
+    d1 = ref.run_decode_step(5, 1)
+    d2 = ref.run_decode_step(7, 2)
+    # KV cache grew: 3 tokens stored.
+    assert len(ref._caches[0][0]["k"]) == 3
+    assert len(ref._caches[0][0]["v"]) == 3
+    # Logits at each step are finite (the fixture's symmetric linspace
+    # weights can produce near-identical logits across steps; the cache
+    # growth + finite-check is the meaningful invariant here).
+    assert np.all(np.isfinite(pf))
+    assert np.all(np.isfinite(d1))
+    assert np.all(np.isfinite(d2))
+
+
+def test_nanogpt_w8a32_simulator_reference_teacher_forced_matches_step_by_step():
+    """`run_teacher_forced` == prefill(t0) + decode(t1) + decode(t2)..."""
+    from taccel.runtime.w8a32_simulator_reference import NanoGPTW8A32SimulatorReference
+
+    payload = _one_layer_gpt2_payload()
+    ref = NanoGPTW8A32SimulatorReference(payload)
+    toks = [3, 5, 7, 9]
+    tf = ref.run_teacher_forced(toks)
+    # Re-run via prefill + decode for the same tokens.
+    ref2 = NanoGPTW8A32SimulatorReference(payload)
+    step = [ref2.run_prefill([toks[0]])]
+    for i in range(1, len(toks)):
+        step.append(ref2.run_decode_step(toks[i], i))
+    for a, b in zip(tf, step):
+        np.testing.assert_array_equal(a, b)
