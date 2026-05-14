@@ -9,30 +9,12 @@ from typing import List
 
 import torch
 
+from taccel.runtime._tokenizer_utils import (
+    decode_char_ids,
+    parse_prompt_ids,
+    tokenize_char_prompt,
+)
 from taccel.runtime.tiny_fixture import run_nanogpt_fp32_e2e, run_stage3_tiny_e2e
-
-
-def _parse_prompt_ids(raw: str) -> List[int]:
-    if not raw.strip():
-        raise ValueError("--prompt-ids must not be empty")
-    return [int(part.strip()) for part in raw.split(",") if part.strip()]
-
-
-def _prompt_to_ids(prompt: str, stoi: dict) -> List[int]:
-    if not prompt:
-        raise ValueError("--prompt must not be empty")
-    missing = sorted({ch for ch in prompt if ch not in stoi})
-    if missing:
-        raise ValueError(f"prompt contains characters absent from checkpoint tokenizer: {missing!r}")
-    return [int(stoi[ch]) for ch in prompt]
-
-
-def _decode_chars(token_ids: List[int], itos: dict) -> str:
-    out = []
-    for tok in token_ids:
-        key = str(int(tok))
-        out.append(str(itos.get(key, itos.get(int(tok), "?"))))
-    return "".join(out)
 
 
 def main(argv=None) -> int:
@@ -55,9 +37,9 @@ def main(argv=None) -> int:
     stoi = payload.get("stoi", {})
     itos = payload.get("itos", {})
     if args.prompt_ids is not None:
-        prompt_ids = _parse_prompt_ids(args.prompt_ids)
+        prompt_ids = parse_prompt_ids(args.prompt_ids)
     elif args.prompt is not None:
-        prompt_ids = _prompt_to_ids(args.prompt, stoi)
+        prompt_ids = tokenize_char_prompt(args.prompt, stoi)
     else:
         prompt_ids = [0]
 
@@ -70,7 +52,7 @@ def main(argv=None) -> int:
         "checkpoint": str(args.checkpoint),
         "prompt_ids": prompt_ids,
         "generated_ids": result.generated,
-        "generated_text": _decode_chars(result.generated, itos),
+        "generated_text": decode_char_ids(result.generated, itos),
         "max_new_tokens": args.max_new_tokens,
         "min_cosine": result.min_cosine,
         "mean_cosine": float(sum(result.cosine_per_step) / len(result.cosine_per_step)),
@@ -84,7 +66,7 @@ def main(argv=None) -> int:
         )
         summary.update({
             "fp32_generated_ids": fp32.fp32_generated,
-            "fp32_generated_text": _decode_chars(fp32.fp32_generated, itos),
+            "fp32_generated_text": decode_char_ids(fp32.fp32_generated, itos),
             "fp32_min_top5_overlap": fp32.min_top5_overlap,
             "fp32_top1_in_golden_top5_all": fp32.fp32_top1_in_golden_top5_all,
             "golden_top1_in_fp32_top5_all": fp32.golden_top1_in_fp32_top5_all,

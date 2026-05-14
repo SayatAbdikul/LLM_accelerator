@@ -17,31 +17,33 @@ from taccel.runtime.gpt2_perplexity import (
     file_sha256,
     tokenize_text_file,
 )
+from taccel.runtime._tokenizer_utils import (
+    decode_char_ids,
+    parse_prompt_ids,
+    tokenize_char_prompt,
+)
 from taccel.runtime.stage5_ptq import stage5_default_ptq_preset_name
 from taccel.runtime.tiny_fixture import run_nanogpt_fp32_e2e, run_stage3_tiny_e2e
 
 
-def _parse_prompt_ids(raw: str) -> List[int]:
-    if not raw.strip():
-        raise ValueError("--prompt-ids must not be empty")
-    return [int(part.strip()) for part in raw.split(",") if part.strip()]
-
-
 def _prompt_to_ids(prompt: str, payload: dict) -> List[int]:
+    """Encode a text prompt using the checkpoint's char-level stoi map.
+
+    Converted GPT-2 artifacts don't embed an stoi (they tokenize via the HF
+    BPE tokenizer alongside the checkpoint), so this surfaces a
+    GPT-2-specific hint pointing callers at --prompt-ids instead.
+    """
     stoi = payload.get("stoi") or {}
-    if stoi:
-        missing = sorted({ch for ch in prompt if ch not in stoi})
-        if missing:
-            raise ValueError(f"prompt contains characters absent from checkpoint tokenizer: {missing!r}")
-        return [int(stoi[ch]) for ch in prompt]
-    raise ValueError("text prompts require tokenizer metadata; use --prompt-ids for converted GPT-2 artifacts")
+    if not stoi:
+        raise ValueError(
+            "text prompts require tokenizer metadata; use --prompt-ids for "
+            "converted GPT-2 artifacts"
+        )
+    return tokenize_char_prompt(prompt, stoi)
 
 
 def _decode_ids(token_ids: List[int], payload: dict) -> str:
-    itos = payload.get("itos") or {}
-    if itos:
-        return "".join(str(itos.get(str(int(tok)), itos.get(int(tok), "?"))) for tok in token_ids)
-    return ""
+    return decode_char_ids(token_ids, payload.get("itos") or {})
 
 
 def main(argv=None) -> int:
@@ -76,7 +78,7 @@ def main(argv=None) -> int:
 
     payload = torch.load(args.checkpoint, map_location="cpu")
     if args.prompt_ids is not None:
-        prompt_ids = _parse_prompt_ids(args.prompt_ids)
+        prompt_ids = parse_prompt_ids(args.prompt_ids)
     elif args.prompt is not None:
         prompt_ids = _prompt_to_ids(args.prompt, payload)
     else:

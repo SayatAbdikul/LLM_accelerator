@@ -209,7 +209,6 @@ def main(argv=None) -> int:
     parser.add_argument("--prompt-id", type=int, default=796)
     parser.add_argument("--max-new-tokens", type=int, default=5)
     parser.add_argument("--decode-steps", type=int, default=5)
-    parser.add_argument("--fp-precision", choices=("fp16", "fp32"), default="fp16")
     parser.add_argument("--ptq-preset", default="weight_only_int8")
     args = parser.parse_args(argv)
 
@@ -218,7 +217,6 @@ def main(argv=None) -> int:
         payload,
         smoke_decode_steps=args.max_new_tokens,
         ptq_preset=args.ptq_preset,
-        fp_precision=args.fp_precision,
     )
 
     global CUR_SIM
@@ -229,7 +227,7 @@ def main(argv=None) -> int:
     runner = HostRunner(
         tiny.build.bundle,
         simulator=sim,
-        logits_dtype=np.float16 if args.fp_precision == "fp16" else np.float32,
+        logits_dtype=np.float16,
     )
 
     print(
