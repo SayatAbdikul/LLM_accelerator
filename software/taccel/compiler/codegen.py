@@ -3216,7 +3216,16 @@ class CodeGenerator:
             if len(node.output_shape) == 2:
                 rows = pad_dim(int(node.output_shape[0]))
                 cols = pad_dim(int(node.output_shape[1]))
-                alloc_bytes = max(alloc_bytes, rows * cols)
+                # M2-W8A16 fix: in W8A{32,16} mode the K/V cache stores FP-precision
+                # elements (4 bytes for FP32, 2 bytes for FP16). The ABUF alloc must
+                # hold rows*cols*elem_bytes, not rows*cols (the INT8 size). Without
+                # this multiplier the FP16 K tile got 1024B instead of 2048B; the
+                # 1024B hole between [128..192] was first-fit-picked as the next
+                # QUANT's INT8 destination, corrupting the FP16 K source at offsets
+                # [192..256] and producing NaN-decoded INT8 byte pairs (e.g. 0x09
+                # 0xfc -> FP16 NaN). See tools/debug_w8a16_nan.py for the trace.
+                tile_elem_bytes = self.elem_bytes if self.w8a32_enabled else 1
+                alloc_bytes = max(alloc_bytes, rows * cols * tile_elem_bytes)
             # M4-debug: large W8A32 kv_load tiles (256-token K/V FP32 cache
             # at GPT-2 scale = 64 KB) fragment under first-fit. Compact
             # before the alloc to expose a contiguous free region.
