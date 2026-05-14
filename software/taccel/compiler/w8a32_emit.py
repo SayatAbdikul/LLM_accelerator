@@ -103,15 +103,9 @@ if TYPE_CHECKING:
     from .ir import IRNode
 
 
-# Phase 3 (c.2) M2: FP-precision byte sizing flows from `cg.elem_bytes`.
-# - cg.elem_bytes == 4: W8A32 (FP32 ABUF storage).
-# - cg.elem_bytes == 2: W8A16 (FP16 ABUF storage).
-# All FP-tile sizing in this module uses `cg.elem_bytes`; INT32 ACCUM
-# storage (always 4 bytes/elem) keeps its hardcoded `* 4`.
-# `FP32_BYTES_PER_ELEM = 4` is retained as a module-level alias for
-# backward compatibility with existing tests that import it; internal
-# code uses `cg.elem_bytes` for the precision-dependent path.
-FP32_BYTES_PER_ELEM = 4
+# W8A16: ABUF FP tiles are FP16 (2 bytes/element). All FP-tile sizing in
+# this module uses `cg.elem_bytes` (= 2). INT32 ACCUM storage keeps its
+# hardcoded `* 4`.
 
 
 def _zero_fill_fp32_padding_rows(
@@ -704,19 +698,13 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
         emit_matmul_w8a32_large_weight_tiled(cg, node)
         return
 
-    # Per-channel FP16 weight-scale vector staging symbol — set up by
-    # `CodeGenerator.generate()` at DRAM-staging time when w8a32_enabled.
-    # W8A32 (fp_precision="fp32"): N FP16 PC scales, separate FP32 bias VADD.
-    # W8A16 (fp_precision="fp16"): 2N FP16 (PC scales + bias), folded into
-    # the DEQUANT epilogue per the bias-fold contract.
+    # Per-channel FP16 weight-scale + folded bias vector staging symbol —
+    # set up by `CodeGenerator.generate()` at DRAM-staging time when
+    # w8a32_enabled. 2N FP16 (PC scales + bias), folded into the DEQUANT
+    # epilogue per the bias-fold contract. Bias half is zero-padded when
+    # the matmul has no bias.
     bias_name = node.attrs.get("bias")
-    if cg.fp_precision == "fp16":
-        pc_scale_sym = f"{weight_name}__w8a16_pc_scale_and_bias"
-        # Bias is folded; no separate VADD path. The 2N FP16 blob is
-        # staged by `_layout_weights` whether or not the matmul has a
-        # bias (bias half is zero-padded when absent).
-    else:
-        pc_scale_sym = f"{weight_name}__w8a32_pc_scale"
+    pc_scale_sym = f"{weight_name}__w8a16_pc_scale_and_bias"
 
     # ----- ABUF allocations -----
     # FP32 input tile (M_pad × K_pad × 4 bytes). The prior op's output
@@ -813,13 +801,12 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
 
     pc_scale_dram = cg._dram_offset_required(
         pc_scale_sym,
-        f"loading W8A{32 if cg.fp_precision == 'fp32' else 16} per-channel "
-        f"weight scales for '{weight_name}'",
+        f"loading W8A16 PC scales + bias for '{weight_name}'",
     )
-    # W8A32: N FP16. W8A16: 2N FP16 (PC scales + folded bias).
-    pc_scale_entries = (2 * N_pad) if cg.fp_precision == "fp16" else N_pad
+    # W8A16: 2N FP16 (PC scales + folded bias).
+    pc_scale_entries = 2 * N_pad
     pc_scale_bytes = pc_scale_entries * 2  # 2 bytes per FP16 entry
-    pc_scale_alloc = cg.mem.wbuf.alloc(f"_w8a32_pc_{weight_name}", pc_scale_bytes)
+    pc_scale_alloc = cg.mem.wbuf.alloc(f"_w8a16_pc_bias_{weight_name}", pc_scale_bytes)
     cg._emit_dma_load(BUF_WBUF, pc_scale_alloc.offset_units, pc_scale_bytes, 0, pc_scale_dram)
     cg._emit(SyncInsn(resource_mask=0b001))
 
@@ -850,56 +837,15 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
         )
     )
     cg._emit(SyncInsn(resource_mask=0b100))
-    cg.mem.wbuf.free(f"_w8a32_pc_{weight_name}")
+    cg.mem.wbuf.free(f"_w8a16_pc_bias_{weight_name}")
 
-    # ----- Stage 6: Optional FP32 bias VADD (W8A32 path only) -----
-    # Under W8A16 (fp_precision="fp16") bias is folded into the DEQUANT
-    # epilogue via the 2N FP16 src2 layout (PC scales + bias); skip the
-    # separate VADD here entirely. Under W8A32 (fp_precision="fp32") the
-    # bias VADD broadcasts the FP32 bias vector to (M_pad, N_pad) via
-    # M_pad DMA loads, each pulling N_pad × 4 bytes from DRAM.
-    if cg.fp_precision == "fp16":
-        # Bias already folded into DEQUANT_ACCUM_FP32_SCALED. Output tile
-        # is the biased FP16 result. Nothing more to do.
-        pass
-    elif bias_name is not None:
-        if bias_name not in cg.fp32_biases:
-            raise KeyError(
-                f"W8A32 matmul '{node.name}' references bias '{bias_name}' "
-                "but no FP32 bias was staged. Pass `fp32_biases={"
-                f"'{bias_name}': <fp32 ndarray>" "}` to CodeGenerator."
-            )
-        bias_sym = f"{bias_name}__fp32"
-        bias_dram = cg._dram_offset_required(
-            bias_sym, f"loading W8A32 FP32 bias for '{node.name}'"
-        )
-        bias_alloc = _abuf_alloc_fp32(cg, f"{node.name}__bias_fp32", M_pad, N_pad)
-        # row_units: how far in 16-byte units to advance per row.
-        row_units = (N_pad * cg.elem_bytes) // 16
-        for row in range(M_pad):
-            cg._emit_dma_load(
-                BUF_ABUF,
-                bias_alloc.offset_units + row * row_units,
-                N_pad * cg.elem_bytes,
-                0,
-                bias_dram,
-            )
-        cg._emit(SyncInsn(resource_mask=0b001))
+    # ----- Stage 6: Bias folded into DEQUANT (no separate VADD) -----
+    # Under W8A16 bias is folded into the DEQUANT epilogue via the 2N
+    # FP16 src2 layout (PC scales + bias); skip the
+    # Bias already folded into DEQUANT_ACCUM_FP32_SCALED via the 2N FP16
+    # src2 layout. Output tile is the biased FP16 result.
 
-        # VADD_FP32 in-place onto the output tile (src1 == dst is fine).
-        cg._emit(ConfigTileInsn(M=m_tiles - 1, N=N_pad // TILE - 1, K=0))
-        cg._emit(
-            VaddFp32Insn(
-                src1_buf=BUF_ABUF, src1_off=out_alloc.offset_units,
-                src2_buf=BUF_ABUF, src2_off=bias_alloc.offset_units,
-                dst_buf=BUF_ABUF, dst_off=out_alloc.offset_units,
-                flags=cg.fp_precision_flag,
-            )
-        )
-        cg._emit(SyncInsn(resource_mask=0b100))
-        cg.mem.abuf.free(f"{node.name}__bias_fp32")
-
-    # ----- Trace event (FP32 dtype, matches sub-layer ops) -----
+    # ----- Trace event (FP dtype, matches sub-layer ops) -----
     out_scale = cg.calibration_scales.get(node.name, 1.0 / 127.0)
     cg._record_trace_event(
         node.name,
@@ -1043,38 +989,17 @@ def emit_matmul_w8a32_large_weight_tiled(
     )
 
     # ----- Per-N-tile DRAM addresses -----
-    # W8A32 (fp_precision="fp32"): PC scale blob is N FP16. Separate FP32
-    # bias DMA path runs after each N-tile DEQUANT.
-    # W8A16 (fp_precision="fp16"): combined blob is 2N FP16 (PC + bias).
-    # Per N-tile we DMA two slices contiguously into WBUF so DEQUANT reads
-    # 2*n_len FP16 (PC slice + bias slice). No separate bias VADD path.
-    if cg.fp_precision == "fp16":
-        combined_sym = f"{weight_name}__w8a16_pc_scale_and_bias"
-        pc_scale_dram_full = cg._dram_offset_required(
-            combined_sym,
-            f"loading W8A16 combined PC scales + bias for '{weight_name}'",
-        )
-        # Bias half starts at byte offset N_pad * 2 within the combined blob.
-        bias_offset_in_blob = N_pad * 2
-    else:
-        pc_scale_sym = f"{weight_name}__w8a32_pc_scale"
-        pc_scale_dram_full = cg._dram_offset_required(
-            pc_scale_sym,
-            f"loading W8A32 per-channel weight scales for '{weight_name}'",
-        )
-        bias_offset_in_blob = None
+    # W8A16: combined PC+bias blob is 2N FP16. Per N-tile we DMA two
+    # slices contiguously into WBUF so DEQUANT reads 2*n_len FP16
+    # (PC slice + bias slice). No separate bias VADD path.
+    combined_sym = f"{weight_name}__w8a16_pc_scale_and_bias"
+    pc_scale_dram_full = cg._dram_offset_required(
+        combined_sym,
+        f"loading W8A16 combined PC scales + bias for '{weight_name}'",
+    )
+    # Bias half starts at byte offset N_pad * 2 within the combined blob.
+    bias_offset_in_blob = N_pad * 2
     bias_name = node.attrs.get("bias")
-    bias_dram_full = None
-    if cg.fp_precision == "fp32" and bias_name is not None:
-        if bias_name not in cg.fp32_biases:
-            raise KeyError(
-                f"large-weight-tiled W8A32 '{node.name}' references bias "
-                f"'{bias_name}' but no FP32 bias was staged."
-            )
-        bias_dram_full = cg._dram_offset_required(
-            f"{bias_name}__fp32",
-            f"loading W8A32 FP32 bias for '{node.name}'",
-        )
 
     # ----- Iterate the (n_tile, k_tile) plan -----
     # _large_weight_tile_plan groups K-tiles within each N-tile in
@@ -1168,37 +1093,25 @@ def emit_matmul_w8a32_large_weight_tiled(
             if k_len != K_pad:
                 cg.mem.abuf.free(f"{node.name}__quant_int8_k{k_start}_n{n_start}")
 
-        # Per-N-tile FP16 PC scale (+ bias under fp16) slice load.
-        # W8A32: n_len FP16 (PC scales only).
+        # Per-N-tile FP16 PC scale + folded bias slice load.
         # W8A16: 2*n_len FP16 (PC slice + bias slice loaded contiguously).
-        if cg.fp_precision == "fp16":
-            slice_bytes = 2 * n_len * 2
-            pc_scale_slice_alloc = cg.mem.wbuf.alloc(
-                f"_w8a16_pc_bias_{node.name}_n{n_start}", slice_bytes
-            )
-            # PC slice → WBUF[0..n_len*2)
-            cg._emit_dma_load(
-                BUF_WBUF, pc_scale_slice_alloc.offset_units, n_len * 2, 0,
-                pc_scale_dram_full + n_start * 2,
-            )
-            # Bias slice → WBUF[n_len*2..2*n_len*2). Contiguous in WBUF so
-            # the DEQUANT reads them as a single 2*n_len FP16 vector.
-            bias_slice_wbuf_off = pc_scale_slice_alloc.offset_units + (n_len * 2) // UNIT
-            cg._emit_dma_load(
-                BUF_WBUF, bias_slice_wbuf_off, n_len * 2, 0,
-                pc_scale_dram_full + bias_offset_in_blob + n_start * 2,
-            )
-            cg._emit(SyncInsn(resource_mask=0b001))
-        else:
-            slice_bytes = n_len * 2
-            pc_scale_slice_alloc = cg.mem.wbuf.alloc(
-                f"_w8a32_pc_{node.name}_n{n_start}", slice_bytes
-            )
-            cg._emit_dma_load(
-                BUF_WBUF, pc_scale_slice_alloc.offset_units, n_len * 2, 0,
-                pc_scale_dram_full + n_start * 2,
-            )
-            cg._emit(SyncInsn(resource_mask=0b001))
+        slice_bytes = 2 * n_len * 2
+        pc_scale_slice_alloc = cg.mem.wbuf.alloc(
+            f"_w8a16_pc_bias_{node.name}_n{n_start}", slice_bytes
+        )
+        # PC slice → WBUF[0..n_len*2)
+        cg._emit_dma_load(
+            BUF_WBUF, pc_scale_slice_alloc.offset_units, n_len * 2, 0,
+            pc_scale_dram_full + n_start * 2,
+        )
+        # Bias slice → WBUF[n_len*2..2*n_len*2). Contiguous in WBUF so
+        # the DEQUANT reads them as a single 2*n_len FP16 vector.
+        bias_slice_wbuf_off = pc_scale_slice_alloc.offset_units + (n_len * 2) // UNIT
+        cg._emit_dma_load(
+            BUF_WBUF, bias_slice_wbuf_off, n_len * 2, 0,
+            pc_scale_dram_full + bias_offset_in_blob + n_start * 2,
+        )
+        cg._emit(SyncInsn(resource_mask=0b001))
 
         # DEQUANT_ACCUM_FP32_SCALED → FP{32,16} N-tile output in ABUF.
         cg._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tile_units - 1, K=0))
@@ -1212,35 +1125,8 @@ def emit_matmul_w8a32_large_weight_tiled(
         cg._emit(SyncInsn(resource_mask=0b100))
         cg.mem.wbuf.free(pc_scale_slice_alloc.name)
 
-        # Optional FP32 bias VADD on this N-tile (W8A32 path only;
-        # W8A16 path folds bias into the DEQUANT epilogue via the 2N
-        # FP16 src2 layout — but the large-weight-tiled per-N-tile
-        # PC+bias staging is not yet plumbed for W8A16. Until that
-        # lands, W8A16 + large-weight-tiled is rejected at the
-        # dispatch site in codegen.py).
-        if cg.fp_precision == "fp32" and bias_dram_full is not None:
-            bias_tile_alloc = cg.mem.abuf.alloc(
-                f"{node.name}__bias_tile_n{n_start}", M_pad * n_len * 4
-            )
-            tile_row_bytes = n_len * 4
-            tile_row_units = tile_row_bytes // UNIT
-            for r in range(M_pad):
-                cg._emit_dma_load(
-                    BUF_ABUF,
-                    bias_tile_alloc.offset_units + r * tile_row_units,
-                    tile_row_bytes, 0,
-                    bias_dram_full + n_start * 4,
-                )
-            cg._emit(SyncInsn(resource_mask=0b001))
-
-            cg._emit(VaddFp32Insn(
-                src1_buf=BUF_ABUF, src1_off=out_tile_alloc.offset_units,
-                src2_buf=BUF_ABUF, src2_off=bias_tile_alloc.offset_units,
-                dst_buf=BUF_ABUF, dst_off=out_tile_alloc.offset_units,
-                flags=cg.fp_precision_flag,
-            ))
-            cg._emit(SyncInsn(resource_mask=0b100))
-            cg.mem.abuf.free(bias_tile_alloc.name)
+        # W8A16: bias is folded into the DEQUANT epilogue via the 2N
+        # FP16 src2 layout above. No separate VADD path.
 
         # DMA-store the FP-precision N-tile to its slot in the full
         # output DRAM-temp. Each row of n_len × elem_bytes goes to
@@ -1317,35 +1203,15 @@ def _emit_matmul_w8a32_large_input_streaming(
         f"{node.name}_w8a32_out_fp32", output_bytes
     )
 
-    # Stage PC scale + bias addresses (same branching as the large-weight-
-    # tiled path: W8A32 uses N-FP16 PC blob + separate FP32 bias; W8A16
-    # uses the combined 2N-FP16 PC+bias blob and folds bias in DEQUANT).
-    if cg.fp_precision == "fp16":
-        combined_sym = f"{weight_name}__w8a16_pc_scale_and_bias"
-        pc_scale_dram_full = cg._dram_offset_required(
-            combined_sym,
-            f"loading W8A16 combined PC scales + bias for '{weight_name}'",
-        )
-        bias_offset_in_blob = N_pad * 2
-    else:
-        pc_scale_sym = f"{weight_name}__w8a32_pc_scale"
-        pc_scale_dram_full = cg._dram_offset_required(
-            pc_scale_sym,
-            f"loading W8A32 per-channel weight scales for '{weight_name}'",
-        )
-        bias_offset_in_blob = None
+    # Stage PC scale + bias addresses. W8A16: combined 2N-FP16 PC+bias
+    # blob; bias is folded in DEQUANT (no separate VADD).
+    combined_sym = f"{weight_name}__w8a16_pc_scale_and_bias"
+    pc_scale_dram_full = cg._dram_offset_required(
+        combined_sym,
+        f"loading W8A16 combined PC scales + bias for '{weight_name}'",
+    )
+    bias_offset_in_blob = N_pad * 2
     bias_name = node.attrs.get("bias")
-    bias_dram_full = None
-    if cg.fp_precision == "fp32" and bias_name is not None:
-        if bias_name not in cg.fp32_biases:
-            raise KeyError(
-                f"large-input W8A32 '{node.name}' references bias "
-                f"'{bias_name}' but no FP32 bias was staged."
-            )
-        bias_dram_full = cg._dram_offset_required(
-            f"{bias_name}__fp32",
-            f"loading W8A32 FP32 bias for '{node.name}'",
-        )
 
     # Tile plan.
     tile_plan = cg._large_weight_tile_plan(K_pad, N_pad)
@@ -1456,46 +1322,36 @@ def _emit_matmul_w8a32_large_input_streaming(
             # only fold bias on the FIRST K-tile; subsequent K-tiles load
             # the PC slice with zero-padded bias half so the K-partials
             # don't accumulate bias multiple times).
-            if cg.fp_precision == "fp16":
-                slice_bytes = 2 * n_len * 2
-                pc_scale_slice_alloc = cg.mem.wbuf.alloc(
-                    f"_w8a16_pc_bias_{node.name}_k{k_start}_n{n_start}",
-                    slice_bytes,
-                )
+            slice_bytes = 2 * n_len * 2
+            pc_scale_slice_alloc = cg.mem.wbuf.alloc(
+                f"_w8a16_pc_bias_{node.name}_k{k_start}_n{n_start}",
+                slice_bytes,
+            )
+            cg._emit_dma_load(
+                BUF_WBUF, pc_scale_slice_alloc.offset_units, n_len * 2, 0,
+                pc_scale_dram_full + n_start * 2,
+            )
+            bias_slice_wbuf_off = (
+                pc_scale_slice_alloc.offset_units + (n_len * 2) // UNIT
+            )
+            if k_idx == 0:
+                # Fold bias on the first K-tile only; subsequent K-tiles'
+                # bias half is zeroed by loading from the __zero_pad__
+                # blob (already staged at DRAM-layout).
                 cg._emit_dma_load(
-                    BUF_WBUF, pc_scale_slice_alloc.offset_units, n_len * 2, 0,
-                    pc_scale_dram_full + n_start * 2,
+                    BUF_WBUF, bias_slice_wbuf_off, n_len * 2, 0,
+                    pc_scale_dram_full + bias_offset_in_blob + n_start * 2,
                 )
-                bias_slice_wbuf_off = (
-                    pc_scale_slice_alloc.offset_units + (n_len * 2) // UNIT
-                )
-                if k_idx == 0:
-                    # Fold bias on the first K-tile only; subsequent
-                    # K-tiles' bias half is zeroed by loading from the
-                    # __zero_pad__ blob (already staged at DRAM-layout).
-                    cg._emit_dma_load(
-                        BUF_WBUF, bias_slice_wbuf_off, n_len * 2, 0,
-                        pc_scale_dram_full + bias_offset_in_blob + n_start * 2,
-                    )
-                else:
-                    zero_pad_dram = cg._dram_offset_required(
-                        "__zero_pad__",
-                        "loading zero bias slice for fc2 per-K-tile",
-                    )
-                    cg._emit_dma_load(
-                        BUF_WBUF, bias_slice_wbuf_off, n_len * 2, 0,
-                        zero_pad_dram,
-                    )
-                cg._emit(SyncInsn(resource_mask=0b001))
             else:
-                pc_scale_slice_alloc = cg.mem.wbuf.alloc(
-                    f"_w8a32_pc_{node.name}_k{k_start}_n{n_start}", n_len * 2
+                zero_pad_dram = cg._dram_offset_required(
+                    "__zero_pad__",
+                    "loading zero bias slice for fc2 per-K-tile",
                 )
                 cg._emit_dma_load(
-                    BUF_WBUF, pc_scale_slice_alloc.offset_units, n_len * 2, 0,
-                    pc_scale_dram_full + n_start * 2,
+                    BUF_WBUF, bias_slice_wbuf_off, n_len * 2, 0,
+                    zero_pad_dram,
                 )
-                cg._emit(SyncInsn(resource_mask=0b001))
+            cg._emit(SyncInsn(resource_mask=0b001))
 
             # Stage 6: DEQUANT → FP32 K-partial (write directly to
             # tile_accum for k_idx==0 since there's nothing to add yet;
@@ -1534,31 +1390,9 @@ def _emit_matmul_w8a32_large_input_streaming(
             # Free this K-tile's PC scale slice; the next K-tile reloads.
             cg.mem.wbuf.free(pc_scale_slice_alloc.name)
 
-        # Optional bias VADD on tile_accum (W8A32 path only; W8A16 path
-        # folds bias into the per-K-tile DEQUANT epilogue via the 2N FP16
-        # src2 layout — not yet plumbed for the fc2 streaming path).
-        if cg.fp_precision == "fp32" and bias_dram_full is not None:
-            bias_tile_alloc = cg.mem.abuf.alloc(
-                f"{node.name}__bias_tile_n{n_start}", M_pad * n_len * 4
-            )
-            tile_row_bytes_b = n_len * 4
-            tile_row_units_b = tile_row_bytes_b // UNIT
-            for r in range(M_pad):
-                cg._emit_dma_load(
-                    BUF_ABUF,
-                    bias_tile_alloc.offset_units + r * tile_row_units_b,
-                    tile_row_bytes_b, 0,
-                    bias_dram_full + n_start * 4,
-                )
-            cg._emit(SyncInsn(resource_mask=0b001))
-            cg._emit(VaddFp32Insn(
-                src1_buf=BUF_ABUF, src1_off=tile_accum_alloc.offset_units,
-                src2_buf=BUF_ABUF, src2_off=bias_tile_alloc.offset_units,
-                dst_buf=BUF_ABUF, dst_off=tile_accum_alloc.offset_units,
-                flags=cg.fp_precision_flag,
-            ))
-            cg._emit(SyncInsn(resource_mask=0b100))
-            cg.mem.abuf.free(bias_tile_alloc.name)
+        # W8A16: bias folded into per-K-tile DEQUANT epilogue via the
+        # 2N FP16 src2 layout (only on the first K-tile; subsequent
+        # K-tiles get zero-bias to avoid double-application).
 
         # DMA-store tile_accum to DRAM-temp.
         out_row_bytes = n_len * cg.elem_bytes

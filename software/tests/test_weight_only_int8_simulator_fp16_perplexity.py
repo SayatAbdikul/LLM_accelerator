@@ -66,7 +66,7 @@ def _diagnostic_host_runner_ppl(payload, eval_ids, vocab_size: int) -> float:
 
 
 def _diagnostic_w8a32_simulator_ppl(payload, eval_ids, vocab_size: int) -> float:
-    """W8A32 simulator-backed PPL — for fp16 vs fp32 deployment comparison."""
+    """W8A16 simulator-backed PPL — diagnostic logging only."""
     from taccel.runtime.gpt2_perplexity import (
         run_weight_only_int8_simulator_teacher_forced_logits,
         teacher_forced_inputs_and_targets,
@@ -75,7 +75,7 @@ def _diagnostic_w8a32_simulator_ppl(payload, eval_ids, vocab_size: int) -> float
     )
     _, targets = teacher_forced_inputs_and_targets(eval_ids)
     logits = run_weight_only_int8_simulator_teacher_forced_logits(
-        payload, eval_ids, fp_precision="fp32",
+        payload, eval_ids,
     )
     nlls = [
         stable_cross_entropy(np.asarray(row, dtype=np.float32), target,
@@ -120,7 +120,6 @@ def test_33_token_simulator_backed_fp16_perplexity():
         calibration_seq_len=8,
         ptq_preset="weight_only_int8",
         simulator_backed=True,
-        fp_precision="fp16",
         compute_fp32_ceiling=False,
     )
 
@@ -181,7 +180,6 @@ def test_257_token_simulator_backed_fp16_perplexity():
         calibration_seq_len=8,
         ptq_preset="weight_only_int8",
         simulator_backed=True,
-        fp_precision="fp16",
         compute_fp32_ceiling=False,
     )
 

@@ -95,25 +95,21 @@ def _w8a32_dynamic_matmul(
     w_int8: np.ndarray,
     w_scales_fp16: np.ndarray,
     bias_fp32: Optional[np.ndarray] = None,
-    fp_precision: str = "fp32",
 ) -> np.ndarray:
-    """One INT8-activation × INT8-weight matmul with FP{32,16} dequant.
+    """One INT8-activation × INT8-weight matmul with FP16 dequant.
 
-    Matches the codegen's `emit_matmul_w8a32` semantics exactly:
-      - max_abs over the full activation tile (one MAX_ABS_REDUCE). Under
-        fp_precision='fp16' the source is FP16-widened to FP32 first.
+    Matches the codegen's `emit_matmul_w8a32` (W8A16) semantics exactly:
+      - max_abs over the full activation tile (one MAX_ABS_REDUCE) after
+        FP16 round-trip on the source (matches simulator's FP16-store path).
       - FP16 inv_scale, FP16 fwd_scale (DEQUANT_ACCUM_FP32_SCALED sreg+1).
       - INT8 round-half-to-even (numpy default → matches QUANT_FP32_INT8).
       - Per-column FP16 weight scales applied after the INT32 accum.
       - Bias added in FP32 BEFORE FP16 cast (bias-fold contract).
-      - Output: FP32 (fp_precision='fp32') or FP16-then-widen
-        (fp_precision='fp16', matches simulator's FP16-store path).
+      - Output: FP16 widened to FP32 (matches simulator's FP16-store path).
     """
-    # Under fp_precision="fp16" the source tile in the simulator is FP16-
-    # widened on read. Mirror that here so max_abs is computed over the
-    # same precision-rounded values.
-    if fp_precision == "fp16":
-        x_fp32 = x_fp32.astype(np.float16).astype(np.float32)
+    # The simulator reads ABUF FP16 and widens to FP32 internally. Mirror
+    # that here so max_abs is computed over the same precision-rounded values.
+    x_fp32 = x_fp32.astype(np.float16).astype(np.float32)
     max_abs = float(np.max(np.abs(x_fp32))) if x_fp32.size else 0.0
     # Eps clamp: matches the simulator's 2**-9 floor (avoids inf/NaN
     # when activations are all zero; FP16 max is ~65504).
@@ -130,64 +126,54 @@ def _w8a32_dynamic_matmul(
     # Dequant: per-column FP16 weight scale × FP32(fwd_fp16) × INT32 accum.
     pc_fp32 = w_scales_fp16.astype(np.float32).reshape(1, -1)
     y_fp32 = accum32.astype(np.float32) * pc_fp32 * np.float32(fwd_fp16)
-    # Bias added BEFORE FP16 cast (matches the simulator's bias-fold
-    # contract under flags=1; the W8A32 path's cast-then-add VADD has the
-    # same numerical effect under flags=0 because the cast is a no-op).
+    # Bias added BEFORE FP16 cast (matches the simulator's bias-fold contract).
     if bias_fp32 is not None:
         y_fp32 = y_fp32 + bias_fp32.astype(np.float32)
-    if fp_precision == "fp16":
-        return y_fp32.astype(np.float16).astype(np.float32)
-    return y_fp32.astype(np.float32)
+    return y_fp32.astype(np.float16).astype(np.float32)
 
 
-def _maybe_cast_fp16(x: np.ndarray, fp_precision: str) -> np.ndarray:
-    """Cast to FP16 and back to FP32 if precision='fp16' (storage round-trip).
-
-    Mirrors `mem.write_fp16_tile` followed by `mem.read_fp16_tile` in the
-    simulator: the in-memory storage is FP16, but the data is widened to
-    FP32 on next read so the downstream FP32-internal compute path stays
-    unchanged. This is a no-op under fp_precision='fp32'.
+def _cast_fp16(x: np.ndarray) -> np.ndarray:
+    """Storage round-trip: FP32 → FP16 → FP32. Mirrors `mem.write_fp16_tile`
+    followed by `mem.read_fp16_tile` in the simulator: in-memory storage is
+    FP16, widened to FP32 on next read.
     """
-    if fp_precision == "fp16":
-        return x.astype(np.float16).astype(np.float32)
-    return x
+    return x.astype(np.float16).astype(np.float32)
 
 
 def _layer_norm_fp32(x: np.ndarray, gamma: np.ndarray, beta: np.ndarray,
-                     eps: float = 1e-5, *, fp_precision: str = "fp32") -> np.ndarray:
+                     eps: float = 1e-5) -> np.ndarray:
     """Row-wise FP32 LayerNorm (matches `_exec_layernorm_fp32`).
 
-    Internal mean/variance reduction is always FP32; under fp_precision='fp16'
-    the source is FP16-widened on read and the output cast to FP16 on store.
+    Source FP16-widened on read; FP32-internal mean/variance reduction;
+    output cast to FP16 on store.
     """
-    x = _maybe_cast_fp16(x, fp_precision)
+    x = _cast_fp16(x)
     mean = x.mean(axis=-1, keepdims=True)
     var = x.var(axis=-1, keepdims=True)
     out = ((x - mean) / np.sqrt(var + eps)) * gamma.reshape(1, -1) + beta.reshape(1, -1)
-    return _maybe_cast_fp16(out, fp_precision)
+    return _cast_fp16(out)
 
 
-def _gelu_fp32(x: np.ndarray, *, fp_precision: str = "fp32") -> np.ndarray:
-    """gelu_new (tanh approximation, matches the FP32 sub-layer hardware)."""
-    x = _maybe_cast_fp16(x, fp_precision)
+def _gelu_fp32(x: np.ndarray) -> np.ndarray:
+    """gelu_new (tanh approximation, matches the FP16 sub-layer hardware)."""
+    x = _cast_fp16(x)
     out = 0.5 * x * (1.0 + np.tanh(
         np.sqrt(2.0 / np.pi) * (x + 0.044715 * x ** 3)
     ))
-    return _maybe_cast_fp16(out, fp_precision)
+    return _cast_fp16(out)
 
 
-def _softmax_masked_fp32(scores: np.ndarray, valid_kv_len: int,
-                         *, fp_precision: str = "fp32") -> np.ndarray:
+def _softmax_masked_fp32(scores: np.ndarray, valid_kv_len: int) -> np.ndarray:
     """Causal masked softmax along the last axis. `valid_kv_len`
     columns are kept; the rest get -inf before the softmax."""
-    scores = _maybe_cast_fp16(scores, fp_precision)
+    scores = _cast_fp16(scores)
     masked = scores.astype(np.float32).copy()
     if valid_kv_len < masked.shape[-1]:
         masked[..., valid_kv_len:] = -np.inf
     masked -= np.max(masked, axis=-1, keepdims=True)
     exp = np.exp(masked)
     out = exp / np.sum(exp, axis=-1, keepdims=True)
-    return _maybe_cast_fp16(out, fp_precision)
+    return _cast_fp16(out)
 
 
 class NanoGPTW8A32SimulatorReference:
@@ -200,11 +186,7 @@ class NanoGPTW8A32SimulatorReference:
     """
 
     def __init__(self, payload: dict, *, default_act_scale: float = 6.0 / 127.0,
-                 calibration_scales: Optional[Dict[str, float]] = None,
-                 fp_precision: str = "fp32") -> None:
-        if fp_precision not in ("fp32", "fp16"):
-            raise ValueError(f"fp_precision must be 'fp32' or 'fp16', got {fp_precision!r}")
-        self.fp_precision = fp_precision
+                 calibration_scales: Optional[Dict[str, float]] = None) -> None:
         self.payload = payload
         cfg = payload["model_args"]
         sd = payload["state_dict"]
@@ -339,20 +321,17 @@ class NanoGPTW8A32SimulatorReference:
         # Per-head Q/K/V projections (dynamic activation scale).
         q = _w8a32_dynamic_matmul(
             ln1, head["q_int8"], head["q_scales"], head["q_b"],
-            fp_precision=self.fp_precision,
         )
         k = _w8a32_dynamic_matmul(
             ln1, head["k_int8"], head["k_scales"], head["k_b"],
-            fp_precision=self.fp_precision,
         )
         v = _w8a32_dynamic_matmul(
             ln1, head["v_int8"], head["v_scales"], head["v_b"],
-            fp_precision=self.fp_precision,
         )
         # KV cache append. Under fp_precision='fp16' the K/V tiles are
         # FP16-stored in the simulator's KV cache; mirror that here.
-        self._caches[layer_idx][head_idx]["k"].append(_maybe_cast_fp16(k[0], self.fp_precision))
-        self._caches[layer_idx][head_idx]["v"].append(_maybe_cast_fp16(v[0], self.fp_precision))
+        self._caches[layer_idx][head_idx]["k"].append(_cast_fp16(k[0]))
+        self._caches[layer_idx][head_idx]["v"].append(_cast_fp16(v[0]))
         k_cache = np.stack(self._caches[layer_idx][head_idx]["k"], axis=0)
         v_cache = np.stack(self._caches[layer_idx][head_idx]["v"], axis=0)
 
@@ -363,17 +342,17 @@ class NanoGPTW8A32SimulatorReference:
             np.float32(q_scale) * np.float32(k_scale) * np.float32(self.inv_sqrt_d_head)
         )
         # Q/K source widened from FP16 if applicable (matches QUANT input).
-        q_int8 = self._qkt_attn_v_quantize(_maybe_cast_fp16(q, self.fp_precision), q_scale)
-        k_int8 = self._qkt_attn_v_quantize(_maybe_cast_fp16(k_cache, self.fp_precision), k_scale)
+        q_int8 = self._qkt_attn_v_quantize(_cast_fp16(q), q_scale)
+        k_int8 = self._qkt_attn_v_quantize(_cast_fp16(k_cache), k_scale)
         scores_int32 = q_int8.astype(np.int32) @ k_int8.astype(np.int32).T
         scores_fp32 = scores_int32.astype(np.float32) * np.float32(composite_qkt)
         # QKT output stored at FP precision.
-        scores_fp32 = _maybe_cast_fp16(scores_fp32, self.fp_precision)
+        scores_fp32 = _cast_fp16(scores_fp32)
 
         # Masked softmax with valid_kv_len = position + 1.
         valid_kv_len = position + 1
         probs_fp32 = _softmax_masked_fp32(
-            scores_fp32, valid_kv_len, fp_precision=self.fp_precision,
+            scores_fp32, valid_kv_len,
         )
 
         # attn_v: static composite scale.
@@ -382,11 +361,11 @@ class NanoGPTW8A32SimulatorReference:
         composite_av = np.float16(np.float32(sm_scale) * np.float32(v_scale))
         sm_int8 = self._qkt_attn_v_quantize(probs_fp32, sm_scale)
         v_cache_int8 = self._qkt_attn_v_quantize(
-            _maybe_cast_fp16(v_cache, self.fp_precision), v_scale,
+            _cast_fp16(v_cache), v_scale,
         )
         head_out_int32 = sm_int8.astype(np.int32) @ v_cache_int8.astype(np.int32)
         head_out_fp32 = head_out_int32.astype(np.float32) * np.float32(composite_av)
-        return _maybe_cast_fp16(head_out_fp32, self.fp_precision)
+        return _cast_fp16(head_out_fp32)
 
     def run_decode_step(self, token_id: int, position: int) -> np.ndarray:
         """Run one decode step and return its FP32 logits."""
@@ -398,12 +377,11 @@ class NanoGPTW8A32SimulatorReference:
         # Token + position embedding lookups. Storage is FP{32,16} matching
         # how the codegen stages embedding tables.
         x = self.wte[token_id:token_id + 1] + self.wpe[position:position + 1]
-        x = _maybe_cast_fp16(x, self.fp_precision)
+        x = _cast_fp16(x)
 
         for layer_idx, layer in enumerate(self.layers):
             ln1 = _layer_norm_fp32(
                 x, layer["ln1_w"], layer["ln1_b"], self.layer_norm_epsilon,
-                fp_precision=self.fp_precision,
             )
             head_outs = []
             for head_idx in range(self.n_head):
@@ -413,33 +391,27 @@ class NanoGPTW8A32SimulatorReference:
             concat = np.concatenate(head_outs, axis=-1)
             out_proj = _w8a32_dynamic_matmul(
                 concat, layer["c_proj_int8"], layer["c_proj_scales"], layer["c_proj_b"],
-                fp_precision=self.fp_precision,
             )
-            x = _maybe_cast_fp16(x + out_proj, self.fp_precision)  # residual1
+            x = _cast_fp16(x + out_proj)  # residual1
 
             ln2 = _layer_norm_fp32(
                 x, layer["ln2_w"], layer["ln2_b"], self.layer_norm_epsilon,
-                fp_precision=self.fp_precision,
             )
             fc1 = _w8a32_dynamic_matmul(
                 ln2, layer["fc1_int8"], layer["fc1_scales"], layer["fc1_b"],
-                fp_precision=self.fp_precision,
             )
-            gelu = _gelu_fp32(fc1, fp_precision=self.fp_precision)
+            gelu = _gelu_fp32(fc1)
             fc2 = _w8a32_dynamic_matmul(
                 gelu, layer["fc2_int8"], layer["fc2_scales"], layer["fc2_b"],
-                fp_precision=self.fp_precision,
             )
-            x = _maybe_cast_fp16(x + fc2, self.fp_precision)  # residual2
+            x = _cast_fp16(x + fc2)  # residual2
 
         ln_f = _layer_norm_fp32(
             x, self.ln_f_w, self.ln_f_b, self.layer_norm_epsilon,
-            fp_precision=self.fp_precision,
         )
         # lm_head: takes only the last row of ln_f (incremental decode).
         logits = _w8a32_dynamic_matmul(
             ln_f[-1:], self.lm_head_w_int8, self.lm_head_w_scales, self.lm_head_b,
-            fp_precision=self.fp_precision,
         )
         self._next_position += 1
         return logits[0].astype(np.float32)

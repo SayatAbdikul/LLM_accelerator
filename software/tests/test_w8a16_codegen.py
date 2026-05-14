@@ -8,7 +8,7 @@ extension repurposes `RTypeInsn.flags[0]` as an fp_precision selector:
 
 This test module verifies the compiler-side polymorphism:
 
-  - CodeGenerator(`fp_precision="fp16"`) wires elem_bytes=2,
+  - CodeGenerator(``) wires elem_bytes=2,
     fp_precision_flag=1, and the half-size FP-tile byte sizing.
   - Every R-type emit site in `w8a32_emit.py` carries
     `flags=cg.fp_precision_flag`.
@@ -42,7 +42,7 @@ from taccel.compiler.w8a32_emit import (
 from taccel.isa.opcodes import Opcode
 
 
-def _fresh_codegen(*, w8a32: bool = True, fp_precision: str = "fp16") -> CodeGenerator:
+def _fresh_codegen(*, w8a32: bool = True) -> CodeGenerator:
     """W8A16 codegen with no weights/scales — for isolated emit-site tests."""
     return CodeGenerator(
         weight_data={},
@@ -51,7 +51,6 @@ def _fresh_codegen(*, w8a32: bool = True, fp_precision: str = "fp16") -> CodeGen
         model_config=deit_tiny_config(),
         stream_name="prefill",
         w8a32_enabled=w8a32,
-        fp_precision=fp_precision,
     )
 
 
@@ -68,38 +67,13 @@ def _reset_cg(cg: CodeGenerator) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_codegen_fp_precision_default_is_fp32():
-    """Backward compat: default fp_precision is 'fp32' (M2.7 flips to 'fp16')."""
-    cg = _fresh_codegen(fp_precision="fp32")
-    assert cg.fp_precision == "fp32"
-    assert cg.elem_bytes == 4
-    assert cg.fp_precision_flag == 0
-
-
-def test_codegen_fp_precision_fp16_wires_elem_bytes_2_and_flag_1():
-    cg = _fresh_codegen(fp_precision="fp16")
-    assert cg.fp_precision == "fp16"
+def test_codegen_fp16_wires_elem_bytes_2_and_flag_1():
+    """W8A16 codegen always sets elem_bytes=2, fp_precision_flag=1."""
+    cg = _fresh_codegen()
     assert cg.elem_bytes == 2
     assert cg.fp_precision_flag == 1
-
-
-def test_codegen_fp_precision_invalid_raises():
-    with pytest.raises(ValueError, match="fp_precision must be 'fp32' or 'fp16'"):
-        CodeGenerator(
-            weight_data={},
-            calibration_scales={},
-            prescaled_biases={},
-            model_config=deit_tiny_config(),
-            fp_precision="bf16",
-        )
-
-
-def test_codegen_fp_spill_threshold_scales_with_precision():
-    """FP16 tiles are half-size; the spill threshold scales accordingly."""
-    cg_fp32 = _fresh_codegen(fp_precision="fp32")
-    cg_fp16 = _fresh_codegen(fp_precision="fp16")
-    assert cg_fp32.fp32_spill_threshold_bytes == 16384
-    assert cg_fp16.fp32_spill_threshold_bytes == 8192
+    # Spill threshold scales with elem_bytes (8 KB for FP16, half the FP32 budget).
+    assert cg.fp32_spill_threshold_bytes == 8192
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +82,7 @@ def test_codegen_fp_spill_threshold_scales_with_precision():
 
 
 def test_emit_gelu_fp16_carries_flags_1():
-    cg = _fresh_codegen(fp_precision="fp16")
+    cg = _fresh_codegen()
     node = IRNode(op="gelu", name="g0", inputs=["gx"], output_shape=(16, 16), attrs={})
     emit_gelu_fp32(cg, node)
     gelu_insns = [i for i in cg.instructions if i.opcode == Opcode.GELU_FP32]
@@ -116,18 +90,8 @@ def test_emit_gelu_fp16_carries_flags_1():
     assert gelu_insns[0].flags == 1
 
 
-def test_emit_gelu_fp32_carries_flags_0():
-    """Backward compat: GELU under fp_precision='fp32' carries flags=0."""
-    cg = _fresh_codegen(fp_precision="fp32")
-    node = IRNode(op="gelu", name="g0", inputs=["gx"], output_shape=(16, 16), attrs={})
-    emit_gelu_fp32(cg, node)
-    gelu_insns = [i for i in cg.instructions if i.opcode == Opcode.GELU_FP32]
-    assert len(gelu_insns) == 1
-    assert gelu_insns[0].flags == 0
-
-
 def test_emit_vadd_fp16_carries_flags_1():
-    cg = _fresh_codegen(fp_precision="fp16")
+    cg = _fresh_codegen()
     node = IRNode(op="vadd", name="v0", inputs=["a", "b"], output_shape=(16, 16), attrs={})
     emit_vadd_fp32(cg, node)
     vadd = [i for i in cg.instructions if i.opcode == Opcode.VADD_FP32]
@@ -136,7 +100,7 @@ def test_emit_vadd_fp16_carries_flags_1():
 
 
 def test_emit_softmax_fp16_carries_flags_1():
-    cg = _fresh_codegen(fp_precision="fp16")
+    cg = _fresh_codegen()
     node = IRNode(op="softmax", name="s0", inputs=["sx"], output_shape=(16, 16), attrs={})
     emit_softmax_fp32(cg, node, masked=False)
     sm = [i for i in cg.instructions if i.opcode == Opcode.SOFTMAX_FP32]
@@ -156,8 +120,7 @@ def test_emit_layernorm_fp16_carries_flags_1():
         model_config=deit_tiny_config(),
         stream_name="prefill",
         w8a32_enabled=True,
-        fp_precision="fp16",
-    )
+        )
     cg.dram_layout["gamma"] = 0
     cg.dram_layout["beta"] = 32
     node = IRNode(op="layernorm", name="ln0", inputs=["lx", "gamma", "beta"], output_shape=(16, 16), attrs={})
@@ -172,23 +135,18 @@ def test_emit_layernorm_fp16_carries_flags_1():
 # ---------------------------------------------------------------------------
 
 
-def test_w8a16_abuf_alloc_is_half_of_w8a32():
-    """A 16x16 tile under fp16 occupies 32 ABUF units; under fp32 it's 64."""
-    cg_fp32 = _fresh_codegen(fp_precision="fp32")
-    cg_fp16 = _fresh_codegen(fp_precision="fp16")
+def test_w8a16_abuf_alloc_is_fp16_sized():
+    """A 16x16 tile under FP16 occupies 32 ABUF units (16*16*2 bytes)."""
+    cg = _fresh_codegen()
     node = IRNode(op="gelu", name="g0", inputs=["gx"], output_shape=(16, 16), attrs={})
-    emit_gelu_fp32(cg_fp32, node)
-    emit_gelu_fp32(cg_fp16, node)
-    a_fp32 = cg_fp32.mem.abuf.get("g0")
-    a_fp16 = cg_fp16.mem.abuf.get("g0")
-    assert a_fp32.size_bytes == 16 * 16 * 4
-    assert a_fp16.size_bytes == 16 * 16 * 2
-    assert a_fp16.size_bytes * 2 == a_fp32.size_bytes
+    emit_gelu_fp32(cg, node)
+    a = cg.mem.abuf.get("g0")
+    assert a.size_bytes == 16 * 16 * 2
 
 
 def test_w8a16_abuf_alloc_scales_with_n_pad():
-    """Test at d_model=128: 16x128 fp16 tile = 4 KB; fp32 = 8 KB."""
-    cg = _fresh_codegen(fp_precision="fp16")
+    """Test at d_model=128: 16x128 FP16 tile = 4 KB."""
+    cg = _fresh_codegen()
     node = IRNode(op="gelu", name="g0", inputs=["gx"], output_shape=(16, 128), attrs={})
     emit_gelu_fp32(cg, node)
     a = cg.mem.abuf.get("g0")
@@ -196,11 +154,11 @@ def test_w8a16_abuf_alloc_scales_with_n_pad():
 
 
 # ---------------------------------------------------------------------------
-# Simple matmul under fp_precision="fp16": bias-fold + flags + no VADD
+# Simple matmul under : bias-fold + flags + no VADD
 # ---------------------------------------------------------------------------
 
 
-def _build_matmul_cg(*, fp_precision: str, with_bias: bool):
+def _build_matmul_cg(*, with_bias: bool):
     """Build a codegen with a single matmul weight + optional bias staged."""
     K, N = 16, 16
     weight = np.zeros((K, N), dtype=np.int8)
@@ -221,7 +179,6 @@ def _build_matmul_cg(*, fp_precision: str, with_bias: bool):
         model_config=deit_tiny_config(),
         stream_name="prefill",
         w8a32_enabled=True,
-        fp_precision=fp_precision,
         fp32_biases=fp32_biases,
     )
     # Stage DRAM symbols the emitter will need.
@@ -230,7 +187,7 @@ def _build_matmul_cg(*, fp_precision: str, with_bias: bool):
 
 
 def test_emit_matmul_w8a16_dequant_carries_flags_1():
-    cg = _build_matmul_cg(fp_precision="fp16", with_bias=False)
+    cg = _build_matmul_cg(with_bias=False)
     dequant_scaled = [i for i in cg.instructions if i.opcode == Opcode.DEQUANT_ACCUM_FP32_SCALED]
     assert len(dequant_scaled) == 1
     assert dequant_scaled[0].flags == 1
@@ -238,18 +195,11 @@ def test_emit_matmul_w8a16_dequant_carries_flags_1():
 
 def test_emit_matmul_w8a16_no_separate_bias_vadd():
     """Under fp16, bias is folded into DEQUANT — no separate VADD_FP32(bias)."""
-    cg = _build_matmul_cg(fp_precision="fp16", with_bias=True)
+    cg = _build_matmul_cg(with_bias=True)
     vadds = [i for i in cg.instructions if i.opcode == Opcode.VADD_FP32]
     # No residual VADD in this graph; the only candidate would be a bias VADD
     # which is folded under fp16. So count must be zero.
     assert len(vadds) == 0
-
-
-def test_emit_matmul_w8a32_separate_bias_vadd_persists():
-    """Under fp32, bias VADD remains separate (legacy contract)."""
-    cg = _build_matmul_cg(fp_precision="fp32", with_bias=True)
-    vadds = [i for i in cg.instructions if i.opcode == Opcode.VADD_FP32]
-    assert len(vadds) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +208,7 @@ def test_emit_matmul_w8a32_separate_bias_vadd_persists():
 
 
 def test_w8a16_pc_scale_and_bias_blob_staged_for_matmul_with_bias():
-    cg = _build_matmul_cg(fp_precision="fp16", with_bias=True)
+    cg = _build_matmul_cg(with_bias=True)
     sym = "fcw__w8a16_pc_scale_and_bias"
     assert sym in cg.dram_layout
     offset = cg.dram_layout[sym]
@@ -274,7 +224,7 @@ def test_w8a16_pc_scale_and_bias_blob_staged_for_matmul_with_bias():
 
 
 def test_w8a16_pc_scale_and_bias_blob_zero_padded_when_no_bias():
-    cg = _build_matmul_cg(fp_precision="fp16", with_bias=False)
+    cg = _build_matmul_cg(with_bias=False)
     sym = "fcw__w8a16_pc_scale_and_bias"
     assert sym in cg.dram_layout
     offset = cg.dram_layout[sym]
@@ -283,59 +233,6 @@ def test_w8a16_pc_scale_and_bias_blob_zero_padded_when_no_bias():
     # First half: PC scales unchanged. Second half: zero (no bias).
     np.testing.assert_array_equal(arr[:16], np.full(16, np.float16(0.01)))
     np.testing.assert_array_equal(arr[16:], np.zeros(16, dtype=np.float16))
-
-
-def test_w8a16_pc_scale_and_bias_blob_also_staged_under_fp32_path():
-    """The combined blob is staged regardless of fp_precision (small constant
-    overhead, keeps prefill/decode DRAM identical when precision flips)."""
-    cg = _build_matmul_cg(fp_precision="fp32", with_bias=True)
-    sym = "fcw__w8a16_pc_scale_and_bias"
-    assert sym in cg.dram_layout
-
-
-# ---------------------------------------------------------------------------
-# Zero-pad blob sizing
-# ---------------------------------------------------------------------------
-
-
-def test_zero_pad_blob_size_scales_with_elem_bytes():
-    """__zero_pad__ blob is sized for the active fp_precision (2× FP16, 4× FP32)."""
-    # Build with a 2-D weight so the max_k_pad path takes effect.
-    K = 32
-    weight = np.zeros((K, 16), dtype=np.int8)
-    scales = np.ones(16, dtype=np.float16) * np.float16(0.01)
-    graph = IRGraph()
-    graph.add_node(IRNode(op="matmul", name="fc", inputs=["x", "w"], output_shape=(16, 16), attrs={}))
-    cg_fp32 = CodeGenerator(
-        weight_data={"w": (weight, scales)},
-        calibration_scales={},
-        prescaled_biases={},
-        model_config=deit_tiny_config(),
-        w8a32_enabled=True,
-        fp_precision="fp32",
-    )
-    cg_fp32.generate(graph)
-    cg_fp16 = CodeGenerator(
-        weight_data={"w": (weight, scales)},
-        calibration_scales={},
-        prescaled_biases={},
-        model_config=deit_tiny_config(),
-        w8a32_enabled=True,
-        fp_precision="fp16",
-    )
-    cg_fp16.generate(graph)
-    # __zero_pad__ size: max((TILE-1) * d_model * elem_bytes, (TILE-1) * max_k_pad * elem_bytes).
-    # The blob length difference between fp32 and fp16 must be a factor of 2.
-    # Find the symbol's allocation size: it lives in dram_blob from `dram_layout["__zero_pad__"]`
-    # to the next symbol's offset. Easiest check: dram_blob total in fp32 path is larger.
-    fp32_blob_size = len(cg_fp32.dram_blob)
-    fp16_blob_size = len(cg_fp16.dram_blob)
-    # The zero pad in fp16 mode is half — but other staged blobs (the 2N
-    # combined PC+bias under fp16) add a small constant. Net: fp32 blob
-    # should be larger by approximately the zero-pad delta (TILE-1) * d * 2.
-    assert fp32_blob_size > fp16_blob_size, (
-        f"fp32 DRAM blob {fp32_blob_size} should exceed fp16 {fp16_blob_size}"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +271,6 @@ def test_w8a16_simple_matmul_simulator_round_trip():
         prescaled_biases={},
         model_config=deit_tiny_config(),
         w8a32_enabled=True,
-        fp_precision="fp16",
         fp32_biases={"fcb": bias_fp32},
     )
     instructions, dram_data = cg.generate(graph)
@@ -430,22 +326,8 @@ def test_kv_cache_layout_accepts_elem_bytes_2():
     assert layout.kv_cache_size == 2 * int8_layout.kv_cache_size
 
 
-# ---------------------------------------------------------------------------
-# Decoder bundle: fp_precision plumbing
-# ---------------------------------------------------------------------------
-
-
-def test_decoder_bundle_accepts_fp_precision_param():
-    """build_decoder_program_bundle must accept fp_precision as a kw arg."""
-    from inspect import signature
-    from taccel.compiler.decoder_bundle import build_decoder_program_bundle
-    sig = signature(build_decoder_program_bundle)
-    assert "fp_precision" in sig.parameters
-    assert sig.parameters["fp_precision"].default == "fp32"
-
-
 # ===========================================================================
-# M3 — attention internals under fp_precision="fp16"
+# M3 — attention internals under 
 # ===========================================================================
 #
 # QKT and attn_v emitters use static composite scales (no bias to fold).
@@ -463,7 +345,6 @@ def _qkt_w8a16_codegen(
     q_scale: float = 0.05,
     k_scale: float = 0.07,
     inv_sqrt_d_head: float = None,
-    fp_precision: str = "fp16",
 ):
     """Build a CodeGenerator + 1-node IR graph for an isolated matmul_qkt."""
     from taccel.compiler.model_config import ModelConfig
@@ -482,7 +363,6 @@ def _qkt_w8a16_codegen(
         model_config=config,
         stream_name="prefill",
         w8a32_enabled=True,
-        fp_precision=fp_precision,
     )
     graph = IRGraph()
     node = IRNode(
@@ -503,7 +383,6 @@ def _attn_v_w8a16_codegen(
     d_head: int = 16,
     sm_scale: float = 1.0 / 127.0,
     v_scale: float = 0.07,
-    fp_precision: str = "fp16",
 ):
     """Build a CodeGenerator + 1-node IR graph for an isolated matmul_attn_v."""
     from taccel.compiler.model_config import ModelConfig
@@ -520,7 +399,6 @@ def _attn_v_w8a16_codegen(
         model_config=config,
         stream_name="prefill",
         w8a32_enabled=True,
-        fp_precision=fp_precision,
     )
     graph = IRGraph()
     node = IRNode(
@@ -535,7 +413,7 @@ def _attn_v_w8a16_codegen(
 def test_emit_matmul_qkt_w8a16_per_strip_dequant_flags1():
     """Every QUANT_FP32_INT8 and DEQUANT_ACCUM_FP32 emitted by the QKT
     lowering under fp_precision='fp16' carries flags=1."""
-    cg, graph, _ = _qkt_w8a16_codegen(fp_precision="fp16")
+    cg, graph, _ = _qkt_w8a16_codegen()
     insns, _ = cg.generate(graph)
     fp_op_codes = {
         Opcode.QUANT_FP32_INT8,
@@ -553,26 +431,10 @@ def test_emit_matmul_qkt_w8a16_per_strip_dequant_flags1():
         )
 
 
-def test_emit_matmul_qkt_w8a32_per_strip_dequant_flags0_backward_compat():
-    """Same emitter under fp_precision='fp32' carries flags=0 — backward compat."""
-    cg, graph, _ = _qkt_w8a16_codegen(fp_precision="fp32")
-    insns, _ = cg.generate(graph)
-    fp_op_codes = {
-        Opcode.QUANT_FP32_INT8,
-        Opcode.DEQUANT_ACCUM_FP32,
-        Opcode.MAX_ABS_REDUCE_FP32,
-    }
-    fp_insns = [i for i in insns if i.opcode in fp_op_codes]
-    for insn in fp_insns:
-        assert insn.flags == 0, (
-            f"{insn.opcode.name} emitted with flags={insn.flags}, expected 0"
-        )
-
-
 def test_emit_matmul_attn_v_w8a16_dequant_flags1():
     """Every R-type FP op emitted by attn_v lowering under fp_precision='fp16'
     carries flags=1."""
-    cg, graph, _ = _attn_v_w8a16_codegen(fp_precision="fp16")
+    cg, graph, _ = _attn_v_w8a16_codegen()
     insns, _ = cg.generate(graph)
     fp_op_codes = {
         Opcode.QUANT_FP32_INT8,
@@ -590,24 +452,11 @@ def test_emit_matmul_attn_v_w8a16_dequant_flags1():
         )
 
 
-def test_emit_matmul_attn_v_w8a32_dequant_flags0_backward_compat():
-    cg, graph, _ = _attn_v_w8a16_codegen(fp_precision="fp32")
-    insns, _ = cg.generate(graph)
-    fp_op_codes = {
-        Opcode.QUANT_FP32_INT8,
-        Opcode.DEQUANT_ACCUM_FP32,
-        Opcode.MAX_ABS_REDUCE_FP32,
-    }
-    fp_insns = [i for i in insns if i.opcode in fp_op_codes]
-    for insn in fp_insns:
-        assert insn.flags == 0
-
-
 def test_w8a16_qkt_pc_scale_blob_unchanged_under_fp16():
     """QKT uses a static composite PC scale (q × k × inv_sqrt_d_head),
     no bias. The PC scale blob layout is N FP16 regardless of
     fp_precision — only the DEQUANT's flag bit changes."""
-    cg, graph, node = _qkt_w8a16_codegen(fp_precision="fp16")
+    cg, graph, node = _qkt_w8a16_codegen()
     cg.generate(graph)
     sym = f"{node.name}__qkt_pc_scale"
     assert sym in cg.dram_layout
@@ -657,8 +506,7 @@ def test_w8a16_qkt_round_trip_simulator():
     k_fp32 = (rng.standard_normal((seq_len, d_head)) * 2.0).astype(np.float32)
 
     cg, graph, _ = _qkt_w8a16_codegen(
-        seq_len=seq_len, d_head=d_head, fp_precision="fp16",
-    )
+        seq_len=seq_len, d_head=d_head, )
     instructions, dram_data = cg.generate(graph)
 
     state = MachineState()
@@ -725,8 +573,7 @@ def test_w8a16_attn_v_round_trip_simulator():
     v_fp32 = (rng.standard_normal((seq_len, d_head)) * 2.0).astype(np.float32)
 
     cg, graph, _ = _attn_v_w8a16_codegen(
-        seq_len=seq_len, d_head=d_head, fp_precision="fp16",
-    )
+        seq_len=seq_len, d_head=d_head, )
     instructions, dram_data = cg.generate(graph)
 
     state = MachineState()

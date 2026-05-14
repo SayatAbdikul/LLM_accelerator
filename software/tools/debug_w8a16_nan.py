@@ -45,7 +45,6 @@ def _patch_writers():
     targets = {
         "write_int8_tile": ("int8", 1),
         "write_int32_tile": ("int32", 4),
-        "write_fp32_tile": ("fp32", 4),
         "write_fp16_tile": ("fp16", 2),
         "write_fp16_vector": ("fp16_vec", 2),
         "write_bytes": ("bytes", 1),
@@ -121,13 +120,10 @@ class TracingSim(Simulator):
             M = m_tiles * 16
             N = n_tiles * 16
             fp_precision = int(cur_insn.flags) & 0x1
-            reader = (
-                mem_helpers.read_fp16_tile
-                if fp_precision == 1
-                else mem_helpers.read_fp32_tile
-            )
             try:
-                src = reader(self.state, cur_insn.src1_buf, cur_insn.src1_off, M, N)
+                src = mem_helpers.read_fp16_tile(
+                    self.state, cur_insn.src1_buf, cur_insn.src1_off, M, N
+                )
                 src_f32 = src.astype(np.float32, copy=False)
             except Exception:
                 src_f32 = None

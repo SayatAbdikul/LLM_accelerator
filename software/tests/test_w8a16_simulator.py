@@ -135,42 +135,6 @@ def test_dequant_accum_fp32_flags1_writes_fp16_output():
     np.testing.assert_array_equal(out, expected_fp16)
 
 
-def test_dequant_accum_fp32_flags0_unchanged_from_w8a32():
-    """flags=0 must be bit-identical to W8A32 — backward-compat regression."""
-    sim_a = _make_sim_with_tile()
-    sim_b = _make_sim_with_tile()
-    rng = np.random.default_rng(3)
-    accum = rng.integers(-5_000, 5_000, size=(16, 16), dtype=np.int32)
-    scales = rng.uniform(1e-4, 1e-2, size=16).astype(np.float32)
-
-    for sim in (sim_a, sim_b):
-        mem.write_int32_tile(sim.state, BUF_ACCUM, 0, accum)
-        mem.write_fp16_vector(sim.state, BUF_WBUF, SCALE_OFF, scales)
-
-    # flags=0 (default if omitted) — original W8A32 path.
-    sim_a._execute(
-        DequantAccumFp32Insn(
-            src1_buf=BUF_ACCUM, src1_off=0,
-            src2_buf=BUF_WBUF, src2_off=SCALE_OFF,
-            dst_buf=BUF_ABUF, dst_off=DST_OFF,
-        )
-    )
-    out_a = mem.read_fp32_tile(sim_a.state, BUF_ABUF, DST_OFF, 16, 16)
-
-    # Explicit flags=0 — must match.
-    sim_b._execute(
-        DequantAccumFp32Insn(
-            src1_buf=BUF_ACCUM, src1_off=0,
-            src2_buf=BUF_WBUF, src2_off=SCALE_OFF,
-            dst_buf=BUF_ABUF, dst_off=DST_OFF,
-            flags=0,
-        )
-    )
-    out_b = mem.read_fp32_tile(sim_b.state, BUF_ABUF, DST_OFF, 16, 16)
-
-    np.testing.assert_array_equal(out_a, out_b)
-
-
 # ---------------------------------------------------------------------------
 # QUANT_FP32_INT8 (flags=1) — FP16 source → INT8 output
 # ---------------------------------------------------------------------------
@@ -600,103 +564,6 @@ def test_dequant_accum_fp32_scaled_flags1_no_double_rounding():
     assert correct != wrong, "test fixture invalid — must distinguish bias-fold vs double-round"
 
 
-def test_dequant_accum_fp32_scaled_flags0_uses_n_pc_only_no_bias():
-    """flags=0 (W8A32 path): src2 = N FP16 PC scales only. No bias fold;
-    bit-identical to the existing M2.5-A contract.
-    """
-    sim_legacy = _make_sim_with_tile()
-    sim_flags0 = _make_sim_with_tile()
-    rng = np.random.default_rng(14)
-    accum = rng.integers(-5_000, 5_000, size=(16, 16), dtype=np.int32)
-    wt_scales = rng.uniform(1e-4, 1e-2, size=16).astype(np.float32)
-    # Write garbage bias values AFTER the PC scales — these MUST be ignored
-    # under flags=0 (W8A32 reads N FP16 only, not 2N).
-    garbage_bias = np.full(16, 99999.0, dtype=np.float32)
-    act_scale = np.float32(0.125)
-
-    for sim in (sim_legacy, sim_flags0):
-        mem.write_int32_tile(sim.state, BUF_ACCUM, 0, accum)
-        mem.write_fp16_vector(sim.state, BUF_WBUF, SCALE_OFF, np.concatenate([wt_scales, garbage_bias]))
-        sim.state.scale_regs[5] = np.float16(act_scale)
-
-    # Legacy path: no flags arg.
-    sim_legacy._execute(
-        DequantAccumFp32ScaledInsn(
-            src1_buf=BUF_ACCUM, src1_off=0,
-            src2_buf=BUF_WBUF, src2_off=SCALE_OFF,
-            dst_buf=BUF_ABUF, dst_off=DST_OFF,
-            sreg=5,
-        )
-    )
-    out_legacy = mem.read_fp32_tile(sim_legacy.state, BUF_ABUF, DST_OFF, 16, 16)
-
-    # Explicit flags=0: must match legacy.
-    sim_flags0._execute(
-        DequantAccumFp32ScaledInsn(
-            src1_buf=BUF_ACCUM, src1_off=0,
-            src2_buf=BUF_WBUF, src2_off=SCALE_OFF,
-            dst_buf=BUF_ABUF, dst_off=DST_OFF,
-            sreg=5,
-            flags=0,
-        )
-    )
-    out_flags0 = mem.read_fp32_tile(sim_flags0.state, BUF_ABUF, DST_OFF, 16, 16)
-
-    np.testing.assert_array_equal(out_legacy, out_flags0)
-
-    # And the garbage bias must NOT have been added.
-    pc_fp16 = wt_scales.astype(np.float16).astype(np.float32)
-    act_widened = np.float32(np.float16(act_scale))
-    expected_no_bias = (
-        accum.astype(np.float32) * pc_fp16.reshape(1, 16) * act_widened
-    ).astype(np.float32)
-    np.testing.assert_array_equal(out_legacy, expected_no_bias)
-
-
-def test_dequant_accum_fp32_scaled_flags1_with_zero_bias_matches_flags0_downcast():
-    """flags=1 with zero bias must equal flags=0 result downcast to FP16."""
-    sim_fp32 = _make_sim_with_tile()
-    sim_fp16 = _make_sim_with_tile()
-    rng = np.random.default_rng(15)
-    accum = rng.integers(-2_000, 2_000, size=(16, 16), dtype=np.int32)
-    wt_scales = rng.uniform(1e-4, 1e-2, size=16).astype(np.float32)
-    zero_bias = np.zeros(16, dtype=np.float32)
-    act_scale = np.float32(0.0625)
-
-    # flags=0: src2 = N FP16 PC scales.
-    mem.write_int32_tile(sim_fp32.state, BUF_ACCUM, 0, accum)
-    mem.write_fp16_vector(sim_fp32.state, BUF_WBUF, SCALE_OFF, wt_scales)
-    sim_fp32.state.scale_regs[1] = np.float16(act_scale)
-    sim_fp32._execute(
-        DequantAccumFp32ScaledInsn(
-            src1_buf=BUF_ACCUM, src1_off=0,
-            src2_buf=BUF_WBUF, src2_off=SCALE_OFF,
-            dst_buf=BUF_ABUF, dst_off=DST_OFF,
-            sreg=1,
-            flags=0,
-        )
-    )
-    out_fp32 = mem.read_fp32_tile(sim_fp32.state, BUF_ABUF, DST_OFF, 16, 16)
-
-    # flags=1: src2 = 2N FP16 (PC + zero bias).
-    mem.write_int32_tile(sim_fp16.state, BUF_ACCUM, 0, accum)
-    mem.write_fp16_vector(sim_fp16.state, BUF_WBUF, SCALE_OFF, np.concatenate([wt_scales, zero_bias]))
-    sim_fp16.state.scale_regs[1] = np.float16(act_scale)
-    sim_fp16._execute(
-        DequantAccumFp32ScaledInsn(
-            src1_buf=BUF_ACCUM, src1_off=0,
-            src2_buf=BUF_WBUF, src2_off=SCALE_OFF,
-            dst_buf=BUF_ABUF, dst_off=DST_OFF,
-            sreg=1,
-            flags=1,
-        )
-    )
-    out_fp16 = _read_fp16_from_abuf(sim_fp16, DST_OFF, 16, 16)
-
-    # flags=1 result should be flags=0 result downcast to FP16.
-    np.testing.assert_array_equal(out_fp16, out_fp32.astype(np.float16).astype(np.float32))
-
-
 # ---------------------------------------------------------------------------
 # Composition: matmul prelude in FP16
 #   MAX_ABS_REDUCE → QUANT → (eye-matmul stub) → DEQUANT_SCALED+bias
@@ -785,31 +652,3 @@ def test_matmul_prelude_composition_w8a16_round_trips_with_bias_fold():
     np.testing.assert_array_equal(out, expected_fp16)
 
 
-# ---------------------------------------------------------------------------
-# Cross-cutting: backward-compat — every existing flags=0 test still passes
-# after the polymorphism change (sanity guard, runs the full op set in flags=0)
-# ---------------------------------------------------------------------------
-
-
-def test_all_ops_flags0_unchanged_backward_compat_smoke():
-    """Run a representative op in flags=0 mode to confirm the polymorphism
-    change didn't regress the W8A32 path. Full coverage lives in
-    test_w8a32_simulator.py.
-    """
-    sim = _make_sim_with_tile()
-    rng = np.random.default_rng(99)
-    a = rng.standard_normal((16, 16)).astype(np.float32)
-    b = rng.standard_normal((16, 16)).astype(np.float32)
-    mem.write_fp32_tile(sim.state, BUF_ABUF, SRC1_OFF, a)
-    mem.write_fp32_tile(sim.state, BUF_ABUF, SRC2_OFF + 64, b)  # offset shift for FP32 size
-
-    sim._execute(
-        VaddFp32Insn(
-            src1_buf=BUF_ABUF, src1_off=SRC1_OFF,
-            src2_buf=BUF_ABUF, src2_off=SRC2_OFF + 64,
-            dst_buf=BUF_ABUF, dst_off=DST_OFF + 64,
-            flags=0,
-        )
-    )
-    out = mem.read_fp32_tile(sim.state, BUF_ABUF, DST_OFF + 64, 16, 16)
-    np.testing.assert_array_equal(out, (a + b).astype(np.float32))

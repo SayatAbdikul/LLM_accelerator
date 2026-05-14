@@ -234,19 +234,11 @@ def model_config_from_fixture_payload(payload: Dict[str, object]) -> ModelConfig
     )
 
 
-def _embedding_for_precision(tensor, fp_precision: str) -> np.ndarray:
-    """Pick FP32 vs FP16 embedding table based on the codegen's fp_precision."""
-    if fp_precision == "fp16":
-        return _fp16_embedding(tensor)
-    return _fp32_embedding(tensor)
-
-
 def quantize_fixture_payload(
     payload: Dict[str, object],
     calibration_scales: Optional[Dict[str, float]] = None,
     per_tensor_fc1_blocks: Optional[set[int]] = None,
     w8a32_enabled: bool = False,
-    fp_precision: str = "fp32",
 ):
     """Return codegen-ready weights, biases, FP32 biases, scales, config, and logits size.
 
@@ -296,15 +288,13 @@ def quantize_fixture_payload(
     # cross-table scale constraint. The split below picks one or the
     # other based on `w8a32_enabled` (M3-prep).
     if w8a32_enabled:
-        # M3-prep + M2-W8A16: embedding output is FP32 (fp_precision="fp32",
-        # 4 bytes/elem) or FP16 (fp_precision="fp16", 2 bytes/elem). The
-        # codegen DMAs `d_model_pad * elem_bytes` bytes per row and the
-        # resulting ABUF tile is interpreted at that precision by the
-        # first sub-layer op (LN reads it, widening FP16 to FP32 internally
-        # if precision="fp16").
+        # W8A16: embedding output is FP16 (2 bytes/elem). The codegen DMAs
+        # `d_model_pad * 2` bytes per row and the resulting ABUF tile is
+        # interpreted as FP16 by the first sub-layer op (LN widens FP16
+        # to FP32 internally on read).
         weight_data = {
-            "transformer.wte.weight": (_embedding_for_precision(state_dict["transformer.wte.weight"], fp_precision), None),
-            "transformer.wpe.weight": (_embedding_for_precision(state_dict["transformer.wpe.weight"], fp_precision), None),
+            "transformer.wte.weight": (_fp16_embedding(state_dict["transformer.wte.weight"]), None),
+            "transformer.wpe.weight": (_fp16_embedding(state_dict["transformer.wpe.weight"]), None),
             "transformer.ln_f.weight": (_fp16_vector(state_dict["transformer.ln_f.weight"]), None),
             "transformer.ln_f.bias": (_fp16_vector(state_dict["transformer.ln_f.bias"]), None),
         }
@@ -420,13 +410,9 @@ def quantize_fixture_payload(
         fp32_biases["lm_head.bias"] = _fp32_bias(
             state_dict, "lm_head.bias", output_dim=config.vocab_size,
         )
-    # M3-D + M2-W8A16: in W8A{32,16} mode lm_head produces FP-precision
-    # output (FP32 = 4 bytes/elem, FP16 = 2 bytes/elem). The logits DRAM
-    # region grows by elem_bytes vs the INT8 path.
-    if w8a32_enabled:
-        logits_elem_bytes = 2 if fp_precision == "fp16" else 4
-    else:
-        logits_elem_bytes = 1
+    # W8A16: lm_head produces FP16 output (2 bytes/elem). The logits
+    # DRAM region grows by 2× vs the INT8 path.
+    logits_elem_bytes = 2 if w8a32_enabled else 1
     return (
         weight_data,
         prescaled_biases,
@@ -443,7 +429,6 @@ def build_stage3_tiny_decoder_bundle(
     smoke_decode_steps: int = 2,
     calibration_scales: Optional[Dict[str, float]] = None,
     ptq_preset: str | Stage5PTQPreset | None = None,
-    fp_precision: str = "fp32",
 ) -> TinyFixtureBundle:
     """Build the full 1-token tiny decoder ProgramBundle used by Stage 3 tests."""
     resolved_preset = resolve_stage5_ptq_preset(ptq_preset)
@@ -468,7 +453,6 @@ def build_stage3_tiny_decoder_bundle(
         calibration_scales=calibration_scales,
         per_tensor_fc1_blocks=gelu_from_accum_blocks,
         w8a32_enabled=bool(resolved_preset.weight_only_int8),
-        fp_precision=fp_precision,
     )
     validate_stage5_ptq_preset_for_model(config, resolved_preset)
     calibration_scales = apply_stage5_ptq_scale_policy(calibration_scales, config, resolved_preset)
@@ -500,7 +484,6 @@ def build_stage3_tiny_decoder_bundle(
         gelu_from_accum_blocks=gelu_from_accum_blocks or None,
         w8a32_enabled=bool(resolved_preset.weight_only_int8),
         fp32_biases=fp32_biases,
-        fp_precision=fp_precision,
     )
     return TinyFixtureBundle(build=build, config=config, logits_size=logits_size)
 
@@ -592,19 +575,15 @@ def _run_reference_trace(
 def run_stage3_tiny_e2e(payload: Dict[str, object], *,
                         prompt_ids: Sequence[int] = (0,),
                         max_new_tokens: int = 32,
-                        ptq_preset: str | Stage5PTQPreset | None = None,
-                        fp_precision: str = "fp32") -> TinyE2EResult:
+                        ptq_preset: str | Stage5PTQPreset | None = None) -> TinyE2EResult:
     """Run the Stage 3 32-step gate comparing the golden model against a
     PyTorch fake-quant numpy reference that shares calibration scales.
 
     Both paths use the same per-node INT8 scales derived from calibration on
     the fixture's embedded Shakespeare text, so differences reflect arithmetic
-    correctness rather than calibration drift.
-
-    `fp_precision` (W8A16 M4-F): when "fp16" and ptq_preset is a W8A32/W8A16
-    weight-only variant, builds the bundle with FP16 activation storage
-    (Phase 3 option c.2). Default "fp32" preserves the legacy behavior for
-    every other preset (W8A8 reference still uses INT8 throughout).
+    correctness rather than calibration drift. When ptq_preset is the W8A16
+    weight-only variant, the bundle uses FP16 activation storage; otherwise
+    INT8 throughout (W8A8 reference).
     """
     # Single calibration pass — shared by compiler and reference
     resolved_preset = resolve_stage5_ptq_preset(ptq_preset)
@@ -625,7 +604,6 @@ def run_stage3_tiny_e2e(payload: Dict[str, object], *,
         smoke_decode_steps=max_new_tokens,
         calibration_scales=calibration_scales,
         ptq_preset=resolved_preset,
-        fp_precision=fp_precision,
     )
     actual = run_tiny_decode_trace(tiny, prompt_ids, max_new_tokens=max_new_tokens)
 

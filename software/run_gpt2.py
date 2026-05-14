@@ -51,18 +51,6 @@ def main(argv=None) -> int:
     parser.add_argument("--prompt", default=None, help="Text prompt when tokenizer metadata is available")
     parser.add_argument("--max-new-tokens", type=int, default=2)
     parser.add_argument("--ptq-preset", default=None)
-    parser.add_argument(
-        "--fp-precision",
-        choices=("fp32", "fp16"),
-        default="fp32",
-        help=(
-            "FP storage precision for W8A32/W8A16 weight-only presets. "
-            "'fp32' = W8A32 (legacy), 'fp16' = W8A16 (new default deployment, "
-            "INT8 weights + FP16 activations, bias folded into DEQUANT). "
-            "Ignored for INT8 (W8A8) presets. Compare the generated tokens "
-            "vs FP32 via --compare-fp32."
-        ),
-    )
     parser.add_argument("--compare-fp32", action="store_true")
     parser.add_argument("--perplexity-text", type=Path, default=None)
     parser.add_argument("--calibration-text", type=Path, default=None)
@@ -100,7 +88,6 @@ def main(argv=None) -> int:
         prompt_ids=prompt_ids,
         max_new_tokens=args.max_new_tokens,
         ptq_preset=ptq_preset,
-        fp_precision=args.fp_precision,
     )
     summary = {
         "checkpoint": str(args.checkpoint),
@@ -147,7 +134,6 @@ def main(argv=None) -> int:
             ptq_preset=ptq_preset,
             output_aware_search_n_seqs=args.output_aware_search_n_seqs,
             output_aware_search_seq_len=args.output_aware_search_seq_len,
-            fp_precision=args.fp_precision,
         )
         summary.update({
             "perplexity_golden": ppl.golden_perplexity,

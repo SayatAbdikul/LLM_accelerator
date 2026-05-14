@@ -65,49 +65,31 @@ class CodeGenerator:
                  stream_name: str = "prefill",
                  kv_layout: Optional[KVCacheLayout] = None,
                  w8a32_enabled: bool = False,
-                 fp32_biases: Optional[Dict[str, np.ndarray]] = None,
-                 fp_precision: str = "fp32"):
+                 fp32_biases: Optional[Dict[str, np.ndarray]] = None):
         """
         Args:
             weight_data: name → (quantized_data, per_channel_scales)
             calibration_scales: tensor_name → per-tensor activation scale
             prescaled_biases: name → INT32 pre-scaled bias array
-            w8a32_enabled: Phase 3 (c.1) W8A32 lowering. When True, the
-                sub-layer ops (LAYERNORM, GELU, SOFTMAX, MASKED_SOFTMAX,
-                VADD) emit FP32 variants via `w8a32_emit.py`. After
-                M2.5-B (this milestone), `matmul` nodes also lower
-                through `emit_matmul_w8a32` — MAX_ABS_REDUCE_FP32 +
-                QUANT_FP32_INT8 prelude, INT8 MATMUL, then
-                DEQUANT_ACCUM_FP32_SCALED epilogue with optional FP32
-                bias VADD. `matmul_qkt` and `matmul_attn_v` (attention
-                internals) and the cross-cutting fused paths
-                (gelu-from-accum, dequant-add residual, strip-mined,
-                large-weight-tiled, fused-out-proj-accum) still raise
-                — those are M3. The W8A8 optimization blocks
+            w8a32_enabled: When True, sub-layer ops (LAYERNORM_FP32,
+                GELU_FP32, SOFTMAX_FP32, MASKED_SOFTMAX_FP32, VADD_FP32)
+                and matmul nodes lower through `w8a32_emit.py` — the
+                W8A16 path: INT8 weights + FP16 activations, bias folded
+                into DEQUANT_ACCUM_FP32_SCALED via 2N FP16 src2 layout.
+                The W8A8 INT8-round-trip optimizations
                 (dequant_add residual, requant_pc, gelu_from_accum,
-                fused_softmax_attnv) are force-disabled because
-                they're optimizations of the INT8 round-trip that
-                W8A32 doesn't have.
+                fused_softmax_attnv) are force-disabled in W8A16 mode.
+                (Field name "w8a32_enabled" is retained for backward
+                compat; semantically it now selects the W8A16 path.)
             fp32_biases: Optional map of bias_name → FP32 1-D vector.
                 Used only when `w8a32_enabled=True`. The codegen stages
-                each FP32 bias to DRAM under the symbol
-                `f"{bias_name}__fp32"` (W8A32 path) or folded into the
-                `__w8a16_pc_scale_and_bias` combined blob (W8A16 path,
-                see `fp_precision` below). The bias array itself stays
-                FP32 in Python — the codegen handles the cast at staging
-                time based on `fp_precision`. The INT8 path's
-                `prescaled_biases` (INT32, prescaled by input_act_scale ×
-                mean_w_scale) is incompatible with the dynamic activation
-                scale — hence this parallel FP32 artifact.
-            fp_precision: Phase 3 (c.2) W8A16. One of:
-                - "fp32" (W8A32): legacy path, FP32 ABUF storage, separate
-                  VADD_FP32 for bias post-DEQUANT. RTypeInsn.flags[0]=0.
-                - "fp16" (W8A16, default): FP16 ABUF storage, bias folded
-                  into DEQUANT_ACCUM_FP32_SCALED via 2N FP16 src2 layout.
-                  RTypeInsn.flags[0]=1. Half-size tiles vs FP32.
-                Active only when `w8a32_enabled=True`. Drives `elem_bytes`
-                (2 vs 4) and `fp_precision_flag` (1 vs 0) consumed by
-                `w8a32_emit.py`.
+                each FP32 bias folded into the
+                `__w8a16_pc_scale_and_bias` combined 2N FP16 blob
+                consumed by DEQUANT_ACCUM_FP32_SCALED.
+
+        Element size is FP16 (2 bytes/element) throughout the W8A16
+        datapath; `self.elem_bytes = 2` and `self.fp_precision_flag = 1`
+        are hardcoded.
         """
         self.weight_data = weight_data
         self.config = model_config or deit_tiny_config()
@@ -117,20 +99,18 @@ class CodeGenerator:
         self.kv_layout = kv_layout
         self.calibration_scales = calibration_scales
         self.prescaled_biases = prescaled_biases
-        # FP32 biases for the W8A32 path (M2.5-B). Empty dict when not provided
-        # so emit_matmul_w8a32 raises a clear error if a bias is referenced
+        # FP biases for the W8A16 path. Empty dict when not provided so
+        # emit_matmul_w8a32 raises a clear error if a bias is referenced
         # without a corresponding FP32 staging entry.
         self.fp32_biases: Dict[str, np.ndarray] = dict(fp32_biases or {})
         self.w8a32_enabled = bool(w8a32_enabled)
-        # Phase 3 (c.2) M2 — FP precision selector for the W8A32/W8A16 path.
-        # `elem_bytes` drives byte sizing in w8a32_emit.py (4 → 2 for FP16).
-        # `fp_precision_flag` becomes RTypeInsn.flags[0] on every emitted
-        # W8A32 R-type op (0x17-0x1F): 0=FP32, 1=FP16.
-        if fp_precision not in ("fp32", "fp16"):
-            raise ValueError(f"fp_precision must be 'fp32' or 'fp16', got {fp_precision!r}")
-        self.fp_precision = fp_precision
-        self.elem_bytes: int = 2 if fp_precision == "fp16" else 4
-        self.fp_precision_flag: int = 1 if fp_precision == "fp16" else 0
+        # W8A16: FP16 storage (2 bytes/elem) on all ABUF tiles produced
+        # by R-type opcodes 0x17-0x1F; flags[0]=1 selects the FP16 path
+        # at instruction-emit time. Both values are constants now that
+        # the W8A32 (FP32-storage) path has been removed.
+        self.fp_precision = "fp16"
+        self.elem_bytes: int = 2
+        self.fp_precision_flag: int = 1
         if self.w8a32_enabled:
             # M2 design contract: in W8A32 mode the INT8-round-trip
             # optimizations are off — they're optimizations of behavior
@@ -184,10 +164,9 @@ class CodeGenerator:
         # M4-A: spill an FP-precision residual tile to DRAM only when its
         # byte size exceeds this threshold. Tiny fixtures skip spill so
         # existing test instruction counts are preserved; real GPT-2
-        # (d_model=768) triggers spill. The threshold scales with element
-        # size so the same logical tile-shape boundary (d_model ≈ 256)
-        # holds for both FP32 (16 KB) and FP16 (8 KB).
-        self.fp32_spill_threshold_bytes: int = 16384 if self.elem_bytes == 4 else 8192
+        # (d_model=768) triggers spill. 8 KB matches the d_model ≈ 256
+        # FP16 tile boundary.
+        self.fp32_spill_threshold_bytes: int = 8192
         # Default to 0 so unit tests that bypass _layout_weights (and
         # would set dram_temp_start to a non-zero offset) don't crash
         # in _spill_fp32_tile_to_dram. _layout_weights overwrites this.
@@ -2558,7 +2537,7 @@ class CodeGenerator:
                 node.name, BUF_ABUF, out_alloc.offset_units,
                 M_pad, total_out_bytes_per_row // elem_bytes,  # elements per row
                 seq_len, node.output_shape[1],
-                "fp32" if elem_bytes == 4 else "fp16",
+                "fp16",
                 self.calibration_scales.get(node.name, 1.0 / 127.0),
             )
             return
@@ -3136,7 +3115,7 @@ class CodeGenerator:
             d_model_pad,
             seq_len,
             d_model,
-            ("fp32" if self.elem_bytes == 4 else "fp16") if use_fp else "int8",
+            "fp16" if use_fp else "int8",
             self.calibration_scales.get(node.name, 6.0 / 127.0),
         )
 

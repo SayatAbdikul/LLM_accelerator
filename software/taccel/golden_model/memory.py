@@ -138,69 +138,24 @@ def write_int32_tile(state, buf_id: int, offset_units: int, data: np.ndarray):
 # ---------------------------------------------------------------------------
 
 
-def read_fp32_tile(state, buf_id: int, offset_units: int, rows: int, cols: int) -> np.ndarray:
-    """Read an FP32 tile from SRAM buffer.
-
-    Same byte addressing as `read_int8_tile` (16-byte units) but
-    interprets the underlying bytes as little-endian float32. ACCUM is
-    not a valid source/destination for FP32 — its storage is fixed
-    INT32 by the hardware contract.
-    """
-    if buf_id == BUF_ACCUM:
-        raise ValueError(
-            "ACCUM buffer is INT32-only; read FP32 from ABUF/WBUF via "
-            "DEQUANT_ACCUM_FP32 to write to ABUF"
-        )
-    _check_sram_bounds(buf_id, offset_units)
-    byte_offset = offset_units * UNIT
-    total_bytes = rows * cols * 4
-
-    buf = state.get_buffer(buf_id)
-    end = byte_offset + total_bytes
-    if end > len(buf):
-        raise SRAMAccessError(buf_id, offset_units, BUFFER_MAX_OFF[buf_id])
-
-    data = np.frombuffer(buf[byte_offset:end], dtype=np.float32).copy()
-    return data.reshape(rows, cols)
-
-
-def write_fp32_tile(state, buf_id: int, offset_units: int, data: np.ndarray):
-    """Write an FP32 tile to SRAM buffer (same addressing as read_fp32_tile)."""
-    if buf_id == BUF_ACCUM:
-        raise ValueError(
-            "ACCUM buffer is INT32-only; FP32 results write to ABUF"
-        )
-    _check_sram_bounds(buf_id, offset_units)
-    byte_offset = offset_units * UNIT
-    flat = data.astype(np.float32).tobytes()
-
-    buf = state.get_buffer(buf_id)
-    end = byte_offset + len(flat)
-    if end > len(buf):
-        raise SRAMAccessError(buf_id, offset_units, BUFFER_MAX_OFF[buf_id])
-
-    buf[byte_offset:end] = flat
-
-
 # ---------------------------------------------------------------------------
 # W8A16 FP16 tile helpers (Phase 3 (c.2), M1)
 #
 # ABUF bytes are reinterpreted as FP16 (2 bytes/element) when accessed by
-# the W8A32 R-type opcodes (0x17-0x1F) with `flags=1`. Reads widen to FP32
-# on return (FP16-storage / FP32-datapath convention, matches
-# read_fp16_vector). Writes accept FP32 and downcast to FP16 on store.
-# Same byte addressing as the FP32 helpers (16-byte units); only the
-# element size and dtype differ.
+# the W8A32 R-type opcodes (0x17-0x1F). Reads widen to FP32 on return
+# (FP16-storage / FP32-datapath convention, matches read_fp16_vector).
+# Writes accept FP32 and downcast to FP16 on store. Same byte addressing
+# as the INT tile helpers (16-byte units); only the element size differs.
 # ---------------------------------------------------------------------------
 
 
 def read_fp16_tile(state, buf_id: int, offset_units: int, rows: int, cols: int) -> np.ndarray:
     """Read an FP16 tile from SRAM buffer, widened to FP32 on return.
 
-    Same byte addressing as `read_fp32_tile` (16-byte units) but
-    interprets the underlying bytes as little-endian float16 and
-    widens to FP32 — internal datapath is FP32, storage is FP16.
-    ACCUM is not a valid source/destination (INT32-only by contract).
+    Byte addressing in 16-byte units; underlying bytes interpreted as
+    little-endian float16 and widened to FP32 on return — internal
+    datapath is FP32, storage is FP16. ACCUM is not a valid
+    source/destination (INT32-only by contract).
     """
     if buf_id == BUF_ACCUM:
         raise ValueError(

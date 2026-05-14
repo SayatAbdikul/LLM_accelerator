@@ -193,21 +193,18 @@ def run_weight_only_int8_teacher_forced_logits(
 def run_weight_only_int8_simulator_teacher_forced_logits(
     payload: Dict[str, object],
     context_tokens: Sequence[int],
-    *,
-    fp_precision: str = "fp32",
 ) -> List[np.ndarray]:
-    """W8A{32,16} simulator-backed golden via the compiled bundle + HostRunner.
+    """W8A16 simulator-backed golden via the compiled bundle + HostRunner.
 
     Builds the bundle via `build_stage3_tiny_decoder_bundle(..,
-    ptq_preset='weight_only_int8', fp_precision=fp_precision)`, wraps in
-    `HostRunner(.., logits_dtype=np.float32|np.float16)`, runs prefill +
-    decode for every teacher-forced position, widens FP16 → FP32 on return
-    so the downstream cross-entropy computation sees FP32 throughout.
+    ptq_preset='weight_only_int8')`, wraps in
+    `HostRunner(.., logits_dtype=np.float16)`, runs prefill + decode for
+    every teacher-forced position, widens FP16 → FP32 on return so the
+    downstream cross-entropy computation sees FP32 throughout.
 
-    `fp_precision` ∈ {'fp32' (W8A32, legacy), 'fp16' (W8A16, new default
-    deployment)}. The returned logits should bit-match the like-for-like
-    Python reference (`NanoGPTW8A32SimulatorReference`, M4-E) within
-    FP16 ULP — that match is the codegen-correctness gate.
+    Returned logits should bit-match the like-for-like Python reference
+    (`NanoGPTW8A32SimulatorReference`) within FP16 ULP — that match is
+    the codegen-correctness gate.
     """
     from .tiny_fixture import build_stage3_tiny_decoder_bundle
     from .host_runner import HostRunner
@@ -219,10 +216,8 @@ def run_weight_only_int8_simulator_teacher_forced_logits(
         payload,
         ptq_preset="weight_only_int8",
         smoke_decode_steps=len(inputs) - 1,
-        fp_precision=fp_precision,
     )
-    logits_dtype = np.float16 if fp_precision == "fp16" else np.float32
-    runner = HostRunner(bundle.build.bundle, logits_dtype=logits_dtype)
+    runner = HostRunner(bundle.build.bundle, logits_dtype=np.float16)
     # Teacher-forced: prefill on token 0, then decode for tokens 1..N-1.
     # Logits widened to FP32 on return so stable_cross_entropy gets FP32.
     logits_list: List[np.ndarray] = []
@@ -238,21 +233,19 @@ def run_weight_only_int8_simulator_teacher_forced_logits(
 def run_weight_only_int8_simulator_reference_teacher_forced_logits(
     payload: Dict[str, object],
     context_tokens: Sequence[int],
-    *,
-    fp_precision: str = "fp32",
 ) -> List[np.ndarray]:
-    """W8A{32,16} like-for-like NumPy reference logits (M4-E).
+    """W8A16 like-for-like NumPy reference logits (M4-E).
 
     Used as the `fake_quant` reference when `simulator_backed=True` so
     `relative_delta` measures **codegen correctness** (simulator-backed
     bundle vs the M4-E Python reference) rather than QDQ-vs-host-runner
     identity. The reference mirrors the simulator's FP16-storage /
-    FP32-internal contract when `fp_precision='fp16'`.
+    FP32-internal contract.
     """
     from .w8a32_simulator_reference import NanoGPTW8A32SimulatorReference
 
     inputs, _ = teacher_forced_inputs_and_targets(context_tokens)
-    ref = NanoGPTW8A32SimulatorReference(payload, fp_precision=fp_precision)
+    ref = NanoGPTW8A32SimulatorReference(payload)
     return ref.run_teacher_forced(inputs)
 
 
@@ -335,7 +328,6 @@ def evaluate_gpt2_perplexity(
     debug_fp32_kv_cache: bool = False,
     debug_fp32_residual_stream: bool = False,
     simulator_backed: bool = False,
-    fp_precision: str = "fp32",
 ) -> GPT2PerplexityResult:
     if context_len < 1:
         raise ValueError("context_len must be positive")
@@ -389,7 +381,7 @@ def evaluate_gpt2_perplexity(
         if simulator_backed:
             fake_logits = (
                 run_weight_only_int8_simulator_reference_teacher_forced_logits(
-                    payload, eval_tokens, fp_precision=fp_precision,
+                    payload, eval_tokens,
                 )
             )
         else:
@@ -408,7 +400,7 @@ def evaluate_gpt2_perplexity(
 
         if simulator_backed:
             golden_logits = run_weight_only_int8_simulator_teacher_forced_logits(
-                payload, eval_tokens, fp_precision=fp_precision,
+                payload, eval_tokens,
             )
         else:
             golden_logits = run_weight_only_int8_golden_teacher_forced_logits(
