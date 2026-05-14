@@ -6,7 +6,6 @@ can run either a full causal forward or an incremental KV-cache decode path.
 """
 from __future__ import annotations
 
-import os
 from typing import Dict, Optional, Sequence
 
 import numpy as np
@@ -371,8 +370,6 @@ class NanoGPTFQReference:
         raw_residual2_blocks: Sequence[int] | None = None,
         gelu_from_accum_blocks: Sequence[int] | None = None,
         ln_eps: float | None = None,
-        keep_kv_cache_fp32: bool = False,
-        fp32_residual_stream: bool = False,
     ) -> None:
         self.n_layer = int(model_args["n_layer"])
         self.n_head = int(model_args["n_head"])
@@ -388,28 +385,6 @@ class NanoGPTFQReference:
         self.raw_residual1_blocks = set(int(v) for v in (raw_residual1_blocks or ()))
         self.raw_residual2_blocks = set(int(v) for v in (raw_residual2_blocks or ()))
         self.gelu_from_accum_blocks = set(int(v) for v in (gelu_from_accum_blocks or ()))
-        # Phase 0B diagnostic: when True, store FP32 K and V in cache (instead
-        # of INT8). Used to test whether K/V cache compounding noise is the
-        # long-eval bottleneck. Does NOT change Q quantization (Q is freshly
-        # computed each step — single-step noise, not compounding). The
-        # deployed bundle never sets this; it's reference-only.
-        self.keep_kv_cache_fp32 = bool(keep_kv_cache_fp32)
-        # Phase 1 Branch B (Branch B v1) diagnostic: when True, route the
-        # residual stream through FP32 (no INT8 quantization on
-        # block_residual1/2 or the LN outputs ln1/ln2/ln_f). This is the
-        # absolute upper bound for what per-token activation quantization on
-        # residual-stream nodes could ever achieve. Implementation:
-        #   - Forces NANOGPT_FQ_INTEGER_LINEAR=0 so the matmul branches read
-        #     clean FP32 LN outputs as inputs (in INT8 matmul mode the input
-        #     is re-quantized via _fp32_to_int8 anyway, so the experiment
-        #     would be a no-op there).
-        #   - Skips _qdq for ln1/ln2/ln_f.
-        #   - Tracks a parallel x_fp32_clean variable for residual1/2 so
-        #     consecutive residual additions don't accumulate INT8 rounding.
-        # Reference-only — never sets this in the deployed bundle.
-        self.fp32_residual_stream = bool(fp32_residual_stream)
-        if self.fp32_residual_stream:
-            os.environ["NANOGPT_FQ_INTEGER_LINEAR"] = "0"
         sd = state_dict
         self._has_nonzero_linear_bias = any(
             ("bias" in name and ("c_attn" in name or "c_proj" in name or "c_fc" in name))
@@ -898,22 +873,10 @@ class NanoGPTFQReference:
             x = x_int8.astype(np.float32) * _arch_scale(x_scale)
         record("tok_pos_add", x, scale=x_scale, int8=x_int8)
 
-        # Phase 1 Branch B: when fp32_residual_stream is enabled, track a
-        # parallel clean-FP32 residual stream alongside the INT8 path. The
-        # clean stream is what gets fed into LN ops, replacing x. Every
-        # residual1/2 update accumulates in FP32 to bypass INT8 rounding,
-        # but Q/K/V/fc1/fc2 matmul outputs are still INT8-quantized — this
-        # isolates the residual-stream contribution to PPL error.
-        if self.fp32_residual_stream:
-            x_fp32_clean = (
-                self.wte_fp32[[token_id]] + self.wpe_fp32[[position_id]]
-            )
-            x = x_fp32_clean
-
         for L, layer in enumerate(self.layers):
             ln1_scale = _scale(s, f"block{L}_ln1")
             ln1_raw = _layernorm_np(x, layer["ln1_w"], layer["ln1_b"], self.eps)
-            ln1 = ln1_raw if self.fp32_residual_stream else _qdq(ln1_raw, ln1_scale)
+            ln1 = _qdq(ln1_raw, ln1_scale)
             record(f"block{L}_ln1", ln1, scale=ln1_scale, int8=_fp32_to_int8(ln1, ln1_scale))
             ln1_i8 = _fp32_to_int8(ln1, ln1_scale)
             head_outs_int8 = []
@@ -956,25 +919,12 @@ class NanoGPTFQReference:
                 caches[L][H]["k"].append(k_i8[0].copy())
                 caches[L][H]["v"].append(v_i8[0].copy())
                 caches[L][H].setdefault("v_fp32", []).append(value_fp32[0].copy())
-                # Phase 0B diagnostic: also stash FP32 K when toggle is on. We
-                # always store the INT8 versions too so trace recording stays
-                # bit-identical; the FP32 path is selected for the matmuls
-                # below.
-                if self.keep_kv_cache_fp32:
-                    caches[L][H].setdefault("k_fp32", []).append(k[0].copy())
 
                 k_cache_i8 = np.stack(caches[L][H]["k"], axis=0).astype(np.int8)
                 v_cache_i8 = np.stack(caches[L][H]["v"], axis=0).astype(np.int8)
                 v_cache = v_cache_i8.astype(np.float32) * _arch_scale(v_scale)
                 v_cache_fp32 = np.stack(caches[L][H]["v_fp32"], axis=0).astype(np.float32)
-                if self.keep_kv_cache_fp32:
-                    # FP32 K/V cache: skip INT8 cache dequant entirely and use
-                    # fresh-FP32 K/V tensors. Q is the dequantized form of the
-                    # current step's Q INT8 (already in `q`), so we pay only
-                    # single-step Q noise, no K/V compounding noise.
-                    k_cache_fp32 = np.stack(caches[L][H]["k_fp32"], axis=0).astype(np.float32)
-                    attn = (q @ k_cache_fp32.T) * self.attn_scale
-                elif self._integer_linear_reference():
+                if self._integer_linear_reference():
                     qkt_accum = q_i8.astype(np.int32) @ k_cache_i8.astype(np.int32).T
                     attn = _dequant_accum_fp32(
                         qkt_accum,
@@ -999,15 +949,7 @@ class NanoGPTFQReference:
                 )
                 attn_v_fp32 = attn_group_active("attn_v", L, H)
                 value_cache_fp32 = attn_group_active("attn_v_value_fp32", L, H)
-                if self.keep_kv_cache_fp32:
-                    # Phase 0B: skip V-cache dequant. Use the FP32 V cache
-                    # directly. Output is then quantized to attn_v_scale (a
-                    # single-step quantization, not compounding) so downstream
-                    # concat / out_proj sees the same INT8 contract as the
-                    # baseline path.
-                    head_out = _qdq(probs @ v_cache_fp32, attn_v_scale)
-                    head_out_i8 = _fp32_to_int8(head_out, attn_v_scale)
-                elif not (attn_v_fp32 or value_cache_fp32):
+                if not (attn_v_fp32 or value_cache_fp32):
                     if self._integer_linear_reference():
                         head_accum = probs_i8.astype(np.int32) @ v_cache_i8.astype(np.int32)
                         head_out_i8 = _requant_accum_int8(
@@ -1063,26 +1005,11 @@ class NanoGPTFQReference:
             else:
                 x_int8 = _dequant_add_accum_int8(out_accum, out_accum_scale, x_int8, _scale(s, "tok_pos_add") if L == 0 else _scale(s, f"block{L - 1}_residual2"), x_scale)
                 x = x_int8.astype(np.float32) * _arch_scale(x_scale)
-            # Branch B: override `x` with clean-FP32 residual1. Compute the
-            # c_proj output via FP32 matmul of (INT8-rounded concat × QDQ
-            # weight) + ORIGINAL FP32 bias. This avoids the per-channel-vs-
-            # mean bias encoding mismatch in the integer path (where
-            # c_proj_b_i32 is encoded with per-channel weight scales but the
-            # dequant uses mean weight scale, producing a per-channel bias
-            # error that compounds across layers in a clean FP32 add chain).
-            if self.fp32_residual_stream:
-                concat_fp32_for_residual = concat_int8.astype(np.float32) * _arch_scale(concat_scale)
-                out_proj_clean = (
-                    concat_fp32_for_residual @ layer["c_proj_w"].T
-                    + layer["c_proj_b"]
-                )
-                x_fp32_clean = x_fp32_clean + out_proj_clean
-                x = x_fp32_clean
             record(f"block{L}_residual1", x, scale=x_scale, int8=x_int8)
 
             ln2_scale = _scale(s, f"block{L}_ln2")
             ln2_raw = _layernorm_np(x, layer["ln2_w"], layer["ln2_b"], self.eps)
-            ln2 = ln2_raw if self.fp32_residual_stream else _qdq(ln2_raw, ln2_scale)
+            ln2 = _qdq(ln2_raw, ln2_scale)
             record(f"block{L}_ln2", ln2, scale=ln2_scale, int8=_fp32_to_int8(ln2, ln2_scale))
             fc1_scale = _scale(s, f"block{L}_fc1")
             gelu_scale = _scale(s, f"block{L}_gelu", 1.0 / 127.0)
@@ -1185,22 +1112,11 @@ class NanoGPTFQReference:
             else:
                 x_int8 = _dequant_add_accum_int8(fc2_accum, fc2_accum_scale, residual1_int8, residual1_scale, x_scale)
                 x = x_int8.astype(np.float32) * _arch_scale(x_scale)
-            # Branch B: same as residual1 — clean FP32 c_fc-out matmul with
-            # INT8 GELU input (QDQ form) and original FP32 bias.
-            if self.fp32_residual_stream:
-                gelu_i8_for_residual = _fp32_to_int8(gelu, gelu_scale)
-                gelu_fp32_for_residual = gelu_i8_for_residual.astype(np.float32) * _arch_scale(gelu_scale)
-                fc2_clean = (
-                    gelu_fp32_for_residual @ layer["proj_w"].T
-                    + layer["proj_b"]
-                )
-                x_fp32_clean = x_fp32_clean + fc2_clean
-                x = x_fp32_clean
             record(f"block{L}_residual2", x, scale=x_scale, int8=x_int8)
 
         ln_f_scale = _scale(s, "ln_f")
         ln_f_raw = _layernorm_np(x, self.ln_f_w, self.ln_f_b, self.eps)
-        ln_f = ln_f_raw if ("ln_f" in groups or self.fp32_residual_stream) else _qdq(ln_f_raw, ln_f_scale)
+        ln_f = ln_f_raw if "ln_f" in groups else _qdq(ln_f_raw, ln_f_scale)
         record("ln_f", ln_f, scale=ln_f_scale, int8=_fp32_to_int8(ln_f, ln_f_scale))
         if "lm_head" in groups:
             logits = ln_f @ self.lm_head_w_fp32.T

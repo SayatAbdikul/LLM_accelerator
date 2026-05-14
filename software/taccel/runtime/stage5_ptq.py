@@ -544,8 +544,7 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         output_aware_include_pairs=True,
         bias_correction_blocks=tuple(range(12)),
     ),
-    # QuaRot Phase 1 presets. The diagnostic
-    # (software/tools/diagnose_activation_outliers.py) showed that residual-
+    # QuaRot Phase 1 presets. Diagnostic experiments showed that residual-
     # stream rotation by an orthogonal matrix recovers a substantial fraction
     # of the FP32→INT8 PPL gap. Production uses a 1-PRESERVING rotation
     # (R · 1 = 1), which is mathematically required for LayerNorm's mean-

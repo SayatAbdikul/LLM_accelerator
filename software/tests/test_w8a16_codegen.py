@@ -10,7 +10,7 @@ This test module verifies the compiler-side polymorphism:
 
   - CodeGenerator(``) wires elem_bytes=2,
     fp_precision_flag=1, and the half-size FP-tile byte sizing.
-  - Every R-type emit site in `w8a32_emit.py` carries
+  - Every R-type emit site in `w8a16_emit.py` carries
     `flags=cg.fp_precision_flag`.
   - ABUF allocations under fp16 are exactly half-size of fp32.
   - DEQUANT_ACCUM_FP32_SCALED's src2 vector layout differs by flag:
@@ -30,12 +30,12 @@ from taccel.compiler.codegen import CodeGenerator
 from taccel.compiler.ir import IRGraph, IRNode
 from taccel.compiler.model_config import deit_tiny_config
 from taccel.compiler.tiler import pad_dim, TILE
-from taccel.compiler.w8a32_emit import (
+from taccel.compiler.w8a16_emit import (
     emit_gelu_fp32,
     emit_layernorm_fp32,
-    emit_matmul_attn_v_w8a32,
-    emit_matmul_qkt_w8a32,
-    emit_matmul_w8a32,
+    emit_matmul_attn_v_w8a16,
+    emit_matmul_qkt_w8a16,
+    emit_matmul_w8a16,
     emit_softmax_fp32,
     emit_vadd_fp32,
 )
@@ -50,7 +50,7 @@ def _fresh_codegen(*, w8a32: bool = True) -> CodeGenerator:
         prescaled_biases={},
         model_config=deit_tiny_config(),
         stream_name="prefill",
-        w8a32_enabled=w8a32,
+        use_fp16_activations=w8a32,
     )
 
 
@@ -73,7 +73,7 @@ def test_codegen_fp16_wires_elem_bytes_2_and_flag_1():
     assert cg.elem_bytes == 2
     assert cg.fp_precision_flag == 1
     # Spill threshold scales with elem_bytes (8 KB for FP16, half the FP32 budget).
-    assert cg.fp32_spill_threshold_bytes == 8192
+    assert cg.fp_spill_threshold_bytes == 8192
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +119,7 @@ def test_emit_layernorm_fp16_carries_flags_1():
         prescaled_biases={},
         model_config=deit_tiny_config(),
         stream_name="prefill",
-        w8a32_enabled=True,
+        use_fp16_activations=True,
         )
     cg.dram_layout["gamma"] = 0
     cg.dram_layout["beta"] = 32
@@ -163,9 +163,9 @@ def _build_matmul_cg(*, with_bias: bool):
     K, N = 16, 16
     weight = np.zeros((K, N), dtype=np.int8)
     scales = np.ones(N, dtype=np.float16) * np.float16(0.01)
-    fp32_biases = {}
+    biases = {}
     if with_bias:
-        fp32_biases["fcb"] = np.linspace(-0.5, 0.5, N, dtype=np.float32)
+        biases["fcb"] = np.linspace(-0.5, 0.5, N, dtype=np.float32)
     graph = IRGraph()
     graph.add_node(IRNode(
         op="matmul", name="fc",
@@ -178,8 +178,8 @@ def _build_matmul_cg(*, with_bias: bool):
         prescaled_biases={},
         model_config=deit_tiny_config(),
         stream_name="prefill",
-        w8a32_enabled=True,
-        fp32_biases=fp32_biases,
+        use_fp16_activations=True,
+        biases=biases,
     )
     # Stage DRAM symbols the emitter will need.
     cg.generate(graph)
@@ -270,8 +270,8 @@ def test_w8a16_simple_matmul_simulator_round_trip():
         calibration_scales={},
         prescaled_biases={},
         model_config=deit_tiny_config(),
-        w8a32_enabled=True,
-        fp32_biases={"fcb": bias_fp32},
+        use_fp16_activations=True,
+        biases={"fcb": bias_fp32},
     )
     instructions, dram_data = cg.generate(graph)
 
@@ -359,10 +359,10 @@ def _qkt_w8a16_codegen(
         weight_data={},
         calibration_scales={"q_in": q_scale, "k_in": k_scale, "qkt_out": 1.0},
         prescaled_biases={},
-        fp32_biases={},
+        biases={},
         model_config=config,
         stream_name="prefill",
-        w8a32_enabled=True,
+        use_fp16_activations=True,
     )
     graph = IRGraph()
     node = IRNode(
@@ -395,10 +395,10 @@ def _attn_v_w8a16_codegen(
         weight_data={},
         calibration_scales={"sm_in": sm_scale, "v_in": v_scale, "attn_v_out": 1.0},
         prescaled_biases={},
-        fp32_biases={},
+        biases={},
         model_config=config,
         stream_name="prefill",
-        w8a32_enabled=True,
+        use_fp16_activations=True,
     )
     graph = IRGraph()
     node = IRNode(

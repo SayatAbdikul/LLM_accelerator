@@ -2,10 +2,10 @@
 
 Companion to `WeightOnlyHostRunner`, but with the *same* per-matmul
 INT8-activation re-quantization semantics that the simulator-backed
-W8A32 codegen produces (`emit_matmul_w8a32` / `emit_matmul_qkt_w8a32` /
-`emit_matmul_attn_v_w8a32`). Where `WeightOnlyHostRunner` produces the
+W8A32 codegen produces (`emit_matmul_w8a16` / `emit_matmul_qkt_w8a16` /
+`emit_matmul_attn_v_w8a16`). Where `WeightOnlyHostRunner` produces the
 **FP32-with-INT8-weight-QDQ** ceiling (~53.42 PPL on real GPT-2),
-`NanoGPTW8A32SimulatorReference` produces the **dynamic-INT8-activation
+`NanoGPTW8A16SimulatorReference` produces the **dynamic-INT8-activation
 + INT8 weight** number that should bit-match the simulator-backed
 bundle (modulo runtime FP16 ULP).
 
@@ -34,7 +34,7 @@ scales `w_scales`):
   y_fp32  = accum32 * w_scales.astype(np.float16).astype(np.float32) * float(fwd_fp16)
           + bias_fp32
 
-QKT path (matches `emit_matmul_qkt_w8a32`):
+QKT path (matches `emit_matmul_qkt_w8a16`):
 
   q_scale, k_scale: static calibration (defaults 6/127 if absent)
   composite_fp16  = np.float16(q_scale * k_scale * inv_sqrt_d_head)
@@ -90,7 +90,7 @@ def _quant_w_per_channel_int8(w_fp32: np.ndarray) -> tuple[np.ndarray, np.ndarra
     return w_int8, w_scales
 
 
-def _w8a32_dynamic_matmul(
+def _w8a16_dynamic_matmul(
     x_fp32: np.ndarray,
     w_int8: np.ndarray,
     w_scales_fp16: np.ndarray,
@@ -98,7 +98,7 @@ def _w8a32_dynamic_matmul(
 ) -> np.ndarray:
     """One INT8-activation × INT8-weight matmul with FP16 dequant.
 
-    Matches the codegen's `emit_matmul_w8a32` (W8A16) semantics exactly:
+    Matches the codegen's `emit_matmul_w8a16` (W8A16) semantics exactly:
       - max_abs over the full activation tile (one MAX_ABS_REDUCE) after
         FP16 round-trip on the source (matches simulator's FP16-store path).
       - FP16 inv_scale, FP16 fwd_scale (DEQUANT_ACCUM_FP32_SCALED sreg+1).
@@ -176,7 +176,7 @@ def _softmax_masked_fp32(scores: np.ndarray, valid_kv_len: int) -> np.ndarray:
     return _cast_fp16(out)
 
 
-class NanoGPTW8A32SimulatorReference:
+class NanoGPTW8A16SimulatorReference:
     """Like-for-like W8A32 reference matching the simulator-backed bundle.
 
     See module docstring. Constructs INT8 weights + FP16 scales from
@@ -319,13 +319,13 @@ class NanoGPTW8A32SimulatorReference:
                         position: int) -> np.ndarray:
         head = self.layers[layer_idx]["heads"][head_idx]
         # Per-head Q/K/V projections (dynamic activation scale).
-        q = _w8a32_dynamic_matmul(
+        q = _w8a16_dynamic_matmul(
             ln1, head["q_int8"], head["q_scales"], head["q_b"],
         )
-        k = _w8a32_dynamic_matmul(
+        k = _w8a16_dynamic_matmul(
             ln1, head["k_int8"], head["k_scales"], head["k_b"],
         )
-        v = _w8a32_dynamic_matmul(
+        v = _w8a16_dynamic_matmul(
             ln1, head["v_int8"], head["v_scales"], head["v_b"],
         )
         # KV cache append. Under fp_precision='fp16' the K/V tiles are
@@ -371,7 +371,7 @@ class NanoGPTW8A32SimulatorReference:
         """Run one decode step and return its FP32 logits."""
         if position != self._next_position:
             raise ValueError(
-                f"NanoGPTW8A32SimulatorReference: position {position} doesn't "
+                f"NanoGPTW8A16SimulatorReference: position {position} doesn't "
                 f"match internal cursor {self._next_position}"
             )
         # Token + position embedding lookups. Storage is FP{32,16} matching
@@ -389,7 +389,7 @@ class NanoGPTW8A32SimulatorReference:
                     self._attention_head(ln1, layer_idx, head_idx, position)
                 )
             concat = np.concatenate(head_outs, axis=-1)
-            out_proj = _w8a32_dynamic_matmul(
+            out_proj = _w8a16_dynamic_matmul(
                 concat, layer["c_proj_int8"], layer["c_proj_scales"], layer["c_proj_b"],
             )
             x = _cast_fp16(x + out_proj)  # residual1
@@ -397,11 +397,11 @@ class NanoGPTW8A32SimulatorReference:
             ln2 = _layer_norm_fp32(
                 x, layer["ln2_w"], layer["ln2_b"], self.layer_norm_epsilon,
             )
-            fc1 = _w8a32_dynamic_matmul(
+            fc1 = _w8a16_dynamic_matmul(
                 ln2, layer["fc1_int8"], layer["fc1_scales"], layer["fc1_b"],
             )
             gelu = _gelu_fp32(fc1)
-            fc2 = _w8a32_dynamic_matmul(
+            fc2 = _w8a16_dynamic_matmul(
                 gelu, layer["fc2_int8"], layer["fc2_scales"], layer["fc2_b"],
             )
             x = _cast_fp16(x + fc2)  # residual2
@@ -410,7 +410,7 @@ class NanoGPTW8A32SimulatorReference:
             x, self.ln_f_w, self.ln_f_b, self.layer_norm_epsilon,
         )
         # lm_head: takes only the last row of ln_f (incremental decode).
-        logits = _w8a32_dynamic_matmul(
+        logits = _w8a16_dynamic_matmul(
             ln_f[-1:], self.lm_head_w_int8, self.lm_head_w_scales, self.lm_head_b,
         )
         self._next_position += 1

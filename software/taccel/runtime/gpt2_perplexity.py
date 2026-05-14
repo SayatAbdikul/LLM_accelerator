@@ -203,7 +203,7 @@ def run_weight_only_int8_simulator_teacher_forced_logits(
     downstream cross-entropy computation sees FP32 throughout.
 
     Returned logits should bit-match the like-for-like Python reference
-    (`NanoGPTW8A32SimulatorReference`) within FP16 ULP — that match is
+    (`NanoGPTW8A16SimulatorReference`) within FP16 ULP — that match is
     the codegen-correctness gate.
     """
     from .tiny_fixture import build_stage3_tiny_decoder_bundle
@@ -242,10 +242,10 @@ def run_weight_only_int8_simulator_reference_teacher_forced_logits(
     identity. The reference mirrors the simulator's FP16-storage /
     FP32-internal contract.
     """
-    from .w8a32_simulator_reference import NanoGPTW8A32SimulatorReference
+    from .w8a16_simulator_reference import NanoGPTW8A16SimulatorReference
 
     inputs, _ = teacher_forced_inputs_and_targets(context_tokens)
-    ref = NanoGPTW8A32SimulatorReference(payload)
+    ref = NanoGPTW8A16SimulatorReference(payload)
     return ref.run_teacher_forced(inputs)
 
 
@@ -287,8 +287,6 @@ def run_fake_quant_teacher_forced_logits(
     calibration_scales: Dict[str, float],
     *,
     ptq_preset: str | Stage5PTQPreset | None = None,
-    keep_kv_cache_fp32: bool = False,
-    fp32_residual_stream: bool = False,
 ) -> List[np.ndarray]:
     inputs, _ = teacher_forced_inputs_and_targets(context_tokens)
     resolved_preset = resolve_stage5_ptq_preset(ptq_preset)
@@ -300,8 +298,6 @@ def run_fake_quant_teacher_forced_logits(
         raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
         raw_residual2_blocks=stage5_raw_residual2_blocks(resolved_preset),
         gelu_from_accum_blocks=stage5_gelu_from_accum_blocks(resolved_preset),
-        keep_kv_cache_fp32=keep_kv_cache_fp32,
-        fp32_residual_stream=fp32_residual_stream,
     )
     return ref.incremental_logits_trace(inputs)
 
@@ -325,8 +321,6 @@ def evaluate_gpt2_perplexity(
     output_aware_search_workers: int | None = None,
     output_aware_include_pairs: bool = False,
     compute_fp32_ceiling: bool = True,
-    debug_fp32_kv_cache: bool = False,
-    debug_fp32_residual_stream: bool = False,
     simulator_backed: bool = False,
 ) -> GPT2PerplexityResult:
     if context_len < 1:
@@ -374,7 +368,7 @@ def evaluate_gpt2_perplexity(
         vocab_size = int(payload["model_args"]["vocab_size"])
         # M4-F: when simulator_backed=True, both sides switch to the
         # M2.5-A-dynamic-scaling math.
-        #   - fake_quant path  = M4-E NanoGPTW8A32SimulatorReference
+        #   - fake_quant path  = M4-E NanoGPTW8A16SimulatorReference
         #   - golden path      = M4-F simulator-backed HostRunner bundle
         # relative_delta then measures codegen correctness (within
         # FP16 ULP) rather than the QDQ-vs-host-runner identity.
@@ -598,8 +592,6 @@ def evaluate_gpt2_perplexity(
         eval_tokens,
         calibration_scales,
         ptq_preset=resolved_preset,
-        keep_kv_cache_fp32=debug_fp32_kv_cache,
-        fp32_residual_stream=debug_fp32_residual_stream,
     )
     if len(golden_logits) != len(targets) or len(fake_logits) != len(targets):
         raise RuntimeError("teacher-forced logits/targets length mismatch")

@@ -42,28 +42,6 @@ def main(argv=None) -> int:
         help="Skip Phase 0A FP32-reference ceiling computation (saves ~30s/run).",
     )
     parser.add_argument(
-        "--debug-fp32-kv-cache",
-        action="store_true",
-        help=(
-            "Phase 0B diagnostic: keep K/V cache in FP32 in the fake-quant "
-            "reference (Q stays INT8). Tests whether K/V cache compounding "
-            "noise is the long-eval bottleneck. Reference-only — does NOT "
-            "ship to the deployed bundle."
-        ),
-    )
-    parser.add_argument(
-        "--debug-fp32-residual-stream",
-        action="store_true",
-        help=(
-            "Phase 1 Branch B diagnostic: route the residual stream through "
-            "FP32 in the fake-quant reference (no INT8 quantization on "
-            "block_residual1/2 or LN outputs ln1/ln2/ln_f; matmul outputs "
-            "Q/K/V/fc1/fc2/lm_head still INT8). Reference-only — does NOT "
-            "ship. Used to test whether residual-stream INT8 quantization "
-            "is the dominant long-eval bottleneck."
-        ),
-    )
-    parser.add_argument(
         "--simulator-backed",
         action="store_true",
         help=(
@@ -71,7 +49,7 @@ def main(argv=None) -> int:
             "compiled ProgramBundle + simulator (W8A16 deployment) instead "
             "of WeightOnlyHostRunner. When set, the `fake_quant` path uses "
             "the like-for-like NumPy reference "
-            "(NanoGPTW8A32SimulatorReference) and `relative_delta` measures "
+            "(NanoGPTW8A16SimulatorReference) and `relative_delta` measures "
             "codegen correctness, not host-runner-vs-reference identity. "
             "Note: ~100× slower than WeightOnlyHostRunner; expect ~2 min "
             "for 33-token / ~14 min for 257-token at GPT-2 124M."
@@ -110,8 +88,6 @@ def main(argv=None) -> int:
         output_aware_search_workers=args.output_aware_search_workers,
         output_aware_include_pairs=args.output_aware_include_pairs,
         compute_fp32_ceiling=(not args.skip_fp32_ceiling),
-        debug_fp32_kv_cache=args.debug_fp32_kv_cache,
-        debug_fp32_residual_stream=args.debug_fp32_residual_stream,
         simulator_backed=args.simulator_backed,
     )
     out = asdict(result)

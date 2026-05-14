@@ -65,7 +65,7 @@ def _diagnostic_host_runner_ppl(payload, eval_ids, vocab_size: int) -> float:
     return float(ppl)
 
 
-def _diagnostic_w8a32_simulator_ppl(payload, eval_ids, vocab_size: int) -> float:
+def _diagnostic_w8a16_simulator_ppl(payload, eval_ids, vocab_size: int) -> float:
     """W8A16 simulator-backed PPL — diagnostic logging only."""
     from taccel.runtime.gpt2_perplexity import (
         run_weight_only_int8_simulator_teacher_forced_logits,

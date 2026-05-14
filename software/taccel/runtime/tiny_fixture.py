@@ -199,7 +199,7 @@ def _fp32_bias(
 ) -> np.ndarray:
     """Return raw FP32 bias for the W8A32 path (M2.5-C), padded to N_pad.
 
-    The W8A32 matmul lowering (`emit_matmul_w8a32`) adds the bias in
+    The W8A32 matmul lowering (`emit_matmul_w8a16`) adds the bias in
     FP32 *after* the DEQUANT epilogue, so the bias is staged unscaled —
     just the original FP32 values from the state dict, padded to the
     matmul output width. Missing biases yield zeros (same fallback as
@@ -238,19 +238,19 @@ def quantize_fixture_payload(
     payload: Dict[str, object],
     calibration_scales: Optional[Dict[str, float]] = None,
     per_tensor_fc1_blocks: Optional[set[int]] = None,
-    w8a32_enabled: bool = False,
+    use_fp16_activations: bool = False,
 ):
     """Return codegen-ready weights, biases, FP32 biases, scales, config, and logits size.
 
     Returns a 6-tuple:
-      (weight_data, prescaled_biases, fp32_biases, calibration_scales,
+      (weight_data, prescaled_biases, biases, calibration_scales,
        config, logits_size)
 
-    `fp32_biases` holds raw FP32 bias values (padded to N_pad) for
+    `biases` holds raw FP32 bias values (padded to N_pad) for
     every matmul bias the W8A32 lowering will need to consume:
 
       M2.5-C (always staged, since these resolve through
-      `emit_matmul_w8a32` once the matmul lowering exists):
+      `emit_matmul_w8a16` once the matmul lowering exists):
         - `transformer.h.{layer}.attn.c_proj.bias` (out_proj)
         - `transformer.h.{layer}.mlp.c_fc.bias`     (fc1)
         - `transformer.h.{layer}.mlp.c_proj.bias`   (fc2)
@@ -262,7 +262,7 @@ def quantize_fixture_payload(
         - `transformer.h.{layer}.attn.c_attn.bias_h{H}_{proj}`
           for proj ∈ {query, key, value}, h ∈ [0, n_head).
 
-    `w8a32_enabled` (M3-prep, default False): when True, the token and
+    `use_fp16_activations` (M3-prep, default False): when True, the token and
     position embedding tables are stored as raw FP32 (4 bytes/elem)
     instead of being quantized to INT8. The codegen's
     `_emit_embedding_lookup` reads `d_model_pad * 4` bytes per row in
@@ -286,8 +286,8 @@ def quantize_fixture_payload(
     # a representation of token + position in any single real scale).
     # W8A32 path stores them as raw FP32 — no quantization step, no
     # cross-table scale constraint. The split below picks one or the
-    # other based on `w8a32_enabled` (M3-prep).
-    if w8a32_enabled:
+    # other based on `use_fp16_activations` (M3-prep).
+    if use_fp16_activations:
         # W8A16: embedding output is FP16 (2 bytes/elem). The codegen DMAs
         # `d_model_pad * 2` bytes per row and the resulting ABUF tile is
         # interpreted as FP16 by the first sub-layer op (LN widens FP16
@@ -313,7 +313,7 @@ def quantize_fixture_payload(
     prescaled_biases: Dict[str, np.ndarray] = {}
     # M2.5-C: raw FP32 biases for the W8A32 simple-matmul lowering.
     # Populated for non-attention matmuls only — see the docstring.
-    fp32_biases: Dict[str, np.ndarray] = {}
+    biases: Dict[str, np.ndarray] = {}
 
     for layer in range(config.n_layer):
         for ln in ("ln_1", "ln_2"):
@@ -339,13 +339,13 @@ def quantize_fixture_payload(
                         weight_scales=weight_data[name][1],
                     )
                     # M3-prep: stage the FP32 sibling for the per-head
-                    # Q/K/V matmul that emit_matmul_w8a32 will eventually
+                    # Q/K/V matmul that emit_matmul_w8a16 will eventually
                     # consume. Currently behind the matmul_qkt/matmul_attn_v
                     # guardrail (matmul_qkt/attn_v themselves are M3); the
                     # per-head Q/K/V matmuls upstream are `op="matmul"`
-                    # nodes and will be lowered by emit_matmul_w8a32 once
+                    # nodes and will be lowered by emit_matmul_w8a16 once
                     # M3 lifts the graph-level guardrail.
-                    fp32_biases[bias_name] = _fp32_bias(
+                    biases[bias_name] = _fp32_bias(
                         state_dict, bias_name, output_dim=config.d_head,
                     )
         weight_data[f"transformer.h.{layer}.attn.c_proj.weight"] = _quantize_linear_weight(
@@ -387,10 +387,10 @@ def quantize_fixture_payload(
                 weight_scales=weight_data[weight_name][1],
             )
             # M2.5-C: same families, FP32 unscaled — consumed by
-            # emit_matmul_w8a32 when w8a32_enabled. The bias names map
+            # emit_matmul_w8a16 when use_fp16_activations. The bias names map
             # 1:1 onto the IR node's `attrs["bias"]` values emitted by
             # the nanogpt frontend (out_proj, fc1, fc2 per layer).
-            fp32_biases[bias_name] = _fp32_bias(
+            biases[bias_name] = _fp32_bias(
                 state_dict, bias_name, output_dim=output_dim,
             )
 
@@ -407,16 +407,16 @@ def quantize_fixture_payload(
             weight_scales=weight_data["lm_head.weight"][1],
         )
         # M2.5-C: same key, FP32 unscaled.
-        fp32_biases["lm_head.bias"] = _fp32_bias(
+        biases["lm_head.bias"] = _fp32_bias(
             state_dict, "lm_head.bias", output_dim=config.vocab_size,
         )
     # W8A16: lm_head produces FP16 output (2 bytes/elem). The logits
     # DRAM region grows by 2× vs the INT8 path.
-    logits_elem_bytes = 2 if w8a32_enabled else 1
+    logits_elem_bytes = 2 if use_fp16_activations else 1
     return (
         weight_data,
         prescaled_biases,
-        fp32_biases,
+        biases,
         calibration_scales,
         config,
         pad_dim(config.vocab_size) * logits_elem_bytes,
@@ -444,7 +444,7 @@ def build_stage3_tiny_decoder_bundle(
     (
         weight_data,
         prescaled_biases,
-        fp32_biases,
+        biases,
         calibration_scales,
         config,
         logits_size,
@@ -452,7 +452,7 @@ def build_stage3_tiny_decoder_bundle(
         payload,
         calibration_scales=calibration_scales,
         per_tensor_fc1_blocks=gelu_from_accum_blocks,
-        w8a32_enabled=bool(resolved_preset.weight_only_int8),
+        use_fp16_activations=bool(resolved_preset.weight_only_int8),
     )
     validate_stage5_ptq_preset_for_model(config, resolved_preset)
     calibration_scales = apply_stage5_ptq_scale_policy(calibration_scales, config, resolved_preset)
@@ -482,8 +482,8 @@ def build_stage3_tiny_decoder_bundle(
         dequant_add_residual1_blocks=stage5_dequant_add_residual1_blocks(config, resolved_preset),
         dequant_add_residual2_blocks=stage5_dequant_add_residual2_blocks(config, resolved_preset),
         gelu_from_accum_blocks=gelu_from_accum_blocks or None,
-        w8a32_enabled=bool(resolved_preset.weight_only_int8),
-        fp32_biases=fp32_biases,
+        use_fp16_activations=bool(resolved_preset.weight_only_int8),
+        biases=biases,
     )
     return TinyFixtureBundle(build=build, config=config, logits_size=logits_size)
 

@@ -2,7 +2,7 @@
 
 This module contains the per-op lowering functions for the W8A32 path.
 The main `CodeGenerator` (`codegen.py`) dispatches to these helpers at
-each sub-layer emission site when its `w8a32_enabled` flag is True.
+each sub-layer emission site when its `use_fp16_activations` flag is True.
 
 Scope (M2 + M2.5-B)
 -------------------
@@ -11,7 +11,7 @@ Scope (M2 + M2.5-B)
   - GELU_FP32       (M2):       FP32-I/O drop-in for INT8 GELU
   - SOFTMAX_FP32 / MASKED_SOFTMAX_FP32 (M2): drop-in for INT8 softmax
   - VADD_FP32       (M2):       FP32-I/O drop-in for INT8 VADD residual
-  - emit_matmul_w8a32 (M2.5-B): full prelude+epilogue lowering of
+  - emit_matmul_w8a16 (M2.5-B): full prelude+epilogue lowering of
     `matmul` IR nodes using the M2.5-A dynamic activation-scale
     primitives. Sequence:
       FP32 input → MAX_ABS_REDUCE_FP32 → S[s] (127/max), S[s+1] (max/127)
@@ -26,7 +26,7 @@ Out of scope (M3)
 
   - `matmul_qkt` / `matmul_attn_v` (attention internals).
   - Strip-mined / large-weight-tiled / fused-out-proj-accum matmul
-    variants. emit_matmul_w8a32 raises NotImplementedError when any of
+    variants. emit_matmul_w8a16 raises NotImplementedError when any of
     the sizing thresholds force a non-simple lowering.
   - Fused gelu-from-accum and dequant-add residual epilogues.
   - Embedding → FP32 boundary handling (the IR fragments tested in
@@ -87,8 +87,8 @@ from .tiler import TILE, pad_dim
 def _fp16_to_uint16(val) -> int:
     """Convert FP32/python float to its FP16 bit pattern (uint16, little-endian).
 
-    Mirror of `codegen._fp16_to_uint16` — duplicated to keep w8a32_emit a
-    self-contained import surface (codegen imports w8a32_emit, not the
+    Mirror of `codegen._fp16_to_uint16` — duplicated to keep w8a16_emit a
+    self-contained import surface (codegen imports w8a16_emit, not the
     other way around).
     """
     fp16 = np.float16(val)
@@ -214,7 +214,7 @@ def emit_layernorm_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
     # earlier LN at a block boundary), reload it via the FP32 helper so
     # the LN reads it directly from ABUF.
     if in_name in cg.dram_temp_fp32_outputs and cg.mem.abuf.get(in_name) is None:
-        in_alloc = cg._load_dram_to_abuf_fp32(in_name, M_pad, N_pad)
+        in_alloc = cg._load_dram_to_abuf_fp(in_name, M_pad, N_pad)
     else:
         in_alloc = _abuf_alloc_fp32(cg, in_name, M_pad, N_pad)
     out_alloc = _abuf_alloc_fp32(cg, node.name, M_pad, N_pad)
@@ -250,14 +250,14 @@ def emit_layernorm_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
     # M4-A: spill the LN input (residual) to DRAM-temp if it has future
     # uses and is big enough to matter. This frees ABUF for the per-head
     # attention sub-block. The consumer (next residual VADD) reloads it
-    # via `_load_dram_to_abuf_fp32`. Skip for tiny fixtures (≤ 16 KB
+    # via `_load_dram_to_abuf_fp`. Skip for tiny fixtures (≤ 16 KB
     # tiles) so existing tests' instruction counts stay unchanged.
     tile_bytes = M_pad * N_pad * cg.elem_bytes
     last_use_idx = cg.last_uses.get(in_name, -1)
     has_future_use = last_use_idx > cg.current_node_idx
     if (
         has_future_use
-        and tile_bytes >= cg.fp32_spill_threshold_bytes
+        and tile_bytes >= cg.fp_spill_threshold_bytes
         and in_name not in cg.dram_temp_fp32_outputs
     ):
         cg._spill_fp32_tile_to_dram(in_name, in_alloc, M_pad, N_pad)
@@ -267,7 +267,7 @@ def emit_gelu_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
     """W8A32 GELU_FP32 lowering (tanh approximation, matching gelu_new).
 
     M4-G extension: when the input is in DRAM-temp (e.g. produced by
-    `emit_matmul_w8a32_large_weight_tiled` for fc1 → GELU → fc2 at
+    `emit_matmul_w8a16_large_weight_tiled` for fc1 → GELU → fc2 at
     GPT-2 scale where the 192 KB fc1 output doesn't fit ABUF), stream
     the GELU tile-by-tile through DRAM: load N-tile to ABUF → GELU →
     store back to DRAM. The output node lives in the same DRAM-temp
@@ -288,7 +288,7 @@ def emit_gelu_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
         input_dram_off = cg.dram_temp_outputs[in_name]
         full_bytes = M_pad * N_pad * cg.elem_bytes
         output_dram_off = cg.dram_temp_start + cg.mem.alloc_dram_temp(
-            f"{node.name}_w8a32_out_fp32", full_bytes
+            f"{node.name}_w8a16_out_fp32", full_bytes
         )
 
         # Pick an N-tile size that fits ABUF together with some slack
@@ -509,7 +509,7 @@ def emit_vadd_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
     1. **Reload from FP32 DRAM-temp.** If either input was spilled by
        an earlier `emit_layernorm_fp32` (block boundary residual), DMA-
        load it back into ABUF first. The reload uses the FP32 stride
-       (4 bytes/elem) — `_load_dram_to_abuf_fp32` does this.
+       (4 bytes/elem) — `_load_dram_to_abuf_fp` does this.
 
     2. **In-place output aliasing.** Write the FP32 sum into one of the
        input slots (either is safe since both inputs' last use is this
@@ -541,10 +541,10 @@ def emit_vadd_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
     in0_reloaded = False
     in1_reloaded = False
     if in0_name in cg.dram_temp_fp32_outputs and cg.mem.abuf.get(in0_name) is None:
-        cg._load_dram_to_abuf_fp32(in0_name, M_pad, N_pad)
+        cg._load_dram_to_abuf_fp(in0_name, M_pad, N_pad)
         in0_reloaded = True
     if in1_name in cg.dram_temp_fp32_outputs and cg.mem.abuf.get(in1_name) is None:
-        cg._load_dram_to_abuf_fp32(in1_name, M_pad, N_pad)
+        cg._load_dram_to_abuf_fp(in1_name, M_pad, N_pad)
         in1_reloaded = True
 
     cg._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=0))
@@ -609,7 +609,7 @@ def emit_vadd_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
 # ---------------------------------------------------------------------------
 
 
-def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
+def emit_matmul_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     """W8A32 matmul lowering using the M2.5-A dynamic activation-scale primitives.
 
     Replaces the INT8 path's REQUANT/REQUANT_PC epilogue with the
@@ -628,7 +628,7 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
       - Simple matmul only. The sizing thresholds that force
         strip-mining / large-weight-tiling in the INT8 path raise
         NotImplementedError here.
-      - `fp32_biases` must contain an entry for any `node.attrs['bias']`
+      - `biases` must contain an entry for any `node.attrs['bias']`
         referenced; the codegen stages it to DRAM as `f"{bias_name}__fp32"`.
       - Fused gelu-from-accum and dequant-add residual epilogues are
         force-disabled at CodeGenerator init; this helper raises if they
@@ -636,7 +636,7 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     """
     if node.op != "matmul":
         raise NotImplementedError(
-            f"emit_matmul_w8a32 only handles op='matmul' (got {node.op!r}); "
+            f"emit_matmul_w8a16 only handles op='matmul' (got {node.op!r}); "
             "matmul_qkt and matmul_attn_v are M3."
         )
     if cg._dequant_add_enabled_for_output(node.name):
@@ -695,12 +695,12 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
         or accum_bytes > ACCUM_SIZE
         or weight_bytes > WBUF_SIZE
     ):
-        emit_matmul_w8a32_large_weight_tiled(cg, node)
+        emit_matmul_w8a16_large_weight_tiled(cg, node)
         return
 
     # Per-channel FP16 weight-scale + folded bias vector staging symbol —
     # set up by `CodeGenerator.generate()` at DRAM-staging time when
-    # w8a32_enabled. 2N FP16 (PC scales + bias), folded into the DEQUANT
+    # use_fp16_activations. 2N FP16 (PC scales + bias), folded into the DEQUANT
     # epilogue per the bias-fold contract. Bias half is zero-padded when
     # the matmul has no bias.
     bias_name = node.attrs.get("bias")
@@ -711,13 +711,13 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     # FP32 alloc is reused here under the input's name.
     #
     # M4-debug: if the input was spilled to DRAM-temp by an earlier
-    # emit_matmul_w8a32 (post-QUANT spill, see below), reload it now.
+    # emit_matmul_w8a16 (post-QUANT spill, see below), reload it now.
     input_name = node.inputs[0]
     if (
         input_name in cg.dram_temp_fp32_outputs
         and cg.mem.abuf.get(input_name) is None
     ):
-        in_alloc = cg._load_dram_to_abuf_fp32(input_name, M_pad, K_pad)
+        in_alloc = cg._load_dram_to_abuf_fp(input_name, M_pad, K_pad)
     else:
         in_alloc = _abuf_alloc_fp32(cg, input_name, M_pad, K_pad)
     # FP32 output tile (M_pad × N_pad × 4 bytes).
@@ -772,7 +772,7 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     #      bias VADD's allocation pressure).
     #   2. Future use AND tile big enough to matter AND not yet in
     #      DRAM-temp: spill to DRAM-temp; the reload at the next
-    #      consumer's start uses _load_dram_to_abuf_fp32.
+    #      consumer's start uses _load_dram_to_abuf_fp.
     #   3. Future use AND already in DRAM-temp (this matmul reloaded
     #      from a prior spill): just free the ABUF copy. The DRAM slot
     #      from the earlier spill is still valid for the next consumer.
@@ -783,7 +783,7 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
         # Case 1: last use here. Free ABUF immediately.
         if cg.mem.abuf.get(input_name) is not None:
             cg.mem.abuf.free(input_name)
-    elif has_future_use and input_bytes >= cg.fp32_spill_threshold_bytes:
+    elif has_future_use and input_bytes >= cg.fp_spill_threshold_bytes:
         if input_name not in cg.dram_temp_fp32_outputs:
             # Case 2: first spill.
             cg._spill_fp32_tile_to_dram(input_name, in_alloc, M_pad, K_pad)
@@ -865,7 +865,7 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
 # ---------------------------------------------------------------------------
 
 
-def emit_matmul_w8a32_large_weight_tiled(
+def emit_matmul_w8a16_large_weight_tiled(
     cg: "CodeGenerator", node: "IRNode",
 ) -> None:
     """W8A32 matmul lowering when the weight blob exceeds WBUF or the
@@ -894,14 +894,14 @@ def emit_matmul_w8a32_large_weight_tiled(
     What this lowering does NOT handle
     ----------------------------------
     - **fc2-style large-input matmuls** where `M_pad × K_pad × 4 >
-      ABUF_SIZE`. The caller (`emit_matmul_w8a32`) raises
+      ABUF_SIZE`. The caller (`emit_matmul_w8a16`) raises
       NotImplementedError before reaching this helper. Two-pass max_abs
       + per-K-tile QUANT streaming is the planned follow-up.
     - **Fused gelu-from-accum / dequant-add residual** — both are
       force-disabled in W8A32 mode by the CodeGenerator constructor;
       this helper relies on that guarantee.
 
-    Mathematically identical to the simple `emit_matmul_w8a32`: one
+    Mathematically identical to the simple `emit_matmul_w8a16`: one
     dynamic activation scale, one INT32 K-accumulation per N-tile, one
     DEQUANT epilogue. The like-for-like Python reference (M4-E) needs
     no per-K-tile case.
@@ -935,7 +935,7 @@ def emit_matmul_w8a32_large_weight_tiled(
     # path: hardware MAX_ABS_REDUCE_FP32 can't combine across calls and
     # the input doesn't fit ABUF whole.
     if input_name in cg.dram_temp_fp32_outputs:
-        _emit_matmul_w8a32_large_input_streaming(
+        _emit_matmul_w8a16_large_input_streaming(
             cg, node, w_q, w_scales, M_pad, N_pad, K_pad,
         )
         return
@@ -985,7 +985,7 @@ def emit_matmul_w8a32_large_weight_tiled(
     # ----- DRAM-temp output region (full M_pad × N_pad FP32) -----
     output_bytes = M_pad * N_pad * cg.elem_bytes
     dram_temp_off = cg.dram_temp_start + cg.mem.alloc_dram_temp(
-        f"{node.name}_w8a32_out_fp32", output_bytes
+        f"{node.name}_w8a16_out_fp32", output_bytes
     )
 
     # ----- Per-N-tile DRAM addresses -----
@@ -1166,7 +1166,7 @@ def emit_matmul_w8a32_large_weight_tiled(
     )
 
 
-def _emit_matmul_w8a32_large_input_streaming(
+def _emit_matmul_w8a16_large_input_streaming(
     cg: "CodeGenerator", node: "IRNode",
     w_q: np.ndarray, w_scales: np.ndarray,
     M_pad: int, N_pad: int, K_pad: int,
@@ -1200,7 +1200,7 @@ def _emit_matmul_w8a32_large_input_streaming(
     # Output DRAM-temp slot for full M_pad × N_pad × elem_bytes FP-precision.
     output_bytes = M_pad * N_pad * cg.elem_bytes
     dram_temp_off = cg.dram_temp_start + cg.mem.alloc_dram_temp(
-        f"{node.name}_w8a32_out_fp32", output_bytes
+        f"{node.name}_w8a16_out_fp32", output_bytes
     )
 
     # Stage PC scale + bias addresses. W8A16: combined 2N-FP16 PC+bias
@@ -1421,11 +1421,11 @@ def _emit_matmul_w8a32_large_input_streaming(
 # ---------------------------------------------------------------------------
 
 
-def emit_matmul_qkt_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
+def emit_matmul_qkt_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     """W8A32 lowering for `matmul_qkt` (per-head Q @ K^T attention matmul).
 
     Q and K live in ABUF as FP32 (the per-head Q/K projection matmuls
-    that produced them were lowered through `emit_matmul_w8a32`, so
+    that produced them were lowered through `emit_matmul_w8a16`, so
     each already benefits from M2.5-A dynamic activation scaling at
     *its* re-quant boundary). For QKT we re-quantize Q and K to INT8
     using static calibration scales, INT8-matmul, then dequant via the
@@ -1670,18 +1670,18 @@ def emit_matmul_qkt_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
 # ---------------------------------------------------------------------------
 
 
-def emit_matmul_attn_v_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
+def emit_matmul_attn_v_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     """W8A32 lowering for `matmul_attn_v` (softmax(QK^T) @ V per head).
 
     Both inputs live in ABUF as FP32 by the time this emitter fires:
       - softmax output: produced by `emit_softmax_fp32` (M2) — FP32
         normalized probabilities in (M=seq_len, K=seq_len).
       - V tile: produced by the per-head V projection's
-        `emit_matmul_w8a32` — FP32 in (K=seq_len, N=d_head).
+        `emit_matmul_w8a16` — FP32 in (K=seq_len, N=d_head).
 
     V is already laid out as [K, N] (no transpose needed — the MATMUL
     expects src2 in WBUF as [K, N] which is exactly V's shape). So the
-    sequence is structurally similar to `emit_matmul_qkt_w8a32` minus
+    sequence is structurally similar to `emit_matmul_qkt_w8a16` minus
     the transpose step:
 
         FP32 softmax → QUANT_FP32_INT8 (S[s]=1/sm_scale) → INT8 ABUF scratch
@@ -1693,7 +1693,7 @@ def emit_matmul_attn_v_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
 
     Static calibration scales here — same architecture as the M3-A QKT
     re-quant boundary. No 1/√d_head factor in the composite (that was
-    already applied by emit_matmul_qkt_w8a32 in its dequant epilogue;
+    already applied by emit_matmul_qkt_w8a16 in its dequant epilogue;
     the softmax input is the correctly-scaled attention scores, and
     softmax output values are in [0, 1] regardless of input scale).
 
@@ -1708,7 +1708,7 @@ def emit_matmul_attn_v_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
 
     Synthetic-fragment caveat (test fixtures only):
       In real graphs every input to attn_v is produced by an earlier
-      `matmul` node whose `emit_matmul_w8a32` already allocated its
+      `matmul` node whose `emit_matmul_w8a16` already allocated its
       ABUF region under `node.name`. Tests that build a synthetic
       `matmul_attn_v` fragment with graph-input names like `sm`/`v_in`
       MUST pre-allocate those inputs in `cg.mem.abuf` before
@@ -1716,13 +1716,13 @@ def emit_matmul_attn_v_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
       land them on a region that an earlier emit step's freed scratch
       occupied — the emitted scratch-QUANT instruction still writes
       there at execution time and corrupts the pre-seeded input
-      bytes. The end-to-end test in `test_w8a32_codegen.py` does this
+      bytes. The end-to-end test in `test_w8a16_codegen.py` does this
       pre-allocation explicitly; see the comment around the
       `cg.mem.abuf.alloc("v_in", ...)` calls there.
     """
     if node.op != "matmul_attn_v":
         raise NotImplementedError(
-            f"emit_matmul_attn_v_w8a32 only handles op='matmul_attn_v' "
+            f"emit_matmul_attn_v_w8a16 only handles op='matmul_attn_v' "
             f"(got {node.op!r})."
         )
 
@@ -1745,7 +1745,7 @@ def emit_matmul_attn_v_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     )
 
     # ----- M3-C: zero V's FP32 pad rows before quantization -----
-    # Same reasoning as K's pad-row zero-fill in emit_matmul_qkt_w8a32:
+    # Same reasoning as K's pad-row zero-fill in emit_matmul_qkt_w8a16:
     # LN(zero_row) = β contaminates V's padding rows downstream of the V
     # projection. Zeroing the FP32 pad rows before V-QUANT ensures the
     # attention output (softmax × V) doesn't include padded-position

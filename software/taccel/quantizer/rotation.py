@@ -8,13 +8,11 @@ This module provides:
     weights; no runtime intervention is needed (modulo β-fold for LN, which
     lives in `taccel.quantizer.ln_fold`).
 
-This is the production counterpart of the diagnostic functions at
-`software/tools/diagnose_activation_outliers.py:330-680`. Differences from the
-diagnostic:
+Design history: the rotation was first prototyped as a fake-quant diagnostic
+(now retired). Production-relevant deltas from that prototype:
   * No `target_blocks` knob: rotation always covers the full network. Partial
     rotation is unsound in production (see plan §0).
-  * The runtime un-rotate-before-LN trick used by the diagnostic's
-    `_ResidualStreamRotatedFQReference` is replaced by the offline β-fold in
+  * The runtime un-rotate-before-LN trick is replaced by the offline β-fold in
     `taccel.quantizer.ln_fold`, which keeps the bundle's LN computation
     unchanged.
 

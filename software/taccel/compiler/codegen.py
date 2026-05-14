@@ -64,25 +64,25 @@ class CodeGenerator:
                  model_config: Optional[ModelConfig] = None,
                  stream_name: str = "prefill",
                  kv_layout: Optional[KVCacheLayout] = None,
-                 w8a32_enabled: bool = False,
-                 fp32_biases: Optional[Dict[str, np.ndarray]] = None):
+                 use_fp16_activations: bool = False,
+                 biases: Optional[Dict[str, np.ndarray]] = None):
         """
         Args:
             weight_data: name → (quantized_data, per_channel_scales)
             calibration_scales: tensor_name → per-tensor activation scale
             prescaled_biases: name → INT32 pre-scaled bias array
-            w8a32_enabled: When True, sub-layer ops (LAYERNORM_FP32,
+            use_fp16_activations: When True, sub-layer ops (LAYERNORM_FP32,
                 GELU_FP32, SOFTMAX_FP32, MASKED_SOFTMAX_FP32, VADD_FP32)
-                and matmul nodes lower through `w8a32_emit.py` — the
+                and matmul nodes lower through `w8a16_emit.py` — the
                 W8A16 path: INT8 weights + FP16 activations, bias folded
                 into DEQUANT_ACCUM_FP32_SCALED via 2N FP16 src2 layout.
                 The W8A8 INT8-round-trip optimizations
                 (dequant_add residual, requant_pc, gelu_from_accum,
                 fused_softmax_attnv) are force-disabled in W8A16 mode.
-                (Field name "w8a32_enabled" is retained for backward
+                (Field name "use_fp16_activations" is retained for backward
                 compat; semantically it now selects the W8A16 path.)
-            fp32_biases: Optional map of bias_name → FP32 1-D vector.
-                Used only when `w8a32_enabled=True`. The codegen stages
+            biases: Optional map of bias_name → FP32 1-D vector.
+                Used only when `use_fp16_activations=True`. The codegen stages
                 each FP32 bias folded into the
                 `__w8a16_pc_scale_and_bias` combined 2N FP16 blob
                 consumed by DEQUANT_ACCUM_FP32_SCALED.
@@ -100,10 +100,10 @@ class CodeGenerator:
         self.calibration_scales = calibration_scales
         self.prescaled_biases = prescaled_biases
         # FP biases for the W8A16 path. Empty dict when not provided so
-        # emit_matmul_w8a32 raises a clear error if a bias is referenced
+        # emit_matmul_w8a16 raises a clear error if a bias is referenced
         # without a corresponding FP32 staging entry.
-        self.fp32_biases: Dict[str, np.ndarray] = dict(fp32_biases or {})
-        self.w8a32_enabled = bool(w8a32_enabled)
+        self.biases: Dict[str, np.ndarray] = dict(biases or {})
+        self.use_fp16_activations = bool(use_fp16_activations)
         # W8A16: FP16 storage (2 bytes/elem) on all ABUF tiles produced
         # by R-type opcodes 0x17-0x1F; flags[0]=1 selects the FP16 path
         # at instruction-emit time. Both values are constants now that
@@ -111,7 +111,7 @@ class CodeGenerator:
         self.fp_precision = "fp16"
         self.elem_bytes: int = 2
         self.fp_precision_flag: int = 1
-        if self.w8a32_enabled:
+        if self.use_fp16_activations:
             # M2 design contract: in W8A32 mode the INT8-round-trip
             # optimizations are off — they're optimizations of behavior
             # the W8A32 path doesn't have. Force-disable so downstream
@@ -155,7 +155,7 @@ class CodeGenerator:
         # the FP32 stride. INT8 reloads use M_pad * N_pad bytes; FP32
         # reloads use M_pad * N_pad * 4 bytes.
         self.dram_temp_fp32_outputs: Dict[str, int] = {}
-        # M4-A: exposed to per-emitter helpers (see `w8a32_emit.py`).
+        # M4-A: exposed to per-emitter helpers (see `w8a16_emit.py`).
         # `last_uses` maps output_name → final node index that consumes it.
         # `current_node_idx` is the index of the node currently being emitted.
         # Set by `generate()` immediately before each `_emit_node` call.
@@ -166,7 +166,7 @@ class CodeGenerator:
         # existing test instruction counts are preserved; real GPT-2
         # (d_model=768) triggers spill. 8 KB matches the d_model ≈ 256
         # FP16 tile boundary.
-        self.fp32_spill_threshold_bytes: int = 8192
+        self.fp_spill_threshold_bytes: int = 8192
         # Default to 0 so unit tests that bypass _layout_weights (and
         # would set dram_temp_start to a non-zero offset) don't crash
         # in _spill_fp32_tile_to_dram. _layout_weights overwrites this.
@@ -192,9 +192,9 @@ class CodeGenerator:
         Returns (instructions, dram_data_blob).
         """
         # Phase 3 (c.1) M3-B: all W8A32 matmul ops are now lowered.
-        # - `matmul`         → emit_matmul_w8a32       (M2.5-B)
-        # - `matmul_qkt`     → emit_matmul_qkt_w8a32   (M3-A)
-        # - `matmul_attn_v`  → emit_matmul_attn_v_w8a32 (M3-B)
+        # - `matmul`         → emit_matmul_w8a16       (M2.5-B)
+        # - `matmul_qkt`     → emit_matmul_qkt_w8a16   (M3-A)
+        # - `matmul_attn_v`  → emit_matmul_attn_v_w8a16 (M3-B)
         # The graph-level guardrail is empty. Per-emitter NotImplementedError
         # still fires for unsupported shapes (strip-mining, pad-row
         # zero-fill, masked-softmax CONFIG_ATTN — the last two are M3-C
@@ -206,7 +206,7 @@ class CodeGenerator:
 
         # Compute last-use index for each node output so we can free ABUF
         last_uses = graph.compute_last_uses()
-        # M4-A: expose to per-emitter helpers (`w8a32_emit.emit_layernorm_fp32`
+        # M4-A: expose to per-emitter helpers (`w8a16_emit.emit_layernorm_fp32`
         # spills FP32 residuals after reading them, and `emit_vadd_fp32`
         # reloads them from `dram_temp_outputs` and aliases the output
         # in-place into the sublayer input — both rely on this state).
@@ -295,42 +295,18 @@ class CodeGenerator:
             offset += len(blob)
 
         # W8A32 (M2.5-B): stage raw FP32 biases under the symbol
-        # `f"{name}__fp32"`. emit_matmul_w8a32 DMA-loads these to ABUF and
+        # `f"{name}__fp32"`. emit_matmul_w8a16 DMA-loads these to ABUF and
         # VADD_FP32s them onto the post-DEQUANT FP32 matmul output. The
         # INT32 prescaled version above is unusable in W8A32 because the
         # dynamic activation scale (max_abs/127) is only known at runtime.
-        for name, bias_fp32 in self.fp32_biases.items():
+        for name, bias_fp32 in self.biases.items():
             sym = f"{name}__fp32"
             self.dram_layout[sym] = offset
             blob = np.asarray(bias_fp32, dtype=np.float32).tobytes()
             self.dram_blob.extend(blob)
             offset += len(blob)
 
-        # W8A32 (M2.5-B): stage an FP16 per-channel weight-scale vector
-        # for every 2-D quantized weight. DEQUANT_ACCUM_FP32_SCALED reads
-        # an FP16 PC vector from WBUF (loaded from DRAM at runtime). For
-        # per-tensor-quant weights the scales vector is constant across
-        # channels; we still stage N_pad entries so the WBUF DMA load is
-        # uniform across weight kinds. Padding cols beyond N_out get
-        # zero scales — the MATMUL output for padding cols is undefined
-        # in any case (the activation columns there are zero-padded).
-        if self.w8a32_enabled:
-            for name, (data, scales) in self.weight_data.items():
-                if not (isinstance(data, np.ndarray) and data.ndim == 2):
-                    continue
-                if scales is None:
-                    continue
-                N_pad = pad_dim(int(data.shape[1]))
-                pc_fp16 = np.zeros(N_pad, dtype=np.float16)
-                scales_fp16 = np.asarray(scales, dtype=np.float16).reshape(-1)
-                n_take = min(len(scales_fp16), N_pad)
-                pc_fp16[:n_take] = scales_fp16[:n_take]
-                sym = f"{name}__w8a32_pc_scale"
-                self.dram_layout[sym] = offset
-                blob = pc_fp16.tobytes()
-                self.dram_blob.extend(blob)
-                offset += len(blob)
-
+        if self.use_fp16_activations:
             # W8A16 (Phase 3 (c.2) M2): stage a combined PC-scale-plus-bias
             # FP16 blob per matmul weight. The DEQUANT_ACCUM_FP32_SCALED
             # epilogue under flags=1 reads `2N FP16` from src2 (N PC scales
@@ -363,8 +339,8 @@ class CodeGenerator:
                 pc_fp16[:n_take] = scales_fp16[:n_take]
                 bias_name = node.attrs.get("bias")
                 bias_fp16 = np.zeros(N_pad, dtype=np.float16)
-                if bias_name is not None and bias_name in self.fp32_biases:
-                    bias_src = np.asarray(self.fp32_biases[bias_name], dtype=np.float32).reshape(-1)
+                if bias_name is not None and bias_name in self.biases:
+                    bias_src = np.asarray(self.biases[bias_name], dtype=np.float32).reshape(-1)
                     b_take = min(len(bias_src), N_pad)
                     bias_fp16[:b_take] = bias_src[:b_take].astype(np.float16)
                 sym = f"{weight_name}__w8a16_pc_scale_and_bias"
@@ -383,7 +359,7 @@ class CodeGenerator:
                 offset += len(blob)
 
             # W8A32 (M3-A): stage a per-matmul_qkt FP16 PC scale vector.
-            # emit_matmul_qkt_w8a32 uses DEQUANT_ACCUM_FP32 (the M1 variant —
+            # emit_matmul_qkt_w8a16 uses DEQUANT_ACCUM_FP32 (the M1 variant —
             # no act_scale slot) to multiply the INT32 ACCUM by a single
             # composite factor `q_scale * k_scale * inv_sqrt_d_head` (static,
             # calibration-based). This folds the SCALE_MUL IR node into the
@@ -402,7 +378,7 @@ class CodeGenerator:
                     node.attrs.get("scale", self.config.d_head ** -0.5)
                 )
                 # Order of casts matters for FP16 bit-exactness — the
-                # codegen and `test_emit_matmul_qkt_w8a32_pc_scale_bytes_
+                # codegen and `test_emit_matmul_qkt_w8a16_pc_scale_bytes_
                 # bit_exact_fp16_composite` test fixture both go FP32 ×
                 # FP32 × FP32 → FP16. Don't refactor to a Python-float
                 # (FP64) intermediate: it would shift the FP16 rounding
@@ -430,11 +406,11 @@ class CodeGenerator:
                 offset += len(blob)
 
             # W8A32 (M3-B): stage a per-matmul_attn_v FP16 PC scale vector.
-            # emit_matmul_attn_v_w8a32 uses DEQUANT_ACCUM_FP32 (M1, no
+            # emit_matmul_attn_v_w8a16 uses DEQUANT_ACCUM_FP32 (M1, no
             # _SCALED) with a constant composite scale `sm_scale × v_scale`
             # — the softmax output's static calibration scale times V's
-            # output scale from its parent emit_matmul_w8a32. No
-            # 1/√d_head factor here (already applied by emit_matmul_qkt_w8a32
+            # output scale from its parent emit_matmul_w8a16. No
+            # 1/√d_head factor here (already applied by emit_matmul_qkt_w8a16
             # in its dequant epilogue, so the softmax input is already
             # the correctly-scaled attention scores).
             for node in graph.nodes:
@@ -474,12 +450,12 @@ class CodeGenerator:
             _zero_pad_size = (pad_dim(self.config.max_seq_len) - self.config.max_seq_len) * self.config.d_head
         else:
             _zero_pad_size = (TILE - 1) * self.config.d_model
-        if self.w8a32_enabled:
+        if self.use_fp16_activations:
             # Scale by element size: W8A32 = 4 bytes/elem, W8A16 = 2.
             _zero_pad_size *= self.elem_bytes
             # M4-debug (padding-pollution fix): enlarge `__zero_pad__` to
             # cover the largest K_pad across all W8A32 matmuls so
-            # emit_matmul_w8a32* can zero-fill input padding rows before
+            # emit_matmul_w8a16* can zero-fill input padding rows before
             # MAX_ABS_REDUCE_FP32. Padding rows accumulate non-zero values
             # (LN(zero_row)=beta, matmul outputs adding bias to all rows)
             # that inflate the dynamic activation scale and degrade INT8
@@ -792,9 +768,9 @@ class CodeGenerator:
         # raise NotImplementedError for the strip-mined / large-weight
         # cases (those are M3). Other paths (qkt, attn_v) are still
         # blocked by the `generate()` guardrail.
-        if self.w8a32_enabled:
-            from .w8a32_emit import emit_matmul_w8a32
-            emit_matmul_w8a32(self, node)
+        if self.use_fp16_activations:
+            from .w8a16_emit import emit_matmul_w8a16
+            emit_matmul_w8a16(self, node)
             return
 
         M, N = node.output_shape
@@ -2011,18 +1987,18 @@ class CodeGenerator:
         SOFTMAX each strip from ACCUM directly to INT8 → WBUF immediately.
         After all strips, WBUF holds [208,208] INT8 = 43KB for downstream softmax.
 
-        W8A32 mode (M3-A): dispatches to `emit_matmul_qkt_w8a32` which
+        W8A32 mode (M3-A): dispatches to `emit_matmul_qkt_w8a16` which
         re-quantizes the FP32 Q and K (produced by the upstream per-head
-        Q/K projection matmuls under `emit_matmul_w8a32`) to INT8 with
+        Q/K projection matmuls under `emit_matmul_w8a16`) to INT8 with
         static calibration scales, does INT8 MATMUL, and dequants to FP32
         scores via DEQUANT_ACCUM_FP32 with a composite PC scale that folds
         `1/√d_head` into the dequant factor. The downstream `scale_mul`
         IR node becomes a no-op (rename) and `softmax` flows through
         MASKED_SOFTMAX_FP32 (M2 path).
         """
-        if self.w8a32_enabled:
-            from .w8a32_emit import emit_matmul_qkt_w8a32
-            emit_matmul_qkt_w8a32(self, node)
+        if self.use_fp16_activations:
+            from .w8a16_emit import emit_matmul_qkt_w8a16
+            emit_matmul_qkt_w8a16(self, node)
             return
         head_idx = node.attrs["head_idx"]
         query_len = int(node.attrs.get("query_len", node.output_shape[0]))
@@ -2359,15 +2335,15 @@ class CodeGenerator:
         V_h is in ABUF. MATMUL src1=WBUF[attn], src2=ABUF[V].
         After matmul, free both attn (WBUF) and V (ABUF via last-use).
 
-        W8A32 mode (M3-B): dispatches to `emit_matmul_attn_v_w8a32`.
+        W8A32 mode (M3-B): dispatches to `emit_matmul_attn_v_w8a16`.
         Both inputs are FP32 in ABUF by that point (softmax output FP32
         from emit_softmax_fp32; V FP32 from the per-head V projection's
-        emit_matmul_w8a32). Re-quant statically, INT8 MATMUL, DEQUANT
+        emit_matmul_w8a16). Re-quant statically, INT8 MATMUL, DEQUANT
         to FP32 attn_v tile. No transpose (V is already K-major).
         """
-        if self.w8a32_enabled:
-            from .w8a32_emit import emit_matmul_attn_v_w8a32
-            emit_matmul_attn_v_w8a32(self, node)
+        if self.use_fp16_activations:
+            from .w8a16_emit import emit_matmul_attn_v_w8a16
+            emit_matmul_attn_v_w8a16(self, node)
             return
         if self._block_selected(node.name, self.fused_softmax_attnv_blocks):
             return
@@ -2472,27 +2448,27 @@ class CodeGenerator:
         M_pad = pad_dim(seq_len)
         N_pad = pad_dim(head_dim)
         num_heads = len(node.inputs)
-        # M4-debug (concat_heads W8A32 fix) + M2-W8A16: when w8a32_enabled,
+        # M4-debug (concat_heads W8A32 fix) + M2-W8A16: when use_fp16_activations,
         # per-head attn_v outputs live in ABUF as FP-precision (FP32 or
         # FP16). The pre-M4-debug emitter unconditionally read from WBUF;
         # for W8A32 with n_head>=1 this produced an unfilled out_alloc
         # whose bytes were stale INT8 scratch (read as FP32 → 0x7F7F7F7F ≈
         # 3.4e38). W8A16 needs elem_bytes=2 (FP16 stride) not 4.
-        elem_bytes = self.elem_bytes if self.w8a32_enabled else 1
+        elem_bytes = self.elem_bytes if self.use_fp16_activations else 1
         per_head_bytes = N_pad * elem_bytes
         total_out_bytes_per_row = num_heads * per_head_bytes
         # M4-debug (concat_heads ABUF fragmentation): at GPT-2 scale
         # (n_head=12, d_head=64, FP32) the per-head loop fragments ABUF.
         # Need 48 KB contiguous for the concat tile; compaction packs
         # live allocations leftward to expose a large free block.
-        if self.w8a32_enabled:
+        if self.use_fp16_activations:
             self._compact_abuf()
         out_alloc = self.mem.abuf.alloc(node.name, M_pad * total_out_bytes_per_row)
 
         row_units = per_head_bytes // UNIT
         out_row_units = total_out_bytes_per_row // UNIT
 
-        if self.w8a32_enabled:
+        if self.use_fp16_activations:
             # W8A32: optimize n_head=1 with a rename (no copy). For
             # n_head>1, emit BufCopy from ABUF (the head's FP32 region)
             # into the concat slot, M_pad rows per head.
@@ -2510,7 +2486,7 @@ class CodeGenerator:
                         out_alloc = src_alloc
             else:
                 # M4-debug: per-head attn_v outputs may have been spilled
-                # to DRAM-temp by emit_matmul_attn_v_w8a32 (production
+                # to DRAM-temp by emit_matmul_attn_v_w8a16 (production
                 # decode scale Kseq_pad >= 64). Reload each one before
                 # BufCopying to its concat slot, then free the reloaded
                 # ABUF tile.
@@ -2519,7 +2495,7 @@ class CodeGenerator:
                         inp_name in self.dram_temp_fp32_outputs
                         and self.mem.abuf.get(inp_name) is None
                     ):
-                        self._load_dram_to_abuf_fp32(inp_name, M_pad, N_pad)
+                        self._load_dram_to_abuf_fp(inp_name, M_pad, N_pad)
                     src_alloc = self.mem.abuf.get(inp_name)
                     if src_alloc is None:
                         continue
@@ -2597,11 +2573,11 @@ class CodeGenerator:
 
     def _emit_softmax(self, node: IRNode):
         """C1: softmax already emitted per-strip in _emit_qkt; this node is a rename."""
-        if self.w8a32_enabled:
+        if self.use_fp16_activations:
             # Phase 3 (c.1) M2: softmax in W8A32 emits SOFTMAX_FP32 (or
             # MASKED_SOFTMAX_FP32 for causal). Causal detection comes
             # from the node's attrs — same convention as the INT8 path.
-            from .w8a32_emit import emit_softmax_fp32
+            from .w8a16_emit import emit_softmax_fp32
             masked = bool(node.attrs.get("causal", False)) or bool(node.attrs.get("masked", False))
             emit_softmax_fp32(self, node, masked=masked)
             return
@@ -2615,11 +2591,11 @@ class CodeGenerator:
 
     def _emit_gelu(self, node: IRNode):
         """Emit GELU SFU instruction (no-op if inlined with a strip-mined matmul)."""
-        if self.w8a32_enabled:
+        if self.use_fp16_activations:
             # Phase 3 (c.1) M2: GELU dispatches to the FP32 lowering helper.
             # W8A32 mode force-disables gelu_from_accum + strip-mined inlining,
             # so the simple GELU path is what we want here.
-            from .w8a32_emit import emit_gelu_fp32
+            from .w8a16_emit import emit_gelu_fp32
             emit_gelu_fp32(self, node)
             return
         if node.attrs.get("inline_with"):
@@ -2742,9 +2718,9 @@ class CodeGenerator:
 
     def _emit_layernorm(self, node: IRNode):
         """Emit LAYERNORM SFU instruction."""
-        if self.w8a32_enabled:
+        if self.use_fp16_activations:
             # Phase 3 (c.1) M2: LN dispatches to the FP32 lowering helper.
-            from .w8a32_emit import emit_layernorm_fp32
+            from .w8a16_emit import emit_layernorm_fp32
             emit_layernorm_fp32(self, node)
             return
         M_pad = pad_dim(node.output_shape[0])
@@ -2858,7 +2834,7 @@ class CodeGenerator:
 
         Returns the DRAM byte offset where the FP32 tile lives. The
         consumer (typically `emit_vadd_fp32`) reloads it via
-        `_load_dram_to_abuf_fp32` and the spilled `dram_temp_outputs`
+        `_load_dram_to_abuf_fp` and the spilled `dram_temp_outputs`
         entry is cleaned up in the generate loop's post-emit free.
         """
         size_bytes = M_pad * N_pad * self.elem_bytes  # FP32=4, FP16=2
@@ -2877,7 +2853,7 @@ class CodeGenerator:
         self.mem.abuf.free(name)
         return dram_off
 
-    def _load_dram_to_abuf_fp32(self, input_name: str,
+    def _load_dram_to_abuf_fp(self, input_name: str,
                                  M_pad: int, N_pad: int) -> Allocation:
         """M4-A: FP32 counterpart to `_load_dram_to_abuf` (4 bytes/elem).
 
@@ -2901,14 +2877,14 @@ class CodeGenerator:
         Handles the case where one input is DRAM-resident (strip-mined output)
         by loading it into ABUF first.
         """
-        if self.w8a32_enabled:
+        if self.use_fp16_activations:
             # Phase 3 (c.1) M2: residual stream VADD in W8A32 emits the
             # non-saturating VADD_FP32. dequant_add residual paths are
             # force-disabled in the W8A32 constructor, so we won't hit
             # the DequantAddInsn branch below in this mode.
             if node.name in self.precomputed_nodes:
                 return
-            from .w8a32_emit import emit_vadd_fp32
+            from .w8a16_emit import emit_vadd_fp32
             emit_vadd_fp32(self, node)
             return
         M_pad = pad_dim(node.output_shape[0])
@@ -3044,11 +3020,11 @@ class CodeGenerator:
         # M3-prep + M2-W8A16: token/position embeddings emit at FP precision
         # in W8A{32,16} mode (`self.elem_bytes` = 4 for fp32, 2 for fp16).
         # The DeiT path uses embedding_kind="patch_cls" and never sets
-        # w8a32_enabled today (CodeGenerator init force-disables W8A8
+        # use_fp16_activations today (CodeGenerator init force-disables W8A8
         # opts for W8A32 but doesn't touch the DeiT compiler entry);
         # the embedding-kind guard makes the intent explicit.
         use_fp = (
-            self.w8a32_enabled
+            self.use_fp16_activations
             and self.config.embedding_kind == "token_pos"
         )
         elem_bytes = self.elem_bytes if use_fp else 1
@@ -3134,12 +3110,12 @@ class CodeGenerator:
         tokens = int(node.attrs.get("tokens", 1 if decode_default else node.attrs.get("seq_len", 1)))
         # M4-B: W8A32 stores FP32 K/V tiles (4 bytes/elem) in the KV cache.
         # The KV cache layout's `elem_bytes` is the source of truth; falling
-        # back to `w8a32_enabled` keeps decoder bundles whose `kv_layout`
+        # back to `use_fp16_activations` keeps decoder bundles whose `kv_layout`
         # wasn't built with explicit `elem_bytes` working as expected.
         elem_bytes = 1
         if self.kv_layout is not None:
             elem_bytes = int(self.kv_layout.elem_bytes)
-        elif self.w8a32_enabled:
+        elif self.use_fp16_activations:
             elem_bytes = 4
         return tokens * self.config.d_head * elem_bytes
 
@@ -3203,12 +3179,12 @@ class CodeGenerator:
                 # QUANT's INT8 destination, corrupting the FP16 K source at offsets
                 # [192..256] and producing NaN-decoded INT8 byte pairs (e.g. 0x09
                 # 0xfc -> FP16 NaN). See tools/debug_w8a16_nan.py for the trace.
-                tile_elem_bytes = self.elem_bytes if self.w8a32_enabled else 1
+                tile_elem_bytes = self.elem_bytes if self.use_fp16_activations else 1
                 alloc_bytes = max(alloc_bytes, rows * cols * tile_elem_bytes)
             # M4-debug: large W8A32 kv_load tiles (256-token K/V FP32 cache
             # at GPT-2 scale = 64 KB) fragment under first-fit. Compact
             # before the alloc to expose a contiguous free region.
-            if dst_buf == BUF_ABUF and self.w8a32_enabled and alloc_bytes > 16 * 1024:
+            if dst_buf == BUF_ABUF and self.use_fp16_activations and alloc_bytes > 16 * 1024:
                 self._compact_abuf()
             alloc = self.mem.abuf.alloc(node.name, alloc_bytes)
             dst_off = alloc.offset_units
@@ -3260,7 +3236,7 @@ class CodeGenerator:
 
         W8A32 path (M3-D): lm_head produces FP32 (4 bytes/elem), so the
         DMA store moves 4× more bytes and row strides are 4× wider.
-        Detected via `cg.w8a32_enabled`; the IR contract is unchanged
+        Detected via `cg.use_fp16_activations`; the IR contract is unchanged
         (logits_store always describes the logical shape).
         """
         if not node.inputs:
@@ -3289,7 +3265,7 @@ class CodeGenerator:
         # M3-D + M2-W8A16: W8A{32,16} lm_head output is FP-precision
         # (FP32=4 or FP16=2 bytes/elem) — both the DMA xfer size and
         # the row stride scale by self.elem_bytes.
-        elem_bytes = self.elem_bytes if self.w8a32_enabled else 1
+        elem_bytes = self.elem_bytes if self.use_fp16_activations else 1
         size_bytes = int(node.attrs.get(
             "xfer_bytes", store_rows * cols_pad * elem_bytes,
         ))
