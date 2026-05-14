@@ -9,6 +9,7 @@ from typing import Dict, Iterable, List, Sequence
 import numpy as np
 import torch
 
+from taccel.compiler.tiler import pad_dim
 from taccel.runtime.calibration import (
     apply_fc2_aware_gelu_scale_search_from_token_ids,
     apply_output_aware_attn_scale_search_from_token_ids,
@@ -170,6 +171,7 @@ def _golden_generate(
     ptq_preset,
     calibration_scales: Dict[str, float],
     vocab_size: int,
+    fp_precision: str = "fp32",
 ) -> List[int]:
     prompt = [int(tok) for tok in prompt_ids]
     if not prompt:
@@ -180,8 +182,15 @@ def _golden_generate(
         smoke_decode_steps=max_decode_position,
         calibration_scales=calibration_scales,
         ptq_preset=ptq_preset,
+        fp_precision=fp_precision,
     )
-    runner = HostRunner(tiny.build.bundle, logits_dtype=np.int8)
+    # M4-F: infer logits dtype from the bundle's logits_size byte budget.
+    #   pad_dim(vocab) * 1 = INT8  (W8A8 path; fp_precision is ignored)
+    #   pad_dim(vocab) * 2 = FP16  (W8A16 path; fp_precision="fp16")
+    #   pad_dim(vocab) * 4 = FP32  (W8A32 path; fp_precision="fp32")
+    elem_bytes = max(1, int(tiny.logits_size) // pad_dim(int(vocab_size)))
+    logits_dtype = {1: np.int8, 2: np.float16, 4: np.float32}.get(elem_bytes, np.int8)
+    runner = HostRunner(tiny.build.bundle, logits_dtype=logits_dtype)
 
     generated = list(prompt)
     logits = runner.run_prefill([prompt[0]])
@@ -246,6 +255,21 @@ def main(argv=None) -> int:
         "--quality-preset",
         action="store_true",
         help=f"use the current Stage 5 promoted preset ({stage5_default_ptq_preset_name()}); slower startup",
+    )
+    parser.add_argument(
+        "--fp-precision",
+        choices=("fp32", "fp16"),
+        default="fp32",
+        help=(
+            "FP storage precision for the W8A32/W8A16 weight-only preset "
+            "(weight_only_int8). 'fp32' = W8A32 (legacy, INT8 weights + "
+            "FP32 activations). 'fp16' = W8A16 (INT8 weights + FP16 "
+            "activations + bias-fold DEQUANT, the current deployment "
+            "path). Ignored for INT8 (W8A8) presets — the chat default "
+            "'fc2_8_to_11_raw_vadd' is W8A8 so this flag has no effect "
+            "unless you also pass --ptq-preset weight_only_int8 (or use "
+            "--quality-preset if that resolves to a W8A32-class preset)."
+        ),
     )
     parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--context-tokens", type=int, default=96)
@@ -317,6 +341,25 @@ def main(argv=None) -> int:
     if args.mode in {"golden", "both"}:
         if not args.calibration_text.exists():
             raise FileNotFoundError(args.calibration_text)
+        # Label the actual deployment path so users don't mistake a silently-
+        # W8A8 run for W8A16. Only weight_only_int8 presets honor --fp-precision.
+        if bool(getattr(ptq_preset, "weight_only_int8", False)):
+            deployment_label = f"W8A{16 if args.fp_precision == 'fp16' else 32}"
+            deployment_detail = (
+                "INT8 weights + FP16 activations (bias-fold DEQUANT)"
+                if args.fp_precision == "fp16"
+                else "INT8 weights + FP32 activations"
+            )
+        else:
+            deployment_label = "W8A8"
+            deployment_detail = "INT8 weights + INT8 activations"
+            if args.fp_precision != "fp32":
+                print(
+                    f"NOTE: --fp-precision {args.fp_precision} is ignored for the "
+                    f"'{ptq_preset.name}' preset (not weight_only_int8). "
+                    "Pass --ptq-preset weight_only_int8 for the W8A16 path."
+                )
+        print(f"golden deployment path: {deployment_label} ({deployment_detail})")
         print(
             "Preparing golden model calibration "
             f"({ptq_preset.name}, {calibration_n_seqs}x{calibration_seq_len})..."
@@ -404,6 +447,7 @@ def main(argv=None) -> int:
                 ptq_preset=ptq_preset,
                 calibration_scales=golden_scales,
                 vocab_size=vocab_size,
+                fp_precision=args.fp_precision,
             )
             response = _response_text(tokenizer, generated, len(prompt_ids), stop_strings)
             if args.prompt_style == "chat":
