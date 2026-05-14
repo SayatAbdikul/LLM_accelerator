@@ -3132,6 +3132,11 @@ class CodeGenerator:
                 rows = pad_dim(int(node.output_shape[0]))
                 cols = pad_dim(int(node.output_shape[1]))
                 alloc_bytes = max(alloc_bytes, rows * cols)
+            # M4-debug: large W8A32 kv_load tiles (256-token K/V FP32 cache
+            # at GPT-2 scale = 64 KB) fragment under first-fit. Compact
+            # before the alloc to expose a contiguous free region.
+            if dst_buf == BUF_ABUF and self.w8a32_enabled and alloc_bytes > 16 * 1024:
+                self._compact_abuf()
             alloc = self.mem.abuf.alloc(node.name, alloc_bytes)
             dst_off = alloc.offset_units
         tokens = int(node.attrs.get("tokens", 1))

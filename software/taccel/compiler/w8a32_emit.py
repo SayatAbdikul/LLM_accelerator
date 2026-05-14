@@ -700,7 +700,17 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     # ----- ABUF allocations -----
     # FP32 input tile (M_pad × K_pad × 4 bytes). The prior op's output
     # FP32 alloc is reused here under the input's name.
-    in_alloc = _abuf_alloc_fp32(cg, node.inputs[0], M_pad, K_pad)
+    #
+    # M4-debug: if the input was spilled to DRAM-temp by an earlier
+    # emit_matmul_w8a32 (post-QUANT spill, see below), reload it now.
+    input_name = node.inputs[0]
+    if (
+        input_name in cg.dram_temp_fp32_outputs
+        and cg.mem.abuf.get(input_name) is None
+    ):
+        in_alloc = cg._load_dram_to_abuf_fp32(input_name, M_pad, K_pad)
+    else:
+        in_alloc = _abuf_alloc_fp32(cg, input_name, M_pad, K_pad)
     # FP32 output tile (M_pad × N_pad × 4 bytes).
     out_alloc = _abuf_alloc_fp32(cg, node.name, M_pad, N_pad)
     # INT8 scratch tile (M_pad × K_pad × 1 byte) for the QUANT output.
@@ -742,6 +752,27 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
         )
     )
     cg._emit(SyncInsn(resource_mask=0b100))
+
+    # M4-debug: spill the FP32 input ABUF region to DRAM-temp if it
+    # has future uses (e.g. block0_ln1 is consumed by 12 heads × 3
+    # projections = 36 Q/K/V matmuls but stays alive across the per-
+    # head loop). Spilling frees 48 KB ABUF at d_model=768 so the
+    # downstream kv_load + QKT can fit. The next matmul that reads
+    # this input reloads via the dram_temp_fp32_outputs check above.
+    last_use_idx = cg.last_uses.get(input_name, -1)
+    input_bytes = M_pad * K_pad * FP32_BYTES_PER_ELEM
+    if (
+        last_use_idx > cg.current_node_idx
+        and input_bytes >= cg.fp32_spill_threshold_bytes
+        and input_name not in cg.dram_temp_fp32_outputs
+    ):
+        cg._spill_fp32_tile_to_dram(input_name, in_alloc, M_pad, K_pad)
+    elif last_use_idx == cg.current_node_idx:
+        # Last use is this matmul; the post-emit free will release the
+        # ABUF slot but we can release it sooner to give the rest of
+        # this emission (DEQUANT output, bias VADD) more breathing room.
+        if cg.mem.abuf.get(input_name) is not None:
+            cg.mem.abuf.free(input_name)
 
     # ----- Stage 3: Load INT8 weights + FP16 PC scales to WBUF -----
     dram_off = cg._dram_offset_required(weight_name, f"loading weight '{weight_name}'")
