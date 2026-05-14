@@ -425,6 +425,19 @@ class CodeGenerator:
             _zero_pad_size = (TILE - 1) * self.config.d_model
         if self.w8a32_enabled:
             _zero_pad_size *= 4
+            # M4-debug (padding-pollution fix): enlarge `__zero_pad__` to
+            # cover the largest K_pad across all W8A32 matmuls so
+            # emit_matmul_w8a32* can zero-fill input padding rows before
+            # MAX_ABS_REDUCE_FP32. Padding rows accumulate non-zero values
+            # (LN(zero_row)=beta, matmul outputs adding bias to all rows)
+            # that inflate the dynamic activation scale and degrade INT8
+            # precision catastrophically when M_pad >> M (decode/single-
+            # token prefill).
+            max_k_pad = self.config.d_model
+            for _w_name, (data, _scales) in self.weight_data.items():
+                if isinstance(data, np.ndarray) and data.ndim == 2:
+                    max_k_pad = max(max_k_pad, pad_dim(int(data.shape[0])))
+            _zero_pad_size = max(_zero_pad_size, (TILE - 1) * max_k_pad * 4)
         self.dram_layout["__zero_pad__"] = offset
         self.dram_blob.extend(bytes(_zero_pad_size))
         offset += _zero_pad_size
@@ -2385,20 +2398,19 @@ class CodeGenerator:
         )
 
     def _emit_concat_heads(self, node: IRNode):
-        """BUF_COPY per-head outputs from WBUF into a contiguous ABUF region.
+        """BUF_COPY per-head outputs from WBUF (INT8) or ABUF (W8A32 FP32)
+        into a contiguous ABUF region.
 
-        Each head's attn_v output [M_pad, head_dim] is in WBUF. We interleave
-        them into ABUF to form the correct [M_pad, num_heads*head_dim] layout
-        required by the out_proj matmul.
+        INT8 path: each head's attn_v output [M_pad, head_dim] is in WBUF.
+        We interleave them into ABUF as [M_pad, num_heads * head_dim] INT8.
+
+        W8A32 path (M3-B+): each head's attn_v output is FP32 in ABUF
+        (4 bytes/elem). We interleave them into a contiguous FP32 ABUF
+        region with 4× the byte stride.
 
         The matmul reads activations as row-major [M, K], so each output row t
         must contain all heads' data for that token:
-            ABUF[out + t*K_total : out + t*K_total + K_total] = [h0[t], h1[t], ..., hH[t]]
-
-        BufCopy only supports flat (non-strided) copies, so we emit one copy
-        per token per head (row_units = head_dim / UNIT = 4 units per copy):
-            src: WBUF[head_h + t * row_units]
-            dst: ABUF[out  + t * out_row_units + h * row_units]
+            tile[t, :] = [h0[t], h1[t], ..., hH[t]]
         """
         if self._fused_softmax_attnv_accum_out_proj_enabled_for(node.name):
             return
@@ -2408,18 +2420,71 @@ class CodeGenerator:
         M_pad = pad_dim(seq_len)
         N_pad = pad_dim(head_dim)
         num_heads = len(node.inputs)
+        # M4-debug (concat_heads W8A32 fix): when w8a32_enabled, per-head
+        # attn_v outputs live in ABUF as FP32, not WBUF as INT8. The
+        # pre-M4-debug emitter unconditionally read from WBUF; for W8A32
+        # with n_head>=1 this produced an unfilled out_alloc whose bytes
+        # were stale INT8 scratch from prior matmuls (read as FP32 →
+        # 0x7F7F7F7F ≈ 3.4e38). Catastrophic downstream PPL.
+        elem_bytes = 4 if self.w8a32_enabled else 1
+        per_head_bytes = N_pad * elem_bytes
+        total_out_bytes_per_row = num_heads * per_head_bytes
+        # M4-debug (concat_heads ABUF fragmentation): at GPT-2 scale
+        # (n_head=12, d_head=64, FP32) the per-head loop fragments ABUF.
+        # Need 48 KB contiguous for the concat tile; compaction packs
+        # live allocations leftward to expose a large free block.
+        if self.w8a32_enabled:
+            self._compact_abuf()
+        out_alloc = self.mem.abuf.alloc(node.name, M_pad * total_out_bytes_per_row)
 
-        total_out_dim = num_heads * N_pad          # 192 bytes per token
-        out_alloc = self.mem.abuf.alloc(node.name, M_pad * total_out_dim)
+        row_units = per_head_bytes // UNIT
+        out_row_units = total_out_bytes_per_row // UNIT
 
-        row_units     = N_pad // UNIT              # units per token row per head (=4)
-        out_row_units = total_out_dim // UNIT      # units per token row total   (=12)
+        if self.w8a32_enabled:
+            # W8A32: optimize n_head=1 with a rename (no copy). For
+            # n_head>1, emit BufCopy from ABUF (the head's FP32 region)
+            # into the concat slot, M_pad rows per head.
+            if num_heads == 1:
+                inp_name = node.inputs[0]
+                src_alloc = self.mem.abuf.get(inp_name)
+                if src_alloc is not None:
+                    # Free the just-allocated out_alloc and rename the
+                    # head's existing allocation to the concat node name.
+                    self.mem.abuf.free(node.name)
+                    src_alloc = self.mem.abuf.allocations.pop(inp_name, None)
+                    if src_alloc is not None:
+                        src_alloc.name = node.name
+                        self.mem.abuf.allocations[node.name] = src_alloc
+                        out_alloc = src_alloc
+            else:
+                for h, inp_name in enumerate(node.inputs):
+                    src_alloc = self.mem.abuf.get(inp_name)
+                    if src_alloc is None:
+                        continue
+                    for t in range(M_pad):
+                        src_off = src_alloc.offset_units + t * row_units
+                        dst_off = out_alloc.offset_units + t * out_row_units + h * row_units
+                        self._emit(BufCopyInsn(
+                            src_buf=BUF_ABUF, src_off=src_off,
+                            dst_buf=BUF_ABUF, dst_off=dst_off,
+                            length=row_units,
+                        ))
+                        self._emit(SyncInsn(resource_mask=0b001))
+                    self.mem.abuf.free(inp_name)
+            self._record_trace_event(
+                node.name, BUF_ABUF, out_alloc.offset_units,
+                M_pad, total_out_bytes_per_row // 4,  # FP32 elements per row
+                seq_len, node.output_shape[1], "fp32",
+                self.calibration_scales.get(node.name, 1.0 / 127.0),
+            )
+            return
 
+        # Legacy INT8 path: per-head outputs are in WBUF.
         for h, inp_name in enumerate(node.inputs):
             src_alloc = self.mem.wbuf.get(inp_name)
             if src_alloc is None:
                 continue
-            for t in range(M_pad):                 # one copy per token
+            for t in range(M_pad):
                 src_off = src_alloc.offset_units + t * row_units
                 dst_off = out_alloc.offset_units + t * out_row_units + h * row_units
                 self._emit(BufCopyInsn(
@@ -2434,7 +2499,7 @@ class CodeGenerator:
             BUF_ABUF,
             out_alloc.offset_units,
             M_pad,
-            total_out_dim,
+            total_out_bytes_per_row,
             seq_len,
             node.output_shape[1],
             "int8",

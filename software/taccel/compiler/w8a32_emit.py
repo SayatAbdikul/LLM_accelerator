@@ -108,6 +108,57 @@ if TYPE_CHECKING:
 FP32_BYTES_PER_ELEM = 4
 
 
+def _zero_fill_fp32_padding_rows(
+    cg: "CodeGenerator",
+    in_alloc,
+    M: int,
+    M_pad: int,
+    K_pad: int,
+) -> None:
+    """M4-debug: zero out FP32 padding rows [M, M_pad) × K_pad of an ABUF tile.
+
+    Why
+    ---
+    Hardware MAX_ABS_REDUCE_FP32 reads `M_pad × N_pad` elements based on
+    CONFIG_TILE. CONFIG_TILE's M is in 16-row units, so we can't reduce
+    below M=16. For decode/single-token prefill the valid row is just
+    row 0 and rows 1..15 are padding. Without zero-fill, those padding
+    rows accumulate non-zero values upstream:
+
+      - emit_embedding_lookup zero-fills padding rows. ✓
+      - LN(zero_row) = beta (the LN bias). ✗ output padding rows = beta.
+      - VADD residual = matmul_output + previous_residual.
+        matmul_output's padding rows = matmul_bias (because input is 0,
+        but bias is added to every row). ✗
+      - Subsequent matmul reads `MaxAbsReduce` over the full padded
+        tile → max_abs is inflated by padding-row magnitudes → INT8
+        quantization scale is wrong → valid row uses fewer INT8 levels
+        → output noisy. Compounds across 12 layers → catastrophic PPL.
+
+    Fix: at every dynamic-quant matmul (Q/K/V projections, out_proj,
+    fc1, fc2, lm_head), zero-fill input padding rows just before
+    MAX_ABS_REDUCE so the max is over the valid query rows only.
+
+    DMA source is the enlarged `__zero_pad__` blob (codegen.py
+    `_layout_weights` enlarges it for W8A32 to (TILE-1) × max_k_pad × 4
+    bytes — covers the worst case across all weights).
+
+    Skips when `M >= M_pad` (no padding to fill).
+    """
+    if M >= M_pad:
+        return
+    rows_to_zero = M_pad - M
+    row_bytes = K_pad * FP32_BYTES_PER_ELEM
+    bytes_to_zero = rows_to_zero * row_bytes
+    padding_start_unit = in_alloc.offset_units + (M * row_bytes) // UNIT
+    zero_dram = cg._dram_offset_required(
+        "__zero_pad__",
+        "loading FP32 zero blob for padding-row mask before MAX_ABS_REDUCE",
+    )
+    cg._emit_dma_load(BUF_ABUF, padding_start_unit, bytes_to_zero, 0, zero_dram)
+    cg._emit(SyncInsn(resource_mask=0b001))
+
+
 def _abuf_alloc_fp32(cg: "CodeGenerator", name: str, M_pad: int, N_pad: int):
     """Allocate an ABUF region sized for an [M_pad, N_pad] FP32 tile.
 
@@ -656,6 +707,12 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     # Lives in ABUF, freed immediately after the MATMUL consumes it.
     int8_scratch = cg.mem.abuf.alloc(f"{node.name}__quant_int8", M_pad * K_pad)
 
+    # M4-debug: zero-fill FP32 padding rows before MAX_ABS_REDUCE so the
+    # dynamic activation scale is computed against only the valid query
+    # rows. Otherwise LN-beta / matmul-bias leakage into padding rows
+    # inflates the scale → INT8 precision loss → catastrophic PPL.
+    _zero_fill_fp32_padding_rows(cg, in_alloc, M, M_pad, K_pad)
+
     # Allocate an sreg pair: S[sreg] holds 127/max_abs for QUANT,
     # S[sreg+1] holds max_abs/127 for the DEQUANT epilogue.
     sreg = cg._alloc_sreg_pair()
@@ -869,6 +926,12 @@ def emit_matmul_w8a32_large_weight_tiled(
     # ----- ABUF: full FP32 activation tile in ABUF + INT8 scratch -----
     in_alloc = _abuf_alloc_fp32(cg, input_name, M_pad, K_pad)
     int8_scratch = cg.mem.abuf.alloc(f"{node.name}__quant_int8", M_pad * K_pad)
+
+    # M4-debug: zero-fill FP32 padding rows before MAX_ABS_REDUCE (same
+    # rationale as the simple path; see _zero_fill_fp32_padding_rows
+    # docstring).
+    _zero_fill_fp32_padding_rows(cg, in_alloc, M, M_pad, K_pad)
+
     sreg = cg._alloc_sreg_pair()
 
     # ----- Stage 1: MAX_ABS_REDUCE on the full activation -----
@@ -889,6 +952,16 @@ def emit_matmul_w8a32_large_weight_tiled(
         sreg=sreg,
     ))
     cg._emit(SyncInsn(resource_mask=0b100))
+
+    # M4-debug: free the FP32 input ABUF region now — the INT8 scratch
+    # contains the quantized version and we won't re-read the FP32
+    # input within this matmul. Frees up ~48 KB for d_model=768 fc1,
+    # which is critical for the bias VADD's 32 KB tile alloc later.
+    # Only safe when this node is the input's last consumer (post-emit
+    # free in generate() would otherwise double-free a non-existent slot).
+    if cg.last_uses.get(input_name, -1) == cg.current_node_idx:
+        if cg.mem.abuf.get(input_name) is not None:
+            cg.mem.abuf.free(input_name)
 
     # ----- DRAM-temp output region (full M_pad × N_pad FP32) -----
     output_bytes = M_pad * N_pad * FP32_BYTES_PER_ELEM
@@ -1162,6 +1235,10 @@ def _emit_matmul_w8a32_large_input_streaming(
             f"{node.name}_tile_accum_n{n_start}", M_pad * n_len * 4
         )
 
+        # Logical M (number of valid query rows). Padding rows after
+        # this index need zero-fill before per-K-tile MAX_ABS.
+        M_logical = int(node.output_shape[0])
+
         for k_idx, (k_start, k_len) in enumerate(k_tile_list):
             # Stage 1: load FP32 input K-tile from DRAM into ABUF.
             input_tile_bytes = M_pad * k_len * 4
@@ -1178,6 +1255,11 @@ def _emit_matmul_w8a32_large_input_streaming(
                     input_dram_off + r * full_input_row_bytes + k_start * 4,
                 )
             cg._emit(SyncInsn(resource_mask=0b001))
+
+            # M4-debug: zero-fill padding rows of this K-tile before
+            # MAX_ABS_REDUCE. Without this, the per-K-tile dynamic
+            # scale is inflated by upstream padding garbage.
+            _zero_fill_fp32_padding_rows(cg, in_tile_alloc, M_logical, M_pad, k_len)
 
             # Stage 2: MAX_ABS_REDUCE on this K-tile.
             sreg = cg._alloc_sreg_pair()

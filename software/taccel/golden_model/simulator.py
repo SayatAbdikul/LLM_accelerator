@@ -1102,6 +1102,12 @@ class Simulator:
         # gives 127*512 = 65024 inverse, safely FP16-representable.
         MAX_ABS_EPS = 2.0 ** -9
         max_abs_eps = max(max_abs, MAX_ABS_EPS)
+        # Upper-bound clamp: if a synthetic-fixture activation exceeds
+        # ~FP16_MAX*127/2, fwd_scale=max_abs/127 would overflow FP16.
+        # Real models shouldn't reach this; the clamp keeps the chain
+        # finite when the input distribution is fixture-noisy.
+        FP16_MAX = 65504.0
+        max_abs_eps = min(max_abs_eps, FP16_MAX * 127.0 / 2.0)
         inv_scale = np.float16(127.0 / max_abs_eps)
         fwd_scale = np.float16(max_abs_eps / 127.0)
         self.state.scale_regs[insn.sreg] = inv_scale
