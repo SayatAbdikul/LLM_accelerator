@@ -10,11 +10,7 @@ from typing import Dict, Optional, Sequence
 
 import numpy as np
 
-try:
-    from scipy.special import erf as _scipy_erf
-    _HAS_SCIPY = True
-except ImportError:
-    _HAS_SCIPY = False
+from ._ref_ops import cast_fp16, gelu_erf, gelu_tanh, layernorm, softmax_causal
 
 
 # ---------------------------------------------------------------------------
@@ -29,7 +25,7 @@ def _to_f32(x) -> np.ndarray:
 
 def _to_fp16_widened_f32(x) -> np.ndarray:
     """Mirror golden-model parameter storage for FP16 gamma/beta vectors."""
-    return _to_f32(x).astype(np.float16).astype(np.float32)
+    return cast_fp16(_to_f32(x))
 
 
 def _arch_scale(scale: float) -> np.float32:
@@ -61,69 +57,13 @@ def _scale(scales: Dict[str, float], name: str, default: float = 6.0 / 127.0) ->
     return float(scales.get(name, default))
 
 
-def _layernorm_np(x: np.ndarray, w: np.ndarray, b: np.ndarray, eps: float) -> np.ndarray:
-    """FP32 LayerNorm matching sfu.py Welford-based reduction."""
-    mean = x.mean(axis=-1, keepdims=True).astype(np.float32)
-    var = x.var(axis=-1, keepdims=True).astype(np.float32)
-    return (x - mean) / np.sqrt(var + np.float32(eps)) * w + b
-
-
-def _gelu_np(x: np.ndarray) -> np.ndarray:
-    """GELU matching sfu.py: uses scipy.special.erf when available."""
-    xf = x.astype(np.float32)
-    if _HAS_SCIPY:
-        return xf * np.float32(0.5) * (np.float32(1.0) + _scipy_erf(xf / np.sqrt(np.float32(2.0))))
-    # Abramowitz & Stegun 7.1.26 polynomial fallback
-    sgn = np.sign(xf)
-    t = np.float32(1.0) / (np.float32(1.0) + np.float32(0.3275911) * np.abs(xf))
-    poly = t * (
-        np.float32(0.254829592) + t * (
-            np.float32(-0.284496736) + t * (
-                np.float32(1.421413741) + t * (
-                    np.float32(-1.453152027) + t * np.float32(1.061405429)
-                )
-            )
-        )
-    )
-    erf_approx = sgn * (np.float32(1.0) - poly * np.exp(-(xf ** 2)))
-    return xf * np.float32(0.5) * (np.float32(1.0) + erf_approx)
-
-
-def _gelu_new_np(x: np.ndarray) -> np.ndarray:
-    """GELU-new (tanh approximation) used by GPT-2 (gelu_new / gelu_fast)."""
-    xf = x.astype(np.float32)
-    return xf * np.float32(0.5) * (
-        np.float32(1.0) + np.tanh(
-            np.float32(np.sqrt(2.0 / np.pi)) * (xf + np.float32(0.044715) * xf ** 3)
-        )
-    )
-
-
 def _resolve_gelu_fn(model_args: dict):
     """Return the GELU function matching the model's activation_function."""
     name = str(model_args.get(
         "activation_function",
         "gelu_new" if bool(model_args.get("split_qkv_bias", False)) else "gelu",
     ))
-    return _gelu_new_np if name in {"gelu_new", "gelu_fast"} else _gelu_np
-
-
-def _causal_softmax(x: np.ndarray) -> np.ndarray:
-    """Row-wise causal softmax for x[seq, seq], matching execute_masked_softmax.
-
-    Columns j > i (upper triangle) are masked before the max-subtract step.
-    """
-    seq = x.shape[0]
-    out = np.empty_like(x, dtype=np.float32)
-    for i in range(seq):
-        row = x[i].astype(np.float32).copy()
-        row[i + 1:] = -np.inf
-        valid = row[: i + 1]
-        row_max = float(valid.max())
-        exp_row = np.exp(row - row_max)
-        exp_row[i + 1:] = 0.0
-        out[i] = exp_row / float(exp_row.sum())
-    return out
+    return gelu_tanh if name in {"gelu_new", "gelu_fast"} else gelu_erf
 
 
 # ---------------------------------------------------------------------------
@@ -589,7 +529,7 @@ class NanoGPTFQReference:
             # --- Attention ---
             ln1_scale = _scale(s, f"block{L}_ln1")
             ln1 = _qdq(
-                _layernorm_np(x, layer["ln1_w"], layer["ln1_b"], self.eps),
+                layernorm(x, layer["ln1_w"], layer["ln1_b"], self.eps),
                 ln1_scale,
             )
             if capture is not None:
@@ -630,7 +570,7 @@ class NanoGPTFQReference:
                     )
                 else:
                     attn = (q @ k.T) * self.attn_scale
-                probs = np.ones((1, 1), dtype=np.float32) if seq == 1 else _causal_softmax(attn)
+                probs = np.ones((1, 1), dtype=np.float32) if seq == 1 else softmax_causal(attn)
                 softmax_scale = _scale(s, f"block{L}_head{H}_softmax", 1.0 / 127.0)
                 attn_v_scale = _scale(s, f"block{L}_head{H}_attn_v")
                 probs = _qdq(probs, softmax_scale)
@@ -681,7 +621,7 @@ class NanoGPTFQReference:
 
             # --- MLP ---
             ln2 = _qdq(
-                _layernorm_np(x, layer["ln2_w"], layer["ln2_b"], self.eps),
+                layernorm(x, layer["ln2_w"], layer["ln2_b"], self.eps),
                 _scale(s, f"block{L}_ln2"),
             )
             if capture is not None:
@@ -737,7 +677,7 @@ class NanoGPTFQReference:
             x = x_int8.astype(np.float32) * _arch_scale(x_scale)
 
         ln_f_scale = _scale(s, "ln_f")
-        ln_f = _qdq(_layernorm_np(x, self.ln_f_w, self.ln_f_b, self.eps), ln_f_scale)
+        ln_f = _qdq(layernorm(x, self.ln_f_w, self.ln_f_b, self.eps), ln_f_scale)
         lm_input = ln_f if return_all_logits else ln_f[-1:]
         if not self._large_vocab_lm_head_reference():
             logits = lm_input @ self.lm_head_w.T
@@ -830,37 +770,347 @@ class NanoGPTFQReference:
             traces.append(step_trace)
         return traces
 
-    def _decode_incremental_step(
+    @staticmethod
+    def _mlp_group_active(groups: set[str], name: str, layer_idx: int) -> bool:
+        return name in groups or f"{name}_block_{layer_idx}" in groups
+
+    @staticmethod
+    def _attn_group_active(groups: set[str], name: str, layer_idx: int, head_idx: int) -> bool:
+        return (
+            name in groups
+            or f"{name}_block_{layer_idx}" in groups
+            or f"{name}_head_{layer_idx}_{head_idx}" in groups
+        )
+
+    @staticmethod
+    def _record_trace(
+        trace: Optional[dict[str, dict[str, np.ndarray | float | None]]],
+        name: str,
+        value: np.ndarray,
+        *,
+        scale: Optional[float] = None,
+        int8: Optional[np.ndarray] = None,
+    ) -> None:
+        """Append one entry to a `_decode_incremental_step` trace dict (no-op when ``trace is None``)."""
+        if trace is None:
+            return
+        trace[name] = {
+            "value": np.asarray(value, dtype=np.float32).copy(),
+            "scale": None if scale is None else float(scale),
+            "int8": None if int8 is None else np.asarray(int8, dtype=np.int8).copy(),
+        }
+
+    def _step_attention_head(
+        self,
+        L: int,
+        H: int,
+        ln1: np.ndarray,
+        ln1_scale: float,
+        ln1_i8: np.ndarray,
+        head_weights,
+        s: Dict[str, float],
+        groups: set[str],
+        caches_lh: dict,
+        trace,
+    ) -> np.ndarray:
+        """One attention head: Q/K/V projections, KV-cache append, QKT,
+        softmax, attn_v. Returns ``head_out_i8`` (per-head output INT8 row).
+
+        Closure-free version of the original head loop body — every piece of
+        state needed (scales dict, fp32_groups, per-head cache, trace sink)
+        is passed in. Numerically identical to the inline form.
+        """
+        q_w, k_w, v_w, q_w_fp32, k_w_fp32, v_w_fp32 = head_weights[:6]
+        q_q, k_q, v_q = head_weights[6:9]
+        q_scale_w, k_scale_w, v_scale_w = head_weights[9:12]
+        q_b_i32, k_b_i32, v_b_i32 = head_weights[15:18]
+        q_b_fp32, k_b_fp32, v_b_fp32 = head_weights[18:21]
+        q_scale = _scale(s, f"block{L}_head{H}_query")
+        k_scale = _scale(s, f"block{L}_head{H}_key")
+        v_scale = _scale(s, f"block{L}_head{H}_value")
+        attn_v_scale = _scale(s, f"block{L}_head{H}_attn_v")
+
+        value_fp32 = ln1 @ v_w_fp32.T + v_b_fp32
+        if "qkv" in groups:
+            q = ln1 @ q_w_fp32.T + q_b_fp32
+            k = ln1 @ k_w_fp32.T + k_b_fp32
+            v = value_fp32
+        elif self._integer_linear_reference():
+            q_accum = ln1_i8.astype(np.int32) @ q_q.astype(np.int32).T + q_b_i32
+            k_accum = ln1_i8.astype(np.int32) @ k_q.astype(np.int32).T + k_b_i32
+            v_accum = ln1_i8.astype(np.int32) @ v_q.astype(np.int32).T + v_b_i32
+            q_i8 = _requant_accum_int8(q_accum, np.float32(ln1_scale) * np.float32(q_scale_w), q_scale)
+            k_i8 = _requant_accum_int8(k_accum, np.float32(ln1_scale) * np.float32(k_scale_w), k_scale)
+            v_i8 = _requant_accum_int8(v_accum, np.float32(ln1_scale) * np.float32(v_scale_w), v_scale)
+            q = q_i8.astype(np.float32) * _arch_scale(q_scale)
+            k = k_i8.astype(np.float32) * _arch_scale(k_scale)
+            v = v_i8.astype(np.float32) * _arch_scale(v_scale)
+        else:
+            q = _qdq(ln1 @ q_w.T, q_scale)
+            k = _qdq(ln1 @ k_w.T, k_scale)
+            v = _qdq(ln1 @ v_w.T, v_scale)
+        q_i8 = _fp32_to_int8(q, q_scale)
+        k_i8 = _fp32_to_int8(k, k_scale)
+        v_i8 = _fp32_to_int8(v, v_scale)
+        self._record_trace(trace, f"block{L}_head{H}_query", q, scale=q_scale, int8=_fp32_to_int8(q, q_scale))
+        self._record_trace(trace, f"block{L}_head{H}_key", k, scale=k_scale, int8=k_i8)
+        self._record_trace(trace, f"block{L}_head{H}_value", v, scale=v_scale, int8=v_i8)
+        caches_lh["k"].append(k_i8[0].copy())
+        caches_lh["v"].append(v_i8[0].copy())
+        caches_lh.setdefault("v_fp32", []).append(value_fp32[0].copy())
+
+        k_cache_i8 = np.stack(caches_lh["k"], axis=0).astype(np.int8)
+        v_cache_i8 = np.stack(caches_lh["v"], axis=0).astype(np.int8)
+        v_cache = v_cache_i8.astype(np.float32) * _arch_scale(v_scale)
+        v_cache_fp32 = np.stack(caches_lh["v_fp32"], axis=0).astype(np.float32)
+        if self._integer_linear_reference():
+            qkt_accum = q_i8.astype(np.int32) @ k_cache_i8.astype(np.int32).T
+            attn = _dequant_accum_fp32(
+                qkt_accum,
+                np.float32(q_scale) * np.float32(k_scale) * np.float32(self.attn_scale),
+            )
+        else:
+            k_cache = k_cache_i8.astype(np.float32) * _arch_scale(k_scale)
+            attn = (q @ k_cache.T) * self.attn_scale
+        row = attn[0].astype(np.float32)
+        row_max = float(row.max())
+        exp_row = np.exp(row - row_max)
+        probs = (exp_row / float(exp_row.sum()))[None, :]
+        softmax_scale = _scale(s, f"block{L}_head{H}_softmax", 1.0 / 127.0)
+        if not self._attn_group_active(groups, "softmax", L, H):
+            probs = _qdq(probs, softmax_scale)
+        probs_i8 = _fp32_to_int8(probs, softmax_scale)
+        self._record_trace(trace, f"block{L}_head{H}_softmax", probs, scale=softmax_scale, int8=probs_i8)
+        attn_v_fp32 = self._attn_group_active(groups, "attn_v", L, H)
+        value_cache_fp32 = self._attn_group_active(groups, "attn_v_value_fp32", L, H)
+        if not (attn_v_fp32 or value_cache_fp32):
+            if self._integer_linear_reference():
+                head_accum = probs_i8.astype(np.int32) @ v_cache_i8.astype(np.int32)
+                head_out_i8 = _requant_accum_int8(
+                    head_accum,
+                    np.float32(softmax_scale) * np.float32(v_scale),
+                    attn_v_scale,
+                )
+                head_out = head_out_i8.astype(np.float32) * _arch_scale(attn_v_scale)
+            else:
+                head_out = _qdq(probs @ v_cache, attn_v_scale)
+                head_out_i8 = _fp32_to_int8(head_out, attn_v_scale)
+        else:
+            head_out = probs @ (v_cache_fp32 if value_cache_fp32 else v_cache)
+            head_out_i8 = _fp32_to_int8(head_out, attn_v_scale)
+        self._record_trace(trace, f"block{L}_head{H}_attn_v", head_out, scale=attn_v_scale, int8=head_out_i8)
+        return head_out_i8
+
+    def _step_attention_block(
+        self,
+        L: int,
+        layer: dict,
+        x: np.ndarray,
+        x_int8: np.ndarray,
+        x_scale_prev: float,
+        s: Dict[str, float],
+        groups: set[str],
+        caches_L: list,
+        trace,
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """LN1 + multi-head attention + concat + out_proj + residual1.
+
+        ``x``/``x_int8`` come in as the pre-block state (embedding output or
+        previous block's residual2). ``x_scale_prev`` is its scale (only
+        consulted by the integer ``dequant_add_accum`` residual path).
+        Returns the post-residual1 ``(x, x_int8, x_scale)`` triple.
+        """
+        ln1_scale = _scale(s, f"block{L}_ln1")
+        ln1_raw = layernorm(x, layer["ln1_w"], layer["ln1_b"], self.eps)
+        ln1 = _qdq(ln1_raw, ln1_scale)
+        self._record_trace(trace, f"block{L}_ln1", ln1, scale=ln1_scale, int8=_fp32_to_int8(ln1, ln1_scale))
+        ln1_i8 = _fp32_to_int8(ln1, ln1_scale)
+        head_outs_int8 = [
+            self._step_attention_head(
+                L, H, ln1, ln1_scale, ln1_i8, head_weights,
+                s, groups, caches_L[H], trace,
+            )
+            for H, head_weights in enumerate(layer["heads"])
+        ]
+
+        concat_int8 = np.concatenate(head_outs_int8, axis=-1)
+        concat_scale = _scale(s, f"block{L}_concat")
+        concat = concat_int8.astype(np.float32) * _arch_scale(concat_scale)
+        self._record_trace(trace, f"block{L}_concat", concat, scale=concat_scale, int8=concat_int8)
+
+        out_proj_scale = _scale(s, f"block{L}_out_proj")
+        if "out_proj" in groups:
+            out_proj = concat @ layer["c_proj_w_fp32"].T + layer["c_proj_b"]
+            out_proj_i8 = _fp32_to_int8(_qdq(out_proj, out_proj_scale), out_proj_scale)
+            out_accum = None
+            out_accum_scale = None
+        else:
+            out_accum = (
+                concat_int8.astype(np.int32) @ layer["c_proj_w_q"].astype(np.int32).T
+                + layer["c_proj_b_i32"]
+            )
+            out_accum_scale = np.float32(concat_scale) * np.float32(layer["c_proj_w_scale"])
+            if layer["c_proj_requant_pc"] is not None:
+                out_proj_i8 = _requant_accum_pc_int8(out_accum, layer["c_proj_requant_pc"])
+            else:
+                out_proj_i8 = _requant_accum_int8(out_accum, out_accum_scale, out_proj_scale)
+            out_proj = out_proj_i8.astype(np.float32) * _arch_scale(out_proj_scale)
+        self._record_trace(trace, f"block{L}_out_proj", out_proj, scale=out_proj_scale, int8=out_proj_i8)
+
+        x_scale = _scale(s, f"block{L}_residual1")
+        if L in self.raw_residual1_blocks and "residual_vadd" not in groups:
+            x_int8 = _int8_saturating_add(x_int8, out_proj_i8)
+            x = x_int8.astype(np.float32) * _arch_scale(x_scale)
+        elif "residual_vadd" in groups or out_accum is None:
+            x = _qdq(x + out_proj, x_scale)
+            x_int8 = _fp32_to_int8(x, x_scale)
+        else:
+            x_int8 = _dequant_add_accum_int8(
+                out_accum, out_accum_scale, x_int8, x_scale_prev, x_scale,
+            )
+            x = x_int8.astype(np.float32) * _arch_scale(x_scale)
+        self._record_trace(trace, f"block{L}_residual1", x, scale=x_scale, int8=x_int8)
+        return x, x_int8, x_scale
+
+    def _step_mlp_block(
+        self,
+        L: int,
+        layer: dict,
+        x: np.ndarray,
+        x_int8: np.ndarray,
+        x_scale_residual1: float,
+        s: Dict[str, float],
+        groups: set[str],
+        trace,
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """LN2 + FC1 + GELU + FC2 + residual2. Returns (x, x_int8, x_scale).
+
+        ``x``/``x_int8`` come in as the post-residual1 state; the method
+        produces the post-residual2 state and the f"block{L}_residual2"
+        scale. ``mlp_*`` fp32_groups switch individual matmuls back to
+        FP32 weights; the rest of the path stays INT8.
+        """
+        def mlp_group_active(name: str) -> bool:
+            return self._mlp_group_active(groups, name, L)
+
+        ln2_scale = _scale(s, f"block{L}_ln2")
+        ln2_raw = layernorm(x, layer["ln2_w"], layer["ln2_b"], self.eps)
+        ln2 = _qdq(ln2_raw, ln2_scale)
+        self._record_trace(trace, f"block{L}_ln2", ln2, scale=ln2_scale, int8=_fp32_to_int8(ln2, ln2_scale))
+        fc1_scale = _scale(s, f"block{L}_fc1")
+        gelu_scale = _scale(s, f"block{L}_gelu", 1.0 / 127.0)
+        fc2_scale = _scale(s, f"block{L}_fc2")
+        full_mlp_fp32 = (
+            "mlp" in groups
+            or "mlp_full" in groups
+            or f"mlp_block_{L}" in groups
+        )
+        fc1_fp32 = (
+            full_mlp_fp32
+            or mlp_group_active("mlp_fc1")
+            or mlp_group_active("mlp_fc1_gelu")
+            or mlp_group_active("mlp_fc1_gelu_fc2")
+        )
+        gelu_fp32 = (
+            full_mlp_fp32
+            or mlp_group_active("mlp_gelu")
+            or mlp_group_active("mlp_fc1_gelu")
+            or mlp_group_active("mlp_gelu_fc2")
+            or mlp_group_active("mlp_fc1_gelu_fc2")
+        )
+        fc2_fp32 = (
+            full_mlp_fp32
+            or mlp_group_active("mlp_fc2")
+            or mlp_group_active("mlp_gelu_fc2")
+            or mlp_group_active("mlp_fc1_gelu_fc2")
+        )
+
+        fc1_accum = None
+        if fc1_fp32:
+            fc1_raw = ln2 @ layer["fc_w_fp32"].T + layer["fc_b"]
+            fc1 = fc1_raw if gelu_fp32 else _qdq(fc1_raw, fc1_scale)
+        elif self._use_integer_linear(layer["fc_requant_pc"]):
+            ln2_i8 = _fp32_to_int8(ln2, ln2_scale)
+            fc1_accum = (
+                ln2_i8.astype(np.int32) @ layer["fc_w_q"].astype(np.int32).T
+                + layer["fc_b_i32"]
+            )
+            if L in self.gelu_from_accum_blocks:
+                fc1 = _dequant_accum_fp32(
+                    fc1_accum,
+                    np.float32(ln2_scale) * np.float32(layer["fc_w_scale"]),
+                )
+            elif layer["fc_requant_pc"] is not None:
+                fc1_i8 = _requant_accum_pc_int8(fc1_accum, layer["fc_requant_pc"])
+                fc1 = fc1_i8.astype(np.float32) * _arch_scale(fc1_scale)
+            else:
+                fc1_i8 = _requant_accum_int8(
+                    fc1_accum,
+                    np.float32(ln2_scale) * np.float32(layer["fc_w_scale"]),
+                    fc1_scale,
+                )
+                fc1 = fc1_i8.astype(np.float32) * _arch_scale(fc1_scale)
+        else:
+            fc1 = _qdq(ln2 @ layer["fc_w"].T + layer["fc_b"], fc1_scale)
+
+        gelu_raw = self.gelu_fn(fc1)
+        gelu = gelu_raw if (gelu_fp32 or fc2_fp32) else _qdq(gelu_raw, gelu_scale)
+        fc2_accum = None
+        fc2_accum_scale = None
+        if fc2_fp32:
+            fc2 = gelu @ layer["proj_w_fp32"].T + layer["proj_b"]
+            fc2_i8 = _fp32_to_int8(_qdq(fc2, fc2_scale), fc2_scale)
+        else:
+            gelu = _qdq(gelu, gelu_scale)
+            gelu_i8 = _fp32_to_int8(gelu, gelu_scale)
+            fc2_accum = (
+                gelu_i8.astype(np.int32) @ layer["proj_w_q"].astype(np.int32).T
+                + layer["proj_b_i32"]
+            )
+            fc2_accum_scale = np.float32(gelu_scale) * np.float32(layer["proj_w_scale"])
+            if layer["proj_requant_pc"] is not None:
+                fc2_i8 = _requant_accum_pc_int8(fc2_accum, layer["proj_requant_pc"])
+            else:
+                fc2_i8 = _requant_accum_int8(fc2_accum, fc2_accum_scale, fc2_scale)
+            fc2 = fc2_i8.astype(np.float32) * _arch_scale(fc2_scale)
+        fc1_trace_scale = (
+            float(np.float32(ln2_scale) * np.float32(layer["fc_w_scale"]))
+            if L in self.gelu_from_accum_blocks and fc1_accum is not None
+            else fc1_scale
+        )
+        self._record_trace(
+            trace, f"block{L}_fc1", fc1, scale=fc1_trace_scale,
+            int8=None if L in self.gelu_from_accum_blocks and fc1_accum is not None else _fp32_to_int8(fc1, fc1_scale),
+        )
+        self._record_trace(trace, f"block{L}_gelu", gelu, scale=gelu_scale, int8=_fp32_to_int8(gelu, gelu_scale))
+        self._record_trace(trace, f"block{L}_fc2", fc2, scale=fc2_scale, int8=fc2_i8)
+
+        residual1_int8 = x_int8
+        residual1_scale = x_scale_residual1
+        x_scale = _scale(s, f"block{L}_residual2")
+        if L in self.raw_residual2_blocks and "residual_vadd" not in groups:
+            x_int8 = _int8_saturating_add(residual1_int8, fc2_i8)
+            x = x_int8.astype(np.float32) * _arch_scale(x_scale)
+        elif "residual_vadd" in groups or fc2_accum is None:
+            x = _qdq(x + fc2, x_scale)
+            x_int8 = _fp32_to_int8(x, x_scale)
+        else:
+            x_int8 = _dequant_add_accum_int8(
+                fc2_accum, fc2_accum_scale, residual1_int8, residual1_scale, x_scale,
+            )
+            x = x_int8.astype(np.float32) * _arch_scale(x_scale)
+        self._record_trace(trace, f"block{L}_residual2", x, scale=x_scale, int8=x_int8)
+        return x, x_int8, x_scale
+
+    def _step_embedding(
         self,
         token_id: int,
         position_id: int,
-        caches,
-        trace: Optional[dict[str, dict[str, np.ndarray | float | None]]] = None,
-        fp32_groups: Optional[set[str]] = None,
-    ) -> np.ndarray:
-        s = self.scales
-        groups = set(fp32_groups or ())
-
-        def mlp_group_active(name: str, layer_idx: int) -> bool:
-            return name in groups or f"{name}_block_{layer_idx}" in groups
-
-        def attn_group_active(name: str, layer_idx: int, head_idx: int) -> bool:
-            return (
-                name in groups
-                or f"{name}_block_{layer_idx}" in groups
-                or f"{name}_head_{layer_idx}_{head_idx}" in groups
-            )
-
-        def record(name: str, value: np.ndarray, *, scale: Optional[float] = None,
-                   int8: Optional[np.ndarray] = None) -> None:
-            if trace is None:
-                return
-            trace[name] = {
-                "value": np.asarray(value, dtype=np.float32).copy(),
-                "scale": None if scale is None else float(scale),
-                "int8": None if int8 is None else np.asarray(int8, dtype=np.int8).copy(),
-            }
-
+        s: Dict[str, float],
+        groups: set[str],
+        trace,
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """tok+pos embedding lookup. Returns (x, x_int8, x_scale)."""
         x_scale = _scale(s, "tok_pos_add")
         if "embeddings" in groups:
             x = self.wte_fp32[[token_id]] + self.wpe_fp32[[position_id]]
@@ -871,261 +1121,41 @@ class NanoGPTFQReference:
                 self.wpe_int8[[position_id]],
             )
             x = x_int8.astype(np.float32) * _arch_scale(x_scale)
-        record("tok_pos_add", x, scale=x_scale, int8=x_int8)
+        self._record_trace(trace, "tok_pos_add", x, scale=x_scale, int8=x_int8)
+        return x, x_int8, x_scale
 
-        for L, layer in enumerate(self.layers):
-            ln1_scale = _scale(s, f"block{L}_ln1")
-            ln1_raw = _layernorm_np(x, layer["ln1_w"], layer["ln1_b"], self.eps)
-            ln1 = _qdq(ln1_raw, ln1_scale)
-            record(f"block{L}_ln1", ln1, scale=ln1_scale, int8=_fp32_to_int8(ln1, ln1_scale))
-            ln1_i8 = _fp32_to_int8(ln1, ln1_scale)
-            head_outs_int8 = []
-            for H, head_weights in enumerate(layer["heads"]):
-                q_w, k_w, v_w, q_w_fp32, k_w_fp32, v_w_fp32 = head_weights[:6]
-                q_q, k_q, v_q = head_weights[6:9]
-                q_scale_w, k_scale_w, v_scale_w = head_weights[9:12]
-                q_b_i32, k_b_i32, v_b_i32 = head_weights[15:18]
-                q_b_fp32, k_b_fp32, v_b_fp32 = head_weights[18:21]
-                q_scale = _scale(s, f"block{L}_head{H}_query")
-                k_scale = _scale(s, f"block{L}_head{H}_key")
-                v_scale = _scale(s, f"block{L}_head{H}_value")
-                attn_v_scale = _scale(s, f"block{L}_head{H}_attn_v")
+    def _step_final(
+        self,
+        x: np.ndarray,
+        s: Dict[str, float],
+        groups: set[str],
+        trace,
+    ) -> np.ndarray:
+        """ln_f + lm_head. Returns logits in the shape expected by callers
+        (FP32 1-D array for fp32-output ``groups``, INT8 1-D row otherwise).
 
-                value_fp32 = ln1 @ v_w_fp32.T + v_b_fp32
-                if "qkv" in groups:
-                    q = ln1 @ q_w_fp32.T + q_b_fp32
-                    k = ln1 @ k_w_fp32.T + k_b_fp32
-                    v = value_fp32
-                elif self._integer_linear_reference():
-                    q_accum = ln1_i8.astype(np.int32) @ q_q.astype(np.int32).T + q_b_i32
-                    k_accum = ln1_i8.astype(np.int32) @ k_q.astype(np.int32).T + k_b_i32
-                    v_accum = ln1_i8.astype(np.int32) @ v_q.astype(np.int32).T + v_b_i32
-                    q_i8 = _requant_accum_int8(q_accum, np.float32(ln1_scale) * np.float32(q_scale_w), q_scale)
-                    k_i8 = _requant_accum_int8(k_accum, np.float32(ln1_scale) * np.float32(k_scale_w), k_scale)
-                    v_i8 = _requant_accum_int8(v_accum, np.float32(ln1_scale) * np.float32(v_scale_w), v_scale)
-                    q = q_i8.astype(np.float32) * _arch_scale(q_scale)
-                    k = k_i8.astype(np.float32) * _arch_scale(k_scale)
-                    v = v_i8.astype(np.float32) * _arch_scale(v_scale)
-                else:
-                    q = _qdq(ln1 @ q_w.T, q_scale)
-                    k = _qdq(ln1 @ k_w.T, k_scale)
-                    v = _qdq(ln1 @ v_w.T, v_scale)
-                q_i8 = _fp32_to_int8(q, q_scale)
-                k_i8 = _fp32_to_int8(k, k_scale)
-                v_i8 = _fp32_to_int8(v, v_scale)
-                record(f"block{L}_head{H}_query", q, scale=q_scale, int8=_fp32_to_int8(q, q_scale))
-                record(f"block{L}_head{H}_key", k, scale=k_scale, int8=k_i8)
-                record(f"block{L}_head{H}_value", v, scale=v_scale, int8=v_i8)
-                caches[L][H]["k"].append(k_i8[0].copy())
-                caches[L][H]["v"].append(v_i8[0].copy())
-                caches[L][H].setdefault("v_fp32", []).append(value_fp32[0].copy())
-
-                k_cache_i8 = np.stack(caches[L][H]["k"], axis=0).astype(np.int8)
-                v_cache_i8 = np.stack(caches[L][H]["v"], axis=0).astype(np.int8)
-                v_cache = v_cache_i8.astype(np.float32) * _arch_scale(v_scale)
-                v_cache_fp32 = np.stack(caches[L][H]["v_fp32"], axis=0).astype(np.float32)
-                if self._integer_linear_reference():
-                    qkt_accum = q_i8.astype(np.int32) @ k_cache_i8.astype(np.int32).T
-                    attn = _dequant_accum_fp32(
-                        qkt_accum,
-                        np.float32(q_scale) * np.float32(k_scale) * np.float32(self.attn_scale),
-                    )
-                else:
-                    k_cache = k_cache_i8.astype(np.float32) * _arch_scale(k_scale)
-                    attn = (q @ k_cache.T) * self.attn_scale
-                row = attn[0].astype(np.float32)
-                row_max = float(row.max())
-                exp_row = np.exp(row - row_max)
-                probs = (exp_row / float(exp_row.sum()))[None, :]
-                softmax_scale = _scale(s, f"block{L}_head{H}_softmax", 1.0 / 127.0)
-                if not attn_group_active("softmax", L, H):
-                    probs = _qdq(probs, softmax_scale)
-                probs_i8 = _fp32_to_int8(probs, softmax_scale)
-                record(
-                    f"block{L}_head{H}_softmax",
-                    probs,
-                    scale=softmax_scale,
-                    int8=probs_i8,
-                )
-                attn_v_fp32 = attn_group_active("attn_v", L, H)
-                value_cache_fp32 = attn_group_active("attn_v_value_fp32", L, H)
-                if not (attn_v_fp32 or value_cache_fp32):
-                    if self._integer_linear_reference():
-                        head_accum = probs_i8.astype(np.int32) @ v_cache_i8.astype(np.int32)
-                        head_out_i8 = _requant_accum_int8(
-                            head_accum,
-                            np.float32(softmax_scale) * np.float32(v_scale),
-                            attn_v_scale,
-                        )
-                        head_out = head_out_i8.astype(np.float32) * _arch_scale(attn_v_scale)
-                    else:
-                        head_out = _qdq(probs @ v_cache, attn_v_scale)
-                        head_out_i8 = _fp32_to_int8(head_out, attn_v_scale)
-                else:
-                    head_out = probs @ (v_cache_fp32 if value_cache_fp32 else v_cache)
-                    head_out_i8 = _fp32_to_int8(head_out, attn_v_scale)
-                record(
-                    f"block{L}_head{H}_attn_v",
-                    head_out,
-                    scale=attn_v_scale,
-                    int8=head_out_i8,
-                )
-                head_outs_int8.append(head_out_i8)
-
-            concat_int8 = np.concatenate(head_outs_int8, axis=-1)
-            concat_scale = _scale(s, f"block{L}_concat")
-            concat = concat_int8.astype(np.float32) * _arch_scale(concat_scale)
-            record(f"block{L}_concat", concat, scale=concat_scale, int8=concat_int8)
-
-            out_proj_scale = _scale(s, f"block{L}_out_proj")
-            if "out_proj" in groups:
-                out_proj = concat @ layer["c_proj_w_fp32"].T + layer["c_proj_b"]
-                out_proj_i8 = _fp32_to_int8(_qdq(out_proj, out_proj_scale), out_proj_scale)
-                out_accum = None
-                out_accum_scale = None
-            else:
-                out_accum = (
-                    concat_int8.astype(np.int32) @ layer["c_proj_w_q"].astype(np.int32).T
-                    + layer["c_proj_b_i32"]
-                )
-                out_accum_scale = np.float32(concat_scale) * np.float32(layer["c_proj_w_scale"])
-                if layer["c_proj_requant_pc"] is not None:
-                    out_proj_i8 = _requant_accum_pc_int8(out_accum, layer["c_proj_requant_pc"])
-                else:
-                    out_proj_i8 = _requant_accum_int8(out_accum, out_accum_scale, out_proj_scale)
-                out_proj = out_proj_i8.astype(np.float32) * _arch_scale(out_proj_scale)
-            record(f"block{L}_out_proj", out_proj, scale=out_proj_scale, int8=out_proj_i8)
-            x_scale = _scale(s, f"block{L}_residual1")
-            if L in self.raw_residual1_blocks and "residual_vadd" not in groups:
-                x_int8 = _int8_saturating_add(x_int8, out_proj_i8)
-                x = x_int8.astype(np.float32) * _arch_scale(x_scale)
-            elif "residual_vadd" in groups or out_accum is None:
-                x = _qdq(x + out_proj, x_scale)
-                x_int8 = _fp32_to_int8(x, x_scale)
-            else:
-                x_int8 = _dequant_add_accum_int8(out_accum, out_accum_scale, x_int8, _scale(s, "tok_pos_add") if L == 0 else _scale(s, f"block{L - 1}_residual2"), x_scale)
-                x = x_int8.astype(np.float32) * _arch_scale(x_scale)
-            record(f"block{L}_residual1", x, scale=x_scale, int8=x_int8)
-
-            ln2_scale = _scale(s, f"block{L}_ln2")
-            ln2_raw = _layernorm_np(x, layer["ln2_w"], layer["ln2_b"], self.eps)
-            ln2 = _qdq(ln2_raw, ln2_scale)
-            record(f"block{L}_ln2", ln2, scale=ln2_scale, int8=_fp32_to_int8(ln2, ln2_scale))
-            fc1_scale = _scale(s, f"block{L}_fc1")
-            gelu_scale = _scale(s, f"block{L}_gelu", 1.0 / 127.0)
-            fc2_scale = _scale(s, f"block{L}_fc2")
-            full_mlp_fp32 = (
-                "mlp" in groups
-                or "mlp_full" in groups
-                or f"mlp_block_{L}" in groups
-            )
-            fc1_fp32 = (
-                full_mlp_fp32
-                or mlp_group_active("mlp_fc1", L)
-                or mlp_group_active("mlp_fc1_gelu", L)
-                or mlp_group_active("mlp_fc1_gelu_fc2", L)
-            )
-            gelu_fp32 = (
-                full_mlp_fp32
-                or mlp_group_active("mlp_gelu", L)
-                or mlp_group_active("mlp_fc1_gelu", L)
-                or mlp_group_active("mlp_gelu_fc2", L)
-                or mlp_group_active("mlp_fc1_gelu_fc2", L)
-            )
-            fc2_fp32 = (
-                full_mlp_fp32
-                or mlp_group_active("mlp_fc2", L)
-                or mlp_group_active("mlp_gelu_fc2", L)
-                or mlp_group_active("mlp_fc1_gelu_fc2", L)
-            )
-
-            fc1_accum = None
-            if fc1_fp32:
-                fc1_raw = ln2 @ layer["fc_w_fp32"].T + layer["fc_b"]
-                fc1 = fc1_raw if gelu_fp32 else _qdq(fc1_raw, fc1_scale)
-            elif self._use_integer_linear(layer["fc_requant_pc"]):
-                ln2_i8 = _fp32_to_int8(ln2, ln2_scale)
-                fc1_accum = (
-                    ln2_i8.astype(np.int32) @ layer["fc_w_q"].astype(np.int32).T
-                    + layer["fc_b_i32"]
-                )
-                if L in self.gelu_from_accum_blocks:
-                    fc1 = _dequant_accum_fp32(
-                        fc1_accum,
-                        np.float32(ln2_scale) * np.float32(layer["fc_w_scale"]),
-                    )
-                elif layer["fc_requant_pc"] is not None:
-                    fc1_i8 = _requant_accum_pc_int8(fc1_accum, layer["fc_requant_pc"])
-                    fc1 = fc1_i8.astype(np.float32) * _arch_scale(fc1_scale)
-                else:
-                    fc1_i8 = _requant_accum_int8(
-                        fc1_accum,
-                        np.float32(ln2_scale) * np.float32(layer["fc_w_scale"]),
-                        fc1_scale,
-                    )
-                    fc1 = fc1_i8.astype(np.float32) * _arch_scale(fc1_scale)
-            else:
-                fc1 = _qdq(ln2 @ layer["fc_w"].T + layer["fc_b"], fc1_scale)
-
-            gelu_raw = self.gelu_fn(fc1)
-            gelu = gelu_raw if (gelu_fp32 or fc2_fp32) else _qdq(gelu_raw, gelu_scale)
-            fc2_accum = None
-            fc2_accum_scale = None
-            if fc2_fp32:
-                fc2 = gelu @ layer["proj_w_fp32"].T + layer["proj_b"]
-                fc2_i8 = _fp32_to_int8(_qdq(fc2, fc2_scale), fc2_scale)
-            else:
-                gelu = _qdq(gelu, gelu_scale)
-                gelu_i8 = _fp32_to_int8(gelu, gelu_scale)
-                fc2_accum = (
-                    gelu_i8.astype(np.int32) @ layer["proj_w_q"].astype(np.int32).T
-                    + layer["proj_b_i32"]
-                )
-                fc2_accum_scale = np.float32(gelu_scale) * np.float32(layer["proj_w_scale"])
-                if layer["proj_requant_pc"] is not None:
-                    fc2_i8 = _requant_accum_pc_int8(fc2_accum, layer["proj_requant_pc"])
-                else:
-                    fc2_i8 = _requant_accum_int8(fc2_accum, fc2_accum_scale, fc2_scale)
-                fc2 = fc2_i8.astype(np.float32) * _arch_scale(fc2_scale)
-            fc1_trace_scale = (
-                float(np.float32(ln2_scale) * np.float32(layer["fc_w_scale"]))
-                if L in self.gelu_from_accum_blocks and fc1_accum is not None
-                else fc1_scale
-            )
-            record(
-                f"block{L}_fc1",
-                fc1,
-                scale=fc1_trace_scale,
-                int8=None if L in self.gelu_from_accum_blocks and fc1_accum is not None else _fp32_to_int8(fc1, fc1_scale),
-            )
-            record(f"block{L}_gelu", gelu, scale=gelu_scale, int8=_fp32_to_int8(gelu, gelu_scale))
-            record(f"block{L}_fc2", fc2, scale=fc2_scale, int8=fc2_i8)
-            residual1_int8 = x_int8
-            residual1_scale = x_scale
-            x_scale = _scale(s, f"block{L}_residual2")
-            if L in self.raw_residual2_blocks and "residual_vadd" not in groups:
-                x_int8 = _int8_saturating_add(residual1_int8, fc2_i8)
-                x = x_int8.astype(np.float32) * _arch_scale(x_scale)
-            elif "residual_vadd" in groups or fc2_accum is None:
-                x = _qdq(x + fc2, x_scale)
-                x_int8 = _fp32_to_int8(x, x_scale)
-            else:
-                x_int8 = _dequant_add_accum_int8(fc2_accum, fc2_accum_scale, residual1_int8, residual1_scale, x_scale)
-                x = x_int8.astype(np.float32) * _arch_scale(x_scale)
-            record(f"block{L}_residual2", x, scale=x_scale, int8=x_int8)
-
+        Six lm_head paths are dispatched by ``fp32_groups``:
+          - ``"lm_head"``                — FP32 weights, FP32 output (returned as FP32).
+          - ``"lm_head_weight_fp32"``    — FP32 weights → INT8 logits (last row).
+          - ``"lm_head_requant_fp32"``   — INT8 accum × FP32 PC scale / lm_head_scale.
+          - ``"lm_head_output_fp32"``    — INT8 accum × FP32 PC scale (no clip).
+          - Default (small vocab)        — FP32 logits → INT8 (single matmul).
+          - Default (large vocab)        — INT8 accum + PC-requant (optionally
+                                            with FP32 bias added pre-clip to
+                                            avoid double-saturation).
+        """
         ln_f_scale = _scale(s, "ln_f")
-        ln_f_raw = _layernorm_np(x, self.ln_f_w, self.ln_f_b, self.eps)
+        ln_f_raw = layernorm(x, self.ln_f_w, self.ln_f_b, self.eps)
         ln_f = ln_f_raw if "ln_f" in groups else _qdq(ln_f_raw, ln_f_scale)
-        record("ln_f", ln_f, scale=ln_f_scale, int8=_fp32_to_int8(ln_f, ln_f_scale))
+        self._record_trace(trace, "ln_f", ln_f, scale=ln_f_scale, int8=_fp32_to_int8(ln_f, ln_f_scale))
         if "lm_head" in groups:
             logits = ln_f @ self.lm_head_w_fp32.T
-            record("lm_head", logits, scale=None, int8=None)
+            self._record_trace(trace, "lm_head", logits, scale=None, int8=None)
             return logits[0].astype(np.float32)
-        elif "lm_head_weight_fp32" in groups:
+        if "lm_head_weight_fp32" in groups:
             logits_fp32 = ln_f[-1:] @ self.lm_head_w_fp32.T
             return _to_int8_logits(logits_fp32[0], _scale(s, "lm_head"))
-        elif "lm_head_requant_fp32" in groups:
+        if "lm_head_requant_fp32" in groups:
             ln_f_i8 = _fp32_to_int8(ln_f, ln_f_scale)
             logits_accum = ln_f_i8.astype(np.int32) @ self.lm_head_w_q.astype(np.int32).T
             requant_f32 = (
@@ -1134,7 +1164,7 @@ class NanoGPTFQReference:
                 / max(np.float32(_scale(s, "lm_head")), np.float32(1e-12))
             )
             return _requant_accum_pc_int8(logits_accum, requant_f32)[0]
-        elif "lm_head_output_fp32" in groups:
+        if "lm_head_output_fp32" in groups:
             ln_f_i8 = _fp32_to_int8(ln_f, ln_f_scale)
             logits_accum = ln_f_i8.astype(np.int32) @ self.lm_head_w_q.astype(np.int32).T
             # requant_pc may be padded to 16-wide boundary; slice to actual vocab size.
@@ -1147,8 +1177,8 @@ class NanoGPTFQReference:
             if self.lm_head_b_fp32 is not None:
                 logits = logits + self.lm_head_b_fp32
             logits_i8 = _to_int8_logits(logits[0], _scale(s, "lm_head"))
-            record(
-                "lm_head",
+            self._record_trace(
+                trace, "lm_head",
                 logits_i8.astype(np.float32) * _arch_scale(_scale(s, "lm_head")),
                 scale=_scale(s, "lm_head"),
                 int8=logits_i8,
@@ -1166,13 +1196,36 @@ class NanoGPTFQReference:
         else:
             logits_i8 = _requant_accum_pc_int8(logits_accum, self.lm_head_requant_pc)
         logits = logits_i8.astype(np.float32) * _arch_scale(_scale(s, "lm_head"))
-        record(
-            "lm_head",
-            logits,
+        self._record_trace(
+            trace, "lm_head", logits,
             scale=_scale(s, "lm_head"),
             int8=logits_i8,
         )
         return logits_i8[0]
+
+    def _decode_incremental_step(
+        self,
+        token_id: int,
+        position_id: int,
+        caches,
+        trace: Optional[dict[str, dict[str, np.ndarray | float | None]]] = None,
+        fp32_groups: Optional[set[str]] = None,
+    ) -> np.ndarray:
+        """One incremental decode step: tok+pos embedding → 12 blocks of
+        attention+MLP → ln_f → lm_head. State (KV cache) flows in/out via
+        ``caches``; per-node trace flows via ``trace``.
+        """
+        s = self.scales
+        groups = set(fp32_groups or ())
+        x, x_int8, x_scale = self._step_embedding(token_id, position_id, s, groups, trace)
+        for L, layer in enumerate(self.layers):
+            x, x_int8, x_scale = self._step_attention_block(
+                L, layer, x, x_int8, x_scale, s, groups, caches[L], trace,
+            )
+            x, x_int8, x_scale = self._step_mlp_block(
+                L, layer, x, x_int8, x_scale, s, groups, trace,
+            )
+        return self._step_final(x, s, groups, trace)
 
 
 # ---------------------------------------------------------------------------
@@ -1212,7 +1265,7 @@ def _fp32_forward(
     for L in range(n_layer):
         ln1_w = _to_f32(sd[f"transformer.h.{L}.ln_1.weight"])
         ln1_b = _to_f32(sd[f"transformer.h.{L}.ln_1.bias"])
-        ln1 = out[f"block{L}_ln1"] = _layernorm_np(x, ln1_w, ln1_b, eps)
+        ln1 = out[f"block{L}_ln1"] = layernorm(x, ln1_w, ln1_b, eps)
 
         head_outs = []
         for H in range(n_head):
@@ -1235,7 +1288,7 @@ def _fp32_forward(
             k = out[f"block{L}_head{H}_key"] = ln1 @ k_w.T + k_b
             v = out[f"block{L}_head{H}_value"] = ln1 @ v_w.T + v_b
             attn = (q @ k.T) * (d_head ** -0.5)
-            probs = np.ones((1, 1), dtype=np.float32) if seq == 1 else _causal_softmax(attn)
+            probs = np.ones((1, 1), dtype=np.float32) if seq == 1 else softmax_causal(attn)
             out[f"block{L}_head{H}_softmax"] = probs
             head_out = out[f"block{L}_head{H}_attn_v"] = probs @ v
             head_outs.append(head_out)
@@ -1248,7 +1301,7 @@ def _fp32_forward(
 
         ln2_w = _to_f32(sd[f"transformer.h.{L}.ln_2.weight"])
         ln2_b = _to_f32(sd[f"transformer.h.{L}.ln_2.bias"])
-        ln2 = out[f"block{L}_ln2"] = _layernorm_np(x, ln2_w, ln2_b, eps)
+        ln2 = out[f"block{L}_ln2"] = layernorm(x, ln2_w, ln2_b, eps)
         fc_w = _to_f32(sd[f"transformer.h.{L}.mlp.c_fc.weight"])
         fc_b = _to_f32(sd[f"transformer.h.{L}.mlp.c_fc.bias"])
         fc1 = out[f"block{L}_fc1"] = ln2 @ fc_w.T + fc_b
@@ -1258,7 +1311,7 @@ def _fp32_forward(
         fc2 = out[f"block{L}_fc2"] = gelu @ proj_w.T + proj_b
         x = out[f"block{L}_residual2"] = x + fc2
 
-    ln_f = out["ln_f"] = _layernorm_np(x, ln_f_w, ln_f_b, eps)
+    ln_f = out["ln_f"] = layernorm(x, ln_f_w, ln_f_b, eps)
     # Optional `lm_head.bias` is created by `fold_layernorm_for_quarot`
     # (β-fold of `ln_f` produces this). For models without QuaRot, the key
     # is absent and the bias contribution is zero.

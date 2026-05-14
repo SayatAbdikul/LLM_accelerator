@@ -60,6 +60,8 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
+from ._ref_ops import cast_fp16, gelu_tanh, layernorm, softmax_masked
+
 
 def _pad_to_multiple(arr: np.ndarray, axis: int, multiple: int = 16) -> np.ndarray:
     """Right-pad `arr` along `axis` to a multiple of `multiple` with zeros."""
@@ -130,50 +132,6 @@ def _w8a16_dynamic_matmul(
     if bias_fp32 is not None:
         y_fp32 = y_fp32 + bias_fp32.astype(np.float32)
     return y_fp32.astype(np.float16).astype(np.float32)
-
-
-def _cast_fp16(x: np.ndarray) -> np.ndarray:
-    """Storage round-trip: FP32 → FP16 → FP32. Mirrors `mem.write_fp16_tile`
-    followed by `mem.read_fp16_tile` in the simulator: in-memory storage is
-    FP16, widened to FP32 on next read.
-    """
-    return x.astype(np.float16).astype(np.float32)
-
-
-def _layer_norm_fp32(x: np.ndarray, gamma: np.ndarray, beta: np.ndarray,
-                     eps: float = 1e-5) -> np.ndarray:
-    """Row-wise FP32 LayerNorm (matches `_exec_layernorm_fp32`).
-
-    Source FP16-widened on read; FP32-internal mean/variance reduction;
-    output cast to FP16 on store.
-    """
-    x = _cast_fp16(x)
-    mean = x.mean(axis=-1, keepdims=True)
-    var = x.var(axis=-1, keepdims=True)
-    out = ((x - mean) / np.sqrt(var + eps)) * gamma.reshape(1, -1) + beta.reshape(1, -1)
-    return _cast_fp16(out)
-
-
-def _gelu_fp32(x: np.ndarray) -> np.ndarray:
-    """gelu_new (tanh approximation, matches the FP16 sub-layer hardware)."""
-    x = _cast_fp16(x)
-    out = 0.5 * x * (1.0 + np.tanh(
-        np.sqrt(2.0 / np.pi) * (x + 0.044715 * x ** 3)
-    ))
-    return _cast_fp16(out)
-
-
-def _softmax_masked_fp32(scores: np.ndarray, valid_kv_len: int) -> np.ndarray:
-    """Causal masked softmax along the last axis. `valid_kv_len`
-    columns are kept; the rest get -inf before the softmax."""
-    scores = _cast_fp16(scores)
-    masked = scores.astype(np.float32).copy()
-    if valid_kv_len < masked.shape[-1]:
-        masked[..., valid_kv_len:] = -np.inf
-    masked -= np.max(masked, axis=-1, keepdims=True)
-    exp = np.exp(masked)
-    out = exp / np.sum(exp, axis=-1, keepdims=True)
-    return _cast_fp16(out)
 
 
 class NanoGPTW8A16SimulatorReference:
@@ -330,8 +288,8 @@ class NanoGPTW8A16SimulatorReference:
         )
         # KV cache append. Under fp_precision='fp16' the K/V tiles are
         # FP16-stored in the simulator's KV cache; mirror that here.
-        self._caches[layer_idx][head_idx]["k"].append(_cast_fp16(k[0]))
-        self._caches[layer_idx][head_idx]["v"].append(_cast_fp16(v[0]))
+        self._caches[layer_idx][head_idx]["k"].append(cast_fp16(k[0]))
+        self._caches[layer_idx][head_idx]["v"].append(cast_fp16(v[0]))
         k_cache = np.stack(self._caches[layer_idx][head_idx]["k"], axis=0)
         v_cache = np.stack(self._caches[layer_idx][head_idx]["v"], axis=0)
 
@@ -342,17 +300,17 @@ class NanoGPTW8A16SimulatorReference:
             np.float32(q_scale) * np.float32(k_scale) * np.float32(self.inv_sqrt_d_head)
         )
         # Q/K source widened from FP16 if applicable (matches QUANT input).
-        q_int8 = self._qkt_attn_v_quantize(_cast_fp16(q), q_scale)
-        k_int8 = self._qkt_attn_v_quantize(_cast_fp16(k_cache), k_scale)
+        q_int8 = self._qkt_attn_v_quantize(cast_fp16(q), q_scale)
+        k_int8 = self._qkt_attn_v_quantize(cast_fp16(k_cache), k_scale)
         scores_int32 = q_int8.astype(np.int32) @ k_int8.astype(np.int32).T
         scores_fp32 = scores_int32.astype(np.float32) * np.float32(composite_qkt)
         # QKT output stored at FP precision.
-        scores_fp32 = _cast_fp16(scores_fp32)
+        scores_fp32 = cast_fp16(scores_fp32)
 
         # Masked softmax with valid_kv_len = position + 1.
         valid_kv_len = position + 1
-        probs_fp32 = _softmax_masked_fp32(
-            scores_fp32, valid_kv_len,
+        probs_fp32 = softmax_masked(
+            scores_fp32, valid_kv_len, fp16_storage=True,
         )
 
         # attn_v: static composite scale.
@@ -361,11 +319,11 @@ class NanoGPTW8A16SimulatorReference:
         composite_av = np.float16(np.float32(sm_scale) * np.float32(v_scale))
         sm_int8 = self._qkt_attn_v_quantize(probs_fp32, sm_scale)
         v_cache_int8 = self._qkt_attn_v_quantize(
-            _cast_fp16(v_cache), v_scale,
+            cast_fp16(v_cache), v_scale,
         )
         head_out_int32 = sm_int8.astype(np.int32) @ v_cache_int8.astype(np.int32)
         head_out_fp32 = head_out_int32.astype(np.float32) * np.float32(composite_av)
-        return _cast_fp16(head_out_fp32)
+        return cast_fp16(head_out_fp32)
 
     def run_decode_step(self, token_id: int, position: int) -> np.ndarray:
         """Run one decode step and return its FP32 logits."""
@@ -377,11 +335,12 @@ class NanoGPTW8A16SimulatorReference:
         # Token + position embedding lookups. Storage is FP{32,16} matching
         # how the codegen stages embedding tables.
         x = self.wte[token_id:token_id + 1] + self.wpe[position:position + 1]
-        x = _cast_fp16(x)
+        x = cast_fp16(x)
 
         for layer_idx, layer in enumerate(self.layers):
-            ln1 = _layer_norm_fp32(
-                x, layer["ln1_w"], layer["ln1_b"], self.layer_norm_epsilon,
+            ln1 = layernorm(
+                x, layer["ln1_w"], layer["ln1_b"],
+                eps=self.layer_norm_epsilon, fp16_storage=True,
             )
             head_outs = []
             for head_idx in range(self.n_head):
@@ -392,22 +351,24 @@ class NanoGPTW8A16SimulatorReference:
             out_proj = _w8a16_dynamic_matmul(
                 concat, layer["c_proj_int8"], layer["c_proj_scales"], layer["c_proj_b"],
             )
-            x = _cast_fp16(x + out_proj)  # residual1
+            x = cast_fp16(x + out_proj)  # residual1
 
-            ln2 = _layer_norm_fp32(
-                x, layer["ln2_w"], layer["ln2_b"], self.layer_norm_epsilon,
+            ln2 = layernorm(
+                x, layer["ln2_w"], layer["ln2_b"],
+                eps=self.layer_norm_epsilon, fp16_storage=True,
             )
             fc1 = _w8a16_dynamic_matmul(
                 ln2, layer["fc1_int8"], layer["fc1_scales"], layer["fc1_b"],
             )
-            gelu = _gelu_fp32(fc1)
+            gelu = gelu_tanh(fc1, fp16_storage=True)
             fc2 = _w8a16_dynamic_matmul(
                 gelu, layer["fc2_int8"], layer["fc2_scales"], layer["fc2_b"],
             )
-            x = _cast_fp16(x + fc2)  # residual2
+            x = cast_fp16(x + fc2)  # residual2
 
-        ln_f = _layer_norm_fp32(
-            x, self.ln_f_w, self.ln_f_b, self.layer_norm_epsilon,
+        ln_f = layernorm(
+            x, self.ln_f_w, self.ln_f_b,
+            eps=self.layer_norm_epsilon, fp16_storage=True,
         )
         # lm_head: takes only the last row of ln_f (incremental decode).
         logits = _w8a16_dynamic_matmul(
