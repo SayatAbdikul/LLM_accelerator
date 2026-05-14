@@ -2864,10 +2864,15 @@ def test_kv_cache_layout_w8a32_elem_bytes_four_scales_strides():
 
 
 def test_kv_cache_layout_rejects_other_elem_bytes():
-    """Only INT8 (1) and FP32 (4) element types are supported."""
+    """Only INT8 (1), FP16 (2), and FP32 (4) element types are supported.
+
+    Phase 3 (c.2) M2 added FP16 (2 bytes/elem) as a valid value for the
+    W8A16 path; values outside {1, 2, 4} still raise.
+    """
     from taccel.compiler.kv_cache import build_kv_cache_layout
+    # 2 is now valid (FP16). Test that 8 (or any other value) raises.
     with pytest.raises(ValueError, match="elem_bytes"):
-        build_kv_cache_layout(deit_tiny_config(), elem_bytes=2)
+        build_kv_cache_layout(deit_tiny_config(), elem_bytes=8)
 
 
 def test_kv_transfer_bytes_uses_layout_elem_bytes_in_w8a32():

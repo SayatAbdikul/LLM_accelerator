@@ -238,13 +238,26 @@ def build_decoder_program_bundle(
     gelu_from_accum_blocks: Optional[set[int]] = None,
     w8a32_enabled: bool = False,
     fp32_biases: Optional[Dict[str, np.ndarray]] = None,
+    fp_precision: str = "fp32",
 ) -> DecoderBundleBuild:
-    """Build a ProgramBundle from already-formed decoder IR graphs."""
-    # M4-B: in W8A32 mode the K/V tiles produced by `emit_matmul_w8a32`
-    # are FP32 (4 bytes/elem) after the DEQUANT_ACCUM_FP32_SCALED epilogue.
-    # The KV cache, kv_step_bytes runtime patch, and embedding row stride
-    # all scale by `elem_bytes` to keep byte arithmetic consistent.
-    elem_bytes = 4 if w8a32_enabled else 1
+    """Build a ProgramBundle from already-formed decoder IR graphs.
+
+    `fp_precision` (W8A16, M2): "fp16" (default, new W8A16 path) selects
+    half-size FP16 storage; "fp32" (legacy W8A32) selects 4-byte FP32
+    storage. Active only when `w8a32_enabled=True`. INT8 path
+    (w8a32_enabled=False) ignores this — its tiles are INT8 by contract.
+    """
+    if fp_precision not in ("fp32", "fp16"):
+        raise ValueError(f"fp_precision must be 'fp32' or 'fp16', got {fp_precision!r}")
+    # M4-B + M2-W8A16: in W8A{32,16} mode the K/V tiles produced by
+    # `emit_matmul_w8a32` are FP-precision (4 bytes for FP32, 2 bytes for
+    # FP16) after the DEQUANT_ACCUM_FP32_SCALED epilogue. The KV cache,
+    # kv_step_bytes runtime patch, and embedding row stride all scale by
+    # `elem_bytes` to keep byte arithmetic consistent.
+    if w8a32_enabled:
+        elem_bytes = 2 if fp_precision == "fp16" else 4
+    else:
+        elem_bytes = 1
     kv_layout = build_kv_cache_layout(
         model_config, max_seq_len=max_seq_len, elem_bytes=elem_bytes,
     )
@@ -286,6 +299,7 @@ def build_decoder_program_bundle(
         requant_pc_scale_tables=requant_pc_scale_tables,
         w8a32_enabled=w8a32_enabled,
         fp32_biases=fp32_biases,
+        fp_precision=fp_precision,
     )
     decode_codegen = CodeGenerator(
         weight_data,
@@ -302,6 +316,7 @@ def build_decoder_program_bundle(
         requant_pc_scale_tables=requant_pc_scale_tables,
         w8a32_enabled=w8a32_enabled,
         fp32_biases=fp32_biases,
+        fp_precision=fp_precision,
     )
     prefill_instructions, prefill_data = prefill_codegen.generate(prefill_graph)
     decode_instructions, decode_data = decode_codegen.generate(decode_graph)

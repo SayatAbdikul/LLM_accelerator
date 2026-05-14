@@ -85,16 +85,18 @@ def build_kv_cache_layout(
 ) -> KVCacheLayout:
     """Build the Stage 3 deterministic per-head KV-cache layout.
 
-    `elem_bytes` (M4-B): 1 for INT8 K/V (default; legacy W8A8 path), 4
-    for FP32 K/V (W8A32 weight-only path). All byte-stride math scales
-    by this factor: each head's row stride per token is `d_head *
-    elem_bytes`, each head's total span is `seq_len * d_head *
-    elem_bytes`, and `kv_cache_size = n_layer * 2 * n_head * head_span`.
-    The bank-reach check `M_DRAM_OFF_REACH_BYTES = 0xFFFF * 16` is
-    applied to the resulting (scaled) byte offsets — so W8A32 banks
-    will split sooner than INT8 banks at the same `(n_layer, n_head,
-    seq_len)`. Codegen DMAs (`_kv_transfer_bytes`) and the bundle's
-    `kv_step_bytes` runtime patch field both scale by `elem_bytes`.
+    `elem_bytes` (M4-B + M2-W8A16): 1 for INT8 K/V (legacy W8A8 path),
+    2 for FP16 K/V (W8A16 default), 4 for FP32 K/V (W8A32 legacy). All
+    byte-stride math scales by this factor: each head's row stride per
+    token is `d_head * elem_bytes`, each head's total span is
+    `seq_len * d_head * elem_bytes`, and `kv_cache_size = n_layer * 2 *
+    n_head * head_span`. The bank-reach check
+    `M_DRAM_OFF_REACH_BYTES = 0xFFFF * 16` is applied to the resulting
+    (scaled) byte offsets — so W8A32 banks will split sooner than W8A16
+    banks at the same `(n_layer, n_head, seq_len)`, which in turn split
+    sooner than INT8 banks. Codegen DMAs (`_kv_transfer_bytes`) and the
+    bundle's `kv_step_bytes` runtime patch field both scale by
+    `elem_bytes`.
     """
     seq_len = int(max_seq_len or config.max_seq_len)
     if seq_len <= 0:
@@ -103,8 +105,8 @@ def build_kv_cache_layout(
         raise ValueError("max_seq_len cannot exceed ModelConfig.max_seq_len")
     if config.d_head % 16 != 0:
         raise ValueError("d_head must be 16-byte aligned for KV cache layout")
-    if elem_bytes not in (1, 4):
-        raise ValueError(f"elem_bytes must be 1 (INT8) or 4 (FP32), got {elem_bytes}")
+    if elem_bytes not in (1, 2, 4):
+        raise ValueError(f"elem_bytes must be 1 (INT8), 2 (FP16), or 4 (FP32), got {elem_bytes}")
 
     head_span = seq_len * config.d_head * elem_bytes
     kv_cache_size = config.n_layer * len(KV_KINDS) * config.n_head * head_span

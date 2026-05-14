@@ -103,8 +103,14 @@ if TYPE_CHECKING:
     from .ir import IRNode
 
 
-# Each FP32 element is 4 bytes; the codegen allocates in bytes through
-# `mem.abuf.alloc(name, size_bytes)`, so we multiply M*N by this.
+# Phase 3 (c.2) M2: FP-precision byte sizing flows from `cg.elem_bytes`.
+# - cg.elem_bytes == 4: W8A32 (FP32 ABUF storage).
+# - cg.elem_bytes == 2: W8A16 (FP16 ABUF storage).
+# All FP-tile sizing in this module uses `cg.elem_bytes`; INT32 ACCUM
+# storage (always 4 bytes/elem) keeps its hardcoded `* 4`.
+# `FP32_BYTES_PER_ELEM = 4` is retained as a module-level alias for
+# backward compatibility with existing tests that import it; internal
+# code uses `cg.elem_bytes` for the precision-dependent path.
 FP32_BYTES_PER_ELEM = 4
 
 
@@ -148,7 +154,7 @@ def _zero_fill_fp32_padding_rows(
     if M >= M_pad:
         return
     rows_to_zero = M_pad - M
-    row_bytes = K_pad * FP32_BYTES_PER_ELEM
+    row_bytes = K_pad * cg.elem_bytes
     bytes_to_zero = rows_to_zero * row_bytes
     padding_start_unit = in_alloc.offset_units + (M * row_bytes) // UNIT
     zero_dram = cg._dram_offset_required(
@@ -169,7 +175,7 @@ def _abuf_alloc_fp32(cg: "CodeGenerator", name: str, M_pad: int, N_pad: int):
     existing = cg.mem.abuf.get(name)
     if existing is not None:
         return existing
-    return cg.mem.abuf.alloc(name, M_pad * N_pad * FP32_BYTES_PER_ELEM)
+    return cg.mem.abuf.alloc(name, M_pad * N_pad * cg.elem_bytes)
 
 
 def emit_layernorm_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
@@ -226,6 +232,7 @@ def emit_layernorm_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
             src2_off=gb_alloc.offset_units if gb_alloc else 0,
             dst_buf=BUF_ABUF,
             dst_off=out_alloc.offset_units,
+            flags=cg.fp_precision_flag,
         )
     )
     cg._emit(SyncInsn(resource_mask=0b100))
@@ -251,7 +258,7 @@ def emit_layernorm_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
     # attention sub-block. The consumer (next residual VADD) reloads it
     # via `_load_dram_to_abuf_fp32`. Skip for tiny fixtures (≤ 16 KB
     # tiles) so existing tests' instruction counts stay unchanged.
-    tile_bytes = M_pad * N_pad * FP32_BYTES_PER_ELEM
+    tile_bytes = M_pad * N_pad * cg.elem_bytes
     last_use_idx = cg.last_uses.get(in_name, -1)
     has_future_use = last_use_idx > cg.current_node_idx
     if (
@@ -320,6 +327,7 @@ def emit_gelu_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
                 src1_buf=BUF_ABUF, src1_off=tile_alloc.offset_units,
                 src2_buf=BUF_ABUF, src2_off=0,
                 dst_buf=BUF_ABUF, dst_off=tile_alloc.offset_units,
+                flags=cg.fp_precision_flag,
             ))
             cg._emit(SyncInsn(resource_mask=0b100))
 
@@ -357,6 +365,7 @@ def emit_gelu_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
             src2_off=0,
             dst_buf=BUF_ABUF,
             dst_off=out_alloc.offset_units,
+            flags=cg.fp_precision_flag,
         )
     )
     cg._emit(SyncInsn(resource_mask=0b100))
@@ -473,6 +482,7 @@ def emit_softmax_fp32(cg: "CodeGenerator", node: "IRNode", *, masked: bool = Fal
             src2_off=0,
             dst_buf=BUF_ABUF,
             dst_off=out_alloc.offset_units,
+            flags=cg.fp_precision_flag,
         )
     )
     cg._emit(SyncInsn(resource_mask=0b100))
@@ -563,6 +573,7 @@ def emit_vadd_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
             src2_off=src2_alloc.offset_units,
             dst_buf=BUF_ABUF,
             dst_off=alias_input_alloc.offset_units,
+            flags=cg.fp_precision_flag,
         )
     )
     cg._emit(SyncInsn(resource_mask=0b100))
@@ -674,10 +685,10 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     # the simple lowering's buffer, dispatch to the M4-C large-weight-
     # tiled emitter (or raise for fc2-style large-input cases that we
     # defer to a follow-up milestone).
-    output_bytes = M_pad * N_pad * FP32_BYTES_PER_ELEM
+    output_bytes = M_pad * N_pad * cg.elem_bytes
     accum_bytes = M_pad * N_pad * 4  # INT32
     weight_bytes = int(w_q.size)
-    input_bytes = M_pad * K_pad * FP32_BYTES_PER_ELEM
+    input_bytes = M_pad * K_pad * cg.elem_bytes
     if input_bytes > ABUF_SIZE and node.inputs[0] not in cg.dram_temp_fp32_outputs:
         raise NotImplementedError(
             f"W8A32 matmul '{node.name}' input '{node.inputs[0]}' is "
@@ -695,7 +706,17 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
 
     # Per-channel FP16 weight-scale vector staging symbol — set up by
     # `CodeGenerator.generate()` at DRAM-staging time when w8a32_enabled.
-    pc_scale_sym = f"{weight_name}__w8a32_pc_scale"
+    # W8A32 (fp_precision="fp32"): N FP16 PC scales, separate FP32 bias VADD.
+    # W8A16 (fp_precision="fp16"): 2N FP16 (PC scales + bias), folded into
+    # the DEQUANT epilogue per the bias-fold contract.
+    bias_name = node.attrs.get("bias")
+    if cg.fp_precision == "fp16":
+        pc_scale_sym = f"{weight_name}__w8a16_pc_scale_and_bias"
+        # Bias is folded; no separate VADD path. The 2N FP16 blob is
+        # staged by `_layout_weights` whether or not the matmul has a
+        # bias (bias half is zero-padded when absent).
+    else:
+        pc_scale_sym = f"{weight_name}__w8a32_pc_scale"
 
     # ----- ABUF allocations -----
     # FP32 input tile (M_pad × K_pad × 4 bytes). The prior op's output
@@ -738,17 +759,19 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
             src2_buf=BUF_ABUF, src2_off=0,
             dst_buf=BUF_ABUF, dst_off=0,
             sreg=sreg,
+            flags=cg.fp_precision_flag,
         )
     )
     cg._emit(SyncInsn(resource_mask=0b100))  # wait SFU
 
-    # ----- Stage 2: QUANT_FP32_INT8 (FP32 ABUF → INT8 ABUF) -----
+    # ----- Stage 2: QUANT_FP32_INT8 (FP{32,16} ABUF → INT8 ABUF) -----
     cg._emit(
         QuantFp32Int8Insn(
             src1_buf=BUF_ABUF, src1_off=in_alloc.offset_units,
             src2_buf=BUF_ABUF, src2_off=0,
             dst_buf=BUF_ABUF, dst_off=int8_scratch.offset_units,
             sreg=sreg,
+            flags=cg.fp_precision_flag,
         )
     )
     cg._emit(SyncInsn(resource_mask=0b100))
@@ -766,7 +789,7 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     #      from a prior spill): just free the ABUF copy. The DRAM slot
     #      from the earlier spill is still valid for the next consumer.
     last_use_idx = cg.last_uses.get(input_name, -1)
-    input_bytes = M_pad * K_pad * FP32_BYTES_PER_ELEM
+    input_bytes = M_pad * K_pad * cg.elem_bytes
     has_future_use = last_use_idx > cg.current_node_idx
     if last_use_idx == cg.current_node_idx:
         # Case 1: last use here. Free ABUF immediately.
@@ -790,9 +813,12 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
 
     pc_scale_dram = cg._dram_offset_required(
         pc_scale_sym,
-        f"loading W8A32 per-channel weight scales for '{weight_name}'",
+        f"loading W8A{32 if cg.fp_precision == 'fp32' else 16} per-channel "
+        f"weight scales for '{weight_name}'",
     )
-    pc_scale_bytes = N_pad * 2  # FP16
+    # W8A32: N FP16. W8A16: 2N FP16 (PC scales + folded bias).
+    pc_scale_entries = (2 * N_pad) if cg.fp_precision == "fp16" else N_pad
+    pc_scale_bytes = pc_scale_entries * 2  # 2 bytes per FP16 entry
     pc_scale_alloc = cg.mem.wbuf.alloc(f"_w8a32_pc_{weight_name}", pc_scale_bytes)
     cg._emit_dma_load(BUF_WBUF, pc_scale_alloc.offset_units, pc_scale_bytes, 0, pc_scale_dram)
     cg._emit(SyncInsn(resource_mask=0b001))
@@ -820,18 +846,23 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
             src2_buf=BUF_WBUF, src2_off=pc_scale_alloc.offset_units,
             dst_buf=BUF_ABUF, dst_off=out_alloc.offset_units,
             sreg=sreg + 1,
+            flags=cg.fp_precision_flag,
         )
     )
     cg._emit(SyncInsn(resource_mask=0b100))
     cg.mem.wbuf.free(f"_w8a32_pc_{weight_name}")
 
-    # ----- Stage 6: Optional FP32 bias VADD -----
-    # VADD_FP32 does not broadcast — it reads M_pad × N_pad from both
-    # sources. We replicate the bias's (1, N_pad) vector to (M_pad, N_pad)
-    # in ABUF via M_pad DMA loads, each pulling the same N_pad × 4 bytes
-    # from DRAM into a distinct row of the bias scratch tile.
-    bias_name = node.attrs.get("bias")
-    if bias_name is not None:
+    # ----- Stage 6: Optional FP32 bias VADD (W8A32 path only) -----
+    # Under W8A16 (fp_precision="fp16") bias is folded into the DEQUANT
+    # epilogue via the 2N FP16 src2 layout (PC scales + bias); skip the
+    # separate VADD here entirely. Under W8A32 (fp_precision="fp32") the
+    # bias VADD broadcasts the FP32 bias vector to (M_pad, N_pad) via
+    # M_pad DMA loads, each pulling N_pad × 4 bytes from DRAM.
+    if cg.fp_precision == "fp16":
+        # Bias already folded into DEQUANT_ACCUM_FP32_SCALED. Output tile
+        # is the biased FP16 result. Nothing more to do.
+        pass
+    elif bias_name is not None:
         if bias_name not in cg.fp32_biases:
             raise KeyError(
                 f"W8A32 matmul '{node.name}' references bias '{bias_name}' "
@@ -844,12 +875,12 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
         )
         bias_alloc = _abuf_alloc_fp32(cg, f"{node.name}__bias_fp32", M_pad, N_pad)
         # row_units: how far in 16-byte units to advance per row.
-        row_units = (N_pad * FP32_BYTES_PER_ELEM) // 16
+        row_units = (N_pad * cg.elem_bytes) // 16
         for row in range(M_pad):
             cg._emit_dma_load(
                 BUF_ABUF,
                 bias_alloc.offset_units + row * row_units,
-                N_pad * FP32_BYTES_PER_ELEM,
+                N_pad * cg.elem_bytes,
                 0,
                 bias_dram,
             )
@@ -862,6 +893,7 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
                 src1_buf=BUF_ABUF, src1_off=out_alloc.offset_units,
                 src2_buf=BUF_ABUF, src2_off=bias_alloc.offset_units,
                 dst_buf=BUF_ABUF, dst_off=out_alloc.offset_units,
+                flags=cg.fp_precision_flag,
             )
         )
         cg._emit(SyncInsn(resource_mask=0b100))
@@ -980,6 +1012,7 @@ def emit_matmul_w8a32_large_weight_tiled(
         src2_buf=BUF_ABUF, src2_off=0,
         dst_buf=BUF_ABUF, dst_off=0,
         sreg=sreg,
+        flags=cg.fp_precision_flag,
     ))
     cg._emit(SyncInsn(resource_mask=0b100))
 
@@ -989,6 +1022,7 @@ def emit_matmul_w8a32_large_weight_tiled(
         src2_buf=BUF_ABUF, src2_off=0,
         dst_buf=BUF_ABUF, dst_off=int8_scratch.offset_units,
         sreg=sreg,
+        flags=cg.fp_precision_flag,
     ))
     cg._emit(SyncInsn(resource_mask=0b100))
 
@@ -1003,7 +1037,7 @@ def emit_matmul_w8a32_large_weight_tiled(
             cg.mem.abuf.free(input_name)
 
     # ----- DRAM-temp output region (full M_pad × N_pad FP32) -----
-    output_bytes = M_pad * N_pad * FP32_BYTES_PER_ELEM
+    output_bytes = M_pad * N_pad * cg.elem_bytes
     dram_temp_off = cg.dram_temp_start + cg.mem.alloc_dram_temp(
         f"{node.name}_w8a32_out_fp32", output_bytes
     )
@@ -1129,19 +1163,25 @@ def emit_matmul_w8a32_large_weight_tiled(
         )
         cg._emit(SyncInsn(resource_mask=0b001))
 
-        # DEQUANT_ACCUM_FP32_SCALED → FP32 N-tile output in ABUF.
+        # DEQUANT_ACCUM_FP32_SCALED → FP{32,16} N-tile output in ABUF.
         cg._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tile_units - 1, K=0))
         cg._emit(DequantAccumFp32ScaledInsn(
             src1_buf=BUF_ACCUM, src1_off=0,
             src2_buf=BUF_WBUF, src2_off=pc_scale_slice_alloc.offset_units,
             dst_buf=BUF_ABUF, dst_off=out_tile_alloc.offset_units,
             sreg=sreg + 1,
+            flags=cg.fp_precision_flag,
         ))
         cg._emit(SyncInsn(resource_mask=0b100))
         cg.mem.wbuf.free(pc_scale_slice_alloc.name)
 
-        # Optional FP32 bias VADD on this N-tile.
-        if bias_dram_full is not None:
+        # Optional FP32 bias VADD on this N-tile (W8A32 path only;
+        # W8A16 path folds bias into the DEQUANT epilogue via the 2N
+        # FP16 src2 layout — but the large-weight-tiled per-N-tile
+        # PC+bias staging is not yet plumbed for W8A16. Until that
+        # lands, W8A16 + large-weight-tiled is rejected at the
+        # dispatch site in codegen.py).
+        if cg.fp_precision == "fp32" and bias_dram_full is not None:
             bias_tile_alloc = cg.mem.abuf.alloc(
                 f"{node.name}__bias_tile_n{n_start}", M_pad * n_len * 4
             )
@@ -1160,6 +1200,7 @@ def emit_matmul_w8a32_large_weight_tiled(
                 src1_buf=BUF_ABUF, src1_off=out_tile_alloc.offset_units,
                 src2_buf=BUF_ABUF, src2_off=bias_tile_alloc.offset_units,
                 dst_buf=BUF_ABUF, dst_off=out_tile_alloc.offset_units,
+                flags=cg.fp_precision_flag,
             ))
             cg._emit(SyncInsn(resource_mask=0b100))
             cg.mem.abuf.free(bias_tile_alloc.name)
@@ -1309,6 +1350,7 @@ def _emit_matmul_w8a32_large_input_streaming(
                 src2_buf=BUF_ABUF, src2_off=0,
                 dst_buf=BUF_ABUF, dst_off=0,
                 sreg=sreg,
+                flags=cg.fp_precision_flag,
             ))
             cg._emit(SyncInsn(resource_mask=0b100))
 
@@ -1321,6 +1363,7 @@ def _emit_matmul_w8a32_large_input_streaming(
                 src2_buf=BUF_ABUF, src2_off=0,
                 dst_buf=BUF_ABUF, dst_off=int8_tile_alloc.offset_units,
                 sreg=sreg,
+                flags=cg.fp_precision_flag,
             ))
             cg._emit(SyncInsn(resource_mask=0b100))
             cg.mem.abuf.free(in_tile_alloc.name)
@@ -1377,6 +1420,7 @@ def _emit_matmul_w8a32_large_input_streaming(
                     src2_buf=BUF_WBUF, src2_off=pc_scale_slice_alloc.offset_units,
                     dst_buf=BUF_ABUF, dst_off=tile_accum_alloc.offset_units,
                     sreg=sreg + 1,
+                    flags=cg.fp_precision_flag,
                 ))
                 cg._emit(SyncInsn(resource_mask=0b100))
             else:
@@ -1388,12 +1432,14 @@ def _emit_matmul_w8a32_large_input_streaming(
                     src2_buf=BUF_WBUF, src2_off=pc_scale_slice_alloc.offset_units,
                     dst_buf=BUF_ABUF, dst_off=k_partial_alloc.offset_units,
                     sreg=sreg + 1,
+                    flags=cg.fp_precision_flag,
                 ))
                 cg._emit(SyncInsn(resource_mask=0b100))
                 cg._emit(VaddFp32Insn(
                     src1_buf=BUF_ABUF, src1_off=tile_accum_alloc.offset_units,
                     src2_buf=BUF_ABUF, src2_off=k_partial_alloc.offset_units,
                     dst_buf=BUF_ABUF, dst_off=tile_accum_alloc.offset_units,
+                    flags=cg.fp_precision_flag,
                 ))
                 cg._emit(SyncInsn(resource_mask=0b100))
                 cg.mem.abuf.free(k_partial_alloc.name)
@@ -1401,8 +1447,10 @@ def _emit_matmul_w8a32_large_input_streaming(
             # Free this K-tile's PC scale slice; the next K-tile reloads.
             cg.mem.wbuf.free(pc_scale_slice_alloc.name)
 
-        # Optional bias VADD on tile_accum.
-        if bias_dram_full is not None:
+        # Optional bias VADD on tile_accum (W8A32 path only; W8A16 path
+        # folds bias into the per-K-tile DEQUANT epilogue via the 2N FP16
+        # src2 layout — not yet plumbed for the fc2 streaming path).
+        if cg.fp_precision == "fp32" and bias_dram_full is not None:
             bias_tile_alloc = cg.mem.abuf.alloc(
                 f"{node.name}__bias_tile_n{n_start}", M_pad * n_len * 4
             )
@@ -1420,6 +1468,7 @@ def _emit_matmul_w8a32_large_input_streaming(
                 src1_buf=BUF_ABUF, src1_off=tile_accum_alloc.offset_units,
                 src2_buf=BUF_ABUF, src2_off=bias_tile_alloc.offset_units,
                 dst_buf=BUF_ABUF, dst_off=tile_accum_alloc.offset_units,
+                flags=cg.fp_precision_flag,
             ))
             cg._emit(SyncInsn(resource_mask=0b100))
             cg.mem.abuf.free(bias_tile_alloc.name)
@@ -1528,7 +1577,7 @@ def emit_matmul_qkt_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     # codegen._layout_weights), so the FP32 byte size fits.
     if N_pad > key_len:
         pad_rows = N_pad - key_len
-        k_row_units_fp32 = (K_pad * FP32_BYTES_PER_ELEM) // UNIT
+        k_row_units_fp32 = (K_pad * cg.elem_bytes) // UNIT
         k_pad_units = k_fp32_alloc.offset_units + key_len * k_row_units_fp32
         zero_pad_dram = cg._dram_offset_required(
             "__zero_pad__", f"zeroing K padding rows for '{node.name}'"
@@ -1536,7 +1585,7 @@ def emit_matmul_qkt_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
         cg._emit_dma_load(
             BUF_ABUF,
             k_pad_units,
-            pad_rows * K_pad * FP32_BYTES_PER_ELEM,
+            pad_rows * K_pad * cg.elem_bytes,
             3,
             zero_pad_dram,
         )
@@ -1563,6 +1612,7 @@ def emit_matmul_qkt_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
             src2_buf=BUF_ABUF, src2_off=0,
             dst_buf=BUF_ABUF, dst_off=q_int8_alloc.offset_units,
             sreg=sreg_q,
+            flags=cg.fp_precision_flag,
         )
     )
     cg._emit(SyncInsn(resource_mask=0b100))
@@ -1583,6 +1633,7 @@ def emit_matmul_qkt_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
             src2_buf=BUF_ABUF, src2_off=0,
             dst_buf=BUF_ABUF, dst_off=k_int8_alloc.offset_units,
             sreg=sreg_k,
+            flags=cg.fp_precision_flag,
         )
     )
     cg._emit(SyncInsn(resource_mask=0b100))
@@ -1613,7 +1664,7 @@ def emit_matmul_qkt_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     # Gated by k_loaded being big enough to matter (≥ 16 KB) so unit
     # tests with seq_len=16/d_head=64 (= 4 KB) keep their allocations
     # alive for post-emit inspection.
-    k_size_bytes = N_pad * K_pad * FP32_BYTES_PER_ELEM
+    k_size_bytes = N_pad * K_pad * cg.elem_bytes
     if k_size_bytes >= 16 * 1024:
         cg.mem.abuf.free(f"{node.name}__k_int8")
         k_in_name = node.inputs[1]
@@ -1640,7 +1691,7 @@ def emit_matmul_qkt_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     out_alloc = _abuf_alloc_fp32(cg, node.name, M_pad, N_pad)
 
     # ----- Stage 6: per-strip MATMUL + DEQUANT_ACCUM_FP32 -----
-    out_row_units = (N_pad * FP32_BYTES_PER_ELEM) // UNIT
+    out_row_units = (N_pad * cg.elem_bytes) // UNIT
     for s in range(num_strips):
         # CONFIG_TILE for one Q strip: M=1 tile (16 rows), N=full N_pad, K=full K_pad.
         cg._emit(ConfigTileInsn(M=0, N=n_tiles - 1, K=k_tiles - 1))
@@ -1663,6 +1714,7 @@ def emit_matmul_qkt_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
                 src1_buf=BUF_ACCUM, src1_off=0,
                 src2_buf=BUF_WBUF, src2_off=pc_scale_alloc.offset_units,
                 dst_buf=BUF_ABUF, dst_off=strip_out_off,
+                flags=cg.fp_precision_flag,
             )
         )
         cg._emit(SyncInsn(resource_mask=0b100))
@@ -1783,7 +1835,7 @@ def emit_matmul_attn_v_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     # lines 2249-2258).
     if Kseq_pad > key_len:
         pad_rows = Kseq_pad - key_len
-        v_row_units_fp32 = (N_pad * FP32_BYTES_PER_ELEM) // UNIT
+        v_row_units_fp32 = (N_pad * cg.elem_bytes) // UNIT
         v_pad_units = v_fp32_alloc.offset_units + key_len * v_row_units_fp32
         zero_pad_dram = cg._dram_offset_required(
             "__zero_pad__", f"zeroing V padding rows for '{node.name}'"
@@ -1791,7 +1843,7 @@ def emit_matmul_attn_v_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
         cg._emit_dma_load(
             BUF_ABUF,
             v_pad_units,
-            pad_rows * N_pad * FP32_BYTES_PER_ELEM,
+            pad_rows * N_pad * cg.elem_bytes,
             3,
             zero_pad_dram,
         )
@@ -1818,6 +1870,7 @@ def emit_matmul_attn_v_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
             src2_buf=BUF_ABUF, src2_off=0,
             dst_buf=BUF_ABUF, dst_off=sm_int8_alloc.offset_units,
             sreg=sreg_sm,
+            flags=cg.fp_precision_flag,
         )
     )
     cg._emit(SyncInsn(resource_mask=0b100))
@@ -1825,7 +1878,7 @@ def emit_matmul_attn_v_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     # M4-debug: free FP32 softmax output now — sm_int8 has the quantized
     # version, and softmax's last_use is this attn_v. At GPT-2 scale
     # this frees 16 KB ABUF before v_int8 alloc. Same size gate as V.
-    sm_size_bytes = M_pad * Kseq_pad * FP32_BYTES_PER_ELEM
+    sm_size_bytes = M_pad * Kseq_pad * cg.elem_bytes
     if sm_size_bytes >= 16 * 1024:
         sm_in_name = node.inputs[0]
         if cg.last_uses.get(sm_in_name, -1) <= cg.current_node_idx:
@@ -1848,6 +1901,7 @@ def emit_matmul_attn_v_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
             src2_buf=BUF_ABUF, src2_off=0,
             dst_buf=BUF_ABUF, dst_off=v_int8_alloc.offset_units,
             sreg=sreg_v,
+            flags=cg.fp_precision_flag,
         )
     )
     cg._emit(SyncInsn(resource_mask=0b100))
@@ -1873,7 +1927,7 @@ def emit_matmul_attn_v_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     # GPT-2 decode 256-token scale this frees 64 KB + 16 KB = 80 KB.
     # Gated by v_size >= 16 KB to preserve unit-test allocation
     # inspection at d_head=64 / seq_len=16 (= 4 KB v_loaded).
-    v_size_bytes = Kseq_pad * N_pad * FP32_BYTES_PER_ELEM
+    v_size_bytes = Kseq_pad * N_pad * cg.elem_bytes
     if v_size_bytes >= 16 * 1024:
         cg.mem.abuf.free(f"{node.name}__v_int8")
         v_in_name = node.inputs[1]
@@ -1915,12 +1969,13 @@ def emit_matmul_attn_v_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     )
     cg._emit(SyncInsn(resource_mask=0b010))
 
-    # DEQUANT_ACCUM_FP32: accum × wt_scale_pc → FP32 attn_v in ABUF.
+    # DEQUANT_ACCUM_FP32: accum × wt_scale_pc → FP{32,16} attn_v in ABUF.
     cg._emit(
         DequantAccumFp32Insn(
             src1_buf=BUF_ACCUM, src1_off=0,
             src2_buf=BUF_WBUF, src2_off=pc_scale_alloc.offset_units,
             dst_buf=BUF_ABUF, dst_off=out_alloc.offset_units,
+            flags=cg.fp_precision_flag,
         )
     )
     cg._emit(SyncInsn(resource_mask=0b100))
@@ -1938,7 +1993,7 @@ def emit_matmul_attn_v_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     # concat_heads reloads each spilled tile when assembling the concat
     # tensor.
     if Kseq_pad >= 64 and cg.current_node_idx >= 0:
-        out_bytes = M_pad * N_pad * FP32_BYTES_PER_ELEM
+        out_bytes = M_pad * N_pad * cg.elem_bytes
         cg._spill_fp32_tile_to_dram(node.name, out_alloc, M_pad, N_pad)
         # _spill freed the ABUF; concat_heads detects this via
         # dram_temp_fp32_outputs[node.name] and reloads on demand.

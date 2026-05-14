@@ -65,7 +65,8 @@ class CodeGenerator:
                  stream_name: str = "prefill",
                  kv_layout: Optional[KVCacheLayout] = None,
                  w8a32_enabled: bool = False,
-                 fp32_biases: Optional[Dict[str, np.ndarray]] = None):
+                 fp32_biases: Optional[Dict[str, np.ndarray]] = None,
+                 fp_precision: str = "fp32"):
         """
         Args:
             weight_data: name → (quantized_data, per_channel_scales)
@@ -90,12 +91,23 @@ class CodeGenerator:
             fp32_biases: Optional map of bias_name → FP32 1-D vector.
                 Used only when `w8a32_enabled=True`. The codegen stages
                 each FP32 bias to DRAM under the symbol
-                `f"{bias_name}__fp32"` so `emit_matmul_w8a32` can
-                DMA-load it for the post-DEQUANT FP32 bias VADD. The
-                INT8 path's `prescaled_biases` (INT32, prescaled by
-                input_act_scale × mean_w_scale) is incompatible with
-                M2.5-A's dynamic activation scale — hence this parallel
-                FP32 artifact.
+                `f"{bias_name}__fp32"` (W8A32 path) or folded into the
+                `__w8a16_pc_scale_and_bias` combined blob (W8A16 path,
+                see `fp_precision` below). The bias array itself stays
+                FP32 in Python — the codegen handles the cast at staging
+                time based on `fp_precision`. The INT8 path's
+                `prescaled_biases` (INT32, prescaled by input_act_scale ×
+                mean_w_scale) is incompatible with the dynamic activation
+                scale — hence this parallel FP32 artifact.
+            fp_precision: Phase 3 (c.2) W8A16. One of:
+                - "fp32" (W8A32): legacy path, FP32 ABUF storage, separate
+                  VADD_FP32 for bias post-DEQUANT. RTypeInsn.flags[0]=0.
+                - "fp16" (W8A16, default): FP16 ABUF storage, bias folded
+                  into DEQUANT_ACCUM_FP32_SCALED via 2N FP16 src2 layout.
+                  RTypeInsn.flags[0]=1. Half-size tiles vs FP32.
+                Active only when `w8a32_enabled=True`. Drives `elem_bytes`
+                (2 vs 4) and `fp_precision_flag` (1 vs 0) consumed by
+                `w8a32_emit.py`.
         """
         self.weight_data = weight_data
         self.config = model_config or deit_tiny_config()
@@ -110,6 +122,15 @@ class CodeGenerator:
         # without a corresponding FP32 staging entry.
         self.fp32_biases: Dict[str, np.ndarray] = dict(fp32_biases or {})
         self.w8a32_enabled = bool(w8a32_enabled)
+        # Phase 3 (c.2) M2 — FP precision selector for the W8A32/W8A16 path.
+        # `elem_bytes` drives byte sizing in w8a32_emit.py (4 → 2 for FP16).
+        # `fp_precision_flag` becomes RTypeInsn.flags[0] on every emitted
+        # W8A32 R-type op (0x17-0x1F): 0=FP32, 1=FP16.
+        if fp_precision not in ("fp32", "fp16"):
+            raise ValueError(f"fp_precision must be 'fp32' or 'fp16', got {fp_precision!r}")
+        self.fp_precision = fp_precision
+        self.elem_bytes: int = 2 if fp_precision == "fp16" else 4
+        self.fp_precision_flag: int = 1 if fp_precision == "fp16" else 0
         if self.w8a32_enabled:
             # M2 design contract: in W8A32 mode the INT8-round-trip
             # optimizations are off — they're optimizations of behavior
@@ -160,13 +181,13 @@ class CodeGenerator:
         # Set by `generate()` immediately before each `_emit_node` call.
         self.last_uses: Dict[str, int] = {}
         self.current_node_idx: int = -1
-        # M4-A: spill an FP32 residual tile to DRAM only when its byte
-        # size exceeds this threshold. Tiny fixtures (d_model=16, 1 KB
-        # tiles) skip spill so existing test instruction counts are
-        # preserved; real GPT-2 (d_model=768, 48 KB tiles) triggers spill.
-        # 16 KB picks the boundary at d_model ≈ 256 → only spills when
-        # ABUF residency actually matters.
-        self.fp32_spill_threshold_bytes: int = 16384
+        # M4-A: spill an FP-precision residual tile to DRAM only when its
+        # byte size exceeds this threshold. Tiny fixtures skip spill so
+        # existing test instruction counts are preserved; real GPT-2
+        # (d_model=768) triggers spill. The threshold scales with element
+        # size so the same logical tile-shape boundary (d_model ≈ 256)
+        # holds for both FP32 (16 KB) and FP16 (8 KB).
+        self.fp32_spill_threshold_bytes: int = 16384 if self.elem_bytes == 4 else 8192
         # Default to 0 so unit tests that bypass _layout_weights (and
         # would set dram_temp_start to a non-zero offset) don't crash
         # in _spill_fp32_tile_to_dram. _layout_weights overwrites this.
@@ -331,6 +352,57 @@ class CodeGenerator:
                 self.dram_blob.extend(blob)
                 offset += len(blob)
 
+            # W8A16 (Phase 3 (c.2) M2): stage a combined PC-scale-plus-bias
+            # FP16 blob per matmul weight. The DEQUANT_ACCUM_FP32_SCALED
+            # epilogue under flags=1 reads `2N FP16` from src2 (N PC scales
+            # then N bias values), folds bias in FP32 before casting to
+            # FP16 once. This avoids FP16 double-rounding bias through a
+            # separate VADD. Staging requires walking the matmul graph
+            # nodes to pair each weight with its bias name (`node.attrs
+            # ["bias"]`); matmuls without a bias get zero-padded bias half.
+            #
+            # We stage the same blob whether or not the codegen runs under
+            # fp_precision="fp16" — under "fp32" it's dead DRAM (small
+            # constant overhead), and pre-staging keeps the layout
+            # comparison `prefill_data == decode_data` in the bundle
+            # builder stable across precision flips.
+            for node in graph.nodes:
+                if node.op != "matmul":
+                    continue
+                weight_name = node.inputs[1] if len(node.inputs) > 1 else None
+                if weight_name is None or weight_name not in self.weight_data:
+                    continue
+                data, scales = self.weight_data[weight_name]
+                if not (isinstance(data, np.ndarray) and data.ndim == 2):
+                    continue
+                if scales is None:
+                    continue
+                N_pad = pad_dim(int(data.shape[1]))
+                pc_fp16 = np.zeros(N_pad, dtype=np.float16)
+                scales_fp16 = np.asarray(scales, dtype=np.float16).reshape(-1)
+                n_take = min(len(scales_fp16), N_pad)
+                pc_fp16[:n_take] = scales_fp16[:n_take]
+                bias_name = node.attrs.get("bias")
+                bias_fp16 = np.zeros(N_pad, dtype=np.float16)
+                if bias_name is not None and bias_name in self.fp32_biases:
+                    bias_src = np.asarray(self.fp32_biases[bias_name], dtype=np.float32).reshape(-1)
+                    b_take = min(len(bias_src), N_pad)
+                    bias_fp16[:b_take] = bias_src[:b_take].astype(np.float16)
+                sym = f"{weight_name}__w8a16_pc_scale_and_bias"
+                if sym in self.dram_layout:
+                    # Multiple matmuls might share a weight (e.g., when a
+                    # weight is reused across heads). Stage once; the bias
+                    # half is derived from the first matmul that references
+                    # the weight. If a subsequent matmul has a different
+                    # bias, the codegen will raise a clear error at emit
+                    # time when looking up the symbol. This is conservative
+                    # and matches the W8A32 __fp32 staging convention.
+                    continue
+                self.dram_layout[sym] = offset
+                blob = np.concatenate([pc_fp16, bias_fp16]).tobytes()
+                self.dram_blob.extend(blob)
+                offset += len(blob)
+
             # W8A32 (M3-A): stage a per-matmul_qkt FP16 PC scale vector.
             # emit_matmul_qkt_w8a32 uses DEQUANT_ACCUM_FP32 (the M1 variant —
             # no act_scale slot) to multiply the INT32 ACCUM by a single
@@ -424,7 +496,8 @@ class CodeGenerator:
         else:
             _zero_pad_size = (TILE - 1) * self.config.d_model
         if self.w8a32_enabled:
-            _zero_pad_size *= 4
+            # Scale by element size: W8A32 = 4 bytes/elem, W8A16 = 2.
+            _zero_pad_size *= self.elem_bytes
             # M4-debug (padding-pollution fix): enlarge `__zero_pad__` to
             # cover the largest K_pad across all W8A32 matmuls so
             # emit_matmul_w8a32* can zero-fill input padding rows before
@@ -437,7 +510,7 @@ class CodeGenerator:
             for _w_name, (data, _scales) in self.weight_data.items():
                 if isinstance(data, np.ndarray) and data.ndim == 2:
                     max_k_pad = max(max_k_pad, pad_dim(int(data.shape[0])))
-            _zero_pad_size = max(_zero_pad_size, (TILE - 1) * max_k_pad * 4)
+            _zero_pad_size = max(_zero_pad_size, (TILE - 1) * max_k_pad * self.elem_bytes)
         self.dram_layout["__zero_pad__"] = offset
         self.dram_blob.extend(bytes(_zero_pad_size))
         offset += _zero_pad_size
