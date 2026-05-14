@@ -1931,6 +1931,18 @@ def emit_matmul_attn_v_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     cg.mem.wbuf.free(f"v_head{head_idx}_{node.name}")
     cg.mem.wbuf.free(f"_attn_v_pc_{node.name}")
 
+    # M4-debug: at production decode scale (Kseq_pad >= 64), spill the
+    # per-head attn_v output to DRAM-temp. Otherwise 12 heads × 4 KB
+    # per-head output accumulate in ABUF, leaving no room for head 11's
+    # QKT k_int8 alloc (115 KB live + 16 KB request > 128 KB).
+    # concat_heads reloads each spilled tile when assembling the concat
+    # tensor.
+    if Kseq_pad >= 64 and cg.current_node_idx >= 0:
+        out_bytes = M_pad * N_pad * FP32_BYTES_PER_ELEM
+        cg._spill_fp32_tile_to_dram(node.name, out_alloc, M_pad, N_pad)
+        # _spill freed the ABUF; concat_heads detects this via
+        # dram_temp_fp32_outputs[node.name] and reloads on demand.
+
     # Trace event: FP32 attn_v tile. The recorded scale is the composite
     # `sm_scale × v_scale` (= 1.0 in real units, the FP32 tile is already
     # in real units — the scale is for INT8-equivalent recovery tooling).

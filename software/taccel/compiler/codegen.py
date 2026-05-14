@@ -2457,7 +2457,17 @@ class CodeGenerator:
                         self.mem.abuf.allocations[node.name] = src_alloc
                         out_alloc = src_alloc
             else:
+                # M4-debug: per-head attn_v outputs may have been spilled
+                # to DRAM-temp by emit_matmul_attn_v_w8a32 (production
+                # decode scale Kseq_pad >= 64). Reload each one before
+                # BufCopying to its concat slot, then free the reloaded
+                # ABUF tile.
                 for h, inp_name in enumerate(node.inputs):
+                    if (
+                        inp_name in self.dram_temp_fp32_outputs
+                        and self.mem.abuf.get(inp_name) is None
+                    ):
+                        self._load_dram_to_abuf_fp32(inp_name, M_pad, N_pad)
                     src_alloc = self.mem.abuf.get(inp_name)
                     if src_alloc is None:
                         continue
