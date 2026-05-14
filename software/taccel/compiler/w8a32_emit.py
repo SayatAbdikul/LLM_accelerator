@@ -1603,6 +1603,24 @@ def emit_matmul_qkt_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     )
     cg._emit(SyncInsn(resource_mask=0b001))
 
+    # M4-debug: free the FP32 K (k_loaded) and K_int8 ABUF regions now —
+    # the K^T is in WBUF for the MATMUL, and K's last_use is this QKT
+    # so neither original copy is needed anymore. At GPT-2 decode scale
+    # this frees 64 KB (k_loaded) + 16 KB (k_int8) = 80 KB ABUF before
+    # the qkt out_alloc, which would otherwise OOM at head 7+ when
+    # accumulated attn_v outputs (28 KB+) crowd the buffer.
+    #
+    # Gated by k_loaded being big enough to matter (≥ 16 KB) so unit
+    # tests with seq_len=16/d_head=64 (= 4 KB) keep their allocations
+    # alive for post-emit inspection.
+    k_size_bytes = N_pad * K_pad * FP32_BYTES_PER_ELEM
+    if k_size_bytes >= 16 * 1024:
+        cg.mem.abuf.free(f"{node.name}__k_int8")
+        k_in_name = node.inputs[1]
+        if cg.last_uses.get(k_in_name, -1) <= cg.current_node_idx:
+            if cg.mem.abuf.get(k_in_name) is not None:
+                cg.mem.abuf.free(k_in_name)
+
     # ----- Stage 4: DMA-load the staged FP16 PC scale vector -----
     # Vector entries are all `q_scale * k_scale * inv_sqrt_d_head` cast
     # to FP16 — staged at DRAM-layout time in `_layout_weights`.
@@ -1649,7 +1667,8 @@ def emit_matmul_qkt_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
         )
         cg._emit(SyncInsn(resource_mask=0b100))
 
-    # Cleanup.
+    # Cleanup. k_int8 was freed in Stage 3 (M4-debug) when running
+    # inside generate(); idempotent free here for unit tests.
     cg.mem.abuf.free(f"{node.name}__q_int8")
     cg.mem.abuf.free(f"{node.name}__k_int8")
     cg.mem.wbuf.free(f"kt_head{head_idx}_{node.name}")
