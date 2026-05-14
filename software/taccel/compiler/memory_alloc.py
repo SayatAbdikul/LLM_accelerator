@@ -62,8 +62,17 @@ class BufferAllocator:
                 return alloc
         # Compute live bytes for error message
         live = sum(a.size_units for a in self.allocations.values())
+        import os as _os
+        if _os.environ.get("W8A32_DEBUG_ALLOC"):
+            live_names = sorted(
+                ((n, a.size_units * UNIT) for n, a in self.allocations.items()),
+                key=lambda x: -x[1],
+            )[:15]
+            print(f"[ABUF ALLOC FAIL] requesting {name} ({size_bytes}B)")
+            for n, sz in live_names:
+                print(f"  live: {n}: {sz}B")
         raise MemoryError(
-            f"Cannot allocate {size_bytes}B ({size_units} units) in buffer {self.buf_id}. "
+            f"Cannot allocate {size_bytes}B ({size_units} units) for {name!r} in buffer {self.buf_id}. "
             f"Capacity={self.capacity}B, live={live * UNIT}B, "
             f"largest free block={max((s for _, s in self._free), default=0) * UNIT}B"
         )

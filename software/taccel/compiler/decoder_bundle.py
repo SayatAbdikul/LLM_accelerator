@@ -92,10 +92,29 @@ def mark_runtime_embedding_lookups(graph: IRGraph) -> IRGraph:
 
 def inject_kv_cache_nodes(graph: IRGraph, config: ModelConfig, *,
                           decode: bool, seq_len: int) -> IRGraph:
-    """Insert narrow Stage 3 KV cache nodes into a nanoGPT-style graph."""
+    """Insert narrow Stage 3 KV cache nodes into a nanoGPT-style graph.
+
+    M4-debug: kv_load nodes are inserted **just before their consumer
+    matmul** (kv_load(K) right before matmul_qkt, kv_load(V) right
+    before matmul_attn_v) instead of right after the kv_store. This
+    minimizes the lifetime of the 64 KB FP32 K/V cache tiles at GPT-2
+    decode scale (seq_len=256 → 64 KB per K/V load) so they don't
+    collide with the FP32 LN1 input (48 KB) during the per-head Q/K/V
+    matmuls.
+
+    Old order: ... K matmul → kv_store(K) → kv_load(K) → V matmul ...
+      → k_loaded (64 KB) pins ABUF across V matmul. peak 132 KB > 128.
+
+    New order: ... K matmul → kv_store(K) → V matmul → kv_store(V) →
+                 kv_load(K) → QKT → softmax → kv_load(V) → attn_v ...
+      → k_loaded only alive across QKT; v_loaded only across attn_v.
+    """
     out = IRGraph()
     key_loads: Dict[Tuple[int, int], str] = {}
     value_loads: Dict[Tuple[int, int], str] = {}
+    # M4-debug: pre-compute kv_load names so consumer-side insertion can
+    # reference them before the kv_store is emitted.
+    pending_kv_load: Dict[str, IRNode] = {}  # load_name → kv_load node
 
     for node in graph.nodes:
         copied = IRNode(
@@ -118,6 +137,10 @@ def inject_kv_cache_nodes(graph: IRGraph, config: ModelConfig, *,
             copied.attrs["key_len"] = int(seq_len)
             copied.attrs["runtime_config_attn"] = True
             copied.output_shape = (int(copied.output_shape[0]), int(seq_len))
+            # Emit kv_load(K) IMMEDIATELY before matmul_qkt so the K
+            # tile lifetime is bounded by [kv_load, QKT].
+            if replacement in pending_kv_load:
+                out.add_node(pending_kv_load.pop(replacement))
         if decode and copied.op in ("scale_mul", "softmax") and len(copied.output_shape) == 2:
             copied.attrs["query_len"] = int(copied.output_shape[0])
             copied.attrs["key_len"] = int(seq_len)
@@ -126,10 +149,7 @@ def inject_kv_cache_nodes(graph: IRGraph, config: ModelConfig, *,
             # `emit_softmax_fp32` (not the INT8 path's per-strip-inside-
             # `_emit_qkt` location). For the decode stream, that CONFIG_ATTN
             # must be patched per decode step. Mark the masked softmax so
-            # the emitter registers a `RuntimeConfigAttnSite`. (Pre-M4-D,
-            # the softmax emitted CONFIG_ATTN with static prefill values
-            # that never changed; multi-step decode masked against the
-            # wrong context.)
+            # the emitter registers a `RuntimeConfigAttnSite`.
             if copied.op == "softmax" and bool(copied.attrs.get("masked")):
                 copied.attrs["runtime_config_attn"] = True
         if decode and copied.op == "matmul_attn_v" and layer is not None and head is not None:
@@ -138,6 +158,9 @@ def inject_kv_cache_nodes(graph: IRGraph, config: ModelConfig, *,
                 copied.inputs[1] = replacement
             copied.attrs["query_len"] = int(copied.output_shape[0])
             copied.attrs["key_len"] = int(seq_len)
+            # Emit kv_load(V) IMMEDIATELY before matmul_attn_v.
+            if replacement in pending_kv_load:
+                out.add_node(pending_kv_load.pop(replacement))
 
         out.add_node(copied)
 
@@ -166,8 +189,10 @@ def inject_kv_cache_nodes(graph: IRGraph, config: ModelConfig, *,
         if not decode:
             continue
 
+        # M4-debug: defer kv_load node emission until its consumer
+        # (matmul_qkt for K, matmul_attn_v for V) is encountered.
         load_name = f"{copied.name}_kv_load"
-        out.add_node(IRNode(
+        kv_load_node = IRNode(
             op="kv_load",
             name=load_name,
             inputs=[],
@@ -179,11 +204,18 @@ def inject_kv_cache_nodes(graph: IRGraph, config: ModelConfig, *,
                 "tokens": int(seq_len),
                 "decode": True,
             },
-        ))
+        )
+        pending_kv_load[load_name] = kv_load_node
         if kind == "key":
             key_loads[(int(layer), int(head))] = load_name
         else:
             value_loads[(int(layer), int(head))] = load_name
+
+    # Safety: any kv_load nodes not consumed (shouldn't happen with a
+    # well-formed graph) get appended at the end so the bundle still
+    # references valid producers.
+    for kv_node in pending_kv_load.values():
+        out.add_node(kv_node)
 
     return out
 
