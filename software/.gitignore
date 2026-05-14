@@ -40,3 +40,9 @@ quantization_comparison.json
 
 # storage for dataset
 images/
+
+# Phase-experiment logs (Phase 0-A PTQ research artifacts; large json/text dumps)
+logs/
+
+# DeiT/legacy assembly output
+out/
