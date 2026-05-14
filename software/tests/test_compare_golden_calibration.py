@@ -141,6 +141,10 @@ class TestCalibrationScaleMapping:
         assert len(preset["benchmark"]["calibration_image_ids"]) == 20
         assert preset["compile_args"]["smoothquant_targets"] == "off"
 
+    @pytest.mark.skipif(
+        len(CATS_DOGS_SAMPLE_IDS) == 0,
+        reason="local cats/dogs image fixture (software/images/cats and dogs/) not present",
+    )
     def test_diagnostic_preset_cats_dogs_uses_all_local_samples(self):
         preset = DIAGNOSTIC_PRESETS["cats_dogs_local_all"]
 
@@ -151,6 +155,10 @@ class TestCalibrationScaleMapping:
         assert preset["benchmark"]["eval_image_ids"][0] == "cat1"
         assert preset["benchmark"]["eval_image_ids"][-1] == "dog100"
 
+    @pytest.mark.skipif(
+        len(IMAGENET_CLASS0_SAMPLE_IDS) == 0,
+        reason="local imagenet-class0 image fixture (software/images/imagenet_one_class/) not present",
+    )
     def test_diagnostic_preset_imagenet_class0_uses_all_local_samples(self):
         preset = DIAGNOSTIC_PRESETS["imagenet_class0_local_all"]
 
@@ -477,6 +485,10 @@ class TestCalibrationScaleMapping:
         assert resolved["block9_ln2"]["module_name"] == "vit.encoder.layer.9.layernorm_after"
         assert resolved["block9_ln2"]["scale_keys"] == ["block9_ln2"]
 
+    @pytest.mark.skipif(
+        len(CATS_DOGS_SAMPLE_IDS) == 0,
+        reason="local cats/dogs image fixture (software/images/cats and dogs/) not present",
+    )
     def test_discover_cats_dogs_samples_is_stable_and_labeled(self):
         samples = discover_cats_dogs_samples()
 

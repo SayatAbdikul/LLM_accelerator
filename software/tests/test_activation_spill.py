@@ -9,7 +9,7 @@ from taccel.compiler.tiler import pad_dim
 from taccel.golden_model.simulator import Simulator
 from taccel.isa.encoding import encode
 from taccel.runtime.fake_quant import cosine_similarity
-from taccel.runtime.fake_quant_reference import _gelu_np
+from taccel.runtime._ref_ops import gelu_erf
 
 
 def _program(instructions, data):
@@ -99,7 +99,7 @@ def test_d384_fc1_gelu_spill_is_consumed_by_fc2():
     s_fc1 = np.float32(np.float16(0.125 * 0.0625 / 0.25))
     s_fc2 = np.float32(np.float16(0.25 * 0.0625 / 0.25))
     fc1 = np.clip(np.round((act.astype(np.int32) @ fc1_w.astype(np.int32)).astype(np.float32) * s_fc1), -128, 127).astype(np.int8)
-    gelu_f = _gelu_np(fc1.astype(np.float32) * np.float32(0.25))
+    gelu_f = gelu_erf(fc1.astype(np.float32) * np.float32(0.25))
     gelu = np.clip(np.round(gelu_f / np.float32(0.25)), -128, 127).astype(np.int8)
     fc2 = np.clip(np.round((gelu.astype(np.int32) @ fc2_w.astype(np.int32)).astype(np.float32) * s_fc2), -128, 127).astype(np.int8)
 

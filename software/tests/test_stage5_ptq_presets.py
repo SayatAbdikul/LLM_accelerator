@@ -177,6 +177,10 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         quarot_enabled=False,
         quarot_seed=0xCAFE,
         quarot_kind="random_orthogonal",
+        awq_enabled=False,
+        awq_alpha=0.5,
+        awq_target_modules=(),
+        weight_only_int8=False,
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
         validate_stage5_ptq_preset_for_model({"n_layer": 1}, invalid)
@@ -200,6 +204,10 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         quarot_enabled=False,
         quarot_seed=0xCAFE,
         quarot_kind="random_orthogonal",
+        awq_enabled=False,
+        awq_alpha=0.5,
+        awq_target_modules=(),
+        weight_only_int8=False,
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
         validate_stage5_ptq_preset_for_model({"n_layer": 1}, invalid_output_aware)
@@ -223,6 +231,10 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         quarot_enabled=False,
         quarot_seed=0xCAFE,
         quarot_kind="random_orthogonal",
+        awq_enabled=False,
+        awq_alpha=0.5,
+        awq_target_modules=(),
+        weight_only_int8=False,
     )
     with pytest.raises(ValueError, match="without matching fc2 REQUANT_PC"):
         validate_stage5_ptq_preset_for_model({"n_layer": 1}, invalid_output_aware_mlp)
@@ -246,6 +258,10 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         quarot_enabled=False,
         quarot_seed=0xCAFE,
         quarot_kind="random_orthogonal",
+        awq_enabled=False,
+        awq_alpha=0.5,
+        awq_target_modules=(),
+        weight_only_int8=False,
     )
     with pytest.raises(ValueError, match="GELU-from-ACCUM and FC1 REQUANT_PC"):
         validate_stage5_ptq_preset_for_model({"n_layer": 1}, invalid_gelu_accum)
@@ -270,6 +286,10 @@ def test_stage5_preset_rejects_unsupported_block_indices():
         quarot_enabled=True,
         quarot_seed=0xCAFE,
         quarot_kind="bogus_rotation_kind",
+        awq_enabled=False,
+        awq_alpha=0.5,
+        awq_target_modules=(),
+        weight_only_int8=False,
     )
     with pytest.raises(ValueError, match="unsupported quarot_kind"):
         validate_stage5_ptq_preset_for_model({"n_layer": 1}, invalid_quarot_kind)

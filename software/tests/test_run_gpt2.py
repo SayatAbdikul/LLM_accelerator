@@ -12,6 +12,16 @@ RUNNER = Path(__file__).resolve().parents[1] / "run_gpt2.py"
 GPT2_FIXTURE = Path("software/tests/fixtures/generated/gpt2_converted_nanogpt.pt")
 TOKENIZER_DIR = Path("software/tests/fixtures/generated/hf_gpt2")
 
+# The runner is invoked via a separate venv to avoid OMP-fork issues that
+# show up when subprocess'ing back into the parent's Python environment.
+# Tests that exercise the full CLI need this venv pre-built locally.
+_RUNNER_PYTHON = Path("/tmp/llm_accelerator_stage3_venv/bin/python")
+_NEEDS_RUNNER_VENV = pytest.mark.skipif(
+    not _RUNNER_PYTHON.exists(),
+    reason=f"runner venv {_RUNNER_PYTHON} not present (build via "
+           "tools/train_tiny_fixture.py setup, or set up locally)",
+)
+
 
 def _fixture_tool():
     spec = importlib.util.spec_from_file_location("train_tiny_fixture", TOOL_PATH)
@@ -47,6 +57,7 @@ def _run_runner(args):
     return result
 
 
+@_NEEDS_RUNNER_VENV
 def test_run_gpt2_accepts_nanogpt_payload_smoke(tmp_path):
     tool = _fixture_tool()
     checkpoint = tmp_path / "stage5_smoke_nanogpt.pt"
@@ -67,6 +78,7 @@ def test_run_gpt2_accepts_nanogpt_payload_smoke(tmp_path):
     assert "min_cosine" in result.stdout
 
 
+@_NEEDS_RUNNER_VENV
 def test_run_gpt2_perplexity_json_smoke(tmp_path):
     if not GPT2_FIXTURE.exists() or not TOKENIZER_DIR.exists():
         pytest.skip(

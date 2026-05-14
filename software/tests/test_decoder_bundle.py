@@ -145,32 +145,65 @@ def test_full_decoder_bundle_records_kv_runtime_config_and_logits_sites():
 
 
 def test_decode_kv_load_allocates_padded_tensor_footprint():
+    """Each `kv_load` allocation must reserve `M_pad × N_pad × elem_bytes`
+    bytes, not just the runtime DMA `xfer_bytes`. Without this, a
+    subsequent QUANT_FP32_INT8 could first-fit-pick into the K tile's
+    padding-row region and corrupt the kv_load result. See the M2-W8A16
+    fix comment in `codegen._emit_kv_load`.
+
+    Verified by intercepting `MemoryAllocator.alloc` and checking the
+    sizes recorded for the two `kv_load` allocations. The original
+    non-overlap check was too strict — the allocator correctly re-uses
+    K's ABUF slot for V once K has been BUF_COPYed to WBUF, so the two
+    `LoadInsn.sram_off` values can be equal even when each alloc reserves
+    the full padded footprint.
+    """
+    from taccel.compiler.memory_alloc import BufferAllocator
+
     result = load_nanogpt(config=_config(), variant="forward_1token")
     runtime_graph = mark_runtime_embedding_lookups(result.graph)
     prefill_graph = inject_kv_cache_nodes(runtime_graph, result.config, decode=False, seq_len=1)
     decode_graph = inject_kv_cache_nodes(runtime_graph, result.config, decode=True, seq_len=3)
 
-    build = build_decoder_program_bundle(
-        prefill_graph=prefill_graph,
-        decode_graph=decode_graph,
-        weight_data=_weight_data(),
-        calibration_scales={},
-        prescaled_biases=_prescaled_biases(),
-        model_config=result.config,
-    )
+    captured: dict[str, int] = {}
+    original_alloc = BufferAllocator.alloc
+
+    def alloc_wrapper(self, name, size_bytes, evictable=True):
+        if "kv_load" in name and name not in captured:
+            captured[name] = int(size_bytes)
+        return original_alloc(self, name, size_bytes, evictable)
+
+    BufferAllocator.alloc = alloc_wrapper
+    try:
+        build = build_decoder_program_bundle(
+            prefill_graph=prefill_graph,
+            decode_graph=decode_graph,
+            weight_data=_weight_data(),
+            calibration_scales={},
+            prescaled_biases=_prescaled_biases(),
+            model_config=result.config,
+        )
+    finally:
+        BufferAllocator.alloc = original_alloc
 
     kv_loads = [
         insn for insn in build.decode_codegen.instructions
         if isinstance(insn, LoadInsn) and insn.addr_reg == 2 and insn.xfer_len == 3
     ]
-
     assert len(kv_loads) == 2
-    key_load, value_load = kv_loads
-    ranges = sorted(
-        (insn.sram_off, insn.sram_off + 16)
-        for insn in (key_load, value_load)
+
+    # config has n_embd=16, n_head=1 → d_head=16. seq_len=3 padded to 16
+    # rows of d_head=16 cols × 1 byte (INT8) = 256 bytes per padded tile.
+    padded_tile_bytes = 16 * 16 * 1
+    assert captured["block0_head0_key_kv_load"] >= padded_tile_bytes, (
+        f"K kv_load alloc {captured['block0_head0_key_kv_load']} < "
+        f"padded {padded_tile_bytes}; padding rows may be corrupted by a "
+        f"first-fit-picked downstream INT8 write."
     )
-    assert ranges[0][1] <= ranges[1][0]
+    assert captured["block0_head0_value_kv_load"] >= padded_tile_bytes, (
+        f"V kv_load alloc {captured['block0_head0_value_kv_load']} < "
+        f"padded {padded_tile_bytes}"
+    )
 
 
 def test_decoder_bundle_reserves_codegen_temp_before_logits_and_kv_cache():
