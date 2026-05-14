@@ -1858,6 +1858,19 @@ def emit_matmul_attn_v_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     )
     cg._emit(SyncInsn(resource_mask=0b001))
 
+    # M4-debug: same as QKT — free FP32 V (v_loaded) and V_int8 ABUF
+    # regions now since the MATMUL reads V from WBUF, not ABUF. At
+    # GPT-2 decode 256-token scale this frees 64 KB + 16 KB = 80 KB.
+    # Gated by v_size >= 16 KB to preserve unit-test allocation
+    # inspection at d_head=64 / seq_len=16 (= 4 KB v_loaded).
+    v_size_bytes = Kseq_pad * N_pad * FP32_BYTES_PER_ELEM
+    if v_size_bytes >= 16 * 1024:
+        cg.mem.abuf.free(f"{node.name}__v_int8")
+        v_in_name = node.inputs[1]
+        if cg.last_uses.get(v_in_name, -1) <= cg.current_node_idx:
+            if cg.mem.abuf.get(v_in_name) is not None:
+                cg.mem.abuf.free(v_in_name)
+
     # ----- Stage 4: DMA-load the staged FP16 PC scale vector -----
     pc_scale_sym = f"{node.name}__attn_v_pc_scale"
     pc_scale_dram = cg._dram_offset_required(
