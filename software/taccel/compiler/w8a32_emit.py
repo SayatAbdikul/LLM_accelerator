@@ -753,26 +753,34 @@ def emit_matmul_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     )
     cg._emit(SyncInsn(resource_mask=0b100))
 
-    # M4-debug: spill the FP32 input ABUF region to DRAM-temp if it
-    # has future uses (e.g. block0_ln1 is consumed by 12 heads × 3
-    # projections = 36 Q/K/V matmuls but stays alive across the per-
-    # head loop). Spilling frees 48 KB ABUF at d_model=768 so the
-    # downstream kv_load + QKT can fit. The next matmul that reads
-    # this input reloads via the dram_temp_fp32_outputs check above.
+    # M4-debug: free the FP32 input ABUF region now — the INT8 scratch
+    # contains the quantized version and the rest of this matmul
+    # emission doesn't read FP32. Three cases:
+    #   1. Last use is this matmul: just free ABUF (post-emit free would
+    #      do the same but later — early-free helps the downstream
+    #      bias VADD's allocation pressure).
+    #   2. Future use AND tile big enough to matter AND not yet in
+    #      DRAM-temp: spill to DRAM-temp; the reload at the next
+    #      consumer's start uses _load_dram_to_abuf_fp32.
+    #   3. Future use AND already in DRAM-temp (this matmul reloaded
+    #      from a prior spill): just free the ABUF copy. The DRAM slot
+    #      from the earlier spill is still valid for the next consumer.
     last_use_idx = cg.last_uses.get(input_name, -1)
     input_bytes = M_pad * K_pad * FP32_BYTES_PER_ELEM
-    if (
-        last_use_idx > cg.current_node_idx
-        and input_bytes >= cg.fp32_spill_threshold_bytes
-        and input_name not in cg.dram_temp_fp32_outputs
-    ):
-        cg._spill_fp32_tile_to_dram(input_name, in_alloc, M_pad, K_pad)
-    elif last_use_idx == cg.current_node_idx:
-        # Last use is this matmul; the post-emit free will release the
-        # ABUF slot but we can release it sooner to give the rest of
-        # this emission (DEQUANT output, bias VADD) more breathing room.
+    has_future_use = last_use_idx > cg.current_node_idx
+    if last_use_idx == cg.current_node_idx:
+        # Case 1: last use here. Free ABUF immediately.
         if cg.mem.abuf.get(input_name) is not None:
             cg.mem.abuf.free(input_name)
+    elif has_future_use and input_bytes >= cg.fp32_spill_threshold_bytes:
+        if input_name not in cg.dram_temp_fp32_outputs:
+            # Case 2: first spill.
+            cg._spill_fp32_tile_to_dram(input_name, in_alloc, M_pad, K_pad)
+        else:
+            # Case 3: already spilled; the DRAM slot is the source of
+            # truth. Free the ABUF copy that this matmul's reload made.
+            if cg.mem.abuf.get(input_name) is not None:
+                cg.mem.abuf.free(input_name)
 
     # ----- Stage 3: Load INT8 weights + FP16 PC scales to WBUF -----
     dram_off = cg._dram_offset_required(weight_name, f"loading weight '{weight_name}'")
