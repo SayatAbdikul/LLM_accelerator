@@ -193,22 +193,21 @@ def run_weight_only_int8_teacher_forced_logits(
 def run_weight_only_int8_simulator_teacher_forced_logits(
     payload: Dict[str, object],
     context_tokens: Sequence[int],
+    *,
+    fp_precision: str = "fp32",
 ) -> List[np.ndarray]:
-    """W8A32 Phase 3 option (c.1): simulator-backed golden via the
-    compiled W8A32 ProgramBundle + HostRunner. M4-F entry point.
+    """W8A{32,16} simulator-backed golden via the compiled bundle + HostRunner.
 
-    Builds the W8A32 bundle via `build_stage3_tiny_decoder_bundle(..,
-    ptq_preset='weight_only_int8')`, wraps it in `HostRunner(..,
-    logits_dtype=np.float32)`, and runs prefill+decode for every
-    teacher-forced position. The returned FP32 logits should bit-match
-    the like-for-like Python reference (`NanoGPTW8A32SimulatorReference`,
-    M4-E) within FP16 ULP — that match is the codegen-correctness gate.
+    Builds the bundle via `build_stage3_tiny_decoder_bundle(..,
+    ptq_preset='weight_only_int8', fp_precision=fp_precision)`, wraps in
+    `HostRunner(.., logits_dtype=np.float32|np.float16)`, runs prefill +
+    decode for every teacher-forced position, widens FP16 → FP32 on return
+    so the downstream cross-entropy computation sees FP32 throughout.
 
-    Differs from `run_weight_only_int8_golden_teacher_forced_logits`
-    (option b — `WeightOnlyHostRunner`, FP32 host inference with INT8-
-    QDQ weights). This option (c.1) actually exercises the INT8 MXU
-    path through the simulator; the perplexity number quantifies the
-    M2.5-A dynamic-scaling cost vs option (b)'s ~53.42 PPL ceiling.
+    `fp_precision` ∈ {'fp32' (W8A32, legacy), 'fp16' (W8A16, new default
+    deployment)}. The returned logits should bit-match the like-for-like
+    Python reference (`NanoGPTW8A32SimulatorReference`, M4-E) within
+    FP16 ULP — that match is the codegen-correctness gate.
     """
     from .tiny_fixture import build_stage3_tiny_decoder_bundle
     from .host_runner import HostRunner
@@ -216,18 +215,16 @@ def run_weight_only_int8_simulator_teacher_forced_logits(
     inputs, _ = teacher_forced_inputs_and_targets(context_tokens)
     if not inputs:
         return []
-    # smoke_decode_steps controls the decode-stream graph's seq_len.
-    # For teacher-forced perplexity we run `len(inputs) - 1` decode
-    # steps, each at incrementally higher position; the runtime
-    # CONFIG_ATTN patch sets valid_kv_len = position + 1. The decode
-    # graph's softmax must have at least `len(inputs)` key columns.
     bundle = build_stage3_tiny_decoder_bundle(
         payload,
         ptq_preset="weight_only_int8",
         smoke_decode_steps=len(inputs) - 1,
+        fp_precision=fp_precision,
     )
-    runner = HostRunner(bundle.build.bundle, logits_dtype=np.float32)
+    logits_dtype = np.float16 if fp_precision == "fp16" else np.float32
+    runner = HostRunner(bundle.build.bundle, logits_dtype=logits_dtype)
     # Teacher-forced: prefill on token 0, then decode for tokens 1..N-1.
+    # Logits widened to FP32 on return so stable_cross_entropy gets FP32.
     logits_list: List[np.ndarray] = []
     logits_list.append(np.asarray(runner.run_prefill([inputs[0]]), dtype=np.float32))
     for i in range(1, len(inputs)):
@@ -241,19 +238,21 @@ def run_weight_only_int8_simulator_teacher_forced_logits(
 def run_weight_only_int8_simulator_reference_teacher_forced_logits(
     payload: Dict[str, object],
     context_tokens: Sequence[int],
+    *,
+    fp_precision: str = "fp32",
 ) -> List[np.ndarray]:
-    """W8A32 like-for-like reference logits (M4-E).
+    """W8A{32,16} like-for-like NumPy reference logits (M4-E).
 
     Used as the `fake_quant` reference when `simulator_backed=True` so
     `relative_delta` measures **codegen correctness** (simulator-backed
     bundle vs the M4-E Python reference) rather than QDQ-vs-host-runner
-    identity. Both paths use M2.5-A dynamic activation scaling, so they
-    should match within FP16 ULP.
+    identity. The reference mirrors the simulator's FP16-storage /
+    FP32-internal contract when `fp_precision='fp16'`.
     """
     from .w8a32_simulator_reference import NanoGPTW8A32SimulatorReference
 
     inputs, _ = teacher_forced_inputs_and_targets(context_tokens)
-    ref = NanoGPTW8A32SimulatorReference(payload)
+    ref = NanoGPTW8A32SimulatorReference(payload, fp_precision=fp_precision)
     return ref.run_teacher_forced(inputs)
 
 
@@ -336,6 +335,7 @@ def evaluate_gpt2_perplexity(
     debug_fp32_kv_cache: bool = False,
     debug_fp32_residual_stream: bool = False,
     simulator_backed: bool = False,
+    fp_precision: str = "fp32",
 ) -> GPT2PerplexityResult:
     if context_len < 1:
         raise ValueError("context_len must be positive")
@@ -389,7 +389,7 @@ def evaluate_gpt2_perplexity(
         if simulator_backed:
             fake_logits = (
                 run_weight_only_int8_simulator_reference_teacher_forced_logits(
-                    payload, eval_tokens,
+                    payload, eval_tokens, fp_precision=fp_precision,
                 )
             )
         else:
@@ -408,7 +408,7 @@ def evaluate_gpt2_perplexity(
 
         if simulator_backed:
             golden_logits = run_weight_only_int8_simulator_teacher_forced_logits(
-                payload, eval_tokens,
+                payload, eval_tokens, fp_precision=fp_precision,
             )
         else:
             golden_logits = run_weight_only_int8_golden_teacher_forced_logits(

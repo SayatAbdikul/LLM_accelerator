@@ -2493,13 +2493,13 @@ class CodeGenerator:
         M_pad = pad_dim(seq_len)
         N_pad = pad_dim(head_dim)
         num_heads = len(node.inputs)
-        # M4-debug (concat_heads W8A32 fix): when w8a32_enabled, per-head
-        # attn_v outputs live in ABUF as FP32, not WBUF as INT8. The
-        # pre-M4-debug emitter unconditionally read from WBUF; for W8A32
-        # with n_head>=1 this produced an unfilled out_alloc whose bytes
-        # were stale INT8 scratch from prior matmuls (read as FP32 →
-        # 0x7F7F7F7F ≈ 3.4e38). Catastrophic downstream PPL.
-        elem_bytes = 4 if self.w8a32_enabled else 1
+        # M4-debug (concat_heads W8A32 fix) + M2-W8A16: when w8a32_enabled,
+        # per-head attn_v outputs live in ABUF as FP-precision (FP32 or
+        # FP16). The pre-M4-debug emitter unconditionally read from WBUF;
+        # for W8A32 with n_head>=1 this produced an unfilled out_alloc
+        # whose bytes were stale INT8 scratch (read as FP32 → 0x7F7F7F7F ≈
+        # 3.4e38). W8A16 needs elem_bytes=2 (FP16 stride) not 4.
+        elem_bytes = self.elem_bytes if self.w8a32_enabled else 1
         per_head_bytes = N_pad * elem_bytes
         total_out_bytes_per_row = num_heads * per_head_bytes
         # M4-debug (concat_heads ABUF fragmentation): at GPT-2 scale
@@ -2556,8 +2556,9 @@ class CodeGenerator:
                     self.mem.abuf.free(inp_name)
             self._record_trace_event(
                 node.name, BUF_ABUF, out_alloc.offset_units,
-                M_pad, total_out_bytes_per_row // 4,  # FP32 elements per row
-                seq_len, node.output_shape[1], "fp32",
+                M_pad, total_out_bytes_per_row // elem_bytes,  # elements per row
+                seq_len, node.output_shape[1],
+                "fp32" if elem_bytes == 4 else "fp16",
                 self.calibration_scales.get(node.name, 1.0 / 127.0),
             )
             return
@@ -2881,7 +2882,7 @@ class CodeGenerator:
         `_load_dram_to_abuf_fp32` and the spilled `dram_temp_outputs`
         entry is cleaned up in the generate loop's post-emit free.
         """
-        size_bytes = M_pad * N_pad * 4  # FP32
+        size_bytes = M_pad * N_pad * self.elem_bytes  # FP32=4, FP16=2
         dram_off = self.dram_temp_start + self.mem.alloc_dram_temp(
             f"fp32_spill_{name}", size_bytes
         )
@@ -2909,7 +2910,7 @@ class CodeGenerator:
         dram_off = self.dram_temp_outputs[input_name]
         if self.mem.abuf.get(input_name) is not None:
             self.mem.abuf.free(input_name)
-        size_bytes = M_pad * N_pad * 4
+        size_bytes = M_pad * N_pad * self.elem_bytes
         alloc = self.mem.abuf.alloc(input_name, size_bytes)
         self._emit_dma_load(BUF_ABUF, alloc.offset_units, size_bytes, 3, dram_off)
         self._emit(SyncInsn(resource_mask=0b001))
@@ -3061,16 +3062,17 @@ class CodeGenerator:
         if d_model_pad != d_model:
             raise ValueError("Stage 1 embedding lookup requires d_model to be 16-aligned")
 
-        # M3-prep: token/position embeddings emit FP32 in W8A32 mode.
+        # M3-prep + M2-W8A16: token/position embeddings emit at FP precision
+        # in W8A{32,16} mode (`self.elem_bytes` = 4 for fp32, 2 for fp16).
         # The DeiT path uses embedding_kind="patch_cls" and never sets
         # w8a32_enabled today (CodeGenerator init force-disables W8A8
         # opts for W8A32 but doesn't touch the DeiT compiler entry);
         # the embedding-kind guard makes the intent explicit.
-        use_fp32 = (
+        use_fp = (
             self.w8a32_enabled
             and self.config.embedding_kind == "token_pos"
         )
-        elem_bytes = 4 if use_fp32 else 1
+        elem_bytes = self.elem_bytes if use_fp else 1
         row_bytes = d_model_pad * elem_bytes
 
         runtime_patch = bool(node.attrs.get("runtime_patch", False))
@@ -3134,7 +3136,7 @@ class CodeGenerator:
             d_model_pad,
             seq_len,
             d_model,
-            "fp32" if use_fp32 else "int8",
+            ("fp32" if self.elem_bytes == 4 else "fp16") if use_fp else "int8",
             self.calibration_scales.get(node.name, 6.0 / 127.0),
         )
 
@@ -3296,9 +3298,10 @@ class CodeGenerator:
         if store_rows <= 0:
             raise ValueError(f"{node.name} store_rows must be positive")
 
-        # M3-D: W8A32 lm_head output is FP32 (4 bytes/elem) — both the
-        # DMA xfer size and the row stride scale by 4.
-        elem_bytes = 4 if self.w8a32_enabled else 1
+        # M3-D + M2-W8A16: W8A{32,16} lm_head output is FP-precision
+        # (FP32=4 or FP16=2 bytes/elem) — both the DMA xfer size and
+        # the row stride scale by self.elem_bytes.
+        elem_bytes = self.elem_bytes if self.w8a32_enabled else 1
         size_bytes = int(node.attrs.get(
             "xfer_bytes", store_rows * cols_pad * elem_bytes,
         ))

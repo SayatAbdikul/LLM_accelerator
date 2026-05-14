@@ -288,35 +288,35 @@ def emit_gelu_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
     in_name = node.inputs[0]
     if in_name in cg.dram_temp_fp32_outputs:
         # Stream tile-by-tile. The full input lives at
-        # `cg.dram_temp_outputs[in_name]` as a row-major M_pad × N_pad
-        # × 4 FP32 region. Allocate a new DRAM-temp slot for the GELU
-        # output (same size as input) and copy through.
+        # `cg.dram_temp_outputs[in_name]` as a row-major M_pad × N_pad ×
+        # cg.elem_bytes region (FP32=4 or FP16=2). Allocate a new DRAM-
+        # temp slot for the GELU output (same size as input).
         input_dram_off = cg.dram_temp_outputs[in_name]
-        full_bytes = M_pad * N_pad * 4
+        full_bytes = M_pad * N_pad * cg.elem_bytes
         output_dram_off = cg.dram_temp_start + cg.mem.alloc_dram_temp(
             f"{node.name}_w8a32_out_fp32", full_bytes
         )
 
         # Pick an N-tile size that fits ABUF together with some slack
-        # for the GELU's I/O. M_pad * n_tile * 4 ≤ 32 KB → n_tile ≤
-        # 32K / (16*4) = 512. STAGE4_MAX_N_TILE=512 is the natural pick.
-        n_tile = min(N_pad, 512)
+        # for the GELU's I/O. M_pad * n_tile * elem_bytes ≤ 32 KB →
+        # FP32: n_tile ≤ 32K/(16*4) = 512. FP16: 1024.
+        n_tile = min(N_pad, 32768 // (16 * cg.elem_bytes))
         n_tile = max(TILE, (n_tile // TILE) * TILE)
         for n_start in range(0, N_pad, n_tile):
             n_len = min(n_tile, N_pad - n_start)
             tile_alloc = cg.mem.abuf.alloc(
-                f"{node.name}_gelu_tile_n{n_start}", M_pad * n_len * 4
+                f"{node.name}_gelu_tile_n{n_start}", M_pad * n_len * cg.elem_bytes
             )
-            tile_row_bytes = n_len * 4
+            tile_row_bytes = n_len * cg.elem_bytes
             tile_row_units = tile_row_bytes // UNIT
-            full_row_bytes_in_dram = N_pad * 4
-            # Load M_pad rows of (n_len × 4 bytes) from DRAM into ABUF.
+            full_row_bytes_in_dram = N_pad * cg.elem_bytes
+            # Load M_pad rows of (n_len × elem_bytes bytes) from DRAM into ABUF.
             for r in range(M_pad):
                 cg._emit_dma_load(
                     BUF_ABUF,
                     tile_alloc.offset_units + r * tile_row_units,
                     tile_row_bytes, 0,
-                    input_dram_off + r * full_row_bytes_in_dram + n_start * 4,
+                    input_dram_off + r * full_row_bytes_in_dram + n_start * cg.elem_bytes,
                 )
             cg._emit(SyncInsn(resource_mask=0b001))
 
@@ -337,7 +337,7 @@ def emit_gelu_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
                     BUF_ABUF,
                     tile_alloc.offset_units + r * tile_row_units,
                     tile_row_bytes, 2,
-                    output_dram_off + r * full_row_bytes_in_dram + n_start * 4,
+                    output_dram_off + r * full_row_bytes_in_dram + n_start * cg.elem_bytes,
                 )
             cg._emit(SyncInsn(resource_mask=0b010))
             cg.mem.abuf.free(tile_alloc.name)
@@ -1043,14 +1043,29 @@ def emit_matmul_w8a32_large_weight_tiled(
     )
 
     # ----- Per-N-tile DRAM addresses -----
-    pc_scale_sym = f"{weight_name}__w8a32_pc_scale"
-    pc_scale_dram_full = cg._dram_offset_required(
-        pc_scale_sym,
-        f"loading W8A32 per-channel weight scales for '{weight_name}'",
-    )
+    # W8A32 (fp_precision="fp32"): PC scale blob is N FP16. Separate FP32
+    # bias DMA path runs after each N-tile DEQUANT.
+    # W8A16 (fp_precision="fp16"): combined blob is 2N FP16 (PC + bias).
+    # Per N-tile we DMA two slices contiguously into WBUF so DEQUANT reads
+    # 2*n_len FP16 (PC slice + bias slice). No separate bias VADD path.
+    if cg.fp_precision == "fp16":
+        combined_sym = f"{weight_name}__w8a16_pc_scale_and_bias"
+        pc_scale_dram_full = cg._dram_offset_required(
+            combined_sym,
+            f"loading W8A16 combined PC scales + bias for '{weight_name}'",
+        )
+        # Bias half starts at byte offset N_pad * 2 within the combined blob.
+        bias_offset_in_blob = N_pad * 2
+    else:
+        pc_scale_sym = f"{weight_name}__w8a32_pc_scale"
+        pc_scale_dram_full = cg._dram_offset_required(
+            pc_scale_sym,
+            f"loading W8A32 per-channel weight scales for '{weight_name}'",
+        )
+        bias_offset_in_blob = None
     bias_name = node.attrs.get("bias")
     bias_dram_full = None
-    if bias_name is not None:
+    if cg.fp_precision == "fp32" and bias_name is not None:
         if bias_name not in cg.fp32_biases:
             raise KeyError(
                 f"large-weight-tiled W8A32 '{node.name}' references bias "
@@ -1075,9 +1090,9 @@ def emit_matmul_w8a32_large_weight_tiled(
     for (n_start, n_len), k_tile_list in n_tile_groups:
         n_tile_units = n_len // TILE
 
-        # Per-N-tile output FP32 tile in ABUF.
+        # Per-N-tile output FP-precision tile in ABUF.
         out_tile_alloc = cg.mem.abuf.alloc(
-            f"{node.name}_out_tile_n{n_start}", M_pad * n_len * 4
+            f"{node.name}_out_tile_n{n_start}", M_pad * n_len * cg.elem_bytes
         )
 
         # K-accumulate INT32 ACCUM across all K-tiles for this N-tile.
@@ -1153,15 +1168,37 @@ def emit_matmul_w8a32_large_weight_tiled(
             if k_len != K_pad:
                 cg.mem.abuf.free(f"{node.name}__quant_int8_k{k_start}_n{n_start}")
 
-        # Per-N-tile FP16 PC scale slice (load only n_len entries).
-        pc_scale_slice_alloc = cg.mem.wbuf.alloc(
-            f"_w8a32_pc_{node.name}_n{n_start}", n_len * 2
-        )
-        cg._emit_dma_load(
-            BUF_WBUF, pc_scale_slice_alloc.offset_units, n_len * 2, 0,
-            pc_scale_dram_full + n_start * 2,
-        )
-        cg._emit(SyncInsn(resource_mask=0b001))
+        # Per-N-tile FP16 PC scale (+ bias under fp16) slice load.
+        # W8A32: n_len FP16 (PC scales only).
+        # W8A16: 2*n_len FP16 (PC slice + bias slice loaded contiguously).
+        if cg.fp_precision == "fp16":
+            slice_bytes = 2 * n_len * 2
+            pc_scale_slice_alloc = cg.mem.wbuf.alloc(
+                f"_w8a16_pc_bias_{node.name}_n{n_start}", slice_bytes
+            )
+            # PC slice → WBUF[0..n_len*2)
+            cg._emit_dma_load(
+                BUF_WBUF, pc_scale_slice_alloc.offset_units, n_len * 2, 0,
+                pc_scale_dram_full + n_start * 2,
+            )
+            # Bias slice → WBUF[n_len*2..2*n_len*2). Contiguous in WBUF so
+            # the DEQUANT reads them as a single 2*n_len FP16 vector.
+            bias_slice_wbuf_off = pc_scale_slice_alloc.offset_units + (n_len * 2) // UNIT
+            cg._emit_dma_load(
+                BUF_WBUF, bias_slice_wbuf_off, n_len * 2, 0,
+                pc_scale_dram_full + bias_offset_in_blob + n_start * 2,
+            )
+            cg._emit(SyncInsn(resource_mask=0b001))
+        else:
+            slice_bytes = n_len * 2
+            pc_scale_slice_alloc = cg.mem.wbuf.alloc(
+                f"_w8a32_pc_{node.name}_n{n_start}", slice_bytes
+            )
+            cg._emit_dma_load(
+                BUF_WBUF, pc_scale_slice_alloc.offset_units, n_len * 2, 0,
+                pc_scale_dram_full + n_start * 2,
+            )
+            cg._emit(SyncInsn(resource_mask=0b001))
 
         # DEQUANT_ACCUM_FP32_SCALED → FP{32,16} N-tile output in ABUF.
         cg._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tile_units - 1, K=0))
@@ -1205,18 +1242,18 @@ def emit_matmul_w8a32_large_weight_tiled(
             cg._emit(SyncInsn(resource_mask=0b100))
             cg.mem.abuf.free(bias_tile_alloc.name)
 
-        # DMA-store the FP32 N-tile to its slot in the full output
-        # DRAM-temp. Each row of n_len × 4 bytes goes to
-        # `dram_temp_off + r * N_pad * 4 + n_start * 4`.
-        out_row_bytes = n_len * 4
+        # DMA-store the FP-precision N-tile to its slot in the full
+        # output DRAM-temp. Each row of n_len × elem_bytes goes to
+        # `dram_temp_off + r * N_pad * elem_bytes + n_start * elem_bytes`.
+        out_row_bytes = n_len * cg.elem_bytes
         out_row_units = out_row_bytes // UNIT
-        full_row_bytes_in_dram = N_pad * 4
+        full_row_bytes_in_dram = N_pad * cg.elem_bytes
         for r in range(M_pad):
             cg._emit_dma_store(
                 BUF_ABUF,
                 out_tile_alloc.offset_units + r * out_row_units,
                 out_row_bytes, 2,
-                dram_temp_off + r * full_row_bytes_in_dram + n_start * 4,
+                dram_temp_off + r * full_row_bytes_in_dram + n_start * cg.elem_bytes,
             )
         cg._emit(SyncInsn(resource_mask=0b010))
 
@@ -1271,24 +1308,35 @@ def _emit_matmul_w8a32_large_input_streaming(
     weight_name = node.inputs[1]
     input_name = node.inputs[0]
     input_dram_off = cg.dram_temp_outputs[input_name]
-    full_input_row_bytes = K_pad * 4
+    full_input_row_bytes = K_pad * cg.elem_bytes
     m_tiles = M_pad // TILE
 
-    # Output DRAM-temp slot for full M_pad × N_pad × 4 FP32.
-    output_bytes = M_pad * N_pad * 4
+    # Output DRAM-temp slot for full M_pad × N_pad × elem_bytes FP-precision.
+    output_bytes = M_pad * N_pad * cg.elem_bytes
     dram_temp_off = cg.dram_temp_start + cg.mem.alloc_dram_temp(
         f"{node.name}_w8a32_out_fp32", output_bytes
     )
 
-    # Stage PC scale + bias addresses.
-    pc_scale_sym = f"{weight_name}__w8a32_pc_scale"
-    pc_scale_dram_full = cg._dram_offset_required(
-        pc_scale_sym,
-        f"loading W8A32 per-channel weight scales for '{weight_name}'",
-    )
+    # Stage PC scale + bias addresses (same branching as the large-weight-
+    # tiled path: W8A32 uses N-FP16 PC blob + separate FP32 bias; W8A16
+    # uses the combined 2N-FP16 PC+bias blob and folds bias in DEQUANT).
+    if cg.fp_precision == "fp16":
+        combined_sym = f"{weight_name}__w8a16_pc_scale_and_bias"
+        pc_scale_dram_full = cg._dram_offset_required(
+            combined_sym,
+            f"loading W8A16 combined PC scales + bias for '{weight_name}'",
+        )
+        bias_offset_in_blob = N_pad * 2
+    else:
+        pc_scale_sym = f"{weight_name}__w8a32_pc_scale"
+        pc_scale_dram_full = cg._dram_offset_required(
+            pc_scale_sym,
+            f"loading W8A32 per-channel weight scales for '{weight_name}'",
+        )
+        bias_offset_in_blob = None
     bias_name = node.attrs.get("bias")
     bias_dram_full = None
-    if bias_name is not None:
+    if cg.fp_precision == "fp32" and bias_name is not None:
         if bias_name not in cg.fp32_biases:
             raise KeyError(
                 f"large-input W8A32 '{node.name}' references bias "
@@ -1310,9 +1358,9 @@ def _emit_matmul_w8a32_large_input_streaming(
     for (n_start, n_len), k_tile_list in n_tile_groups:
         n_tile_units = n_len // TILE
 
-        # Per-N-tile FP32 accumulator in ABUF.
+        # Per-N-tile FP-precision accumulator in ABUF.
         tile_accum_alloc = cg.mem.abuf.alloc(
-            f"{node.name}_tile_accum_n{n_start}", M_pad * n_len * 4
+            f"{node.name}_tile_accum_n{n_start}", M_pad * n_len * cg.elem_bytes
         )
 
         # Logical M (number of valid query rows). Padding rows after
@@ -1320,19 +1368,19 @@ def _emit_matmul_w8a32_large_input_streaming(
         M_logical = int(node.output_shape[0])
 
         for k_idx, (k_start, k_len) in enumerate(k_tile_list):
-            # Stage 1: load FP32 input K-tile from DRAM into ABUF.
-            input_tile_bytes = M_pad * k_len * 4
+            # Stage 1: load FP-precision input K-tile from DRAM into ABUF.
+            input_tile_bytes = M_pad * k_len * cg.elem_bytes
             in_tile_alloc = cg.mem.abuf.alloc(
                 f"{node.name}__in_fp32_k{k_start}_n{n_start}", input_tile_bytes
             )
-            tile_row_bytes = k_len * 4
+            tile_row_bytes = k_len * cg.elem_bytes
             tile_row_units = tile_row_bytes // UNIT
             for r in range(M_pad):
                 cg._emit_dma_load(
                     BUF_ABUF,
                     in_tile_alloc.offset_units + r * tile_row_units,
                     tile_row_bytes, 0,
-                    input_dram_off + r * full_input_row_bytes + k_start * 4,
+                    input_dram_off + r * full_input_row_bytes + k_start * cg.elem_bytes,
                 )
             cg._emit(SyncInsn(resource_mask=0b001))
 
@@ -1397,18 +1445,57 @@ def _emit_matmul_w8a32_large_input_streaming(
             cg.mem.abuf.free(int8_tile_alloc.name)
             cg.mem.wbuf.free(w_alloc.name)
 
-            # Per-K-tile PC scale load (small DMA, kept inside the K
-            # loop so weight tile + PC scale never co-exist in WBUF).
-            # Re-loading per K-tile is a small DMA cost compared with
-            # the 256 KB weight tile DMA above.
-            pc_scale_slice_alloc = cg.mem.wbuf.alloc(
-                f"_w8a32_pc_{node.name}_k{k_start}_n{n_start}", n_len * 2
-            )
-            cg._emit_dma_load(
-                BUF_WBUF, pc_scale_slice_alloc.offset_units, n_len * 2, 0,
-                pc_scale_dram_full + n_start * 2,
-            )
-            cg._emit(SyncInsn(resource_mask=0b001))
+            # Per-K-tile PC scale (+ bias under fp16) load. Kept inside
+            # the K loop so weight tile + PC scale never co-exist in WBUF.
+            # W8A32: n_len FP16 (PC scales only).
+            # W8A16: 2*n_len FP16 (PC slice + bias slice loaded contiguously
+            # so the per-K-tile DEQUANT epilogue folds bias on every K-tile;
+            # the FP32 accumulation across K still works because adding
+            # `bias` to each partial sum and then summing is equivalent to
+            # adding `K_tiles * bias` once at the end — WRONG. Mitigation:
+            # only fold bias on the FIRST K-tile; subsequent K-tiles load
+            # the PC slice with zero-padded bias half so the K-partials
+            # don't accumulate bias multiple times).
+            if cg.fp_precision == "fp16":
+                slice_bytes = 2 * n_len * 2
+                pc_scale_slice_alloc = cg.mem.wbuf.alloc(
+                    f"_w8a16_pc_bias_{node.name}_k{k_start}_n{n_start}",
+                    slice_bytes,
+                )
+                cg._emit_dma_load(
+                    BUF_WBUF, pc_scale_slice_alloc.offset_units, n_len * 2, 0,
+                    pc_scale_dram_full + n_start * 2,
+                )
+                bias_slice_wbuf_off = (
+                    pc_scale_slice_alloc.offset_units + (n_len * 2) // UNIT
+                )
+                if k_idx == 0:
+                    # Fold bias on the first K-tile only; subsequent
+                    # K-tiles' bias half is zeroed by loading from the
+                    # __zero_pad__ blob (already staged at DRAM-layout).
+                    cg._emit_dma_load(
+                        BUF_WBUF, bias_slice_wbuf_off, n_len * 2, 0,
+                        pc_scale_dram_full + bias_offset_in_blob + n_start * 2,
+                    )
+                else:
+                    zero_pad_dram = cg._dram_offset_required(
+                        "__zero_pad__",
+                        "loading zero bias slice for fc2 per-K-tile",
+                    )
+                    cg._emit_dma_load(
+                        BUF_WBUF, bias_slice_wbuf_off, n_len * 2, 0,
+                        zero_pad_dram,
+                    )
+                cg._emit(SyncInsn(resource_mask=0b001))
+            else:
+                pc_scale_slice_alloc = cg.mem.wbuf.alloc(
+                    f"_w8a32_pc_{node.name}_k{k_start}_n{n_start}", n_len * 2
+                )
+                cg._emit_dma_load(
+                    BUF_WBUF, pc_scale_slice_alloc.offset_units, n_len * 2, 0,
+                    pc_scale_dram_full + n_start * 2,
+                )
+                cg._emit(SyncInsn(resource_mask=0b001))
 
             # Stage 6: DEQUANT → FP32 K-partial (write directly to
             # tile_accum for k_idx==0 since there's nothing to add yet;
@@ -1425,7 +1512,7 @@ def _emit_matmul_w8a32_large_input_streaming(
                 cg._emit(SyncInsn(resource_mask=0b100))
             else:
                 k_partial_alloc = cg.mem.abuf.alloc(
-                    f"{node.name}__kpart_k{k_start}_n{n_start}", M_pad * n_len * 4
+                    f"{node.name}__kpart_k{k_start}_n{n_start}", M_pad * n_len * cg.elem_bytes
                 )
                 cg._emit(DequantAccumFp32ScaledInsn(
                     src1_buf=BUF_ACCUM, src1_off=0,
@@ -1474,15 +1561,15 @@ def _emit_matmul_w8a32_large_input_streaming(
             cg.mem.abuf.free(bias_tile_alloc.name)
 
         # DMA-store tile_accum to DRAM-temp.
-        out_row_bytes = n_len * 4
+        out_row_bytes = n_len * cg.elem_bytes
         out_row_units = out_row_bytes // UNIT
-        full_out_row_bytes = N_pad * 4
+        full_out_row_bytes = N_pad * cg.elem_bytes
         for r in range(M_pad):
             cg._emit_dma_store(
                 BUF_ABUF,
                 tile_accum_alloc.offset_units + r * out_row_units,
                 out_row_bytes, 2,
-                dram_temp_off + r * full_out_row_bytes + n_start * 4,
+                dram_temp_off + r * full_out_row_bytes + n_start * cg.elem_bytes,
             )
         cg._emit(SyncInsn(resource_mask=0b010))
         cg.mem.abuf.free(tile_accum_alloc.name)
