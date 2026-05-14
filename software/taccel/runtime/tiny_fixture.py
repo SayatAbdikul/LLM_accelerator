@@ -518,14 +518,22 @@ def _greedy_token(logits: np.ndarray, vocab_size: int) -> int:
 
 
 def run_tiny_decode_trace(tiny: TinyFixtureBundle, prompt_ids: Sequence[int], *,
-                          max_new_tokens: int) -> TinyDecodeTrace:
-    """Run a greedy tiny decode trace and retain prefill + per-step logits."""
+                          max_new_tokens: int,
+                          logits_dtype=None) -> TinyDecodeTrace:
+    """Run a greedy tiny decode trace and retain prefill + per-step logits.
+
+    `logits_dtype` (M4-F W8A16): infer from `tiny.logits_size` when None —
+    pad_dim(vocab) * 1 = INT8, *2 = FP16, *4 = FP32.
+    """
     if max_new_tokens < 0:
         raise ValueError("max_new_tokens must be non-negative")
     if not prompt_ids:
         raise ValueError("prompt_ids must be non-empty")
+    if logits_dtype is None:
+        elem_bytes = max(1, int(tiny.logits_size) // pad_dim(int(tiny.config.vocab_size)))
+        logits_dtype = {1: np.int8, 2: np.float16, 4: np.float32}.get(elem_bytes, np.int8)
     generated = [int(tok) for tok in prompt_ids]
-    runner = HostRunner(tiny.build.bundle, logits_dtype=np.int8)
+    runner = HostRunner(tiny.build.bundle, logits_dtype=logits_dtype)
 
     logits_trace: List[np.ndarray] = []
     logits = runner.run_prefill(generated)
@@ -584,13 +592,19 @@ def _run_reference_trace(
 def run_stage3_tiny_e2e(payload: Dict[str, object], *,
                         prompt_ids: Sequence[int] = (0,),
                         max_new_tokens: int = 32,
-                        ptq_preset: str | Stage5PTQPreset | None = None) -> TinyE2EResult:
+                        ptq_preset: str | Stage5PTQPreset | None = None,
+                        fp_precision: str = "fp32") -> TinyE2EResult:
     """Run the Stage 3 32-step gate comparing the golden model against a
     PyTorch fake-quant numpy reference that shares calibration scales.
 
     Both paths use the same per-node INT8 scales derived from calibration on
     the fixture's embedded Shakespeare text, so differences reflect arithmetic
     correctness rather than calibration drift.
+
+    `fp_precision` (W8A16 M4-F): when "fp16" and ptq_preset is a W8A32/W8A16
+    weight-only variant, builds the bundle with FP16 activation storage
+    (Phase 3 option c.2). Default "fp32" preserves the legacy behavior for
+    every other preset (W8A8 reference still uses INT8 throughout).
     """
     # Single calibration pass — shared by compiler and reference
     resolved_preset = resolve_stage5_ptq_preset(ptq_preset)
@@ -611,6 +625,7 @@ def run_stage3_tiny_e2e(payload: Dict[str, object], *,
         smoke_decode_steps=max_new_tokens,
         calibration_scales=calibration_scales,
         ptq_preset=resolved_preset,
+        fp_precision=fp_precision,
     )
     actual = run_tiny_decode_trace(tiny, prompt_ids, max_new_tokens=max_new_tokens)
 
