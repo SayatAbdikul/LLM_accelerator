@@ -1822,6 +1822,16 @@ def emit_matmul_attn_v_w8a32(cg: "CodeGenerator", node: "IRNode") -> None:
     )
     cg._emit(SyncInsn(resource_mask=0b100))
 
+    # M4-debug: free FP32 softmax output now — sm_int8 has the quantized
+    # version, and softmax's last_use is this attn_v. At GPT-2 scale
+    # this frees 16 KB ABUF before v_int8 alloc. Same size gate as V.
+    sm_size_bytes = M_pad * Kseq_pad * FP32_BYTES_PER_ELEM
+    if sm_size_bytes >= 16 * 1024:
+        sm_in_name = node.inputs[0]
+        if cg.last_uses.get(sm_in_name, -1) <= cg.current_node_idx:
+            if cg.mem.abuf.get(sm_in_name) is not None:
+                cg.mem.abuf.free(sm_in_name)
+
     # ----- Stage 2: QUANT_FP32_INT8(V) into an ABUF scratch -----
     cg._emit(ConfigTileInsn(M=k_tiles - 1, N=n_tiles - 1, K=0))
     sreg_v = cg._alloc_sreg()
