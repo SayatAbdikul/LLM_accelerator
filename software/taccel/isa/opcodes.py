@@ -44,9 +44,30 @@ preserving INT8 MXU matmul:
        Eps-guarded for all-zero tiles.
 
 There is no buffer dtype tag — ABUF bytes are reinterpreted as INT8
-(1 byte/elem) or FP32 (4 bytes/elem) based on the opcode. Codegen owns
-the dtype layout. A 16x16 FP32 tile occupies 64 16-byte buffer units
-versus 16 units for the corresponding INT8 tile.
+(1 byte/elem), FP16 (2 bytes/elem), or FP32 (4 bytes/elem) based on
+the opcode AND the `flags[0]` precision selector (W8A16 extension).
+Codegen owns the dtype layout. A 16x16 FP32 tile occupies 64 16-byte
+buffer units; a 16x16 FP16 tile occupies 32 units; the corresponding
+INT8 tile occupies 16 units.
+
+W8A16 extension (Phase 3 (c.2), milestone M1, 2026-05-14)
+---------------------------------------------------------
+The 9 W8A32 opcodes (0x17–0x1F) are polymorphic on `RTypeInsn.flags[0]`:
+  - flags=0  → FP32 storage (W8A32, existing, bit-identical behavior)
+  - flags=1  → FP16 storage (W8A16, new default)
+The opcode set is unchanged; only the per-instruction flag bit selects
+the ABUF dtype. Internal datapath remains FP32 for numerically sensitive
+math (LN variance, softmax exp, GELU x³). Byte-sizing invariant:
+FP16 tile = M_pad × N_pad × 2 (half of FP32, double of INT8).
+
+For DEQUANT_ACCUM_FP32_SCALED (0x1E) specifically, `flags=1` ALSO
+changes the src2 vector layout: src2 = `2N FP16` (N per-channel scales
+followed by N bias values). The epilogue computes
+`fp32 = int32 × pc × act_scale + bias`, then casts to FP16 once. This
+folds bias into the dequant epilogue to avoid FP16 double-rounding
+bias through a separate VADD. Under `flags=0`, src2 = N FP16 PC scales
+only (W8A32 contract, unchanged). Matmuls without bias zero-pad the
+second N entries of the src2 blob.
 
 Reserved fields / opcodes
 -------------------------
@@ -57,6 +78,7 @@ Reserved fields / opcodes
 - CONFIG_ATTN reserved bits [32:0] must be zero.
 - M-TYPE stride_log2 [6:3] is reserved and must be zero.
 - M-TYPE flags [2:0] are reserved and must be zero.
+- R-TYPE flags[0] = fp_precision (W8A16). flags[7:1] are reserved.
 """
 from enum import IntEnum
 

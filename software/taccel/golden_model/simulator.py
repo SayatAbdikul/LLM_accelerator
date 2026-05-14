@@ -792,22 +792,29 @@ class Simulator:
         self.state.cycle_count += M * N
 
     # =======================================================================
-    # W8A32 extension handlers (Phase 3 (c.1), milestone M1, 2026-05-12)
+    # W8A32 / W8A16 extension handlers (Phase 3 (c.1) M1 + (c.2) M1, 2026-05-{12,14})
     #
-    # The seven _exec_*_fp32 handlers below implement the new R-type opcodes
-    # 0x17-0x1D. Buffer addressing follows the same 16-byte-unit contract as
-    # the INT8 variants; the difference is dtype interpretation:
-    #   - FP32 reads/writes use `mem.read_fp32_tile` / `mem.write_fp32_tile`
-    #   - FP16 per-channel / vector parameters use `mem.read_fp16_vector`
-    #   - ACCUM stays INT32-only (the MXU's contract is unchanged)
+    # The nine _exec_*_fp32 handlers below implement R-type opcodes 0x17-0x1F.
+    # `RTypeInsn.flags[0]` is the fp_precision selector:
+    #   - flags=0 -> FP32 ABUF storage (W8A32, existing, bit-identical)
+    #   - flags=1 -> FP16 ABUF storage (W8A16, new default for codegen)
+    # Internal datapath is always FP32 (LN variance, softmax exp, GELU x^3 all
+    # done in FP32). Storage helpers (read_fp16_tile / write_fp16_tile) widen
+    # on read and downcast on write to match the FP16-storage/FP32-datapath
+    # convention used for scale registers.
+    #
+    # For DEQUANT_ACCUM_FP32_SCALED (0x1E) specifically, flags=1 also folds
+    # bias into the dequant epilogue via a `2N FP16` src2 layout (PC scales +
+    # bias values). This avoids FP16 double-rounding bias through a separate
+    # VADD. See the opcode docstring in `opcodes.py` for the contract details.
     # =======================================================================
 
     def _exec_dequant_accum_fp32(self, insn):
-        """DEQUANT_ACCUM_FP32: ACCUM[INT32] x per-col FP16 scales -> ABUF[FP32].
+        """DEQUANT_ACCUM_FP32: ACCUM[INT32] x per-col FP16 scales -> ABUF[FP{32,16}].
 
-        Mirrors `_exec_requant_pc` but writes FP32 to ABUF instead of clipping to
-        INT8. src1 must be ACCUM; src2 points at N FP16 scales (one per output
-        column) in WBUF or ABUF; dst is ABUF written as FP32.
+        Mirrors `_exec_requant_pc` but writes FP32 (flags=0) or FP16 (flags=1)
+        to ABUF instead of clipping to INT8. src1 must be ACCUM; src2 points
+        at N FP16 scales (one per output column) in WBUF or ABUF; dst is ABUF.
         """
         if self.state.tile_config is None:
             raise ConfigError("CONFIG_TILE not set")
@@ -818,6 +825,9 @@ class Simulator:
         if insn.dst_buf == BUF_ACCUM:
             raise IllegalBufferError(insn.dst_buf)
 
+        fp_precision = insn.flags & 0x1
+        write_tile = mem.write_fp16_tile if fp_precision == 1 else mem.write_fp32_tile
+
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
@@ -827,15 +837,16 @@ class Simulator:
         scales = mem.read_fp16_vector(self.state, insn.src2_buf, insn.src2_off, N).reshape(1, N)
         result = (src.astype(np.float32) * scales).astype(np.float32)
 
-        mem.write_fp32_tile(self.state, insn.dst_buf, insn.dst_off, result)
+        write_tile(self.state, insn.dst_buf, insn.dst_off, result)
         self.state.cycle_count += M * N
 
     def _exec_quant_fp32_int8(self, insn):
-        """QUANT_FP32_INT8: ABUF[FP32] -> ABUF[INT8] using sreg scale.
+        """QUANT_FP32_INT8: ABUF[FP{32,16}] -> ABUF[INT8] using sreg scale.
 
         For just-in-time activation quant before the next INT8 MATMUL. The
         scale register holds 1/act_scale as FP16 (i.e. the value to multiply
-        by, not the divisor). Output: clip(round(src / act_scale), -128, 127).
+        by, not the divisor). Output: clip(round(src * scale), -128, 127).
+        Source storage selected by `flags[0]`: 0=FP32, 1=FP16.
         """
         if self.state.tile_config is None:
             raise ConfigError("CONFIG_TILE not set")
@@ -844,22 +855,26 @@ class Simulator:
         if insn.dst_buf == BUF_ACCUM:
             raise IllegalBufferError(insn.dst_buf)
 
+        fp_precision = insn.flags & 0x1
+        read_tile = mem.read_fp16_tile if fp_precision == 1 else mem.read_fp32_tile
+
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
         N = n_tiles * 16
 
         scale = np.float32(self.state.scale_regs[insn.sreg])
-        src = mem.read_fp32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
+        src = read_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
         result = np.clip(np.round(src * scale), -128, 127).astype(np.int8)
         mem.write_int8_tile(self.state, insn.dst_buf, insn.dst_off, result)
         self.state.cycle_count += M * N
 
     def _exec_vadd_fp32(self, insn):
-        """VADD_FP32: ABUF[FP32] + ABUF[FP32] -> ABUF[FP32].
+        """VADD_FP32: ABUF[FP{32,16}] + ABUF[FP{32,16}] -> ABUF[FP{32,16}].
 
-        Used for the W8A32 residual stream: no saturation, no INT8 clip.
-        Both sources and dst live in ABUF interpreted as FP32.
+        Used for the W8A{32,16} residual stream: no saturation, no INT8 clip.
+        Both sources and dst live in ABUF; storage selected by `flags[0]`
+        (0=FP32, 1=FP16). Internal sum performed in FP32 regardless.
         """
         if self.state.tile_config is None:
             raise ConfigError("CONFIG_TILE not set")
@@ -868,29 +883,35 @@ class Simulator:
         if insn.dst_buf == BUF_ACCUM:
             raise IllegalBufferError(insn.dst_buf)
 
+        fp_precision = insn.flags & 0x1
+        read_tile = mem.read_fp16_tile if fp_precision == 1 else mem.read_fp32_tile
+        write_tile = mem.write_fp16_tile if fp_precision == 1 else mem.write_fp32_tile
+
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
         N = n_tiles * 16
 
-        src1 = mem.read_fp32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
-        src2 = mem.read_fp32_tile(self.state, insn.src2_buf, insn.src2_off, M, N)
+        src1 = read_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
+        src2 = read_tile(self.state, insn.src2_buf, insn.src2_off, M, N)
         result = (src1 + src2).astype(np.float32)
-        mem.write_fp32_tile(self.state, insn.dst_buf, insn.dst_off, result)
+        write_tile(self.state, insn.dst_buf, insn.dst_off, result)
         self.state.cycle_count += M * N
 
     def _exec_layernorm_fp32(self, insn):
-        """LAYERNORM_FP32: row-wise LayerNorm with FP32 I/O.
+        """LAYERNORM_FP32: row-wise LayerNorm with FP{32,16} I/O.
 
-        src1: ABUF FP32 input, shape [M, N].
+        src1: ABUF FP32 (flags=0) or FP16 (flags=1) input, shape [M, N].
         src2: gamma+beta vector in WBUF/ABUF stored as 2N FP16 values
               (first N gamma, next N beta), widened to FP32 like the
               INT8 LAYERNORM op does.
-        dst:  ABUF FP32 output, same shape as input.
+        dst:  ABUF FP{32,16} output, same shape as input; flag selects.
 
         Uses the same Welford-style mean/variance + eps=1e-6 convention
-        as the existing INT8 LAYERNORM (see `sfu.py`). The only
-        difference is no INT8 output quantisation step.
+        as the existing INT8 LAYERNORM (see `sfu.py`). Internal reduction
+        is always FP32 — `read_fp16_tile` widens FP16 source on read,
+        so variance is computed in FP32 regardless of storage precision.
+        This is the standard PyTorch FP16-LayerNorm convention.
         """
         if self.state.tile_config is None:
             raise ConfigError("CONFIG_TILE not set")
@@ -899,12 +920,16 @@ class Simulator:
         if insn.dst_buf == BUF_ACCUM:
             raise IllegalBufferError(insn.dst_buf)
 
+        fp_precision = insn.flags & 0x1
+        read_tile = mem.read_fp16_tile if fp_precision == 1 else mem.read_fp32_tile
+        write_tile = mem.write_fp16_tile if fp_precision == 1 else mem.write_fp32_tile
+
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
         N = n_tiles * 16
 
-        src = mem.read_fp32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
+        src = read_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
         gamma_beta = mem.read_fp16_vector(self.state, insn.src2_buf, insn.src2_off, 2 * N)
         gamma = gamma_beta[:N].reshape(1, N)
         beta = gamma_beta[N:].reshape(1, N)
@@ -914,17 +939,18 @@ class Simulator:
         eps = np.float32(1e-6)
         normalized = (src - mean) / np.sqrt(var + eps)
         result = (normalized * gamma + beta).astype(np.float32)
-        mem.write_fp32_tile(self.state, insn.dst_buf, insn.dst_off, result)
+        write_tile(self.state, insn.dst_buf, insn.dst_off, result)
         self.state.cycle_count += M * N
 
     def _exec_gelu_fp32(self, insn):
-        """GELU_FP32: GELU activation with FP32 I/O.
+        """GELU_FP32: GELU activation with FP{32,16} I/O.
 
         Uses the same GELU approximation as the FQ reference (tanh-based
         gelu_new for split_qkv_bias models, plain erf-based gelu otherwise).
-        For the W8A32 path we standardise on the tanh GELU (the GPT-2
-        production checkpoint uses split_qkv_bias=True) — if downstream
-        codegen needs the plain GELU, add a flag here.
+        For the W8A{32,16} path we standardise on the tanh GELU. Internal
+        compute is always FP32 (the x³ term overflows FP16 for |x|>40,
+        well above GPT-2 fc1 input magnitude). Storage is FP32 (flags=0)
+        or FP16 (flags=1) selected per instruction.
         """
         if self.state.tile_config is None:
             raise ConfigError("CONFIG_TILE not set")
@@ -933,26 +959,32 @@ class Simulator:
         if insn.dst_buf == BUF_ACCUM:
             raise IllegalBufferError(insn.dst_buf)
 
+        fp_precision = insn.flags & 0x1
+        read_tile = mem.read_fp16_tile if fp_precision == 1 else mem.read_fp32_tile
+        write_tile = mem.write_fp16_tile if fp_precision == 1 else mem.write_fp32_tile
+
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
         N = n_tiles * 16
 
-        src = mem.read_fp32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
+        src = read_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
         # gelu_new (tanh): xf * 0.5 * (1 + tanh(sqrt(2/pi) * (xf + 0.044715 * xf^3)))
         xf = src.astype(np.float32)
         sqrt_2_over_pi = np.float32(np.sqrt(2.0 / np.pi))
         inner = sqrt_2_over_pi * (xf + np.float32(0.044715) * xf ** 3)
         result = (xf * np.float32(0.5) * (np.float32(1.0) + np.tanh(inner))).astype(np.float32)
-        mem.write_fp32_tile(self.state, insn.dst_buf, insn.dst_off, result)
+        write_tile(self.state, insn.dst_buf, insn.dst_off, result)
         self.state.cycle_count += M * N
 
     def _exec_softmax_fp32(self, insn):
-        """SOFTMAX_FP32: row-wise softmax with FP32 I/O.
+        """SOFTMAX_FP32: row-wise softmax with FP{32,16} I/O.
 
         Standard numerically-stable softmax: y = exp(x - max(x)) / sum.
-        Used for Q@K^T attention scores in the W8A32 path. Causal
-        attention uses the MASKED_SOFTMAX_FP32 variant.
+        Used for Q@K^T attention scores in the W8A{32,16} path. Causal
+        attention uses the MASKED_SOFTMAX_FP32 variant. Storage selected
+        by `flags[0]` (0=FP32, 1=FP16); internal max-sub/exp/normalize
+        always in FP32.
         """
         if self.state.tile_config is None:
             raise ConfigError("CONFIG_TILE not set")
@@ -961,20 +993,24 @@ class Simulator:
         if insn.dst_buf == BUF_ACCUM:
             raise IllegalBufferError(insn.dst_buf)
 
+        fp_precision = insn.flags & 0x1
+        read_tile = mem.read_fp16_tile if fp_precision == 1 else mem.read_fp32_tile
+        write_tile = mem.write_fp16_tile if fp_precision == 1 else mem.write_fp32_tile
+
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
         N = n_tiles * 16
 
-        src = mem.read_fp32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
+        src = read_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
         row_max = src.max(axis=-1, keepdims=True)
         exp_row = np.exp((src - row_max).astype(np.float32))
         result = (exp_row / exp_row.sum(axis=-1, keepdims=True)).astype(np.float32)
-        mem.write_fp32_tile(self.state, insn.dst_buf, insn.dst_off, result)
+        write_tile(self.state, insn.dst_buf, insn.dst_off, result)
         self.state.cycle_count += M * N
 
     def _exec_masked_softmax_fp32(self, insn):
-        """MASKED_SOFTMAX_FP32: causal-masked softmax with FP32 I/O.
+        """MASKED_SOFTMAX_FP32: causal-masked softmax with FP{32,16} I/O.
 
         Consumes CONFIG_ATTN context (set via the existing ConfigAttn path)
         to determine the valid key columns per query row. Used in the
@@ -982,7 +1018,8 @@ class Simulator:
 
         For a query row q and key cols 0..N-1, columns > (q + query_row_base)
         are masked to -inf before the softmax. valid_kv_len further bounds
-        the maximum key column considered.
+        the maximum key column considered. Storage selected by `flags[0]`
+        (0=FP32, 1=FP16); internal compute always FP32.
         """
         if self.state.tile_config is None:
             raise ConfigError("CONFIG_TILE not set")
@@ -990,6 +1027,10 @@ class Simulator:
             raise IllegalBufferError(insn.src1_buf)
         if insn.dst_buf == BUF_ACCUM:
             raise IllegalBufferError(insn.dst_buf)
+
+        fp_precision = insn.flags & 0x1
+        read_tile = mem.read_fp16_tile if fp_precision == 1 else mem.read_fp32_tile
+        write_tile = mem.write_fp16_tile if fp_precision == 1 else mem.write_fp32_tile
 
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
@@ -1000,7 +1041,7 @@ class Simulator:
         query_row_base = int(ctx["query_row_base"])
         valid_kv_len = int(ctx["valid_kv_len"])
 
-        src = mem.read_fp32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
+        src = read_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
         result = np.zeros_like(src, dtype=np.float32)
         for i in range(M):
             row = src[i].astype(np.float32).copy()
@@ -1020,7 +1061,7 @@ class Simulator:
                 exp_row[keep_through + 1:] = 0.0
             denom = float(exp_row.sum())
             result[i] = exp_row / denom if denom > 0.0 else 0.0
-        mem.write_fp32_tile(self.state, insn.dst_buf, insn.dst_off, result.astype(np.float32))
+        write_tile(self.state, insn.dst_buf, insn.dst_off, result.astype(np.float32))
         self.state.cycle_count += M * N
 
     # =======================================================================
@@ -1028,20 +1069,28 @@ class Simulator:
     # =======================================================================
 
     def _exec_dequant_accum_fp32_scaled(self, insn):
-        """DEQUANT_ACCUM_FP32_SCALED: M1's dequant + a dynamic activation scale.
+        """DEQUANT_ACCUM_FP32_SCALED: M1's dequant + dynamic activation scale.
 
         Math:
           output[i,j] = src1[i,j] (INT32) * per_channel_wt_scale[j] (FP16->FP32)
                                           * scale_regs[sreg] (FP16->FP32)
+                                          [+ bias[j] (FP16->FP32) when flags=1]
 
-        Used by the W8A32 matmul-output lowering. The static per-channel
-        weight scale table in `src2` is the same shape and FP16 format as
-        DEQUANT_ACCUM_FP32 reads — only the additional `* scale_regs[sreg]`
-        factor differs. That factor is the activation scale (max_abs / 127)
-        that the matmul prelude wrote via MAX_ABS_REDUCE_FP32.
+        Used by the W8A{32,16} matmul-output lowering. The activation scale
+        from `scale_regs[sreg]` is what the matmul prelude wrote via
+        MAX_ABS_REDUCE_FP32 (max_abs / 127).
 
-        M1's DEQUANT_ACCUM_FP32 (0x17) is unchanged — this is a separate
-        opcode (0x1E) so the M1 contract is preserved verbatim.
+        Storage and src2 layout selected by `flags[0]`:
+          flags=0 (W8A32): src2 = N FP16 PC scales; dst = FP32. Bit-identical
+                            to the M2.5-A contract.
+          flags=1 (W8A16): src2 = 2N FP16 (N PC scales followed by N bias
+                            values); the epilogue folds bias before casting
+                            to FP16 once. This avoids FP16 double-rounding
+                            bias through a separate VADD_FP16. Matmuls
+                            without bias zero-pad the second N entries.
+
+        Internal compute always FP32. M1's DEQUANT_ACCUM_FP32 (0x17) is the
+        no-activation-scale variant; this is the separate scaled opcode (0x1E).
         """
         if self.state.tile_config is None:
             raise ConfigError("CONFIG_TILE not set")
@@ -1052,28 +1101,46 @@ class Simulator:
         if insn.dst_buf == BUF_ACCUM:
             raise IllegalBufferError(insn.dst_buf)
 
+        fp_precision = insn.flags & 0x1
+        write_tile = mem.write_fp16_tile if fp_precision == 1 else mem.write_fp32_tile
+
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
         N = n_tiles * 16
 
         src = mem.read_int32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
-        wt_scales = mem.read_fp16_vector(self.state, insn.src2_buf, insn.src2_off, N).reshape(1, N)
+        if fp_precision == 1:
+            # W8A16: src2 is 2N FP16 (PC scales + bias). Fold bias before cast.
+            pc_and_bias = mem.read_fp16_vector(self.state, insn.src2_buf, insn.src2_off, 2 * N)
+            wt_scales = pc_and_bias[:N].reshape(1, N)
+            bias = pc_and_bias[N:].reshape(1, N)
+        else:
+            # W8A32: src2 is N FP16 PC scales only (bit-identical to M2.5-A).
+            wt_scales = mem.read_fp16_vector(self.state, insn.src2_buf, insn.src2_off, N).reshape(1, N)
+            bias = None
         act_scale = np.float32(self.state.scale_regs[insn.sreg])
         result = (src.astype(np.float32) * wt_scales * act_scale).astype(np.float32)
+        if bias is not None:
+            result = (result + bias).astype(np.float32)
 
-        mem.write_fp32_tile(self.state, insn.dst_buf, insn.dst_off, result)
+        write_tile(self.state, insn.dst_buf, insn.dst_off, result)
         self.state.cycle_count += M * N
 
     def _exec_max_abs_reduce_fp32(self, insn):
-        """MAX_ABS_REDUCE_FP32: compute max(|x|) over an FP32 tile;
+        """MAX_ABS_REDUCE_FP32: compute max(|x|) over an FP{32,16} tile;
         write 127/max_abs to scale_regs[sreg], max_abs/127 to scale_regs[sreg+1].
 
-        Used as the prelude to W8A32 matmul: the result drives
+        Used as the prelude to W8A{32,16} matmul: the result drives
         QUANT_FP32_INT8 (via sreg, multiplier 127/max_abs) and the
         downstream DEQUANT_ACCUM_FP32_SCALED (via sreg+1, multiplier
         max_abs/127). Two scale registers consumed per call,
         matching the DEQUANT_ADD sreg-pair convention.
+
+        Source storage selected by `flags[0]` (0=FP32, 1=FP16); the FP16
+        source is widened to FP32 on read and the max-reduction proceeds
+        in FP32 regardless. Scale-register values are always written as
+        FP16 (the existing FP16-storage/FP32-datapath convention).
 
         All-zero tile guard: if max_abs is 0, the inverse 127/0 is
         infinity. We clamp max_abs to an eps large enough that the
@@ -1091,12 +1158,15 @@ class Simulator:
         if insn.sreg >= 15:
             raise ConfigError("MAX_ABS_REDUCE_FP32 sreg+1 out of range (must be 0..14)")
 
+        fp_precision = insn.flags & 0x1
+        read_tile = mem.read_fp16_tile if fp_precision == 1 else mem.read_fp32_tile
+
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
         N = n_tiles * 16
 
-        src = mem.read_fp32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
+        src = read_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
         max_abs = float(np.max(np.abs(src.astype(np.float32))))
         # Eps-clamp so 127/max_abs fits in FP16 (max ≈ 65504). 2**-9 = 1/512
         # gives 127*512 = 65024 inverse, safely FP16-representable.

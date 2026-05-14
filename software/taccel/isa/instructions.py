@@ -122,6 +122,21 @@ class DequantAddInsn(RTypeInsn):
 #   - SOFTMAX_FP32:       src1=ABUF (FP32), src2=unused, dst=ABUF (FP32)
 #   - MASKED_SOFTMAX_FP32: src1=ABUF (FP32), src2=unused, dst=ABUF (FP32);
 #                          consumes CONFIG_ATTN context like MASKED_SOFTMAX
+#
+# W8A16 extension (Phase 3 (c.2), milestone M1, 2026-05-14)
+# ---------------------------------------------------------
+# The 9 W8A32 R-type opcodes (0x17-0x1F) are reused with `flags[0]` as
+# an fp_precision selector:
+#   - flags=0  -> FP32 storage (existing W8A32 behavior, bit-identical)
+#   - flags=1  -> FP16 storage (new W8A16 default)
+# Under flags=1 the ABUF I/O is 2 bytes/elem (vs 4 for FP32); internal
+# datapath stays FP32 for numerically sensitive math (LN variance,
+# softmax exp, GELU x^3). For DEQUANT_ACCUM_FP32_SCALED specifically,
+# flags=1 also changes src2 layout: it carries `2N FP16` (N PC scales
+# followed by N bias values), and the epilogue computes
+# `fp32 = int32 * pc * act_scale + bias` then casts to FP16 once.
+# This avoids FP16 double-rounding bias through a separate VADD. Under
+# flags=0 the src2 layout is unchanged (N FP16 PC scales only).
 
 
 @dataclass

@@ -182,6 +182,62 @@ def write_fp32_tile(state, buf_id: int, offset_units: int, data: np.ndarray):
     buf[byte_offset:end] = flat
 
 
+# ---------------------------------------------------------------------------
+# W8A16 FP16 tile helpers (Phase 3 (c.2), M1)
+#
+# ABUF bytes are reinterpreted as FP16 (2 bytes/element) when accessed by
+# the W8A32 R-type opcodes (0x17-0x1F) with `flags=1`. Reads widen to FP32
+# on return (FP16-storage / FP32-datapath convention, matches
+# read_fp16_vector). Writes accept FP32 and downcast to FP16 on store.
+# Same byte addressing as the FP32 helpers (16-byte units); only the
+# element size and dtype differ.
+# ---------------------------------------------------------------------------
+
+
+def read_fp16_tile(state, buf_id: int, offset_units: int, rows: int, cols: int) -> np.ndarray:
+    """Read an FP16 tile from SRAM buffer, widened to FP32 on return.
+
+    Same byte addressing as `read_fp32_tile` (16-byte units) but
+    interprets the underlying bytes as little-endian float16 and
+    widens to FP32 — internal datapath is FP32, storage is FP16.
+    ACCUM is not a valid source/destination (INT32-only by contract).
+    """
+    if buf_id == BUF_ACCUM:
+        raise ValueError(
+            "ACCUM buffer is INT32-only; read FP16 from ABUF/WBUF via "
+            "DEQUANT_ACCUM_FP32(flags=1) to write to ABUF"
+        )
+    _check_sram_bounds(buf_id, offset_units)
+    byte_offset = offset_units * UNIT
+    total_bytes = rows * cols * 2
+
+    buf = state.get_buffer(buf_id)
+    end = byte_offset + total_bytes
+    if end > len(buf):
+        raise SRAMAccessError(buf_id, offset_units, BUFFER_MAX_OFF[buf_id])
+
+    raw = np.frombuffer(buf[byte_offset:end], dtype=np.float16).copy()
+    return raw.astype(np.float32).reshape(rows, cols)
+
+
+def write_fp16_tile(state, buf_id: int, offset_units: int, data: np.ndarray):
+    """Write an FP32 tile to SRAM downcast to FP16 (2 bytes/element)."""
+    if buf_id == BUF_ACCUM:
+        raise ValueError(
+            "ACCUM buffer is INT32-only; FP16 results write to ABUF"
+        )
+    _check_sram_bounds(buf_id, offset_units)
+    byte_offset = offset_units * UNIT
+    flat = data.astype(np.float16).tobytes()
+
+    buf = state.get_buffer(buf_id)
+    end = byte_offset + len(flat)
+    if end > len(buf):
+        raise SRAMAccessError(buf_id, offset_units, BUFFER_MAX_OFF[buf_id])
+
+    buf[byte_offset:end] = flat
+
+
 def read_fp16_vector(state, buf_id: int, offset_units: int, length: int) -> np.ndarray:
     """Read FP16 values (e.g. LN gamma/beta or per-channel dequant scales) → FP32.
 
