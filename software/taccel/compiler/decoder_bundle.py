@@ -241,11 +241,11 @@ def build_decoder_program_bundle(
 ) -> DecoderBundleBuild:
     """Build a ProgramBundle from already-formed decoder IR graphs.
 
-    Under `use_fp16_activations=True` (W8A16 path) all FP tiles are FP16
-    (2 bytes/element). INT8 path (use_fp16_activations=False) uses
-    elem_bytes=1.
+    All FP tiles are FP16 (2 bytes/element) — the INT8-activation (W8A8)
+    path was retired with the DeiT/RTL tooling. `use_fp16_activations`
+    is kept for signature compatibility but is always True.
     """
-    elem_bytes = 2 if use_fp16_activations else 1
+    elem_bytes = 2
     kv_layout = build_kv_cache_layout(
         model_config, max_seq_len=max_seq_len, elem_bytes=elem_bytes,
     )

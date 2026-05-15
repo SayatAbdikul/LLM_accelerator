@@ -19,7 +19,6 @@ from ..isa.instructions import (
     LoadInsn, StoreInsn, BufCopyInsn, SetAddrLoInsn, SetAddrHiInsn,
     ConfigTileInsn, SetScaleInsn, SyncInsn, NopInsn, HaltInsn, Instruction,
 )
-from ._codegen_matmul import _CodegenMatmulMixin
 from .ir import IRNode, IRGraph
 from .tiler import tile_matmul, tile_qkt, tile_strip_mine, pad_dim, TILE
 from .memory_alloc import MemoryAllocator, Allocation
@@ -48,14 +47,14 @@ def _set_addr(addr_reg: int, byte_addr: int) -> List[Instruction]:
     ]
 
 
-class CodeGenerator(_CodegenMatmulMixin):
+class CodeGenerator:
     """Generate ISA instructions from IR graph.
 
-    INT8 matmul lowering (`_emit_matmul*`, `_emit_bias_add*`,
-    `_large_weight_tile_*`, etc.) lives on the `_CodegenMatmulMixin`
-    base. The W8A16 path's matmul lowering lives in the sibling package
-    `taccel.compiler.w8a16_emit` and is dispatched from the matmul
-    methods themselves based on `self.use_fp16_activations`.
+    Matmul lowering dispatches to `taccel.compiler.w8a16_emit` (the only
+    activation precision after the W8A8/DeiT path was retired). The
+    large-weight tile-plan helpers (`_large_weight_tile_*`) are consumed
+    by both `_layout_weights` (DRAM staging) and the W8A16 large-weight
+    matmul emitter.
     """
 
     def __init__(self, weight_data: Dict[str, Tuple[np.ndarray, Optional[np.ndarray]]],
@@ -111,7 +110,10 @@ class CodeGenerator(_CodegenMatmulMixin):
         # emit_matmul_w8a16 raises a clear error if a bias is referenced
         # without a corresponding FP32 staging entry.
         self.biases: Dict[str, np.ndarray] = dict(biases or {})
-        self.use_fp16_activations = bool(use_fp16_activations)
+        # W8A8 (INT8-activation) path was retired with the DeiT/RTL tooling.
+        # W8A16 is the only activation precision now; the parameter is kept
+        # for signature compatibility but always resolves True.
+        self.use_fp16_activations = True
         # W8A16: FP16 storage (2 bytes/elem) on all ABUF tiles produced
         # by R-type opcodes 0x17-0x1F; flags[0]=1 selects the FP16 path
         # at instruction-emit time. Both values are constants now that
@@ -678,6 +680,70 @@ class CodeGenerator(_CodegenMatmulMixin):
         if match is None:
             raise ValueError(f"Cannot infer residual2 skip input from '{fc2_name}'")
         return f"block{int(match.group(1))}_residual1"
+
+    @staticmethod
+    def _large_weight_tile_symbol(weight_name: str, k_start: int, k_len: int,
+                                  n_start: int, n_len: int) -> str:
+        return f"{weight_name}__stage4_tile_k{k_start}_{k_len}_n{n_start}_{n_len}"
+
+    @staticmethod
+    def _large_weight_tile_plan(K_pad: int, N_pad: int) -> List[Tuple[int, int, int, int]]:
+        """Return deterministic (k_start, k_len, n_start, n_len) tiles.
+
+        Tiles are sized for a 16-row activation strip.  `N_tile` is capped at
+        512 so the `d=384` FC1 case uses the intended 384x512 WBUF tile.  If the
+        full K dimension still does not fit, split K and use MATMUL accumulate.
+
+        Consumed by `_layout_weights` (DRAM staging) and the W8A16
+        large-weight-tiled matmul emitter (`w8a16_emit.matmul`).
+        """
+        if K_pad <= 0 or N_pad <= 0:
+            raise ValueError("large weight tile dimensions must be positive")
+
+        max_n_by_accum = ACCUM_SIZE // (STAGE4_M_TILE * 4)
+        max_n_by_abuf = ABUF_SIZE // STAGE4_M_TILE
+        n_tile = min(N_pad, STAGE4_MAX_N_TILE, max_n_by_accum, max_n_by_abuf)
+        n_tile = max(TILE, (n_tile // TILE) * TILE)
+
+        while n_tile >= TILE:
+            k_tile = (WBUF_SIZE // n_tile) // TILE * TILE
+            if k_tile >= TILE:
+                break
+            n_tile //= 2
+            n_tile = (n_tile // TILE) * TILE
+        if n_tile < TILE:
+            raise MemoryError("Unable to choose a Stage 4 N tile that fits WBUF")
+
+        k_tile = max(TILE, (WBUF_SIZE // n_tile) // TILE * TILE)
+        k_tile = min(K_pad, k_tile)
+        k_tile = max(TILE, (k_tile // TILE) * TILE)
+
+        tiles: List[Tuple[int, int, int, int]] = []
+        for n_start in range(0, N_pad, n_tile):
+            n_len = min(n_tile, N_pad - n_start)
+            for k_start in range(0, K_pad, k_tile):
+                k_len = min(k_tile, K_pad - k_start)
+                tiles.append((k_start, k_len, n_start, n_len))
+        return tiles
+
+    def _large_weight_tiles_for_n(self, K_pad: int, N_pad: int,
+                                  n_start: int, n_len: int) -> List[Tuple[int, int, int, int]]:
+        return [
+            tile for tile in self._large_weight_tile_plan(K_pad, N_pad)
+            if tile[2] == n_start and tile[3] == n_len
+        ]
+
+    def _emit_matmul(self, node: IRNode):
+        """Emit a standard linear matmul through the W8A16 lowering.
+
+        The legacy INT8 (W8A8) matmul path was retired with the DeiT/RTL
+        tooling; `use_fp16_activations` is always True now, so this
+        unconditionally dispatches to `emit_matmul_w8a16`, which handles
+        the simple / large-weight-tiled / large-input-streaming cases
+        internally based on tile sizing.
+        """
+        from .w8a16_emit import emit_matmul_w8a16
+        emit_matmul_w8a16(self, node)
 
     def _emit_node(self, node: IRNode):
         """Emit instructions for a single IR node."""

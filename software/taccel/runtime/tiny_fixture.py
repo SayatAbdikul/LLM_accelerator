@@ -284,34 +284,19 @@ def quantize_fixture_payload(
     # Token and position embeddings: INT8 path shares the tok_pos_add
     # output scale across both tables (otherwise q_token + q_pos isn't
     # a representation of token + position in any single real scale).
-    # W8A32 path stores them as raw FP32 — no quantization step, no
-    # cross-table scale constraint. The split below picks one or the
-    # other based on `use_fp16_activations` (M3-prep).
-    if use_fp16_activations:
-        # W8A16: embedding output is FP16 (2 bytes/elem). The codegen DMAs
-        # `d_model_pad * 2` bytes per row and the resulting ABUF tile is
-        # interpreted as FP16 by the first sub-layer op (LN widens FP16
-        # to FP32 internally on read).
-        weight_data = {
-            "transformer.wte.weight": (_fp16_embedding(state_dict["transformer.wte.weight"]), None),
-            "transformer.wpe.weight": (_fp16_embedding(state_dict["transformer.wpe.weight"]), None),
-            "transformer.ln_f.weight": (_fp16_vector(state_dict["transformer.ln_f.weight"]), None),
-            "transformer.ln_f.bias": (_fp16_vector(state_dict["transformer.ln_f.bias"]), None),
-        }
-    else:
-        # INT8 path (W8A8 default): both embedding tables share the
-        # output scale used for tok_pos_add; otherwise q_token + q_pos
-        # is not a representation of token + position in any single
-        # real scale.
-        embedding_add_scale = float(calibration_scales.get("tok_pos_add", 6.0 / 127.0))
-        weight_data = {
-            "transformer.wte.weight": (_quantize_embedding(state_dict["transformer.wte.weight"], embedding_add_scale), None),
-            "transformer.wpe.weight": (_quantize_embedding(state_dict["transformer.wpe.weight"], embedding_add_scale), None),
-            "transformer.ln_f.weight": (_fp16_vector(state_dict["transformer.ln_f.weight"]), None),
-            "transformer.ln_f.bias": (_fp16_vector(state_dict["transformer.ln_f.bias"]), None),
-        }
+    # W8A16: embedding output is FP16 (2 bytes/elem). The codegen DMAs
+    # `d_model_pad * 2` bytes per row and the resulting ABUF tile is
+    # interpreted as FP16 by the first sub-layer op (LN widens FP16 to
+    # FP32 internally on read). The INT8-activation (W8A8) embedding
+    # staging was retired with the DeiT/RTL tooling.
+    weight_data = {
+        "transformer.wte.weight": (_fp16_embedding(state_dict["transformer.wte.weight"]), None),
+        "transformer.wpe.weight": (_fp16_embedding(state_dict["transformer.wpe.weight"]), None),
+        "transformer.ln_f.weight": (_fp16_vector(state_dict["transformer.ln_f.weight"]), None),
+        "transformer.ln_f.bias": (_fp16_vector(state_dict["transformer.ln_f.bias"]), None),
+    }
     prescaled_biases: Dict[str, np.ndarray] = {}
-    # M2.5-C: raw FP32 biases for the W8A32 simple-matmul lowering.
+    # Raw FP32 biases folded into the W8A16 DEQUANT epilogue.
     # Populated for non-attention matmuls only — see the docstring.
     biases: Dict[str, np.ndarray] = {}
 
@@ -412,7 +397,7 @@ def quantize_fixture_payload(
         )
     # W8A16: lm_head produces FP16 output (2 bytes/elem). The logits
     # DRAM region grows by 2× vs the INT8 path.
-    logits_elem_bytes = 2 if use_fp16_activations else 1
+    logits_elem_bytes = 2
     return (
         weight_data,
         prescaled_biases,
@@ -452,7 +437,7 @@ def build_stage3_tiny_decoder_bundle(
         payload,
         calibration_scales=calibration_scales,
         per_tensor_fc1_blocks=gelu_from_accum_blocks,
-        use_fp16_activations=bool(resolved_preset.weight_only_int8),
+        use_fp16_activations=True,
     )
     validate_stage5_ptq_preset_for_model(config, resolved_preset)
     calibration_scales = apply_stage5_ptq_scale_policy(calibration_scales, config, resolved_preset)
@@ -482,7 +467,7 @@ def build_stage3_tiny_decoder_bundle(
         dequant_add_residual1_blocks=stage5_dequant_add_residual1_blocks(config, resolved_preset),
         dequant_add_residual2_blocks=stage5_dequant_add_residual2_blocks(config, resolved_preset),
         gelu_from_accum_blocks=gelu_from_accum_blocks or None,
-        use_fp16_activations=bool(resolved_preset.weight_only_int8),
+        use_fp16_activations=True,
         biases=biases,
     )
     return TinyFixtureBundle(build=build, config=config, logits_size=logits_size)

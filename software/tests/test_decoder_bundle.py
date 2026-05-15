@@ -186,15 +186,18 @@ def test_decode_kv_load_allocates_padded_tensor_footprint():
     finally:
         BufferAllocator.alloc = original_alloc
 
+    # seq_len=3 tokens × d_head=16 × 2 bytes (FP16) = 96 B = 6 xfer units.
+    # (Was 3 units under the retired INT8-activation path: 3×16×1 B.)
     kv_loads = [
         insn for insn in build.decode_codegen.instructions
-        if isinstance(insn, LoadInsn) and insn.addr_reg == 2 and insn.xfer_len == 3
+        if isinstance(insn, LoadInsn) and insn.addr_reg == 2 and insn.xfer_len == 6
     ]
     assert len(kv_loads) == 2
 
     # config has n_embd=16, n_head=1 → d_head=16. seq_len=3 padded to 16
-    # rows of d_head=16 cols × 1 byte (INT8) = 256 bytes per padded tile.
-    padded_tile_bytes = 16 * 16 * 1
+    # rows of d_head=16 cols × 2 bytes (FP16; the W8A8 INT8-activation
+    # path was retired) = 512 bytes per padded tile.
+    padded_tile_bytes = 16 * 16 * 2
     assert captured["block0_head0_key_kv_load"] >= padded_tile_bytes, (
         f"K kv_load alloc {captured['block0_head0_key_kv_load']} < "
         f"padded {padded_tile_bytes}; padding rows may be corrupted by a "
