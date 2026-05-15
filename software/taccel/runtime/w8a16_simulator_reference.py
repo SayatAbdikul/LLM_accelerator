@@ -274,7 +274,7 @@ class NanoGPTW8A16SimulatorReference:
         ).astype(np.int8)
 
     def _attention_head(self, ln1: np.ndarray, layer_idx: int, head_idx: int,
-                        position: int) -> np.ndarray:
+                        position: int, record=None) -> np.ndarray:
         head = self.layers[layer_idx]["heads"][head_idx]
         # Per-head Q/K/V projections (dynamic activation scale).
         q = _w8a16_dynamic_matmul(
@@ -286,6 +286,13 @@ class NanoGPTW8A16SimulatorReference:
         v = _w8a16_dynamic_matmul(
             ln1, head["v_int8"], head["v_scales"], head["v_b"],
         )
+        if record is not None:
+            # Same node names / pre-cache-append order as
+            # NanoGPTFP32Reference._decode_incremental_step so the A/B
+            # harness can diff sublayer-by-sublayer.
+            record(f"block{layer_idx}_head{head_idx}_query", q)
+            record(f"block{layer_idx}_head{head_idx}_key", k)
+            record(f"block{layer_idx}_head{head_idx}_value", v)
         # KV cache append. Under fp_precision='fp16' the K/V tiles are
         # FP16-stored in the simulator's KV cache; mirror that here.
         self._caches[layer_idx][head_idx]["k"].append(cast_fp16(k[0]))
@@ -312,6 +319,8 @@ class NanoGPTW8A16SimulatorReference:
         probs_fp32 = softmax_masked(
             scores_fp32, valid_kv_len, fp16_storage=True,
         )
+        if record is not None:
+            record(f"block{layer_idx}_head{head_idx}_softmax", probs_fp32)
 
         # attn_v: static composite scale.
         sm_scale = self._act_scale_for(f"block{layer_idx}_head{head_idx}_softmax")
@@ -323,59 +332,109 @@ class NanoGPTW8A16SimulatorReference:
         )
         head_out_int32 = sm_int8.astype(np.int32) @ v_cache_int8.astype(np.int32)
         head_out_fp32 = head_out_int32.astype(np.float32) * np.float32(composite_av)
-        return cast_fp16(head_out_fp32)
+        head_out = cast_fp16(head_out_fp32)
+        if record is not None:
+            record(f"block{layer_idx}_head{head_idx}_attn_v", head_out)
+        return head_out
 
-    def run_decode_step(self, token_id: int, position: int) -> np.ndarray:
-        """Run one decode step and return its FP32 logits."""
+    def run_decode_step(self, token_id: int, position: int,
+                        trace: Optional[dict] = None) -> np.ndarray:
+        """Run one decode step and return its FP32 logits.
+
+        When `trace` is a dict, records per-sublayer activations under the
+        same node names `NanoGPTFP32Reference` uses (see
+        `incremental_node_trace`) so the two can be diffed sublayer-by-
+        sublayer to localize where W8A16 quantization damage accumulates.
+        """
         if position != self._next_position:
             raise ValueError(
                 f"NanoGPTW8A16SimulatorReference: position {position} doesn't "
                 f"match internal cursor {self._next_position}"
             )
+
+        def record(name: str, value) -> None:
+            if trace is None:
+                return
+            trace[name] = {"value": np.asarray(value, dtype=np.float32).copy()}
+
         # Token + position embedding lookups. Storage is FP{32,16} matching
         # how the codegen stages embedding tables.
         x = self.wte[token_id:token_id + 1] + self.wpe[position:position + 1]
         x = cast_fp16(x)
+        record("tok_pos_add", x)
 
         for layer_idx, layer in enumerate(self.layers):
             ln1 = layernorm(
                 x, layer["ln1_w"], layer["ln1_b"],
                 eps=self.layer_norm_epsilon, fp16_storage=True,
             )
+            record(f"block{layer_idx}_ln1", ln1)
             head_outs = []
             for head_idx in range(self.n_head):
                 head_outs.append(
-                    self._attention_head(ln1, layer_idx, head_idx, position)
+                    self._attention_head(
+                        ln1, layer_idx, head_idx, position, record=record
+                    )
                 )
             concat = np.concatenate(head_outs, axis=-1)
+            record(f"block{layer_idx}_concat", concat)
             out_proj = _w8a16_dynamic_matmul(
                 concat, layer["c_proj_int8"], layer["c_proj_scales"], layer["c_proj_b"],
             )
+            record(f"block{layer_idx}_out_proj", out_proj)
             x = cast_fp16(x + out_proj)  # residual1
+            record(f"block{layer_idx}_residual1", x)
 
             ln2 = layernorm(
                 x, layer["ln2_w"], layer["ln2_b"],
                 eps=self.layer_norm_epsilon, fp16_storage=True,
             )
+            record(f"block{layer_idx}_ln2", ln2)
             fc1 = _w8a16_dynamic_matmul(
                 ln2, layer["fc1_int8"], layer["fc1_scales"], layer["fc1_b"],
             )
+            record(f"block{layer_idx}_fc1", fc1)
             gelu = gelu_tanh(fc1, fp16_storage=True)
+            record(f"block{layer_idx}_gelu", gelu)
             fc2 = _w8a16_dynamic_matmul(
                 gelu, layer["fc2_int8"], layer["fc2_scales"], layer["fc2_b"],
             )
+            record(f"block{layer_idx}_fc2", fc2)
             x = cast_fp16(x + fc2)  # residual2
+            record(f"block{layer_idx}_residual2", x)
 
         ln_f = layernorm(
             x, self.ln_f_w, self.ln_f_b,
             eps=self.layer_norm_epsilon, fp16_storage=True,
         )
+        record("ln_f", ln_f)
         # lm_head: takes only the last row of ln_f (incremental decode).
         logits = _w8a16_dynamic_matmul(
             ln_f[-1:], self.lm_head_w_int8, self.lm_head_w_scales, self.lm_head_b,
         )
+        record("lm_head", logits)
         self._next_position += 1
         return logits[0].astype(np.float32)
+
+    def incremental_node_trace(
+        self,
+        token_ids: Sequence[int],
+        position_ids: Optional[Sequence[int]] = None,
+    ) -> List[dict]:
+        """Per-node W8A16 trace, node names matching NanoGPTFP32Reference."""
+        toks = [int(t) for t in token_ids]
+        if not toks:
+            return []
+        pids = list(position_ids) if position_ids is not None else list(range(len(toks)))
+        if len(pids) != len(toks):
+            raise ValueError("position_ids length must match token_ids length")
+        self._reset_caches()
+        traces: List[dict] = []
+        for tok, pos in zip(toks, pids):
+            step_trace: dict = {}
+            self.run_decode_step(tok, pos, trace=step_trace)
+            traces.append(step_trace)
+        return traces
 
     def run_prefill(self, token_ids: Sequence[int]) -> np.ndarray:
         """Run prefill on a prompt (1-token-per-step) and return the

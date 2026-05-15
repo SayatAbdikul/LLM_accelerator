@@ -193,6 +193,9 @@ def run_weight_only_int8_teacher_forced_logits(
 def run_weight_only_int8_simulator_teacher_forced_logits(
     payload: Dict[str, object],
     context_tokens: Sequence[int],
+    *,
+    calibration_scales: Dict[str, float] | None = None,
+    ptq_preset: str = "weight_only_int8",
 ) -> List[np.ndarray]:
     """W8A16 simulator-backed golden via the compiled bundle + HostRunner.
 
@@ -214,7 +217,8 @@ def run_weight_only_int8_simulator_teacher_forced_logits(
         return []
     bundle = build_stage3_tiny_decoder_bundle(
         payload,
-        ptq_preset="weight_only_int8",
+        ptq_preset=ptq_preset,
+        calibration_scales=calibration_scales,
         smoke_decode_steps=len(inputs) - 1,
     )
     runner = HostRunner(bundle.build.bundle, logits_dtype=np.float16)
@@ -233,6 +237,8 @@ def run_weight_only_int8_simulator_teacher_forced_logits(
 def run_weight_only_int8_simulator_reference_teacher_forced_logits(
     payload: Dict[str, object],
     context_tokens: Sequence[int],
+    *,
+    calibration_scales: Dict[str, float] | None = None,
 ) -> List[np.ndarray]:
     """W8A16 like-for-like NumPy reference logits (M4-E).
 
@@ -245,7 +251,9 @@ def run_weight_only_int8_simulator_reference_teacher_forced_logits(
     from .w8a16_simulator_reference import NanoGPTW8A16SimulatorReference
 
     inputs, _ = teacher_forced_inputs_and_targets(context_tokens)
-    ref = NanoGPTW8A16SimulatorReference(payload)
+    ref = NanoGPTW8A16SimulatorReference(
+        payload, calibration_scales=calibration_scales
+    )
     return ref.run_teacher_forced(inputs)
 
 
@@ -366,6 +374,39 @@ def evaluate_gpt2_perplexity(
     if resolved_preset.weight_only_int8:
         _, targets = teacher_forced_inputs_and_targets(eval_tokens)
         vocab_size = int(payload["model_args"]["vocab_size"])
+        # W8A16 perplexity rungs (plan Tier 1). For the default
+        # `weight_only_int8` preset both branches below are no-ops and
+        # `wo_calibration_scales` stays None → byte-identical to the
+        # recorded baseline (280.49 / 177.62).
+        wo_calibration_scales = None
+        if resolved_preset.quarot_enabled:
+            # Data-free residual-stream rotation (random_orthogonal),
+            # folded entirely into the weights. Runs BEFORE calibration so
+            # the scales reflect the rotated (near-isotropic) distribution
+            # — same rotate→calibrate ordering as the non-weight-only path.
+            apply_quarot_rotation_from_token_ids(
+                payload,
+                calibration_token_ids,
+                seed=resolved_preset.quarot_seed,
+                kind=resolved_preset.quarot_kind,
+            )
+        if resolved_preset.weight_only_int8_calibrate:
+            wo_calibration_scales = build_calibration_scales_from_token_ids(
+                payload,
+                calibration_token_ids,
+                n_seqs=calibration_n_seqs,
+                seq_len=calibration_seq_len,
+                percentile=calibration_percentile,
+                activation_percentile_overrides=(
+                    resolved_preset.activation_percentile_nodes or None
+                ),
+                hessian_gelu_blocks=resolved_preset.hessian_gelu_blocks,
+            )
+            wo_calibration_scales = apply_stage5_ptq_scale_policy(
+                wo_calibration_scales,
+                payload["model_args"],
+                resolved_preset,
+            )
         # M4-F: when simulator_backed=True, both sides switch to the
         # M2.5-A-dynamic-scaling math.
         #   - fake_quant path  = M4-E NanoGPTW8A16SimulatorReference
@@ -376,6 +417,7 @@ def evaluate_gpt2_perplexity(
             fake_logits = (
                 run_weight_only_int8_simulator_reference_teacher_forced_logits(
                     payload, eval_tokens,
+                    calibration_scales=wo_calibration_scales,
                 )
             )
         else:
@@ -395,6 +437,8 @@ def evaluate_gpt2_perplexity(
         if simulator_backed:
             golden_logits = run_weight_only_int8_simulator_teacher_forced_logits(
                 payload, eval_tokens,
+                calibration_scales=wo_calibration_scales,
+                ptq_preset=resolved_preset.name,
             )
         else:
             golden_logits = run_weight_only_int8_golden_teacher_forced_logits(

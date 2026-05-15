@@ -257,7 +257,7 @@ def test_layernorm_fp32_flags1_matches_fp32_reference_downcast():
     beta_fp16 = beta.astype(np.float16).astype(np.float32)
     mean = src_fp16.mean(axis=-1, keepdims=True).astype(np.float32)
     var = src_fp16.var(axis=-1, keepdims=True).astype(np.float32)
-    eps = np.float32(1e-6)
+    eps = np.float32(1e-5)  # matches simulator _exec_layernorm_fp32 / GPT-2 checkpoint
     expected_fp32 = ((src_fp16 - mean) / np.sqrt(var + eps) * gamma_fp16 + beta_fp16).astype(np.float32)
     expected_fp16 = expected_fp32.astype(np.float16).astype(np.float32)
     np.testing.assert_array_equal(out, expected_fp16)

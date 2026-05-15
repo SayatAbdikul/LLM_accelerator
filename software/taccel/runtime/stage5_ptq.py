@@ -56,6 +56,13 @@ class Stage5PTQPreset:
     # residual paths) do not compose with W8A32 — the pipeline raises if
     # any are set alongside this flag.
     weight_only_int8: bool
+    # When True (only meaningful with weight_only_int8=True), the WO branch
+    # in evaluate_gpt2_perplexity builds calibration scales so QKT/attn_v
+    # use real per-tensor scales instead of the static 6/127 fallback, and
+    # (if quarot_enabled) applies the data-free residual-stream rotation
+    # first. Default False keeps `weight_only_int8` zero-calibration and
+    # byte-identical to its recorded baseline.
+    weight_only_int8_calibrate: bool = False
 
 
 def _preset(
@@ -83,6 +90,7 @@ def _preset(
     awq_alpha: float = 0.5,
     awq_target_modules: Sequence[str] = ("c_attn", "c_fc", "lm_head"),
     weight_only_int8: bool = False,
+    weight_only_int8_calibrate: bool = False,
 ) -> Stage5PTQPreset:
     preset = Stage5PTQPreset(
         name=name,
@@ -108,13 +116,20 @@ def _preset(
         awq_alpha=float(awq_alpha),
         awq_target_modules=tuple(str(v) for v in awq_target_modules),
         weight_only_int8=bool(weight_only_int8),
+        weight_only_int8_calibrate=bool(weight_only_int8_calibrate),
     )
     if preset.weight_only_int8:
-        # W8A32 is intentionally orthogonal to every W8A8 transform — those
-        # transforms mutate per-tensor activation scales or rotate the
-        # residual stream against an INT8 activation distribution that the
-        # W8A32 path doesn't have. Surface the conflict at preset
-        # construction time so it can't compose silently.
+        # The weight-only path rejects the *calibration-dependent* W8A8
+        # transforms (per-channel requant, bias correction, output-aware
+        # searches, AWQ) — those mutate per-tensor activation scales or
+        # search against an INT8 activation distribution captured by the
+        # W8A8 calibration machinery, which this path does not run.
+        # NOTE: data-free QuaRot (`quarot_enabled`, kind="random_orthogonal")
+        # is intentionally NOT rejected — it is a seeded offline residual-
+        # stream rotation folded entirely into the weights (no calibration,
+        # no runtime intervention), so it composes cleanly with the W8A16
+        # path. Surface the remaining conflicts at construction time so
+        # they can't compose silently.
         offenders = []
         if preset.activation_percentile_nodes:
             offenders.append("activation_percentile_nodes")
@@ -140,17 +155,16 @@ def _preset(
             offenders.append("bias_correction_blocks")
         if preset.gelu_from_accum_blocks:
             offenders.append("gelu_from_accum_blocks")
-        if preset.quarot_enabled:
-            offenders.append("quarot_enabled")
         if preset.awq_enabled:
             offenders.append("awq_enabled")
         if offenders:
             raise ValueError(
                 f"Stage5 preset {name!r}: weight_only_int8=True is "
-                f"incompatible with W8A8 transforms; got "
-                f"{sorted(offenders)} set. W8A32 runs FP32 activations "
-                f"and has no calibration; rotation/AWQ/BC/output-aware "
-                f"searches/per-channel requant only apply to W8A8."
+                f"incompatible with the calibration-dependent W8A8 "
+                f"transforms; got {sorted(offenders)} set. This path has "
+                f"no W8A8 calibration; AWQ/BC/output-aware searches/"
+                f"per-channel requant only apply to W8A8. (Data-free "
+                f"QuaRot is allowed and composes with weight_only_int8.)"
             )
     return preset
 
@@ -629,6 +643,31 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
     "weight_only_int8": _preset(
         "weight_only_int8",
         weight_only_int8=True,
+    ),
+    # ----------------------------------------------------------------------
+    # W8A16 perplexity-improvement rungs (plan: Tier 0+1, 2026-05-15).
+    #
+    # `weight_only_int8` above runs ZERO calibration → QKT/attn_v fall back
+    # to a static 6/127 activation scale, the dominant context-dependent
+    # PPL loss (the A/B harness localizes >100% rel-L2 at early-block
+    # attention softmax). These two rungs isolate the two fixes; both keep
+    # `weight_only_int8` itself byte-identical to its recorded baseline.
+    #
+    #   weight_only_int8_calibrated → +real QKT/attn_v calibration scales
+    #   weight_only_int8_quarot     → +data-free residual-stream rotation
+    #                                  (random_orthogonal) on top
+    # ----------------------------------------------------------------------
+    "weight_only_int8_calibrated": _preset(
+        "weight_only_int8_calibrated",
+        weight_only_int8=True,
+        weight_only_int8_calibrate=True,
+    ),
+    "weight_only_int8_quarot": _preset(
+        "weight_only_int8_quarot",
+        weight_only_int8=True,
+        weight_only_int8_calibrate=True,
+        quarot_enabled=True,
+        quarot_kind="random_orthogonal",
     ),
 }
 

@@ -889,10 +889,15 @@ class Simulator:
               (first N gamma, next N beta), widened to FP32 on read.
         dst:  ABUF FP16 output, same shape as input.
 
-        Welford-style mean/variance + eps=1e-6 (same convention as the INT8
-        LAYERNORM in sfu.py). Internal reduction is FP32 — read_fp16_tile
-        widens FP16 source on read, so variance is computed in FP32. This
-        is the standard PyTorch FP16-LayerNorm convention.
+        Welford-style mean/variance + eps=1e-5 — the value the GPT-2
+        checkpoint declares (`model_args["layer_norm_epsilon"]`) and the
+        HF GPT-2 / PyTorch standard. All reference implementations
+        (fp32_reference, w8a16_simulator_reference, tiny_fixture) read the
+        same 1e-5; this op is the deployed W8A16 LayerNorm, so it must
+        match them (the old 1e-6 mirrored the retired INT8 sfu.py LN and
+        was a sim↔ref contract bug). Internal reduction is FP32 —
+        read_fp16_tile widens FP16 source on read, so variance is computed
+        in FP32.
         """
         if self.state.tile_config is None:
             raise ConfigError("CONFIG_TILE not set")
@@ -913,7 +918,7 @@ class Simulator:
 
         mean = src.mean(axis=-1, keepdims=True).astype(np.float32)
         var = src.var(axis=-1, keepdims=True).astype(np.float32)
-        eps = np.float32(1e-6)
+        eps = np.float32(1e-5)
         normalized = (src - mean) / np.sqrt(var + eps)
         result = (normalized * gamma + beta).astype(np.float32)
         mem.write_fp16_tile(self.state, insn.dst_buf, insn.dst_off, result)
