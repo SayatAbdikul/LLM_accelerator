@@ -16,6 +16,7 @@ from taccel.runtime.calibration import (
     apply_output_aware_gelu_scale_search_from_token_ids,
     apply_output_aware_lm_head_scale_search_from_token_ids,
     apply_output_aware_mlp_scale_search_from_token_ids,
+    apply_quarot_rotation_from_token_ids,
     build_calibration_scales_from_token_ids,
 )
 from taccel.runtime.fp32_reference import NanoGPTFP32Reference
@@ -347,6 +348,24 @@ def main(argv=None) -> int:
             args.calibration_text,
             max_tokens=calibration_max_tokens,
         )
+        if ptq_preset.quarot_enabled:
+            # Data-free residual-stream rotation (random_orthogonal),
+            # folded into payload["state_dict"] in place. Runs BEFORE
+            # calibration so the scales reflect the rotated (near-
+            # isotropic) distribution — same rotate→calibrate ordering as
+            # evaluate_gpt2_perplexity. This is what makes
+            # weight_only_int8_quarot reach ~FP32 perplexity; without it
+            # the calibrated-only path is net-negative. The rotated payload
+            # flows into both _build_stage5_scales and the per-turn
+            # _golden_generate bundle (same object, mutated in place).
+            print(f"Applying QuaRot rotation ({ptq_preset.quarot_kind}, "
+                  f"seed={ptq_preset.quarot_seed})...")
+            apply_quarot_rotation_from_token_ids(
+                payload,
+                calibration_ids,
+                seed=ptq_preset.quarot_seed,
+                kind=ptq_preset.quarot_kind,
+            )
         golden_scales = _build_stage5_scales(
             payload,
             calibration_ids,
