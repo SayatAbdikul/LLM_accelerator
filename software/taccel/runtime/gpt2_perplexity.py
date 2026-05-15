@@ -239,6 +239,7 @@ def run_weight_only_int8_simulator_reference_teacher_forced_logits(
     context_tokens: Sequence[int],
     *,
     calibration_scales: Dict[str, float] | None = None,
+    kv_quant: "TurboQuantKV | None" = None,
 ) -> List[np.ndarray]:
     """W8A16 like-for-like NumPy reference logits (M4-E).
 
@@ -252,7 +253,7 @@ def run_weight_only_int8_simulator_reference_teacher_forced_logits(
 
     inputs, _ = teacher_forced_inputs_and_targets(context_tokens)
     ref = NanoGPTW8A16SimulatorReference(
-        payload, calibration_scales=calibration_scales
+        payload, calibration_scales=calibration_scales, kv_quant=kv_quant
     )
     return ref.run_teacher_forced(inputs)
 
@@ -330,6 +331,7 @@ def evaluate_gpt2_perplexity(
     output_aware_include_pairs: bool = False,
     compute_fp32_ceiling: bool = True,
     simulator_backed: bool = False,
+    kv_quant: "TurboQuantKV | None" = None,
 ) -> GPT2PerplexityResult:
     if context_len < 1:
         raise ValueError("context_len must be positive")
@@ -418,6 +420,7 @@ def evaluate_gpt2_perplexity(
                 run_weight_only_int8_simulator_reference_teacher_forced_logits(
                     payload, eval_tokens,
                     calibration_scales=wo_calibration_scales,
+                    kv_quant=kv_quant,
                 )
             )
         else:

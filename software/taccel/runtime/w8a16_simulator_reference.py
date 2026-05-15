@@ -61,6 +61,7 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 
 from ._ref_ops import cast_fp16, gelu_tanh, layernorm, softmax_masked
+from taccel.quantizer.turboquant import TurboQuantKV
 
 
 def _pad_to_multiple(arr: np.ndarray, axis: int, multiple: int = 16) -> np.ndarray:
@@ -144,7 +145,11 @@ class NanoGPTW8A16SimulatorReference:
     """
 
     def __init__(self, payload: dict, *, default_act_scale: float = 6.0 / 127.0,
-                 calibration_scales: Optional[Dict[str, float]] = None) -> None:
+                 calibration_scales: Optional[Dict[str, float]] = None,
+                 kv_quant: Optional[TurboQuantKV] = None) -> None:
+        # kv_quant=None → exact FP16 KV behavior, byte-identical baseline.
+        # When set, the KV cache stores the lossy TurboQuant round-trip.
+        self.kv_quant = kv_quant
         self.payload = payload
         cfg = payload["model_args"]
         sd = payload["state_dict"]
@@ -293,10 +298,27 @@ class NanoGPTW8A16SimulatorReference:
             record(f"block{layer_idx}_head{head_idx}_query", q)
             record(f"block{layer_idx}_head{head_idx}_key", k)
             record(f"block{layer_idx}_head{head_idx}_value", v)
-        # KV cache append. Under fp_precision='fp16' the K/V tiles are
-        # FP16-stored in the simulator's KV cache; mirror that here.
-        self._caches[layer_idx][head_idx]["k"].append(cast_fp16(k[0]))
-        self._caches[layer_idx][head_idx]["v"].append(cast_fp16(v[0]))
+        # KV cache append. Baseline: FP16-stored (mirrors the simulator's
+        # FP16 KV cache). With kv_quant: store the lossy TurboQuant
+        # round-trip instead — exactly what a quantized KV cache returns
+        # on read. Applied per-vector at the cache boundary, only to the
+        # targeted tensor(s) (K/V/KV).
+        tq = self.kv_quant
+        if tq is not None and tq.quant_k:
+            k_store = tq.round_trip(k[0])
+        else:
+            k_store = cast_fp16(k[0])
+        if tq is not None and tq.quant_v:
+            v_store = tq.round_trip(v[0])
+        else:
+            v_store = cast_fp16(v[0])
+        self._caches[layer_idx][head_idx]["k"].append(k_store)
+        self._caches[layer_idx][head_idx]["v"].append(v_store)
+        if record is not None and tq is not None:
+            # Cache-level reconstruction nodes for the deep verifier
+            # (Level-2 diffs these directly, not just downstream attn).
+            record(f"block{layer_idx}_head{head_idx}_k_cache_tq", k_store)
+            record(f"block{layer_idx}_head{head_idx}_v_cache_tq", v_store)
         k_cache = np.stack(self._caches[layer_idx][head_idx]["k"], axis=0)
         v_cache = np.stack(self._caches[layer_idx][head_idx]["v"], axis=0)
 
