@@ -210,8 +210,10 @@ static void test_illegal_opcode() {
 static void test_gen2_unsupported() {
     const char* name = "gen2_unsupported_fault";
     SimHarness s;
-    // 0x17 DEQUANT_ACCUM_FP32: src1=ACCUM, src2=WBUF, dst=ABUF, flags=1.
-    s.load({ insn::R_TYPE(0x17, 2, 0, 1, 0, 0, 0, 0, 1), insn::HALT() });
+    // 0x1D MASKED_SOFTMAX_FP32: legal gen-2 opcode whose SFU datapath
+    // lands in P4 — still FAULT_UNSUPPORTED_OP for now (0x17/0x18/0x19/
+    // 0x1A/0x1B became supported in P2/P3). flags=1, valid buffers.
+    s.load({ insn::R_TYPE(0x1D, 0, 0, 0, 0, 0, 0, 0, 1), insn::HALT() });
     s.run(500);
     EXPECT(s.dut->fault == 1, "fault asserted for unimplemented gen-2 op");
     EXPECT(s.dut->done  == 0, "done should be 0 on fault");

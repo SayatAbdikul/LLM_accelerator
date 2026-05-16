@@ -399,6 +399,15 @@ module sfu_engine
   assign dispatch_g2_gelu_w = (opcode == OP_GELU_FP32) &&
                               (src1_buf == BUF_ABUF) &&
                               (dst_buf  == BUF_ABUF);
+  logic dispatch_g2_dq_w;   // 0x17 DEQUANT_ACCUM_FP32
+  logic dispatch_g2_q_w;    // 0x18 QUANT_FP32_INT8
+  assign dispatch_g2_dq_w = (opcode == OP_DEQUANT_ACCUM_FP32) &&
+                            (src1_buf == BUF_ACCUM) &&
+                            (src2_buf == BUF_WBUF) &&
+                            (dst_buf  == BUF_ABUF);
+  assign dispatch_g2_q_w  = (opcode == OP_QUANT_FP32_INT8) &&
+                            (src1_buf == BUF_ABUF) &&
+                            (dst_buf  == BUF_ABUF);
 
   always_comb begin
     dispatch_attn_context_bad_w = 1'b0;
@@ -522,6 +531,25 @@ module sfu_engine
           dispatch_unsupported_w = 1'b1;
         dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_g2_rows_w;
         dispatch_dst_need_rows_w  = dispatch_m_rows_w * dispatch_g2_rows_w;
+      end
+
+      OP_DEQUANT_ACCUM_FP32: begin
+        if (!dispatch_g2_dq_w)
+          dispatch_unsupported_w = 1'b1;
+        if (integer'(dispatch_n_elems_w) > SFU_MAX_ROW_ELEMS)
+          dispatch_unsupported_w = 1'b1;
+        dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_n_chunks_i32_w;
+        dispatch_src2_need_rows_w = {19'h0, dispatch_g2_rows_w};
+        dispatch_dst_need_rows_w  = dispatch_m_rows_w * dispatch_g2_rows_w;
+      end
+
+      OP_QUANT_FP32_INT8: begin
+        if (!dispatch_g2_q_w)
+          dispatch_unsupported_w = 1'b1;
+        if (integer'(dispatch_n_elems_w) > SFU_MAX_ROW_ELEMS)
+          dispatch_unsupported_w = 1'b1;
+        dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_g2_rows_w;
+        dispatch_dst_need_rows_w  = dispatch_m_rows_w * dispatch_n_tiles_w;
       end
 
       default:
@@ -747,7 +775,8 @@ module sfu_engine
                 OP_SOFTMAX_ATTNV, OP_MASKED_SOFTMAX_ATTNV:
                   state <= F_ATTN_QKT_REQ;
 
-                OP_VADD_FP32, OP_LAYERNORM_FP32, OP_GELU_FP32:
+                OP_VADD_FP32, OP_LAYERNORM_FP32, OP_GELU_FP32,
+                OP_DEQUANT_ACCUM_FP32, OP_QUANT_FP32_INT8:
                   state <= F_G2_S1_REQ;
 
                 default: begin
@@ -953,7 +982,9 @@ module sfu_engine
             row_idx_q     <= row_idx_q + 15'd1;
             read_idx_q    <= 13'h0;
             write_chunk_q <= 11'h0;
-            if (((opcode_q == OP_SOFTMAX) || (opcode_q == OP_MASKED_SOFTMAX)) &&
+            if (opcode_q == OP_QUANT_FP32_INT8)
+              state <= F_G2_S1_REQ;          // gen-2 0x18 next-row FP16 read
+            else if (((opcode_q == OP_SOFTMAX) || (opcode_q == OP_MASKED_SOFTMAX)) &&
                 (src1_buf_q == BUF_ACCUM))
               state <= F_ROW_I32_REQ;
             else
@@ -1177,22 +1208,44 @@ module sfu_engine
 
         F_G2_S1_LATCH: begin
           integer base_idx;
-          base_idx = integer'(read_idx_q) * 8;
-          for (int lane = 0; lane < 8; lane++) begin
-            if ((base_idx + lane) < integer'(n_elems_q))
-              row_data_q[base_idx + lane] <=
-                  sfu_fp16_bits_to_fp32({16'h0, get_u16(sram_b_rdata, lane)});
-          end
-          if (read_idx_q + 13'd1 < {2'h0, g2_rows_q[10:0]}) begin
-            read_idx_q <= read_idx_q + 13'd1;
-            state      <= F_G2_S1_REQ;
+          if (opcode_q == OP_DEQUANT_ACCUM_FP32) begin
+            // 0x17: src1 = ACCUM INT32, 4 int32 / 16-byte row, raw -> real
+            // (per-column FP16 scale applied later in F_G2_COMPUTE).
+            base_idx = integer'(read_idx_q) * 4;
+            for (int lane = 0; lane < 4; lane++) begin
+              if ((base_idx + lane) < integer'(n_elems_q))
+                row_data_q[base_idx + lane] <=
+                    real'(get_i32(sram_b_rdata, lane));
+            end
+            if (read_idx_q + 13'd1 < n_chunks_i32_q) begin
+              read_idx_q <= read_idx_q + 13'd1;
+              state      <= F_G2_S1_REQ;
+            end else begin
+              read_idx_q    <= 13'h0;
+              write_chunk_q <= 11'h0;
+              state         <= F_G2_S2_REQ;   // N FP16 per-col scales
+            end
           end else begin
-            read_idx_q    <= 13'h0;
-            write_chunk_q <= 11'h0;
-            if (opcode_q == OP_GELU_FP32)
-              state <= F_G2_COMPUTE;
-            else
-              state <= F_G2_S2_REQ;
+            // FP16 src1 tile, 8 elems / 16-byte row.
+            base_idx = integer'(read_idx_q) * 8;
+            for (int lane = 0; lane < 8; lane++) begin
+              if ((base_idx + lane) < integer'(n_elems_q))
+                row_data_q[base_idx + lane] <=
+                    sfu_fp16_bits_to_fp32({16'h0, get_u16(sram_b_rdata, lane)});
+            end
+            if (read_idx_q + 13'd1 < {2'h0, g2_rows_q[10:0]}) begin
+              read_idx_q <= read_idx_q + 13'd1;
+              state      <= F_G2_S1_REQ;
+            end else begin
+              read_idx_q    <= 13'h0;
+              write_chunk_q <= 11'h0;
+              // GELU / QUANT_FP32_INT8 have no src2 -> straight to compute.
+              if (opcode_q == OP_GELU_FP32 ||
+                  opcode_q == OP_QUANT_FP32_INT8)
+                state <= F_G2_COMPUTE;
+              else
+                state <= F_G2_S2_REQ;
+            end
           end
         end
 
@@ -1264,6 +1317,23 @@ module sfu_engine
                     sfu_fp32_gelu_new(row_data_q[i])));
             end
             state <= F_G2_PACK;
+          end else if (opcode_q == OP_DEQUANT_ACCUM_FP32) begin
+            // 0x17: FP16 = fp32(INT32) * per-column FP16 scale.
+            for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
+              if (i < integer'(n_elems_q))
+                out_h_q[i] <= 16'(sfu_fp32_to_fp16_bits(
+                    sfu_fp32_mul(row_data_q[i], attn_accum_q[i])));
+            end
+            state <= F_G2_PACK;
+          end else if (opcode_q == OP_QUANT_FP32_INT8) begin
+            // 0x18: INT8 = clip(round_half_even(FP16 * scale_regs[sreg])).
+            // quantize_to_i8(v, 1.0) == clamp(round_half_even(v), -128,127).
+            for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
+              if (i < integer'(n_elems_q))
+                out_bytes_q[i] <= quantize_to_i8(
+                    sfu_fp32_mul(row_data_q[i], scale0_q), 1.0);
+            end
+            state <= F_ROW_PACK;          // gen-1 INT8 pack (16 / row)
           end else begin
             // LAYERNORM_FP32: mean / var (population) / eps=1e-5 / gamma,beta.
             real sum_r;
@@ -1424,14 +1494,18 @@ module sfu_engine
       F_G2_S1_REQ: begin
         sram_b_en  = 1'b1;
         sram_b_buf = src1_buf_q;
-        sram_b_row = g2_s1_addr_w[15:0];
+        // 0x17 reads INT32 ACCUM (4 / row); others read an FP16 tile.
+        sram_b_row = (opcode_q == OP_DEQUANT_ACCUM_FP32) ?
+                     row_i32_addr_w[15:0] : g2_s1_addr_w[15:0];
       end
 
       F_G2_S2_REQ: begin
         sram_b_en  = 1'b1;
         sram_b_buf = src2_buf_q;
-        sram_b_row = (opcode_q == OP_LAYERNORM_FP32) ?
-                     g2_lnp_addr_w[15:0] : g2_s2_addr_w[15:0];
+        // LN gamma/beta and 0x17 per-col scales are row-independent
+        // (src2_off + read_idx); VADD's src2 is a full per-row tile.
+        sram_b_row = (opcode_q == OP_VADD_FP32) ?
+                     g2_s2_addr_w[15:0] : g2_lnp_addr_w[15:0];
       end
 
       F_G2_WRITE: begin

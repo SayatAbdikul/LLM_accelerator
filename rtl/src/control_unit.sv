@@ -187,11 +187,11 @@ module control_unit
         // 0x1C SOFTMAX_FP32 is illegal (decode), not here.
         OP_VADD_FP32,
         OP_LAYERNORM_FP32,
-        OP_GELU_FP32:
+        OP_GELU_FP32,
+        OP_DEQUANT_ACCUM_FP32,
+        OP_QUANT_FP32_INT8:
           unsupported_op = (fp_flags == 1'b0);
 
-        OP_DEQUANT_ACCUM_FP32,
-        OP_QUANT_FP32_INT8,
         OP_MASKED_SOFTMAX_FP32,
         OP_DEQUANT_ACCUM_FP32_SCALED,
         OP_MAX_ABS_REDUCE_FP32:
@@ -431,7 +431,9 @@ module control_unit
               OP_GELU,
               OP_VADD_FP32,
               OP_LAYERNORM_FP32,
-              OP_GELU_FP32: begin
+              OP_GELU_FP32,
+              OP_DEQUANT_ACCUM_FP32,
+              OP_QUANT_FP32_INT8: begin
                 if (!tile_valid) begin
                   fault_code_r <= 4'(FAULT_NO_CONFIG);
                   obs_ctrl_fault_pulse  <= 1'b1;
@@ -584,7 +586,8 @@ module control_unit
               helper_dispatch = tile_valid && helper_ready_now;
 
             OP_SOFTMAX, OP_SOFTMAX_ATTNV, OP_LAYERNORM, OP_GELU,
-            OP_VADD_FP32, OP_LAYERNORM_FP32, OP_GELU_FP32:
+            OP_VADD_FP32, OP_LAYERNORM_FP32, OP_GELU_FP32,
+            OP_DEQUANT_ACCUM_FP32, OP_QUANT_FP32_INT8:
               sfu_dispatch = tile_valid && sfu_ready_now;
 
             OP_MASKED_SOFTMAX, OP_MASKED_SOFTMAX_ATTNV:

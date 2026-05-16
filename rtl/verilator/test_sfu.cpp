@@ -1202,6 +1202,62 @@ static void test_g2_gelu_fp32() {
     TEST_PASS(name);
 }
 
+static void test_g2_dequant_accum_fp32() {
+    const char* name = "g2_dequant_accum_fp32";
+    const int band = 0;   // non-transcendental: bit-exact (freeze §7)
+    const std::string d = "fixtures/gen2/dequant_accum_fp32/std";
+    auto s1 = read_binary_file(name, d + "/input_src1.raw");  // M*N int32
+    auto sc = read_binary_file(name, d + "/input_src2.raw");  // N fp16
+    auto expected = read_binary_file(name, d + "/expected_out.raw");
+    SimHarness s;
+    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, s1);
+    sram_write_bytes(s.dut.get(), BUF_WBUF_ID, size_t(G2_S2) * 16, sc);
+    s.load({
+        insn::CONFIG_TILE(1, 4, 1),
+        insn::R_TYPE(0x17, BUF_ACCUM_ID, 0, BUF_WBUF_ID, G2_S2,
+                     BUF_ABUF_ID, G2_DST, 0, 1),
+        insn::SYNC(0b100),
+        insn::HALT(),
+    });
+    s.run(250000);
+    if (s.dut->fault) TEST_FAIL(name, "unexpected fault");
+    auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID,
+                               size_t(G2_DST) * 16, G2_OUT_BYTES);
+    expect_fp16_ulp(name, got, expected, band);   // freeze §7 per-op band
+    TEST_PASS(name);
+}
+
+static void run_g2_quant(const char* name, const std::string& d) {
+    auto s1 = read_binary_file(name, d + "/input_src1.raw");      // M*N fp16
+    auto pre = read_binary_file(name, d + "/scale_regs_pre.raw"); // 16 fp16
+    auto expected = read_binary_file(name, d + "/expected_out.raw"); // M*N i8
+    uint16_t s3 = uint16_t(pre[6]) | (uint16_t(pre[7]) << 8);     // reg 3
+    SimHarness s;
+    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, size_t(G2_S1) * 16, s1);
+    s.load({
+        insn::SET_SCALE(3, s3),
+        insn::CONFIG_TILE(1, 4, 1),
+        insn::R_TYPE(0x18, BUF_ABUF_ID, G2_S1, BUF_ABUF_ID, 0,
+                     BUF_ABUF_ID, G2_DST, 3, 1),
+        insn::SYNC(0b100),
+        insn::HALT(),
+    });
+    s.run(250000);
+    if (s.dut->fault) TEST_FAIL(name, "unexpected fault");
+    // INT8 output: exact byte-match (one byte/elem, M*N bytes).
+    auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID,
+                               size_t(G2_DST) * 16, size_t(G2_M) * G2_N);
+    expect_equal_bytes(name, got, expected);
+    TEST_PASS(name);
+}
+
+static void test_g2_quant_fp32_int8() {
+    run_g2_quant("g2_quant_fp32_int8_std",
+                 "fixtures/gen2/quant_fp32_int8/std");
+    run_g2_quant("g2_quant_fp32_int8_rhe",
+                 "fixtures/gen2/quant_fp32_int8/round_half_even");
+}
+
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
 
@@ -1217,6 +1273,8 @@ int main(int argc, char** argv) {
     test_g2_vadd_fp32();
     test_g2_layernorm_fp32();
     test_g2_gelu_fp32();
+    test_g2_dequant_accum_fp32();
+    test_g2_quant_fp32_int8();
 
     std::printf("\n%d / %d tests passed\n", tests_pass, tests_run);
     if (tests_pass != tests_run) std::exit(1);
