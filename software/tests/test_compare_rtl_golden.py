@@ -34,6 +34,7 @@ It has three legs, in increasing strength:
 """
 import hashlib
 import importlib.util
+import json
 from pathlib import Path
 
 import numpy as np
@@ -207,21 +208,76 @@ def test_frozen_bundle_runs_gen2_clean_and_deterministic():
 
 
 # --------------------------------------------------------------------------
-# Leg 3 — the full freeze §4.5 RTL-vs-golden bar (honest skip → task #105)
+# Leg 3 — the full freeze §4.5 RTL-vs-golden e2e byte-match (P6b, task #105)
 # --------------------------------------------------------------------------
-@pytest.mark.skip(
-    reason=(
-        "Full freeze §4.5 RTL-vs-golden e2e byte-match. The RTL runner "
-        "(rtl/verilator/run_program.cpp) is a single-stream DeiT ProgramBinary "
-        "executor; the frozen bundle is a two-stream HostRunner-driven decoder "
-        "ProgramBundle (prefill+decode, runtime patch sites, kv-cache). "
-        "Feasibility measured: the ProgramBinary writer (assembler.py "
-        "MAGIC=0x54414343 / HEADER_FMT) and the golden trace_manifest 15-field "
-        "snapshot schema (simulator.py ~L328) both exist. Residual = a bounded "
-        "bundle-DRAM->ProgramBinary serializer + trace_manifest->snapshot-CSV + "
-        "first-divergence drive. Tracked as task #105 as a focused block; not "
-        "stubbed here as a fake green."
+def _load_rtl_cosim():
+    import sys
+
+    path = REPO_ROOT / "software" / "tools" / "rtl_cosim.py"
+    spec = importlib.util.spec_from_file_location("rtl_cosim", path)
+    module = importlib.util.module_from_spec(spec)
+    # Register before exec: rtl_cosim defines @dataclass SerializedPrefill,
+    # and dataclasses resolves sys.modules[cls.__module__] at instantiation.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("token_id", [0, 5])
+def test_rtl_cosim_gen2_byte_match(token_id):
+    """Substantive freeze §4.5 property (NOT the literal §5 bar — see scope):
+    the RTL executing the *real* compiled bundle byte-matches the pinned
+    golden end-to-end (every captured gen-1 + gen-2 node) within the freeze
+    §7 per-op-class fp16-ULP bands.
+
+    Scope (honest — two gaps vs the literal §5 definition-of-done):
+      * MODEL: the tiny 2-layer nanoGPT shakespeare-char fixture
+        (train_tiny_fixture DEFAULT_FIXTURE, d128/l2) compiled with the
+        `weight_only_int8_quarot` PRESET — NOT GPT-2 124M (12-layer).
+      * SEQUENCE: single-token PREFILL only — NOT 257-tok prefill+decode.
+        prefill's only runtime patches are token/pos embeddings (kv/attn
+        are decode-only), so a fixed token yields a static single-shot
+        ProgramBinary run_program executes faithfully.
+    This is the *same gen-2 ISA* the GPT-2 bundle emits, exercised through
+    the real compiler/codegen/SYNC path, so the gen-2 datapath is
+    conformant — but freeze §5 stays formally open until GPT-2 124M /
+    257-tok byte-matches (P6c, task #106). See isa_generation_freeze.md §5
+    Status (2026-05-16).
+    """
+    cosim = _load_rtl_cosim()
+    if not cosim.RTL_BINARY.exists():
+        pytest.skip(
+            f"run_program not built ({cosim.RTL_BINARY}); "
+            "build: make -C rtl/verilator run_program"
+        )
+    tool = _load_tool()
+    if not tool.DEFAULT_FIXTURE.exists():
+        pytest.skip(
+            "tiny nanoGPT fixture not generated; run "
+            "PYTHONPATH=software python software/tools/train_tiny_fixture.py"
+        )
+
+    res = cosim.run_cosim(token_id=token_id)
+    s = res["summary"]
+
+    # Clean RTL run is a precondition of a meaningful byte-match.
+    assert s.get("status") == "halted", f"RTL did not cleanly halt: {s}"
+    assert s.get("fault") is False, f"RTL architectural fault: {s}"
+    assert s.get("forbidden_overlap_violation") is False, (
+        f"RTL forbidden engine-overlap (H1 invariant) violated: {s}"
     )
-)
-def test_rtl_cosim_gen2_byte_match():  # pragma: no cover - tracked in #105
-    raise AssertionError("unreachable: skipped pending task #105")
+    assert not s.get("timeout"), f"RTL run timed out: {s}"
+
+    # Non-vacuous: the gate must actually compare captured fragments.
+    assert res["n_events"] >= 50, f"too few trace events: {res}"
+    assert res["n_rtl_captures"] == res["n_events"], (
+        f"RTL capture count {res['n_rtl_captures']} != "
+        f"manifest events {res['n_events']}"
+    )
+
+    # The freeze §4.5 bar: end-to-end byte-match within freeze §7 bands.
+    assert res["divergence"] is None, (
+        "RTL-vs-golden FIRST DIVERGENCE on the frozen gen-2 bundle "
+        f"(token={token_id}):\n"
+        + json.dumps(res["divergence"], indent=2, default=str)
+    )

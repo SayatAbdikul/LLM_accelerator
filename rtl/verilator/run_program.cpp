@@ -1021,15 +1021,20 @@ int main(int argc, char** argv) {
             SnapshotCapture cap;
             cap.req = req;
             cap.cycle = cycle;
+            // Dispatch mirrors the golden simulator's _snapshot_traced_tensors
+            // EXACTLY (anti-drift): if int32 / elif fp32(==FP16 storage) /
+            // else int8*scale. The manifest "fp16" tag (e.g. gen-1 tok_embed)
+            // is read by golden via the else/int8 branch, so it must here too;
+            // only the "fp32" tag is real 2-byte FP16 storage (gen-2 outputs).
             if (req.source == "virtual") {
                 cap.status = "skipped_virtual";
-            } else if (req.dtype == "int8") {
+            } else if (req.dtype == "fp32") {
+                // gen-2 FP16 storage: flat contiguous read (golden
+                // read_fp16_tile), 2 bytes/elem, no scale recovery.
                 cap.status = "captured";
                 cap.byte_offset = snapshot_bytes.size();
-                cap.byte_size = uint64_t(req.logical_rows) * uint64_t(req.logical_cols);
-                // Use tile-layout reader: handles both padded (mem_cols > logical_cols)
-                // and unpadded (mem_cols == logical_cols) cases correctly.
-                const auto bytes = tbutil::sfu_read_logical_i8(
+                cap.byte_size = uint64_t(req.logical_rows) * uint64_t(req.logical_cols) * 2u;
+                const auto bytes = tbutil::sfu_read_logical_fp16(
                     sim.dut.get(),
                     req.buf_id,
                     req.offset_units, req.mem_cols,
@@ -1058,7 +1063,19 @@ int main(int argc, char** argv) {
                 }
                 snapshot_bytes.insert(snapshot_bytes.end(), bytes.begin(), bytes.end());
             } else {
-                cap.status = "unsupported_dtype";
+                // golden's else branch: int8 tile * scale. Covers "int8" and
+                // the "fp16" tag (gen-1 tok_embed/pos_embed are INT8-stored,
+                // dequantized by scale on the golden side via read_int8_tile).
+                cap.status = "captured";
+                cap.byte_offset = snapshot_bytes.size();
+                cap.byte_size = uint64_t(req.logical_rows) * uint64_t(req.logical_cols);
+                const auto bytes = tbutil::sfu_read_logical_i8(
+                    sim.dut.get(),
+                    req.buf_id,
+                    req.offset_units, req.mem_cols,
+                    req.logical_rows, req.logical_cols
+                );
+                snapshot_bytes.insert(snapshot_bytes.end(), bytes.begin(), bytes.end());
             }
             snapshot_captures.push_back(cap);
         };

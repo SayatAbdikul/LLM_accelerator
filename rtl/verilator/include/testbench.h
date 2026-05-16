@@ -863,6 +863,36 @@ inline std::vector<uint8_t> sfu_read_logical_i8(
     return out;
 }
 
+// Read a flat FP16 tile (gen-2 SFU storage). Unlike the int8 SFU layout,
+// golden read_fp16_tile is a plain CONTIGUOUS rows*cols*2 read from
+// offset_units*16 (memory.py:read_fp16_tile), reshaped (mem_rows, mem_cols)
+// and sliced [:logical_rows,:logical_cols]. Mirror that exactly (anti-drift:
+// golden is the reference) and return logical_rows*logical_cols*2 little-
+// endian fp16 bytes.
+inline std::vector<uint8_t> sfu_read_logical_fp16(
+    Vtaccel_top* dut,
+    int buf_id,
+    int offset_units, int mem_cols,
+    int logical_rows, int logical_cols
+) {
+    const size_t phys_bytes =
+        size_t(logical_rows) * size_t(mem_cols) * 2u;
+    const auto phys = sram_read_bytes(dut, buf_id,
+                                      size_t(offset_units) * 16u,
+                                      phys_bytes);
+    std::vector<uint8_t> out(
+        size_t(logical_rows) * size_t(logical_cols) * 2u, 0);
+    for (int m = 0; m < logical_rows; m++) {
+        for (int n = 0; n < logical_cols; n++) {
+            const size_t pp = (size_t(m) * size_t(mem_cols) + size_t(n)) * 2u;
+            const size_t lp = (size_t(m) * size_t(logical_cols) + size_t(n)) * 2u;
+            out[lp]     = phys[pp];
+            out[lp + 1] = phys[pp + 1];
+        }
+    }
+    return out;
+}
+
 inline std::vector<uint8_t> make_pattern(size_t size, uint8_t seed) {
     std::vector<uint8_t> data(size);
     for (size_t i = 0; i < size; ++i)

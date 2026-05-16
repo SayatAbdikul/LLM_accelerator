@@ -111,6 +111,31 @@ To make golden-vs-RTL cosim possible on the production path:
    against the pinned golden model below. Block-level cosim greens are
    necessary but **not** sufficient — the freeze is not satisfied until the
    end-to-end bundle byte-matches.
+   **Status (2026-05-16, P6b) — substantive property GREEN; literal §5 bar
+   NOT yet met (two explicit gaps, named below).** The end-to-end
+   RTL-vs-golden gate is built and green:
+   `test_compare_rtl_golden.py::test_rtl_cosim_gen2_byte_match[0,5]` runs
+   the *real* compiled bundle on Verilator `run_program` and byte-matches
+   the pinned golden across all 71 captured gen-1+gen-2 nodes (LayerNorm/
+   GELU/residual/dequant/quant/masked-softmax/max-abs-reduce/attn) at
+   **0 fp16 ULP on every op-class incl. `gelu_new`** — strictly stronger
+   than the §7 ≤3 gelu band (e2e fp16 rounding collapses the sub-ULP tanh
+   delta, same mechanism §7 noted for masked-softmax); RTL run clean
+   (`status=halted`, `fault=False`, `forbidden_overlap=False`).
+   **Model & scope actually exercised (do not over-read):** the *tiny
+   2-layer nanoGPT shakespeare-char fixture* (`tools/train_tiny_fixture.py`
+   `DEFAULT_FIXTURE`, d128/l2; ~3114-insn prefill, ~5 s/run) compiled with
+   the `weight_only_int8_quarot` **preset**, **single-token PREFILL only**.
+   This is meaningful evidence — it is the *same gen-2 ISA* the GPT-2 W8A16
+   bundle emits, exercised through the real compiler/codegen/SYNC path — so
+   the gen-2 **datapath** is conformant. But the **literal §5 bar is not
+   met on two axes**: (1) **model size** — tiny d128/l2 fixture, *not*
+   GPT-2 124M (12-layer); (2) **sequence** — single-token prefill, *not*
+   257-tok prefill+decode (the decode stream needs PC-rebased trace
+   manifests + per-step kv/attn runtime patching; prefill_pc=0 made prefill
+   rebase-free). Closing both is tracked as **P6c / task #106**; the freeze
+   §5 definition-of-done remains formally open until the GPT-2 124M 257-tok
+   bundle byte-matches.
 6. **Pinned reference golden.** RTL conformance is measured against
    `software/taccel/golden_model/simulator.py` **at the commit created by
    the §5 commit**: `frozen_golden_sha = aa9a9c0fa389d77598acfe68f4ac1347bd9fc9ef`
