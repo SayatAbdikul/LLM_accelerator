@@ -119,6 +119,17 @@ To make golden-vs-RTL cosim possible on the production path:
    `software/tools/gen_gen2_fixtures.py`. Any later `simulator.py` change
    requires a new freeze revision + fixture regen — otherwise "cosim vs the
    gen-2 golden" is a moving target, the exact failure this freeze closes.
+   **Content-level pin (enforced, not just documented).** The commit SHA
+   above does not detect a `simulator.py` edit made *after* `aa9a9c0`
+   within the same or a later commit, so the pin is enforced at the
+   content level: the SHA-1 git-blob hash of
+   `software/taccel/golden_model/simulator.py` is
+   `7746e65598961ac8430f8eeece45d7ec976584cd` (the blob at `aa9a9c0`;
+   verified byte-identical at `HEAD` `3314043` and in the worktree).
+   `software/tests/test_compare_rtl_golden.py::test_frozen_golden_sha_pin`
+   recomputes this blob hash and **fails loud** on any drift — the gen-2
+   conformance gate refuses to run a comparison against an unpinned
+   golden, closing the moving-target hole even inside an unchanged commit.
 7. **Conformance tolerance — per op-class (REVISION 2026-05-16).** The
    original "byte-match within FP16 ULP" (item 5) left the band a single
    guessed number (≤1). Measurement on the P2 ops replaces the guess:

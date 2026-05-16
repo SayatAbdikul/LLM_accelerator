@@ -1377,6 +1377,10 @@ static void test_g2_scale_chain() {
     // First 0x1F's result must survive the second op; both write same val.
     if (scale_reg(s, 5) != exp5 || scale_reg(s, 8) != exp5)
         TEST_FAIL(name, "scale not visible across SYNC");
+    // H1: the SFU-vs-SET_SCALE write-port overlap invariant must hold
+    // (raised obs bit => toolchain serialization broken). Fail loudly.
+    if (s.dut->rootp->taccel_top__DOT__obs_forbidden_overlap_violation_q)
+        TEST_FAIL(name, "obs_forbidden_overlap_violation_q set");
     TEST_PASS(name);
 }
 
