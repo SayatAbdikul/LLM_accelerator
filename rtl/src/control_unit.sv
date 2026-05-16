@@ -140,7 +140,8 @@ module control_unit
   logic        is_masked_sfu_op_w;
 
   assign is_masked_sfu_op_w = (insn.opcode == OP_MASKED_SOFTMAX) ||
-                              (insn.opcode == OP_MASKED_SOFTMAX_ATTNV);
+                              (insn.opcode == OP_MASKED_SOFTMAX_ATTNV) ||
+                              (insn.opcode == OP_MASKED_SOFTMAX_FP32);
   assign attn_softmax_key_cols_w =
       (insn.opcode == OP_MASKED_SOFTMAX_ATTNV) ?
       (({5'h0, tile_k} + 15'd1) << 4) :
@@ -189,10 +190,10 @@ module control_unit
         OP_LAYERNORM_FP32,
         OP_GELU_FP32,
         OP_DEQUANT_ACCUM_FP32,
-        OP_QUANT_FP32_INT8:
+        OP_QUANT_FP32_INT8,
+        OP_MASKED_SOFTMAX_FP32:
           unsupported_op = (fp_flags == 1'b0);
 
-        OP_MASKED_SOFTMAX_FP32,
         OP_DEQUANT_ACCUM_FP32_SCALED,
         OP_MAX_ABS_REDUCE_FP32:
           unsupported_op = 1'b1;
@@ -433,7 +434,8 @@ module control_unit
               OP_LAYERNORM_FP32,
               OP_GELU_FP32,
               OP_DEQUANT_ACCUM_FP32,
-              OP_QUANT_FP32_INT8: begin
+              OP_QUANT_FP32_INT8,
+              OP_MASKED_SOFTMAX_FP32: begin
                 if (!tile_valid) begin
                   fault_code_r <= 4'(FAULT_NO_CONFIG);
                   obs_ctrl_fault_pulse  <= 1'b1;
@@ -590,7 +592,7 @@ module control_unit
             OP_DEQUANT_ACCUM_FP32, OP_QUANT_FP32_INT8:
               sfu_dispatch = tile_valid && sfu_ready_now;
 
-            OP_MASKED_SOFTMAX, OP_MASKED_SOFTMAX_ATTNV:
+            OP_MASKED_SOFTMAX, OP_MASKED_SOFTMAX_ATTNV, OP_MASKED_SOFTMAX_FP32:
               sfu_dispatch = masked_attn_valid_now && sfu_ready_now;
 
             default: ;

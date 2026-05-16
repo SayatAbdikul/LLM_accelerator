@@ -134,8 +134,16 @@ To make golden-vs-RTL cosim possible on the production path:
      RTL ≡ libm-gelu exactly, libm-vs-golden ≡ RTL-vs-golden = (53, 3)).
      The datapath is correct — the residual is purely a float32-tanh
      library difference. Conformance band for `gelu_new`: **|ulp| ≤ 3**.
-     `MASKED_SOFTMAX_FP32` (0x1D, `exp`) is expected to need a similarly
-     characterized `exp` band — to be measured in P4, same discipline.
+   - `MASKED_SOFTMAX_FP32` (0x1D, `exp`) — **measured P4: BIT-EXACT
+     (0 ULP)** on the characterized fixture (uniform(-8,8), qrb=0,
+     valid_kv_len=64). Unlike `gelu_new`, the `row_max` subtraction +
+     softmax normalization + final FP16 round collapse the numpy-vs-libm
+     `expf` differences. Conformance band for `masked_softmax_fp32`:
+     **0 ULP** on the fixture. Caveat: this is one input distribution;
+     the end-to-end bundle (P6) over real activations is the final
+     arbiter — if real-data `exp` drift appears there it gets its own
+     characterized band, same discipline. Band is fixture-asserted, not
+     a universal claim.
    - Bit-replicating numpy's tanh is rejected: numpy-version-fragile and
      the freeze already pins a golden SHA. Characterizing the band per
      op-class is the disciplined resolution the §6 revision mechanism is

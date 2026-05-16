@@ -408,11 +408,16 @@ module sfu_engine
   assign dispatch_g2_q_w  = (opcode == OP_QUANT_FP32_INT8) &&
                             (src1_buf == BUF_ABUF) &&
                             (dst_buf  == BUF_ABUF);
+  logic dispatch_g2_ms_w;   // 0x1D MASKED_SOFTMAX_FP32
+  assign dispatch_g2_ms_w = (opcode == OP_MASKED_SOFTMAX_FP32) &&
+                            (src1_buf == BUF_ABUF) &&
+                            (dst_buf  == BUF_ABUF);
 
   always_comb begin
     dispatch_attn_context_bad_w = 1'b0;
     if ((opcode == OP_MASKED_SOFTMAX) ||
-        (opcode == OP_MASKED_SOFTMAX_ATTNV)) begin
+        (opcode == OP_MASKED_SOFTMAX_ATTNV) ||
+        (opcode == OP_MASKED_SOFTMAX_FP32)) begin
       dispatch_attn_context_bad_w = !attn_valid ||
                                     (attn_mode == 2'b00) ||
                                     (attn_valid_kv_len == 12'h000);
@@ -550,6 +555,15 @@ module sfu_engine
           dispatch_unsupported_w = 1'b1;
         dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_g2_rows_w;
         dispatch_dst_need_rows_w  = dispatch_m_rows_w * dispatch_n_tiles_w;
+      end
+
+      OP_MASKED_SOFTMAX_FP32: begin
+        if (!dispatch_g2_ms_w)
+          dispatch_unsupported_w = 1'b1;
+        if (integer'(dispatch_n_elems_w) > SFU_MAX_ROW_ELEMS)
+          dispatch_unsupported_w = 1'b1;
+        dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_g2_rows_w;
+        dispatch_dst_need_rows_w  = dispatch_m_rows_w * dispatch_g2_rows_w;
       end
 
       default:
@@ -776,7 +790,8 @@ module sfu_engine
                   state <= F_ATTN_QKT_REQ;
 
                 OP_VADD_FP32, OP_LAYERNORM_FP32, OP_GELU_FP32,
-                OP_DEQUANT_ACCUM_FP32, OP_QUANT_FP32_INT8:
+                OP_DEQUANT_ACCUM_FP32, OP_QUANT_FP32_INT8,
+                OP_MASKED_SOFTMAX_FP32:
                   state <= F_G2_S1_REQ;
 
                 default: begin
@@ -1239,9 +1254,10 @@ module sfu_engine
             end else begin
               read_idx_q    <= 13'h0;
               write_chunk_q <= 11'h0;
-              // GELU / QUANT_FP32_INT8 have no src2 -> straight to compute.
+              // GELU / QUANT_FP32_INT8 / MASKED_SOFTMAX_FP32 have no src2.
               if (opcode_q == OP_GELU_FP32 ||
-                  opcode_q == OP_QUANT_FP32_INT8)
+                  opcode_q == OP_QUANT_FP32_INT8 ||
+                  opcode_q == OP_MASKED_SOFTMAX_FP32)
                 state <= F_G2_COMPUTE;
               else
                 state <= F_G2_S2_REQ;
@@ -1334,6 +1350,48 @@ module sfu_engine
                     sfu_fp32_mul(row_data_q[i], scale0_q), 1.0);
             end
             state <= F_ROW_PACK;          // gen-1 INT8 pack (16 / row)
+          end else if (opcode_q == OP_MASKED_SOFTMAX_FP32) begin
+            // 0x1D causal masked softmax. Golden is mode-independent:
+            // keep_through = min(row + query_row_base, valid_kv_len - 1);
+            // cols 0..keep_through visible, rest -> 0. FP32 internal.
+            integer qrow;
+            integer keep_through;
+            real row_max_r;
+            real exp_sum_r;
+            logic have_vis;
+            qrow = integer'(attn_query_row_base_q) + integer'(row_idx_q);
+            keep_through = (qrow < (integer'(attn_valid_kv_len_q) - 1)) ?
+                           qrow : (integer'(attn_valid_kv_len_q) - 1);
+            have_vis  = 1'b0;
+            row_max_r = 0.0;
+            for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
+              if ((i < integer'(n_elems_q)) && (i <= keep_through)) begin
+                if (!have_vis || (row_data_q[i] > row_max_r))
+                  row_max_r = row_data_q[i];
+                have_vis = 1'b1;
+              end
+            end
+            exp_sum_r = 0.0;
+            if (have_vis) begin
+              for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
+                if ((i < integer'(n_elems_q)) && (i <= keep_through))
+                  exp_sum_r = sfu_fp32_add(exp_sum_r,
+                      sfu_fp32_exp(sfu_fp32_sub(row_data_q[i], row_max_r)));
+              end
+            end
+            for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
+              if (i < integer'(n_elems_q)) begin
+                if (have_vis && (i <= keep_through) && (exp_sum_r != 0.0))
+                  out_h_q[i] <= 16'(sfu_fp32_to_fp16_bits(
+                      sfu_fp32_div(
+                          sfu_fp32_exp(
+                              sfu_fp32_sub(row_data_q[i], row_max_r)),
+                          exp_sum_r)));
+                else
+                  out_h_q[i] <= 16'h0;
+              end
+            end
+            state <= F_G2_PACK;
           end else begin
             // LAYERNORM_FP32: mean / var (population) / eps=1e-5 / gamma,beta.
             real sum_r;

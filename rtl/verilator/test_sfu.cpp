@@ -1109,7 +1109,7 @@ static void expect_fp16_ulp(const char* name,
         int mag = int(h & 0x7FFF);
         return (h & 0x8000) ? -mag : mag;
     };
-    int worst = 0, nbad = 0; size_t worst_i = 0;
+    int gmax = 0, nbad = 0; size_t gmax_i = 0;
     for (size_t i = 0; i + 1 < got.size(); i += 2) {
         uint16_t a = uint16_t(got[i]) | (uint16_t(got[i + 1]) << 8);
         uint16_t b = uint16_t(exp[i]) | (uint16_t(exp[i + 1]) << 8);
@@ -1117,15 +1117,16 @@ static void expect_fp16_ulp(const char* name,
         bool a_special = ((a & 0x7C00) == 0x7C00);
         bool b_special = ((b & 0x7C00) == 0x7C00);
         if (a_special || b_special) {           // NaN/Inf: exact only
-            nbad++; if (worst < 0x7fff) { worst = 0x7fff; worst_i = i; }
+            nbad++; gmax = 0x7fff; gmax_i = i;
             continue;
         }
         int u = ord(a) - ord(b); if (u < 0) u = -u;
-        if (u > max_ulp) { nbad++; if (u > worst) { worst = u; worst_i = i; } }
+        if (u > gmax) { gmax = u; gmax_i = i; }   // true max over ALL mismatches
+        if (u > max_ulp) nbad++;
     }
     std::fprintf(stderr,
-        "[%s] fp16-ulp: %d elem(s) over band (max_ulp=%d); worst=%d ULP "
-        "@byte %zu\n", name, nbad, max_ulp, worst, worst_i);
+        "[%s] fp16-ulp: %d elem(s) over band (max_ulp=%d); TRUE max=%d ULP "
+        "@byte %zu\n", name, nbad, max_ulp, gmax, gmax_i);
     if (nbad != 0) TEST_FAIL(name, "fp16-ulp band exceeded");
 }
 
@@ -1258,6 +1259,30 @@ static void test_g2_quant_fp32_int8() {
                  "fixtures/gen2/quant_fp32_int8/round_half_even");
 }
 
+static void test_g2_masked_softmax_fp32() {
+    const char* name = "g2_masked_softmax_fp32";
+    const int band = 0;   // exp: measured BIT-EXACT on this fixture (§7)
+    const std::string d = "fixtures/gen2/masked_softmax_fp32/std";
+    auto s1 = read_binary_file(name, d + "/input_src1.raw");
+    auto expected = read_binary_file(name, d + "/expected_out.raw");
+    SimHarness s;
+    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, size_t(G2_S1) * 16, s1);
+    s.load({
+        insn::CONFIG_TILE(1, 4, 1),
+        insn::CONFIG_ATTN(0, 64, 1),   // qrb=0, valid_kv_len=64, mode!=0
+        insn::R_TYPE(0x1D, BUF_ABUF_ID, G2_S1, BUF_ABUF_ID, 0,
+                     BUF_ABUF_ID, G2_DST, 0, 1),
+        insn::SYNC(0b100),
+        insn::HALT(),
+    });
+    s.run(250000);
+    if (s.dut->fault) TEST_FAIL(name, "unexpected fault");
+    auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID,
+                               size_t(G2_DST) * 16, G2_OUT_BYTES);
+    expect_fp16_ulp(name, got, expected, band);   // freeze §7 per-op band
+    TEST_PASS(name);
+}
+
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
 
@@ -1275,6 +1300,7 @@ int main(int argc, char** argv) {
     test_g2_gelu_fp32();
     test_g2_dequant_accum_fp32();
     test_g2_quant_fp32_int8();
+    test_g2_masked_softmax_fp32();
 
     std::printf("\n%d / %d tests passed\n", tests_pass, tests_run);
     if (tests_pass != tests_run) std::exit(1);
