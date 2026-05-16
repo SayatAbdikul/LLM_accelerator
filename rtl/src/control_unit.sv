@@ -171,25 +171,27 @@ module control_unit
   // -------------------------------------------------------------------------
   function automatic logic unsupported_op(
     input logic [4:0]  op,
-    input logic [1:0]  s_src_mode
+    input logic [1:0]  s_src_mode,
+    input logic        fp_flags
   );
     begin
       case (op)
         OP_SET_SCALE:
           unsupported_op = (s_src_mode != 2'b00);
 
-        // gen-2 FP32 sub-layer ops (frozen ISA): legal to decode, but the
-        // SFU datapaths land incrementally in P2-P5. Until then they fault
-        // FAULT_UNSUPPORTED_OP rather than dispatching to an SFU that cannot
-        // execute them. Per-op lines flip to `(insn.flags == 1'b0)` as each
-        // datapath lands (flags=0 FP32/W8A32 storage stays permanently
-        // unsupported; only flags=1 FP16 is the frozen W8A16 conformance
-        // path). 0x1C SOFTMAX_FP32 is illegal (handled by decode), not here.
-        OP_DEQUANT_ACCUM_FP32,
-        OP_QUANT_FP32_INT8,
+        // gen-2 FP32 sub-layer ops (frozen ISA). Only flags=1 (FP16
+        // storage — the W8A16 conformance path) is implemented; flags=0
+        // (FP32/W8A32 storage) is permanently out of scope. P2 implements
+        // the SFU datapaths for 0x19/0x1A/0x1B; the remaining ops land in
+        // P3-P5 and stay unsupported regardless of flags until then.
+        // 0x1C SOFTMAX_FP32 is illegal (decode), not here.
         OP_VADD_FP32,
         OP_LAYERNORM_FP32,
-        OP_GELU_FP32,
+        OP_GELU_FP32:
+          unsupported_op = (fp_flags == 1'b0);
+
+        OP_DEQUANT_ACCUM_FP32,
+        OP_QUANT_FP32_INT8,
         OP_MASKED_SOFTMAX_FP32,
         OP_DEQUANT_ACCUM_FP32_SCALED,
         OP_MAX_ABS_REDUCE_FP32:
@@ -202,7 +204,7 @@ module control_unit
   endfunction
 
   logic unsupported_now;
-  assign unsupported_now = unsupported_op(insn.opcode, insn.s_src_mode);
+  assign unsupported_now = unsupported_op(insn.opcode, insn.s_src_mode, insn.flags);
 
   // -------------------------------------------------------------------------
   // Sequential FSM + registers
@@ -426,7 +428,10 @@ module control_unit
               OP_SOFTMAX_ATTNV,
               OP_MASKED_SOFTMAX_ATTNV,
               OP_LAYERNORM,
-              OP_GELU: begin
+              OP_GELU,
+              OP_VADD_FP32,
+              OP_LAYERNORM_FP32,
+              OP_GELU_FP32: begin
                 if (!tile_valid) begin
                   fault_code_r <= 4'(FAULT_NO_CONFIG);
                   obs_ctrl_fault_pulse  <= 1'b1;
@@ -578,7 +583,8 @@ module control_unit
             OP_REQUANT, OP_REQUANT_PC, OP_SCALE_MUL, OP_VADD, OP_DEQUANT_ADD:
               helper_dispatch = tile_valid && helper_ready_now;
 
-            OP_SOFTMAX, OP_SOFTMAX_ATTNV, OP_LAYERNORM, OP_GELU:
+            OP_SOFTMAX, OP_SOFTMAX_ATTNV, OP_LAYERNORM, OP_GELU,
+            OP_VADD_FP32, OP_LAYERNORM_FP32, OP_GELU_FP32:
               sfu_dispatch = tile_valid && sfu_ready_now;
 
             OP_MASKED_SOFTMAX, OP_MASKED_SOFTMAX_ATTNV:

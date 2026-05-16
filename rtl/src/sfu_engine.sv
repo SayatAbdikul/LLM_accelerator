@@ -78,9 +78,17 @@ module sfu_engine
   import "DPI-C" function real sfu_fp32_sqrt(input real value_r);
   import "DPI-C" function real sfu_fp32_gelu(input real value_r);
   import "DPI-C" function int sfu_fp32_quantize_i8(input real value_r, input real out_scale_r);
+  // gen-2 FP32 opcodes (frozen ISA): exact IEEE-754 half<->fp32 (numpy
+  // float16 semantics) + tanh gelu_new. NOT the gen-1 erf sfu_fp32_gelu.
+  import "DPI-C" function real sfu_fp16_bits_to_fp32(input int bits);
+  import "DPI-C" function int  sfu_fp32_to_fp16_bits(input real value_r);
+  import "DPI-C" function real sfu_fp32_gelu_new(input real value_r);
 
   localparam int SFU_MAX_ROW_ELEMS = 1024;
   localparam real LN_EPS = 1.0e-6;
+  // gen-2 LAYERNORM_FP32 (0x1A) eps — the GPT-2 / golden value (1e-5).
+  // Distinct from the gen-1 INT8 LN_EPS (1e-6) above; do NOT reuse it.
+  localparam real LN_FP32_EPS = 1.0e-5;
 
   typedef enum logic [4:0] {
     F_IDLE          = 5'd0,
@@ -105,7 +113,16 @@ module sfu_engine
     F_ATTN_V_REQ    = 5'd19,
     F_ATTN_V_LATCH  = 5'd20,
     F_ATTN_WRITE    = 5'd21,
-    F_FAULT         = 5'd22
+    F_FAULT         = 5'd22,
+    // gen-2 FP32 shared datapath (0x19 VADD / 0x1A LN / 0x1B GELU).
+    // FP16 storage (8 elems / 16-byte row), FP32 internal.
+    F_G2_S1_REQ     = 5'd23,
+    F_G2_S1_LATCH   = 5'd24,
+    F_G2_S2_REQ     = 5'd25,
+    F_G2_S2_LATCH   = 5'd26,
+    F_G2_COMPUTE    = 5'd27,
+    F_G2_PACK       = 5'd28,
+    F_G2_WRITE      = 5'd29
   } sfu_state_t;
 
   sfu_state_t state;
@@ -145,6 +162,9 @@ module sfu_engine
   real gamma_q    [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
   real beta_q     [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
   logic [7:0] out_bytes_q [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
+  // gen-2: FP16 result bit-patterns + FP16-rows-per-logical-row (=2*n_tiles).
+  logic [15:0] out_h_q [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
+  logic [12:0] g2_rows_q;
   real attn_row_max_q;
   real attn_exp_sum_q;
   real ln_debug_mean_q /* verilator public_flat_rd */;
@@ -196,6 +216,7 @@ module sfu_engine
   logic [127:0] gelu_i8_write_data_w;
   logic [127:0] gelu_i32_write_data_w;
   logic [127:0] attn_write_data_w;
+  logic [127:0] g2_write_data_w;
 
   function automatic logic [15:0] buf_rows(input logic [1:0] bid);
     begin
@@ -361,6 +382,24 @@ module sfu_engine
   assign dispatch_attn_key_cols_w = (opcode == OP_MASKED_SOFTMAX_ATTNV) ?
                                     dispatch_k_elems_w : dispatch_n_elems_w;
 
+  // gen-2 FP32 shared datapath detection (FP16 storage, ABUF I/O).
+  logic        dispatch_g2_vadd_w;
+  logic        dispatch_g2_ln_w;
+  logic        dispatch_g2_gelu_w;
+  logic [12:0] dispatch_g2_rows_w;   // FP16 rows per logical row = 2*n_tiles
+  assign dispatch_g2_rows_w = {1'b0, dispatch_n_tiles_w} + {1'b0, dispatch_n_tiles_w};
+  assign dispatch_g2_vadd_w = (opcode == OP_VADD_FP32) &&
+                              (src1_buf == BUF_ABUF) &&
+                              (src2_buf == BUF_ABUF) &&
+                              (dst_buf  == BUF_ABUF);
+  assign dispatch_g2_ln_w   = (opcode == OP_LAYERNORM_FP32) &&
+                              (src1_buf == BUF_ABUF) &&
+                              (src2_buf == BUF_WBUF) &&
+                              (dst_buf  == BUF_ABUF);
+  assign dispatch_g2_gelu_w = (opcode == OP_GELU_FP32) &&
+                              (src1_buf == BUF_ABUF) &&
+                              (dst_buf  == BUF_ABUF);
+
   always_comb begin
     dispatch_attn_context_bad_w = 1'b0;
     if ((opcode == OP_MASKED_SOFTMAX) ||
@@ -456,6 +495,35 @@ module sfu_engine
         dispatch_dst_need_rows_w  = dispatch_m_rows_w * dispatch_n_tiles_w;
       end
 
+      OP_VADD_FP32: begin
+        if (!dispatch_g2_vadd_w)
+          dispatch_unsupported_w = 1'b1;
+        if (integer'(dispatch_n_elems_w) > SFU_MAX_ROW_ELEMS)
+          dispatch_unsupported_w = 1'b1;
+        dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_g2_rows_w;
+        dispatch_src2_need_rows_w = dispatch_m_rows_w * dispatch_g2_rows_w;
+        dispatch_dst_need_rows_w  = dispatch_m_rows_w * dispatch_g2_rows_w;
+      end
+
+      OP_LAYERNORM_FP32: begin
+        if (!dispatch_g2_ln_w)
+          dispatch_unsupported_w = 1'b1;
+        if (integer'(dispatch_n_elems_w) > SFU_MAX_ROW_ELEMS)
+          dispatch_unsupported_w = 1'b1;
+        dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_g2_rows_w;
+        dispatch_src2_need_rows_w = {16'h0, dispatch_ln_param_rows_w};
+        dispatch_dst_need_rows_w  = dispatch_m_rows_w * dispatch_g2_rows_w;
+      end
+
+      OP_GELU_FP32: begin
+        if (!dispatch_g2_gelu_w)
+          dispatch_unsupported_w = 1'b1;
+        if (integer'(dispatch_n_elems_w) > SFU_MAX_ROW_ELEMS)
+          dispatch_unsupported_w = 1'b1;
+        dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_g2_rows_w;
+        dispatch_dst_need_rows_w  = dispatch_m_rows_w * dispatch_g2_rows_w;
+      end
+
       default:
         dispatch_unsupported_w = 1'b1;
     endcase
@@ -493,11 +561,36 @@ module sfu_engine
                          ({16'h0, attn_k_idx_q} * {21'h0, n_tiles_q}) +
                          {19'h0, read_idx_q};
 
+  // gen-2 FP16-tile addressing (8 elems / 16-byte row, g2_rows_q per row).
+  logic [31:0] g2_s1_addr_w;
+  logic [31:0] g2_s2_addr_w;
+  logic [31:0] g2_lnp_addr_w;
+  logic [31:0] g2_dst_addr_w;
+  assign g2_s1_addr_w  = {16'h0, src1_off_q} +
+                         ({17'h0, row_idx_q} * {19'h0, g2_rows_q}) +
+                         {19'h0, read_idx_q};
+  assign g2_s2_addr_w  = {16'h0, src2_off_q} +
+                         ({17'h0, row_idx_q} * {19'h0, g2_rows_q}) +
+                         {19'h0, read_idx_q};
+  assign g2_lnp_addr_w = {16'h0, src2_off_q} + {19'h0, read_idx_q};
+  assign g2_dst_addr_w = {16'h0, dst_off_q} +
+                         ({17'h0, row_idx_q} * {19'h0, g2_rows_q}) +
+                         {21'h0, write_chunk_q};
+
   always_comb begin
     row_write_data_w = 128'h0;
     gelu_i8_write_data_w = 128'h0;
     gelu_i32_write_data_w = 128'h0;
     attn_write_data_w = 128'h0;
+    g2_write_data_w = 128'h0;
+
+    // gen-2: pack 8 FP16 results (16-bit each) for the current write chunk.
+    for (int g2l = 0; g2l < 8; g2l++) begin
+      int g2idx;
+      g2idx = integer'(write_chunk_q) * 8 + g2l;
+      if (g2idx < integer'(n_elems_q))
+        g2_write_data_w[(g2l * 16) +: 16] = out_h_q[g2idx];
+    end
 
     for (int lane = 0; lane < 16; lane++) begin
       int idx;
@@ -556,6 +649,7 @@ module sfu_engine
       write_chunk_q  <= 11'h0;
       gelu_part_q    <= 2'h0;
       attn_k_idx_q   <= 16'h0;
+      g2_rows_q      <= 13'h0;
       gelu_i8_row_q  <= 128'h0;
       gelu_row0_q    <= 128'h0;
       gelu_row1_q    <= 128'h0;
@@ -577,6 +671,7 @@ module sfu_engine
         gamma_q[i]    <= 0.0;
         beta_q[i]     <= 0.0;
         out_bytes_q[i] <= 8'h00;
+        out_h_q[i]    <= 16'h0;
       end
       for (int i = 0; i < 16; i++)
         ln_debug_y_q[i] <= 0.0;
@@ -601,6 +696,7 @@ module sfu_engine
             k_elems_q       <= dispatch_k_elems_w;
             ln_gamma_rows_q <= dispatch_ln_gamma_rows_w;
             ln_param_rows_q <= dispatch_ln_param_rows_w;
+            g2_rows_q       <= dispatch_g2_rows_w;
             attn_valid_q    <= attn_valid;
             attn_query_row_base_q <= attn_query_row_base;
             attn_valid_kv_len_q   <= attn_valid_kv_len;
@@ -650,6 +746,9 @@ module sfu_engine
 
                 OP_SOFTMAX_ATTNV, OP_MASKED_SOFTMAX_ATTNV:
                   state <= F_ATTN_QKT_REQ;
+
+                OP_VADD_FP32, OP_LAYERNORM_FP32, OP_GELU_FP32:
+                  state <= F_G2_S1_REQ;
 
                 default: begin
                   fault_code_r <= 4'(FAULT_UNSUPPORTED_OP);
@@ -1061,6 +1160,169 @@ module sfu_engine
           end
         end
 
+        // ----------------------------------------------------------------
+        // gen-2 FP32 shared datapath (0x19 VADD / 0x1A LN / 0x1B GELU).
+        // FP16 storage (8 elems / 16-byte row), FP32 internal. src1 is an
+        // ABUF FP16 tile; src2 is an ABUF FP16 tile (VADD) or 2N FP16
+        // gamma||beta in WBUF (LN); GELU has no src2. Output FP16 to ABUF.
+        // ----------------------------------------------------------------
+        F_G2_S1_REQ: begin
+          if (sram_b_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);
+            state        <= F_FAULT;
+          end else begin
+            state <= F_G2_S1_LATCH;
+          end
+        end
+
+        F_G2_S1_LATCH: begin
+          integer base_idx;
+          base_idx = integer'(read_idx_q) * 8;
+          for (int lane = 0; lane < 8; lane++) begin
+            if ((base_idx + lane) < integer'(n_elems_q))
+              row_data_q[base_idx + lane] <=
+                  sfu_fp16_bits_to_fp32({16'h0, get_u16(sram_b_rdata, lane)});
+          end
+          if (read_idx_q + 13'd1 < {2'h0, g2_rows_q[10:0]}) begin
+            read_idx_q <= read_idx_q + 13'd1;
+            state      <= F_G2_S1_REQ;
+          end else begin
+            read_idx_q    <= 13'h0;
+            write_chunk_q <= 11'h0;
+            if (opcode_q == OP_GELU_FP32)
+              state <= F_G2_COMPUTE;
+            else
+              state <= F_G2_S2_REQ;
+          end
+        end
+
+        F_G2_S2_REQ: begin
+          if (sram_b_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);
+            state        <= F_FAULT;
+          end else begin
+            state <= F_G2_S2_LATCH;
+          end
+        end
+
+        F_G2_S2_LATCH: begin
+          integer base_idx;
+          if (opcode_q == OP_LAYERNORM_FP32) begin
+            // src2 = 2N FP16 (N gamma then N beta), 8 per 16-byte row.
+            base_idx = (integer'(read_idx_q) < integer'(ln_gamma_rows_q)) ?
+                       (integer'(read_idx_q) * 8) :
+                       ((integer'(read_idx_q) - integer'(ln_gamma_rows_q)) * 8);
+            for (int lane = 0; lane < 8; lane++) begin
+              if ((base_idx + lane) < integer'(n_elems_q)) begin
+                if (integer'(read_idx_q) < integer'(ln_gamma_rows_q))
+                  gamma_q[base_idx + lane] <=
+                      sfu_fp16_bits_to_fp32({16'h0, get_u16(sram_b_rdata, lane)});
+                else
+                  beta_q[base_idx + lane] <=
+                      sfu_fp16_bits_to_fp32({16'h0, get_u16(sram_b_rdata, lane)});
+              end
+            end
+            if (read_idx_q + 13'd1 < {1'b0, ln_param_rows_q[11:0]}) begin
+              read_idx_q <= read_idx_q + 13'd1;
+              state      <= F_G2_S2_REQ;
+            end else begin
+              read_idx_q    <= 13'h0;
+              write_chunk_q <= 11'h0;
+              state         <= F_G2_COMPUTE;
+            end
+          end else begin
+            // VADD: src2 is an ABUF FP16 tile (2nd operand).
+            base_idx = integer'(read_idx_q) * 8;
+            for (int lane = 0; lane < 8; lane++) begin
+              if ((base_idx + lane) < integer'(n_elems_q))
+                attn_accum_q[base_idx + lane] <=
+                    sfu_fp16_bits_to_fp32({16'h0, get_u16(sram_b_rdata, lane)});
+            end
+            if (read_idx_q + 13'd1 < {2'h0, g2_rows_q[10:0]}) begin
+              read_idx_q <= read_idx_q + 13'd1;
+              state      <= F_G2_S2_REQ;
+            end else begin
+              read_idx_q    <= 13'h0;
+              write_chunk_q <= 11'h0;
+              state         <= F_G2_COMPUTE;
+            end
+          end
+        end
+
+        F_G2_COMPUTE: begin
+          if (opcode_q == OP_VADD_FP32) begin
+            for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
+              if (i < integer'(n_elems_q))
+                out_h_q[i] <= 16'(sfu_fp32_to_fp16_bits(
+                    sfu_fp32_add(row_data_q[i], attn_accum_q[i])));
+            end
+            state <= F_G2_PACK;
+          end else if (opcode_q == OP_GELU_FP32) begin
+            for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
+              if (i < integer'(n_elems_q))
+                out_h_q[i] <= 16'(sfu_fp32_to_fp16_bits(
+                    sfu_fp32_gelu_new(row_data_q[i])));
+            end
+            state <= F_G2_PACK;
+          end else begin
+            // LAYERNORM_FP32: mean / var (population) / eps=1e-5 / gamma,beta.
+            real sum_r;
+            real mean_r;
+            real var_r;
+            real denom_r;
+            sum_r = 0.0;
+            for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
+              if (i < integer'(n_elems_q))
+                sum_r = sfu_fp32_add(sum_r, row_data_q[i]);
+            end
+            mean_r = sfu_fp32_div(sum_r, real'(n_elems_q));
+            var_r = 0.0;
+            for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
+              if (i < integer'(n_elems_q)) begin
+                real diff_r;
+                diff_r = sfu_fp32_sub(row_data_q[i], mean_r);
+                var_r = sfu_fp32_add(var_r, sfu_fp32_mul(diff_r, diff_r));
+              end
+            end
+            var_r = sfu_fp32_div(var_r, real'(n_elems_q));
+            denom_r = sfu_fp32_sqrt(sfu_fp32_add(var_r, LN_FP32_EPS));
+            for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
+              if (i < integer'(n_elems_q))
+                out_h_q[i] <= 16'(sfu_fp32_to_fp16_bits(
+                    sfu_fp32_add(
+                        sfu_fp32_mul(
+                            sfu_fp32_div(
+                                sfu_fp32_sub(row_data_q[i], mean_r),
+                                denom_r),
+                            gamma_q[i]),
+                        beta_q[i])));
+            end
+            state <= F_G2_PACK;
+          end
+        end
+
+        F_G2_PACK: begin
+          row_write_q <= g2_write_data_w;
+          state       <= F_G2_WRITE;
+        end
+
+        F_G2_WRITE: begin
+          if (sram_a_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);
+            state        <= F_FAULT;
+          end else if (write_chunk_q + 11'd1 < g2_rows_q[10:0]) begin
+            write_chunk_q <= write_chunk_q + 11'd1;
+            state         <= F_G2_PACK;
+          end else if (row_idx_q + 15'd1 < m_rows_q) begin
+            row_idx_q     <= row_idx_q + 15'd1;
+            read_idx_q    <= 13'h0;
+            write_chunk_q <= 11'h0;
+            state         <= F_G2_S1_REQ;
+          end else begin
+            state <= F_IDLE;
+          end
+        end
+
         F_FAULT: ;
 
         default:
@@ -1157,6 +1419,27 @@ module sfu_engine
         sram_a_buf   = dst_buf_q;
         sram_a_row   = row_dst_addr_w[15:0];
         sram_a_wdata = attn_write_data_w;
+      end
+
+      F_G2_S1_REQ: begin
+        sram_b_en  = 1'b1;
+        sram_b_buf = src1_buf_q;
+        sram_b_row = g2_s1_addr_w[15:0];
+      end
+
+      F_G2_S2_REQ: begin
+        sram_b_en  = 1'b1;
+        sram_b_buf = src2_buf_q;
+        sram_b_row = (opcode_q == OP_LAYERNORM_FP32) ?
+                     g2_lnp_addr_w[15:0] : g2_s2_addr_w[15:0];
+      end
+
+      F_G2_WRITE: begin
+        sram_a_en    = 1'b1;
+        sram_a_we    = 1'b1;
+        sram_a_buf   = dst_buf_q;
+        sram_a_row   = g2_dst_addr_w[15:0];
+        sram_a_wdata = row_write_q;
       end
 
       default: ;

@@ -89,6 +89,44 @@ extern "C" int sfu_fp32_quantize_i8(double value_r, double out_scale_r) {
     return q;
 }
 
+// ---------------------------------------------------------------------------
+// gen-2 FP32 opcode DPI helpers (frozen ISA, isa_generation_freeze.md).
+// FP16 storage / FP32 datapath. These MUST match the golden model's
+// numpy semantics exactly (read_fp16_tile / write_fp16_tile = IEEE-754
+// half with round-half-to-even; gelu_new = tanh approximation, NOT the
+// erf sfu_fp32_gelu used by the gen-1 INT8 path).
+// ---------------------------------------------------------------------------
+
+// IEEE-754 half bit pattern -> FP32 (== numpy float16->float32, exact).
+extern "C" double sfu_fp16_bits_to_fp32(int bits) {
+    uint16_t h = static_cast<uint16_t>(bits & 0xFFFF);
+    _Float16 hv;
+    std::memcpy(&hv, &h, sizeof(hv));
+    return static_cast<double>(static_cast<float>(hv));
+}
+
+// FP32 -> IEEE-754 half bit pattern (== numpy .astype(float16):
+// round-half-to-even, subnormals, overflow -> inf).
+extern "C" int sfu_fp32_to_fp16_bits(double value_r) {
+    _Float16 hv = static_cast<_Float16>(static_cast<float>(value_r));
+    uint16_t h;
+    std::memcpy(&h, &hv, sizeof(h));
+    return static_cast<int>(h);
+}
+
+// gelu_new (tanh) in FP32 — matches golden _exec_gelu_fp32 (0x1B):
+//   x*0.5*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+extern "C" double sfu_fp32_gelu_new(double value_r) {
+    const float x = static_cast<float>(value_r);
+    const float k = 0.7978845608028654f;            // sqrt(2/pi)
+    // numpy `xf ** 3` is np.power = powf(x,3), NOT x*x*x — they differ in
+    // FP32 and the difference propagates through tanh (3 fp16 ULP observed).
+    const float x3 = std::pow(x, 3.0f);
+    const float inner = k * (x + 0.044715f * x3);
+    const float y = x * 0.5f * (1.0f + std::tanh(inner));
+    return static_cast<double>(y);
+}
+
 // ============================================================================
 // ISA helper: build 64-bit big-endian instruction words
 // (Matches software/taccel/isa/encoding.py exactly)

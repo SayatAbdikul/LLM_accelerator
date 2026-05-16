@@ -119,6 +119,27 @@ To make golden-vs-RTL cosim possible on the production path:
    `software/tools/gen_gen2_fixtures.py`. Any later `simulator.py` change
    requires a new freeze revision + fixture regen — otherwise "cosim vs the
    gen-2 golden" is a moving target, the exact failure this freeze closes.
+7. **Conformance tolerance — per op-class (REVISION 2026-05-16).** The
+   original "byte-match within FP16 ULP" (item 5) left the band a single
+   guessed number (≤1). Measurement on the P2 ops replaces the guess:
+   - **Non-transcendental ops → exactly 0 fp16 ULP (bit-exact).** Verified:
+     `VADD_FP32` (0x19) and `LAYERNORM_FP32` (0x1A, eps=1e-5, γβ, mean/var)
+     are byte-identical to the golden fixtures. This is mandatory; any
+     drift is a real bug. Applies to 0x17/0x18/0x19/0x1A/0x1E.
+   - **Transcendental-heavy ops → small empirically-characterized band.**
+     `GELU_FP32` (0x1B `gelu_new`) is byte-identical to a libm-`tanhf`
+     implementation of the exact golden formula; it differs from the
+     golden's `np.tanh` (numpy vectorized float32 tanh) by **≤3 fp16 ULP
+     on 53/1024 elements** (measured; `/tmp/verify_gelu.py` reproduces it:
+     RTL ≡ libm-gelu exactly, libm-vs-golden ≡ RTL-vs-golden = (53, 3)).
+     The datapath is correct — the residual is purely a float32-tanh
+     library difference. Conformance band for `gelu_new`: **|ulp| ≤ 3**.
+     `MASKED_SOFTMAX_FP32` (0x1D, `exp`) is expected to need a similarly
+     characterized `exp` band — to be measured in P4, same discipline.
+   - Bit-replicating numpy's tanh is rejected: numpy-version-fragile and
+     the freeze already pins a golden SHA. Characterizing the band per
+     op-class is the disciplined resolution the §6 revision mechanism is
+     for. `expect_fp16_ulp` enforces these bands per op in `test_sfu.cpp`.
 
 ## 5. Actions required to *complete* the freeze (owner: user — I do not commit)
 
