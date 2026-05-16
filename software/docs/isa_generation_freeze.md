@@ -136,6 +136,35 @@ To make golden-vs-RTL cosim possible on the production path:
    rebase-free). Closing both is tracked as **P6c / task #106**; the freeze
    §5 definition-of-done remains formally open until the GPT-2 124M 257-tok
    bundle byte-matches.
+   **Status (2026-05-17, P6c — GPT-2 124M single-tok prefill:
+   byte-EXACT to golden up to the first fp16 overflow; one isolated bug;
+   §5 still open).** Headline: on the real **GPT-2 124M**
+   `weight_only_int8_quarot` bundle (single-token prefill), **RTL is
+   byte-EXACT (0 fp16 ULP) to the pinned golden across the entire prefill
+   for every captured node before golden's first fp16 overflow** — the
+   only exception being **one localized bug (`block0_head0_query`,
+   propagating to its direct child `block0_head0_qkt`)**. RTL runs clean
+   (`status=halted`, `fault=False`, `forbidden_overlap=False`;
+   `run_program` rebuilt with `DRAM_SIZE≥1<<30` — the 16 MB default
+   `FAULT_DRAM_OOB`s on the 392 MB image). Findings (advisor-reviewed,
+   primary-source): **(a) well-posed boundary** — golden first overflows
+   fp16 at `block0_out_proj` (pc 2298, 48/768 → ±65504/NaN; the W8A16
+   storage format genuinely saturates at 124M MLP dynamic range, model
+   still 55.76 PPL); `block0_out_proj` is byte-identical incl. NaN
+   positions (RTL faithfully reproduces even the overflow), and the full
+   pre-boundary prefill is 0 ULP modulo the one bug above. **(b) BUG1** —
+   `block0_head0_query` (first Q-projection, head-0 only; heads 1–11 all
+   0 ULP) miscomputes; architecturally inert at seq=1 (`softmax(1,1)`).
+   Task **#108 (P6e)**. **(c) BUG2** — past the overflow boundary,
+   non-finite-operand handling in the requant path diverges (golden
+   `np.clip`/cast-NaN vs RTL); a localized op-semantics edge for
+   non-finite inputs, *not* a finite-path datapath error. Task **#107
+   (P6d)**. **No freeze edit is shipped:** per §7 discipline, a
+   logits-level / characterized 124M conformance metric (per-tensor
+   byte-match is well-posed only up to the overflow boundary) must be
+   *proposed with its supporting measurement* before §5/§7 are amended —
+   tracked as **#109 (P6f)**, which also carries the 257-tok decode
+   integration. §5 definition-of-done remains formally open.
 6. **Pinned reference golden.** RTL conformance is measured against
    `software/taccel/golden_model/simulator.py` **at the commit created by
    the §5 commit**: `frozen_golden_sha = aa9a9c0fa389d77598acfe68f4ac1347bd9fc9ef`

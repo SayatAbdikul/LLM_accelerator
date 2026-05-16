@@ -169,9 +169,18 @@ def emit_snapshot_csv(trace_manifest: Dict[int, list]) -> str:
 
 
 def capture_golden(*, token_id: int = 0, smoke_decode_steps: int = 1,
-                   payload: Optional[Dict[str, Any]] = None):
+                   payload: Optional[Dict[str, Any]] = None,
+                   exclude_nodes: Optional[set] = None):
     """Run the frozen prefill on the pinned golden HostRunner with the codegen
-    trace manifest attached; return (golden_tensors, serialized_prefill)."""
+    trace manifest attached; return (golden_tensors, serialized_prefill).
+
+    `exclude_nodes` prunes those node names from the manifest BEFORE golden
+    runs. Required for `lm_head` on large-vocab models (GPT-2 124M: vocab
+    50257 -> a 16x50272 fp16 logits tile = 1.6 MB that does NOT live in the
+    128 KB ABUF; it is written to the logits DRAM region, so an ABUF-tile
+    snapshot is structurally invalid and golden's read_fp16_tile OOBs).
+    Final logits are the §4.5 arbiter and are compared via the logits DRAM
+    region separately, not as an ABUF tile."""
     import numpy as np  # noqa: F401  (kept local; numpy is test-only here)
     from taccel.assembler.assembler import ProgramBinary
     from taccel.golden_model.simulator import Simulator
@@ -189,6 +198,12 @@ def capture_golden(*, token_id: int = 0, smoke_decode_steps: int = 1,
     build = tiny.build
     bundle = build.bundle
     prefill_manifest = dict(build.prefill_codegen.trace_manifest)
+    if exclude_nodes:
+        prefill_manifest = {
+            pc: kept
+            for pc, evs in prefill_manifest.items()
+            if (kept := [e for e in evs if e["node_name"] not in exclude_nodes])
+        }
 
     sim = Simulator()
     runner = HostRunner(bundle, simulator=sim)
@@ -219,9 +234,11 @@ def capture_golden(*, token_id: int = 0, smoke_decode_steps: int = 1,
     return golden_tensors, sp, bytes(image[:data_base])
 
 
-def run_rtl(program_bytes: bytes, csv_text: str, *, max_cycles: int = 5_000_000):
+def run_rtl(program_bytes: bytes, csv_text: str, *, max_cycles: int = 5_000_000,
+            timeout_s: int = 1800):
     """Run the patched prefill on Verilator run_program with snapshot capture;
-    return (summary, rtl_entries, rtl_data_bytes)."""
+    return (summary, rtl_entries, rtl_data_bytes). timeout_s default 30min
+    (124M 1-tok prefill measured ~292s clean; headroom for divergent runs)."""
     import json
     import subprocess
     import tempfile
@@ -243,7 +260,7 @@ def run_rtl(program_bytes: bytes, csv_text: str, *, max_cycles: int = 5_000_000)
              "--snapshot-manifest-out", str(td / "man.json"),
              "--snapshot-data-out", str(td / "data.bin"),
              "--max-cycles", str(max_cycles)],
-            capture_output=True, text=True, timeout=900,
+            capture_output=True, text=True, timeout=timeout_s,
         )
         if cp.returncode != 0:
             raise RuntimeError(
@@ -381,13 +398,26 @@ def compare(golden_tensors, rtl_entries, rtl_data, instr_image,
     return None
 
 
-def run_cosim(*, token_id: int = 0, smoke_decode_steps: int = 1):
+def run_cosim(*, token_id: int = 0, smoke_decode_steps: int = 1,
+              payload: Optional[Dict[str, Any]] = None,
+              max_cycles: Optional[int] = None,
+              exclude_nodes: Optional[set] = None):
     """Full freeze §4.5 RTL-vs-golden prefill gate. Returns a result dict;
-    'divergence' is None on byte-match."""
+    'divergence' is None on byte-match.
+
+    `payload=None` -> tiny fixture (P6b). Pass the GPT-2 124M payload for the
+    literal §5 model (P6c). `max_cycles=None` auto-scales from insn_count
+    (~1600 cyc/insn measured on 124M; 3000x headroom) — the 5M default would
+    time the 124M prefill out at ~5M of its ~100M cycles.
+    """
     golden, sp, instr_image = capture_golden(
-        token_id=token_id, smoke_decode_steps=smoke_decode_steps)
+        token_id=token_id, smoke_decode_steps=smoke_decode_steps,
+        payload=payload, exclude_nodes=exclude_nodes)
+    if max_cycles is None:
+        max_cycles = max(5_000_000, sp.insn_count * 3000)
     csv = emit_snapshot_csv(sp.trace_manifest)
-    summary, rtl_entries, rtl_data = run_rtl(sp.program_bytes, csv)
+    summary, rtl_entries, rtl_data = run_rtl(
+        sp.program_bytes, csv, max_cycles=max_cycles)
     divergence = compare(golden, rtl_entries, rtl_data, instr_image,
                          sp.trace_manifest)
     return {
