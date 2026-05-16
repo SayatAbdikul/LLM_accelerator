@@ -307,6 +307,10 @@ module taccel_top
   logic [15:0]  sfu_sram_a_row;
   logic [127:0] sfu_sram_a_wdata;
 
+  logic         sfu_scale_we_w;
+  logic [3:0]   sfu_scale_waddr_w;
+  logic [15:0]  sfu_scale_wdata_w;
+
   logic         sfu_sram_b_en;
   logic [1:0]   sfu_sram_b_buf;
   logic [15:0]  sfu_sram_b_row;
@@ -534,6 +538,12 @@ module taccel_top
         obs_forbidden_overlap_violation_q <= 1'b1;
       if (sfu_busy && (dma_busy || sys_busy || helper_busy))
         obs_forbidden_overlap_violation_q <= 1'b1;
+      // Scale-reg write-port contention: control SET_SCALE vs SFU 0x1F
+      // write-back. The priority mux drops SET_SCALE if both fire; the
+      // toolchain's SYNC(0b100) after 0x1F is supposed to make this
+      // impossible. Flag it so the assumption is verifiable, not hoped.
+      if (scale_we && sfu_scale_we_w)
+        obs_forbidden_overlap_violation_q <= 1'b1;
 
       if (!obs_fault_valid_q) begin
         if (obs_ctrl_fault_pulse_w) begin
@@ -688,9 +698,15 @@ module taccel_top
   register_file u_regfile (
     .clk          (clk),
     .rst_n        (rst_n),
-    .scale_we     (scale_we),
-    .scale_waddr  (scale_waddr),
-    .scale_wdata  (scale_wdata),
+    // Scale-reg write port: SFU (MAX_ABS_REDUCE_FP32 0x1F) takes priority
+    // over control's SET_SCALE. The toolchain emits SYNC(0b100) after 0x1F,
+    // so SET_SCALE is never issued concurrent with an in-flight 0x1F. That
+    // assumption is made verifiable: obs_forbidden_overlap_violation_q is
+    // raised on (scale_we && sfu_scale_we_w) — if it ever trips, the
+    // toolchain serialization is broken, not silently masked by this mux.
+    .scale_we     (sfu_scale_we_w ? 1'b1              : scale_we),
+    .scale_waddr  (sfu_scale_we_w ? sfu_scale_waddr_w : scale_waddr),
+    .scale_wdata  (sfu_scale_we_w ? sfu_scale_wdata_w : scale_wdata),
     .scale_raddr0 (insn.sreg),
     .scale_rdata0 (scale_rdata0),
     .scale_raddr1 (insn.sreg + 4'd1),
@@ -795,7 +811,10 @@ module taccel_top
     .sram_b_buf     (sfu_sram_b_buf),
     .sram_b_row     (sfu_sram_b_row),
     .sram_b_rdata   (sfu_sram_b_rdata),
-    .sram_b_fault   (sfu_sram_b_en & sram_b_fault)
+    .sram_b_fault   (sfu_sram_b_en & sram_b_fault),
+    .sfu_scale_we   (sfu_scale_we_w),
+    .sfu_scale_waddr(sfu_scale_waddr_w),
+    .sfu_scale_wdata(sfu_scale_wdata_w)
   );
 
   dma_engine #(

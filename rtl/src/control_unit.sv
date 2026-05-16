@@ -186,17 +186,19 @@ module control_unit
         // the SFU datapaths for 0x19/0x1A/0x1B; the remaining ops land in
         // P3-P5 and stay unsupported regardless of flags until then.
         // 0x1C SOFTMAX_FP32 is illegal (decode), not here.
+        // All 8 normative gen-2 FP32 ops implemented (P2-P5). Only
+        // flags=1 (FP16 storage, W8A16 conformance path) is supported;
+        // flags=0 (FP32/W8A32 storage) stays out of scope. 0x1C is
+        // illegal (decode), not here.
         OP_VADD_FP32,
         OP_LAYERNORM_FP32,
         OP_GELU_FP32,
         OP_DEQUANT_ACCUM_FP32,
         OP_QUANT_FP32_INT8,
-        OP_MASKED_SOFTMAX_FP32:
-          unsupported_op = (fp_flags == 1'b0);
-
+        OP_MASKED_SOFTMAX_FP32,
         OP_DEQUANT_ACCUM_FP32_SCALED,
         OP_MAX_ABS_REDUCE_FP32:
-          unsupported_op = 1'b1;
+          unsupported_op = (fp_flags == 1'b0);
 
         default:
           unsupported_op = 1'b0;
@@ -435,7 +437,9 @@ module control_unit
               OP_GELU_FP32,
               OP_DEQUANT_ACCUM_FP32,
               OP_QUANT_FP32_INT8,
-              OP_MASKED_SOFTMAX_FP32: begin
+              OP_MASKED_SOFTMAX_FP32,
+              OP_DEQUANT_ACCUM_FP32_SCALED,
+              OP_MAX_ABS_REDUCE_FP32: begin
                 if (!tile_valid) begin
                   fault_code_r <= 4'(FAULT_NO_CONFIG);
                   obs_ctrl_fault_pulse  <= 1'b1;
@@ -589,7 +593,8 @@ module control_unit
 
             OP_SOFTMAX, OP_SOFTMAX_ATTNV, OP_LAYERNORM, OP_GELU,
             OP_VADD_FP32, OP_LAYERNORM_FP32, OP_GELU_FP32,
-            OP_DEQUANT_ACCUM_FP32, OP_QUANT_FP32_INT8:
+            OP_DEQUANT_ACCUM_FP32, OP_QUANT_FP32_INT8,
+            OP_DEQUANT_ACCUM_FP32_SCALED, OP_MAX_ABS_REDUCE_FP32:
               sfu_dispatch = tile_valid && sfu_ready_now;
 
             OP_MASKED_SOFTMAX, OP_MASKED_SOFTMAX_ATTNV, OP_MASKED_SOFTMAX_FP32:

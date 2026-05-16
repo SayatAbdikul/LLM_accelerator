@@ -66,7 +66,12 @@ module sfu_engine
   output logic [1:0]   sram_b_buf,
   output logic [15:0]  sram_b_row,
   input  logic [127:0] sram_b_rdata,
-  input  logic         sram_b_fault
+  input  logic         sram_b_fault,
+
+  // --- Scale-register write-back (MAX_ABS_REDUCE_FP32 0x1F) ---
+  output logic         sfu_scale_we,
+  output logic [3:0]   sfu_scale_waddr,
+  output logic [15:0]  sfu_scale_wdata
 );
 
   import "DPI-C" function real sfu_fp32_round(input real value_r);
@@ -82,6 +87,7 @@ module sfu_engine
   // float16 semantics) + tanh gelu_new. NOT the gen-1 erf sfu_fp32_gelu.
   import "DPI-C" function real sfu_fp16_bits_to_fp32(input int bits);
   import "DPI-C" function int  sfu_fp32_to_fp16_bits(input real value_r);
+  import "DPI-C" function int  sfu_fp64_to_fp16_bits(input real value_r);
   import "DPI-C" function real sfu_fp32_gelu_new(input real value_r);
 
   localparam int SFU_MAX_ROW_ELEMS = 1024;
@@ -122,7 +128,8 @@ module sfu_engine
     F_G2_S2_LATCH   = 5'd26,
     F_G2_COMPUTE    = 5'd27,
     F_G2_PACK       = 5'd28,
-    F_G2_WRITE      = 5'd29
+    F_G2_WRITE      = 5'd29,
+    F_G2_SCALE_WR   = 5'd30   // 0x1F: 2-cycle scale-reg write-back
   } sfu_state_t;
 
   sfu_state_t state;
@@ -165,6 +172,9 @@ module sfu_engine
   // gen-2: FP16 result bit-patterns + FP16-rows-per-logical-row (=2*n_tiles).
   logic [15:0] out_h_q [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
   logic [12:0] g2_rows_q;
+  // 0x1F MAX_ABS_REDUCE_FP32: running global max|x| + 2-cycle write phase.
+  real         g2_maxabs_q;
+  logic        g2_wr_phase_q;
   real attn_row_max_q;
   real attn_exp_sum_q;
   real ln_debug_mean_q /* verilator public_flat_rd */;
@@ -324,6 +334,17 @@ module sfu_engine
     end
   endfunction
 
+  // 0x1F: clamp max|x| to [2^-9, 65504*127/2] (golden MAX_ABS_REDUCE eps).
+  function automatic real g2_clamp_eps(input real m);
+    real e;
+    begin
+      e = m;
+      if (e < 0.001953125) e = 0.001953125;   // 2^-9
+      if (e > 4159004.0)   e = 4159004.0;      // 65504.0*127.0/2.0
+      g2_clamp_eps = e;
+    end
+  endfunction
+
   function automatic logic attn_visible(
     input logic [14:0] row_idx,
     input integer      col_idx
@@ -412,6 +433,15 @@ module sfu_engine
   assign dispatch_g2_ms_w = (opcode == OP_MASKED_SOFTMAX_FP32) &&
                             (src1_buf == BUF_ABUF) &&
                             (dst_buf  == BUF_ABUF);
+  logic dispatch_g2_ds_w;   // 0x1E DEQUANT_ACCUM_FP32_SCALED
+  logic dispatch_g2_mar_w;  // 0x1F MAX_ABS_REDUCE_FP32
+  assign dispatch_g2_ds_w = (opcode == OP_DEQUANT_ACCUM_FP32_SCALED) &&
+                            (src1_buf == BUF_ACCUM) &&
+                            (src2_buf == BUF_WBUF) &&
+                            (dst_buf  == BUF_ABUF);
+  assign dispatch_g2_mar_w = (opcode == OP_MAX_ABS_REDUCE_FP32) &&
+                             (src1_buf == BUF_ABUF) &&
+                             (sreg <= 4'd14);   // sreg+1 must be valid
 
   always_comb begin
     dispatch_attn_context_bad_w = 1'b0;
@@ -566,6 +596,25 @@ module sfu_engine
         dispatch_dst_need_rows_w  = dispatch_m_rows_w * dispatch_g2_rows_w;
       end
 
+      OP_DEQUANT_ACCUM_FP32_SCALED: begin
+        if (!dispatch_g2_ds_w)
+          dispatch_unsupported_w = 1'b1;
+        if (integer'(dispatch_n_elems_w) > SFU_MAX_ROW_ELEMS)
+          dispatch_unsupported_w = 1'b1;
+        dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_n_chunks_i32_w;
+        dispatch_src2_need_rows_w = {16'h0, dispatch_ln_param_rows_w};
+        dispatch_dst_need_rows_w  = dispatch_m_rows_w * dispatch_g2_rows_w;
+      end
+
+      OP_MAX_ABS_REDUCE_FP32: begin
+        if (!dispatch_g2_mar_w)
+          dispatch_unsupported_w = 1'b1;
+        if (integer'(dispatch_n_elems_w) > SFU_MAX_ROW_ELEMS)
+          dispatch_unsupported_w = 1'b1;
+        dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_g2_rows_w;
+        // no src2, no tile dst (writes 2 scale regs).
+      end
+
       default:
         dispatch_unsupported_w = 1'b1;
     endcase
@@ -692,6 +741,8 @@ module sfu_engine
       gelu_part_q    <= 2'h0;
       attn_k_idx_q   <= 16'h0;
       g2_rows_q      <= 13'h0;
+      g2_maxabs_q    <= 0.0;
+      g2_wr_phase_q  <= 1'b0;
       gelu_i8_row_q  <= 128'h0;
       gelu_row0_q    <= 128'h0;
       gelu_row1_q    <= 128'h0;
@@ -739,6 +790,8 @@ module sfu_engine
             ln_gamma_rows_q <= dispatch_ln_gamma_rows_w;
             ln_param_rows_q <= dispatch_ln_param_rows_w;
             g2_rows_q       <= dispatch_g2_rows_w;
+            g2_maxabs_q     <= 0.0;
+            g2_wr_phase_q   <= 1'b0;
             attn_valid_q    <= attn_valid;
             attn_query_row_base_q <= attn_query_row_base;
             attn_valid_kv_len_q   <= attn_valid_kv_len;
@@ -791,7 +844,8 @@ module sfu_engine
 
                 OP_VADD_FP32, OP_LAYERNORM_FP32, OP_GELU_FP32,
                 OP_DEQUANT_ACCUM_FP32, OP_QUANT_FP32_INT8,
-                OP_MASKED_SOFTMAX_FP32:
+                OP_MASKED_SOFTMAX_FP32, OP_DEQUANT_ACCUM_FP32_SCALED,
+                OP_MAX_ABS_REDUCE_FP32:
                   state <= F_G2_S1_REQ;
 
                 default: begin
@@ -1223,9 +1277,10 @@ module sfu_engine
 
         F_G2_S1_LATCH: begin
           integer base_idx;
-          if (opcode_q == OP_DEQUANT_ACCUM_FP32) begin
-            // 0x17: src1 = ACCUM INT32, 4 int32 / 16-byte row, raw -> real
-            // (per-column FP16 scale applied later in F_G2_COMPUTE).
+          if (opcode_q == OP_DEQUANT_ACCUM_FP32 ||
+              opcode_q == OP_DEQUANT_ACCUM_FP32_SCALED) begin
+            // 0x17 / 0x1E: src1 = ACCUM INT32, 4 int32 / 16-byte row, raw
+            // -> real (scales/bias applied later in F_G2_COMPUTE).
             base_idx = integer'(read_idx_q) * 4;
             for (int lane = 0; lane < 4; lane++) begin
               if ((base_idx + lane) < integer'(n_elems_q))
@@ -1238,7 +1293,33 @@ module sfu_engine
             end else begin
               read_idx_q    <= 13'h0;
               write_chunk_q <= 11'h0;
-              state         <= F_G2_S2_REQ;   // N FP16 per-col scales
+              state         <= F_G2_S2_REQ;   // src2: scales (+bias)
+            end
+          end else if (opcode_q == OP_MAX_ABS_REDUCE_FP32) begin
+            // 0x1F: FP16 src1; accumulate the GLOBAL max|x| over the whole
+            // M*N tile (own row loop, no per-row output).
+            real m;
+            real v;
+            real av;
+            m = g2_maxabs_q;
+            base_idx = integer'(read_idx_q) * 8;
+            for (int lane = 0; lane < 8; lane++) begin
+              if ((base_idx + lane) < integer'(n_elems_q)) begin
+                v  = sfu_fp16_bits_to_fp32({16'h0, get_u16(sram_b_rdata, lane)});
+                av = (v < 0.0) ? -v : v;
+                if (av > m) m = av;
+              end
+            end
+            g2_maxabs_q <= m;
+            if (read_idx_q + 13'd1 < {2'h0, g2_rows_q[10:0]}) begin
+              read_idx_q <= read_idx_q + 13'd1;
+              state      <= F_G2_S1_REQ;
+            end else if (row_idx_q + 15'd1 < m_rows_q) begin
+              row_idx_q  <= row_idx_q + 15'd1;
+              read_idx_q <= 13'h0;
+              state      <= F_G2_S1_REQ;
+            end else begin
+              state <= F_G2_SCALE_WR;          // all elements seen
             end
           end else begin
             // FP16 src1 tile, 8 elems / 16-byte row.
@@ -1276,8 +1357,10 @@ module sfu_engine
 
         F_G2_S2_LATCH: begin
           integer base_idx;
-          if (opcode_q == OP_LAYERNORM_FP32) begin
-            // src2 = 2N FP16 (N gamma then N beta), 8 per 16-byte row.
+          if (opcode_q == OP_LAYERNORM_FP32 ||
+              opcode_q == OP_DEQUANT_ACCUM_FP32_SCALED) begin
+            // LN: src2 = 2N FP16 (N gamma || N beta). 0x1E: identical
+            // layout, N wt-scales (-> gamma_q) || N bias (-> beta_q).
             base_idx = (integer'(read_idx_q) < integer'(ln_gamma_rows_q)) ?
                        (integer'(read_idx_q) * 8) :
                        ((integer'(read_idx_q) - integer'(ln_gamma_rows_q)) * 8);
@@ -1350,6 +1433,20 @@ module sfu_engine
                     sfu_fp32_mul(row_data_q[i], scale0_q), 1.0);
             end
             state <= F_ROW_PACK;          // gen-1 INT8 pack (16 / row)
+          end else if (opcode_q == OP_DEQUANT_ACCUM_FP32_SCALED) begin
+            // 0x1E: FP16 = int32 * wt_scale[col] * act_scale + bias[col].
+            // row_data_q=int32(real); gamma_q=wt-scales; beta_q=bias;
+            // scale0_q = scale_regs[sreg] (the fwd act-scale from 0x1F).
+            for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
+              if (i < integer'(n_elems_q))
+                out_h_q[i] <= 16'(sfu_fp32_to_fp16_bits(
+                    sfu_fp32_add(
+                        sfu_fp32_mul(
+                            sfu_fp32_mul(row_data_q[i], gamma_q[i]),
+                            scale0_q),
+                        beta_q[i])));
+            end
+            state <= F_G2_PACK;
           end else if (opcode_q == OP_MASKED_SOFTMAX_FP32) begin
             // 0x1D causal masked softmax. Golden is mode-independent:
             // keep_through = min(row + query_row_base, valid_kv_len - 1);
@@ -1451,6 +1548,16 @@ module sfu_engine
           end
         end
 
+        // 0x1F: write scale_regs[sreg]=127/eps (phase 0), then
+        // scale_regs[sreg+1]=eps/127 (phase 1). Writes driven in the
+        // combinational block; here we just sequence the two phases.
+        F_G2_SCALE_WR: begin
+          if (g2_wr_phase_q == 1'b0)
+            g2_wr_phase_q <= 1'b1;
+          else
+            state <= F_IDLE;
+        end
+
         F_FAULT: ;
 
         default:
@@ -1473,6 +1580,10 @@ module sfu_engine
     sram_b_en    = 1'b0;
     sram_b_buf   = src1_buf_q;
     sram_b_row   = 16'h0;
+
+    sfu_scale_we    = 1'b0;
+    sfu_scale_waddr = 4'h0;
+    sfu_scale_wdata = 16'h0;
 
     case (state)
       F_LN_PARAM_REQ: begin
@@ -1552,8 +1663,9 @@ module sfu_engine
       F_G2_S1_REQ: begin
         sram_b_en  = 1'b1;
         sram_b_buf = src1_buf_q;
-        // 0x17 reads INT32 ACCUM (4 / row); others read an FP16 tile.
-        sram_b_row = (opcode_q == OP_DEQUANT_ACCUM_FP32) ?
+        // 0x17 / 0x1E read INT32 ACCUM (4 / row); others read FP16 tiles.
+        sram_b_row = ((opcode_q == OP_DEQUANT_ACCUM_FP32) ||
+                      (opcode_q == OP_DEQUANT_ACCUM_FP32_SCALED)) ?
                      row_i32_addr_w[15:0] : g2_s1_addr_w[15:0];
       end
 
@@ -1572,6 +1684,24 @@ module sfu_engine
         sram_a_buf   = dst_buf_q;
         sram_a_row   = g2_dst_addr_w[15:0];
         sram_a_wdata = row_write_q;
+      end
+
+      // 0x1F MAX_ABS_REDUCE_FP32 scale write-back. Golden:
+      //   eps = clamp(max|x|, 2^-9, 65504*127/2)
+      //   scale_regs[sreg]   = float16(127/eps)   (phase 0)
+      //   scale_regs[sreg+1] = float16(eps/127)   (phase 1)
+      // float16() is a single round of the float64 quotient.
+      F_G2_SCALE_WR: begin
+        sfu_scale_we = 1'b1;
+        if (g2_wr_phase_q == 1'b0) begin
+          sfu_scale_waddr = sreg_q;
+          sfu_scale_wdata = 16'(sfu_fp64_to_fp16_bits(
+              127.0 / g2_clamp_eps(g2_maxabs_q)));
+        end else begin
+          sfu_scale_waddr = sreg_q + 4'd1;
+          sfu_scale_wdata = 16'(sfu_fp64_to_fp16_bits(
+              g2_clamp_eps(g2_maxabs_q) / 127.0));
+        end
       end
 
       default: ;

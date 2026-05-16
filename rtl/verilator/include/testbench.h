@@ -114,6 +114,17 @@ extern "C" int sfu_fp32_to_fp16_bits(double value_r) {
     return static_cast<int>(h);
 }
 
+// FP64 -> IEEE-754 half (single rounding, == numpy float16(python_float)).
+// Distinct from sfu_fp32_to_fp16_bits which rounds via float32 first;
+// MAX_ABS_REDUCE_FP32's 127.0/max_abs_eps is a float64 quotient that the
+// golden casts directly to float16 (one rounding).
+extern "C" int sfu_fp64_to_fp16_bits(double value_r) {
+    _Float16 hv = static_cast<_Float16>(value_r);   // double -> half, 1 round
+    uint16_t h;
+    std::memcpy(&h, &hv, sizeof(h));
+    return static_cast<int>(h);
+}
+
 // gelu_new (tanh) in FP32 — matches golden _exec_gelu_fp32 (0x1B):
 //   x*0.5*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
 extern "C" double sfu_fp32_gelu_new(double value_r) {

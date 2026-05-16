@@ -1283,6 +1283,103 @@ static void test_g2_masked_softmax_fp32() {
     TEST_PASS(name);
 }
 
+// Peek a scale register (register_file.scale_regs is verilator public).
+static uint16_t scale_reg(SimHarness& s, int idx) {
+    return s.dut->rootp->taccel_top__DOT__u_regfile__DOT__scale_regs[idx];
+}
+
+static void run_g2_max_abs_reduce(const char* name, const std::string& d) {
+    auto s1 = read_binary_file(name, d + "/input_src1.raw");      // M*N fp16
+    auto post = read_binary_file(name, d + "/scale_regs_post.raw"); // 16 fp16
+    uint16_t exp5 = uint16_t(post[10]) | (uint16_t(post[11]) << 8); // reg 5
+    uint16_t exp6 = uint16_t(post[12]) | (uint16_t(post[13]) << 8); // reg 6
+    SimHarness s;
+    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, size_t(G2_S1) * 16, s1);
+    s.load({
+        insn::CONFIG_TILE(1, 4, 1),
+        insn::R_TYPE(0x1F, BUF_ABUF_ID, G2_S1, BUF_ABUF_ID, 0,
+                     BUF_ABUF_ID, 0, 5, 1),   // sreg=5 -> regs 5,6
+        insn::SYNC(0b100),
+        insn::HALT(),
+    });
+    s.run(250000);
+    if (s.dut->fault) TEST_FAIL(name, "unexpected fault");
+    uint16_t g5 = scale_reg(s, 5), g6 = scale_reg(s, 6);
+    if (g5 != exp5 || g6 != exp6) {
+        std::fprintf(stderr, "%s: reg5 got=%04x exp=%04x  reg6 got=%04x "
+                     "exp=%04x\n", name, g5, exp5, g6, exp6);
+        TEST_FAIL(name, "scale-reg writeback mismatch");
+    }
+    TEST_PASS(name);
+}
+
+static void test_g2_max_abs_reduce_fp32() {
+    run_g2_max_abs_reduce("g2_max_abs_reduce_std",
+                          "fixtures/gen2/max_abs_reduce_fp32/std");
+    run_g2_max_abs_reduce("g2_max_abs_reduce_zero",
+                          "fixtures/gen2/max_abs_reduce_fp32/all_zero");
+}
+
+static void test_g2_dequant_accum_fp32_scaled() {
+    const char* name = "g2_dequant_accum_fp32_scaled";
+    const int band = 0;   // non-transcendental: bit-exact (freeze §7)
+    const std::string d = "fixtures/gen2/dequant_accum_fp32_scaled/std";
+    auto s1 = read_binary_file(name, d + "/input_src1.raw");      // M*N i32
+    auto s2 = read_binary_file(name, d + "/input_src2.raw");      // 2N fp16
+    auto pre = read_binary_file(name, d + "/scale_regs_pre.raw"); // 16 fp16
+    auto expected = read_binary_file(name, d + "/expected_out.raw");
+    uint16_t a7 = uint16_t(pre[14]) | (uint16_t(pre[15]) << 8);   // reg 7 act
+    SimHarness s;
+    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, s1);
+    sram_write_bytes(s.dut.get(), BUF_WBUF_ID, size_t(G2_S2) * 16, s2);
+    s.load({
+        insn::SET_SCALE(7, a7),
+        insn::CONFIG_TILE(1, 4, 1),
+        insn::R_TYPE(0x1E, BUF_ACCUM_ID, 0, BUF_WBUF_ID, G2_S2,
+                     BUF_ABUF_ID, G2_DST, 7, 1),
+        insn::SYNC(0b100),
+        insn::HALT(),
+    });
+    s.run(250000);
+    if (s.dut->fault) TEST_FAIL(name, "unexpected fault");
+    auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID,
+                               size_t(G2_DST) * 16, G2_OUT_BYTES);
+    expect_fp16_ulp(name, got, expected, band);   // freeze §7 per-op band
+    TEST_PASS(name);
+}
+
+// 0x1F write-back determinism + survival across a following op/SYNC:
+// both 0x1F calls (same input, different sreg) write the SAME value, and
+// the first result survives the second op. NOT a consumer-visibility test
+// (no 0x18/0x1E reads the written scale here) — the real H2 chain
+// (0x1F -> SYNC -> consumer reading that scale) is exercised by the
+// end-to-end gate (P6) via the compiled bundle.
+static void test_g2_scale_chain() {
+    const char* name = "g2_scale_chain_1f_sync";
+    const std::string d = "fixtures/gen2/max_abs_reduce_fp32/std";
+    auto s1 = read_binary_file(name, d + "/input_src1.raw");
+    auto post = read_binary_file(name, d + "/scale_regs_post.raw");
+    uint16_t exp5 = uint16_t(post[10]) | (uint16_t(post[11]) << 8);
+    SimHarness s;
+    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, size_t(G2_S1) * 16, s1);
+    s.load({
+        insn::CONFIG_TILE(1, 4, 1),
+        insn::R_TYPE(0x1F, BUF_ABUF_ID, G2_S1, BUF_ABUF_ID, 0,
+                     BUF_ABUF_ID, 0, 5, 1),
+        insn::SYNC(0b100),               // wait for 0x1F (SFU) to retire
+        insn::R_TYPE(0x1F, BUF_ABUF_ID, G2_S1, BUF_ABUF_ID, 0,
+                     BUF_ABUF_ID, 0, 8, 1),   // 2nd 0x1F, different sreg
+        insn::SYNC(0b100),
+        insn::HALT(),
+    });
+    s.run(250000);
+    if (s.dut->fault) TEST_FAIL(name, "unexpected fault");
+    // First 0x1F's result must survive the second op; both write same val.
+    if (scale_reg(s, 5) != exp5 || scale_reg(s, 8) != exp5)
+        TEST_FAIL(name, "scale not visible across SYNC");
+    TEST_PASS(name);
+}
+
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
 
@@ -1301,6 +1398,9 @@ int main(int argc, char** argv) {
     test_g2_dequant_accum_fp32();
     test_g2_quant_fp32_int8();
     test_g2_masked_softmax_fp32();
+    test_g2_max_abs_reduce_fp32();
+    test_g2_dequant_accum_fp32_scaled();
+    test_g2_scale_chain();
 
     std::printf("\n%d / %d tests passed\n", tests_pass, tests_run);
     if (tests_pass != tests_run) std::exit(1);

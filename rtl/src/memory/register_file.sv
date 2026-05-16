@@ -85,7 +85,7 @@ module register_file
   // -------------------------------------------------------------------------
   // Scale registers: 16 × FP16 (16 bits each)
   // -------------------------------------------------------------------------
-  logic [15:0] scale_regs [0:NUM_SCALE_REGS-1];
+  logic [15:0] scale_regs [0:NUM_SCALE_REGS-1] /* verilator public_flat_rd */;
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin

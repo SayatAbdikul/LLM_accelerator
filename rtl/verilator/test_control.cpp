@@ -204,18 +204,18 @@ static void test_illegal_opcode() {
 }
 
 // ============================================================================
-// Test: a legal gen-2 FP32 op decodes fine but faults FAULT_UNSUPPORTED_OP
-// until its SFU datapath lands (P2-P5). Verifies P1 control-side gating.
+// Test: all 8 gen-2 ops are implemented (P2-P5) for flags=1 (FP16 storage),
+// but flags=0 (FP32/W8A32 storage) is permanently out of scope and must
+// fault FAULT_UNSUPPORTED_OP. Permanent invariant (no longer per-phase).
 // ============================================================================
 static void test_gen2_unsupported() {
-    const char* name = "gen2_unsupported_fault";
+    const char* name = "gen2_flags0_unsupported_fault";
     SimHarness s;
-    // 0x1E DEQUANT_ACCUM_FP32_SCALED: legal gen-2 opcode whose SFU
-    // datapath lands in P5 — still FAULT_UNSUPPORTED_OP for now
-    // (0x17-0x1B/0x1D became supported in P2-P4). flags=1, valid buffers.
-    s.load({ insn::R_TYPE(0x1E, 0, 0, 0, 0, 0, 0, 0, 1), insn::HALT() });
+    // 0x19 VADD_FP32 with flags=0 (FP32 storage) — legal opcode, supported
+    // path is flags=1 only; flags=0 -> FAULT_UNSUPPORTED_OP at dispatch.
+    s.load({ insn::R_TYPE(0x19, 0, 0, 0, 0, 0, 0, 0, 0), insn::HALT() });
     s.run(500);
-    EXPECT(s.dut->fault == 1, "fault asserted for unimplemented gen-2 op");
+    EXPECT(s.dut->fault == 1, "fault asserted for gen-2 flags=0");
     EXPECT(s.dut->done  == 0, "done should be 0 on fault");
     EXPECT(s.dut->fault_code == 6, "fault_code = FAULT_UNSUPPORTED_OP (6)");
     TEST_PASS(name);
