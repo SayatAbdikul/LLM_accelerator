@@ -189,16 +189,33 @@ static void test_sync_all_idle() {
 }
 
 // ============================================================================
-// Test: Illegal opcode 0x17 → fault
+// Test: Illegal opcode 0x1C (SOFTMAX_FP32, the only reserved opcode under
+// the frozen gen-2 ISA) → FAULT_ILLEGAL_OP
 // ============================================================================
 static void test_illegal_opcode() {
     const char* name = "illegal_opcode_fault";
     SimHarness s;
-    s.load({ insn::ILLEGAL_OP() });
+    s.load({ insn::ILLEGAL_OP() });   // 0x1C
     s.run(500);
     EXPECT(s.dut->fault == 1, "fault asserted for illegal opcode");
     EXPECT(s.dut->done  == 0, "done should be 0 on fault");
     EXPECT(s.dut->fault_code == 1, "fault_code = FAULT_ILLEGAL_OP (1)");
+    TEST_PASS(name);
+}
+
+// ============================================================================
+// Test: a legal gen-2 FP32 op decodes fine but faults FAULT_UNSUPPORTED_OP
+// until its SFU datapath lands (P2-P5). Verifies P1 control-side gating.
+// ============================================================================
+static void test_gen2_unsupported() {
+    const char* name = "gen2_unsupported_fault";
+    SimHarness s;
+    // 0x17 DEQUANT_ACCUM_FP32: src1=ACCUM, src2=WBUF, dst=ABUF, flags=1.
+    s.load({ insn::R_TYPE(0x17, 2, 0, 1, 0, 0, 0, 0, 1), insn::HALT() });
+    s.run(500);
+    EXPECT(s.dut->fault == 1, "fault asserted for unimplemented gen-2 op");
+    EXPECT(s.dut->done  == 0, "done should be 0 on fault");
+    EXPECT(s.dut->fault_code == 6, "fault_code = FAULT_UNSUPPORTED_OP (6)");
     TEST_PASS(name);
 }
 
@@ -553,6 +570,7 @@ int main(int argc, char** argv) {
     test_sync_nop();
     test_sync_all_idle();
     test_illegal_opcode();
+    test_gen2_unsupported();
     test_config_attn_context();
     test_config_attn_faults();
     test_masked_sfu_context_faults();

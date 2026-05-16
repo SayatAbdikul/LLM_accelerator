@@ -428,16 +428,50 @@ int main(int argc, char** argv) {
     end_test();
 
     // -----------------------------------------------------------------------
-    // Reserved opcode 0x17 → illegal=1
+    // gen-2 FP32 ops (frozen ISA, software/docs/isa_generation_freeze.md):
+    // 0x17-0x1B / 0x1D-0x1F decode LEGAL with full R-type fields; only
+    // 0x1C SOFTMAX_FP32 stays reserved → illegal=1.
     // -----------------------------------------------------------------------
-    begin_test("decode_illegal_opcode_0x17");
-    apply(uint64_t(0x17) << OPCODE_SHIFT);
-    CHK(opcode,  0x17);
+    {
+      static const uint64_t kGen2[8] =
+          {0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1D, 0x1E, 0x1F};
+      char nm[40];
+      for (int i = 0; i < 8; i++) {
+        uint64_t op = kGen2[i];
+        snprintf(nm, sizeof(nm), "decode_gen2_legal_0x%02llX",
+                 (unsigned long long)op);
+        begin_test(nm);
+        apply((op         << OPCODE_SHIFT)      |
+              (uint64_t(2) << R_SRC1_BUF_SHIFT) |
+              (uint64_t(7) << R_SRC1_OFF_SHIFT) |
+              (uint64_t(1) << R_SRC2_BUF_SHIFT) |
+              (uint64_t(8) << R_SRC2_OFF_SHIFT) |
+              (uint64_t(0) << R_DST_BUF_SHIFT)  |
+              (uint64_t(9) << R_DST_OFF_SHIFT)  |
+              (uint64_t(5) << R_SREG_SHIFT)     |
+              (uint64_t(1) << R_FLAGS_SHIFT));
+        CHK(opcode,   op);
+        CHK(illegal,  0);
+        CHK(src1_buf, 2);
+        CHK(src2_buf, 1);
+        CHK(dst_off,  9);
+        CHK(sreg,     5);
+        CHK(flags,    1);
+        end_test();
+      }
+    }
+
+    // 0x1C SOFTMAX_FP32 is the only reserved opcode now.
+    begin_test("decode_reserved_opcode_0x1C");
+    apply(uint64_t(0x1C) << OPCODE_SHIFT);
+    CHK(opcode,  0x1C);
     CHK(illegal, 1);
     end_test();
 
-    begin_test("decode_illegal_opcode_0x1F");
-    apply(uint64_t(0x1F) << OPCODE_SHIFT);
+    // gen-2 ops must still reject reserved buffer ID 0b11 (R-type buf check).
+    begin_test("decode_illegal_buf_gen2_src1_0b11");
+    apply((uint64_t(0x1F) << OPCODE_SHIFT) |       // MAX_ABS_REDUCE_FP32
+          (uint64_t(3)    << R_SRC1_BUF_SHIFT));    // 0b11 = reserved
     CHK(illegal, 1);
     end_test();
 

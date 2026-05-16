@@ -1,0 +1,16 @@
+{
+  "M": 16,
+  "N": 64,
+  "src1_off": 0,
+  "src2_off": 512,
+  "dst_off": 1024,
+  "frozen_golden_sha": "aa9a9c0fa389d77598acfe68f4ac1347bd9fc9ef",
+  "op": "masked_softmax_fp32",
+  "opcode": 29,
+  "sreg": 0,
+  "flags": 1,
+  "src1_dtype": "fp16",
+  "dst_dtype": "fp16",
+  "attn_query_row_base": 0,
+  "attn_valid_kv_len": 64
+}

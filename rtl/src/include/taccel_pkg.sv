@@ -41,8 +41,18 @@ package taccel_pkg;
     OP_DEQUANT_ADD = 5'h13,
     OP_CONFIG_ATTN = 5'h14,
     OP_MASKED_SOFTMAX = 5'h15,
-    OP_MASKED_SOFTMAX_ATTNV = 5'h16
-    // 5'h17-5'h1F: reserved — illegal instruction fault
+    OP_MASKED_SOFTMAX_ATTNV = 5'h16,
+    // gen-2 (W8A32 Phase 3 (c.1)) FP32 sub-layer opcodes — frozen ISA
+    // (software/docs/isa_generation_freeze.md). FP16 storage / FP32 internal.
+    OP_DEQUANT_ACCUM_FP32        = 5'h17,
+    OP_QUANT_FP32_INT8           = 5'h18,
+    OP_VADD_FP32                 = 5'h19,
+    OP_LAYERNORM_FP32            = 5'h1A,
+    OP_GELU_FP32                 = 5'h1B,
+    // 5'h1C SOFTMAX_FP32: reserved — illegal (non-causal, no consumer)
+    OP_MASKED_SOFTMAX_FP32       = 5'h1D,
+    OP_DEQUANT_ACCUM_FP32_SCALED = 5'h1E,
+    OP_MAX_ABS_REDUCE_FP32       = 5'h1F
   } opcode_t;
 
   // -------------------------------------------------------------------------

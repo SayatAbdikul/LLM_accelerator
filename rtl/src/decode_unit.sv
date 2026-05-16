@@ -29,10 +29,13 @@ module decode_unit
   assign opcode_raw = insn_data[63:59];
 
   // -------------------------------------------------------------------------
-  // Illegal opcode: reserved range 0x17-0x1F
+  // Illegal opcode: only 0x1C SOFTMAX_FP32 stays reserved (gen-2 ISA freeze —
+  // non-causal, no current frontend consumer). 0x00-0x16 and the gen-2 FP32
+  // ops 0x17-0x1B/0x1D-0x1F are all legal. (opcode_raw is 5-bit so the
+  // formerly "> 0x16" range is now legal except 0x1C.)
   // -------------------------------------------------------------------------
   logic illegal_opcode;
-  assign illegal_opcode = (opcode_raw > 5'h16);
+  assign illegal_opcode = (opcode_raw == 5'h1C);
 
   // CONFIG_ATTN has reserved bits [32:0], matching the software decoder.
   logic illegal_attn_reserved;
@@ -51,7 +54,10 @@ module decode_unit
         // R-type: check src1, src2, dst
         5'h0A, 5'h0B, 5'h0C, 5'h0D, 5'h0E,
         5'h0F, 5'h10, 5'h11, 5'h12, 5'h13,
-        5'h15, 5'h16: begin
+        5'h15, 5'h16,
+        // gen-2 FP32 R-type ops (0x1C excluded — illegal_opcode handles it)
+        5'h17, 5'h18, 5'h19, 5'h1A, 5'h1B,
+        5'h1D, 5'h1E, 5'h1F: begin
           if (insn_data[58:57] == 2'b11 ||
               insn_data[40:39] == 2'b11 ||
               insn_data[22:21] == 2'b11)

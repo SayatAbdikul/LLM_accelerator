@@ -113,10 +113,12 @@ To make golden-vs-RTL cosim possible on the production path:
    end-to-end bundle byte-matches.
 6. **Pinned reference golden.** RTL conformance is measured against
    `software/taccel/golden_model/simulator.py` **at the commit created by
-   the §5 commit**: record here `frozen_golden_sha = <to be filled in on
-   the §5 commit>`. Any later `simulator.py` change requires a new freeze
-   revision — otherwise "cosim vs the gen-2 golden" is a moving target,
-   the exact failure this freeze exists to close.
+   the §5 commit**: `frozen_golden_sha = aa9a9c0fa389d77598acfe68f4ac1347bd9fc9ef`
+   (recorded 2026-05-16; §5 spec files committed/clean). Golden fixtures
+   under `rtl/verilator/fixtures/gen2/` are pinned to this SHA via
+   `software/tools/gen_gen2_fixtures.py`. Any later `simulator.py` change
+   requires a new freeze revision + fixture regen — otherwise "cosim vs the
+   gen-2 golden" is a moving target, the exact failure this freeze closes.
 
 ## 5. Actions required to *complete* the freeze (owner: user — I do not commit)
 

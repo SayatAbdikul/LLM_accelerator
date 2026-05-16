@@ -264,8 +264,10 @@ inline uint64_t DEQUANT_ADD(int src1_buf, int src1_off, int src2_buf, int src2_o
     return R_TYPE(0x13, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags);
 }
 
-// Illegal opcode for fault tests
-constexpr uint64_t ILLEGAL_OP() { return uint64_t(0x17) << OPCODE_SHIFT; }
+// Illegal opcode for fault tests. Under the frozen gen-2 ISA only 0x1C
+// (SOFTMAX_FP32) is reserved/illegal; 0x17-0x1B / 0x1D-0x1F are legal gen-2
+// FP32 opcodes (see software/docs/isa_generation_freeze.md).
+constexpr uint64_t ILLEGAL_OP() { return uint64_t(0x1C) << OPCODE_SHIFT; }
 
 } // namespace insn
 

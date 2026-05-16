@@ -178,6 +178,23 @@ module control_unit
         OP_SET_SCALE:
           unsupported_op = (s_src_mode != 2'b00);
 
+        // gen-2 FP32 sub-layer ops (frozen ISA): legal to decode, but the
+        // SFU datapaths land incrementally in P2-P5. Until then they fault
+        // FAULT_UNSUPPORTED_OP rather than dispatching to an SFU that cannot
+        // execute them. Per-op lines flip to `(insn.flags == 1'b0)` as each
+        // datapath lands (flags=0 FP32/W8A32 storage stays permanently
+        // unsupported; only flags=1 FP16 is the frozen W8A16 conformance
+        // path). 0x1C SOFTMAX_FP32 is illegal (handled by decode), not here.
+        OP_DEQUANT_ACCUM_FP32,
+        OP_QUANT_FP32_INT8,
+        OP_VADD_FP32,
+        OP_LAYERNORM_FP32,
+        OP_GELU_FP32,
+        OP_MASKED_SOFTMAX_FP32,
+        OP_DEQUANT_ACCUM_FP32_SCALED,
+        OP_MAX_ABS_REDUCE_FP32:
+          unsupported_op = 1'b1;
+
         default:
           unsupported_op = 1'b0;
       endcase
@@ -234,7 +251,8 @@ module control_unit
             fault_code_r <= ext_fault_code;
             state        <= S_FAULT;
           end else if (insn.illegal) begin
-            if (insn.opcode > 5'h16) begin
+            if (insn.opcode == 5'h1C) begin
+              // 0x1C SOFTMAX_FP32 is the only reserved opcode (gen-2 freeze).
               fault_code_r <= 4'(FAULT_ILLEGAL_OP);
               obs_ctrl_fault_code <= 4'(FAULT_ILLEGAL_OP);
             end else if (insn.opcode == OP_CONFIG_ATTN) begin
