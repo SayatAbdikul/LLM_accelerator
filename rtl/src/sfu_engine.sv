@@ -314,8 +314,20 @@ module sfu_engine
   );
     int q_i;
     begin
+      // Option B non-finite requant contract (isa_generation_freeze.md §7
+      // item 8, P6g/#110): NaN -> 0, +inf -> +127, -inf -> -128,
+      // finite-overflow -> saturate. Explicit & deterministic — matches
+      // the golden np.where(isnan,0,np.clip(...)) semantics. Threshold
+      // 1e40 unambiguously separates +-inf from any finite operand on
+      // this datapath (fp32 max 3.4e38; fp16-sourced |x| <= 65504).
       if (out_scale_r == 0.0) begin
         quantize_to_i8 = 8'h00;
+      end else if (value_r != value_r) begin
+        quantize_to_i8 = 8'h00;            // NaN -> 0
+      end else if (value_r > 1.0e40) begin
+        quantize_to_i8 = 8'h7F;            // +inf -> +127
+      end else if (value_r < -1.0e40) begin
+        quantize_to_i8 = 8'h80;            // -inf -> -128
       end else begin
         q_i = sfu_fp32_quantize_i8(value_r, out_scale_r);
         if (q_i > 127)

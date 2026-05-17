@@ -150,9 +150,13 @@ To make golden-vs-RTL cosim possible on the production path:
    primary-source): **(a) well-posed boundary** — golden first overflows
    fp16 at `block0_out_proj` (pc 2298, 48/768 → ±65504/NaN; the W8A16
    storage format genuinely saturates at 124M MLP dynamic range, model
-   still 55.76 PPL); `block0_out_proj` is byte-identical incl. NaN
-   positions (RTL faithfully reproduces even the overflow), and the full
-   pre-boundary prefill is 0 ULP modulo the one bug above. **(b) BUG1** —
+   still 55.76 PPL). The `block0_out_proj` *trace snapshot* matches
+   byte-identically at its capture point, but that snapshot is a
+   non-functional tile: it is requantized → stored → reloaded (int8)
+   before the residual path consumes it, and the **functional** out_proj
+   is that reloaded int8 representation — which is exactly where BUG2
+   enters (P6d ground truth, #107). The full pre-boundary prefill is
+   0 ULP modulo the one bug above. **(b) BUG1** —
    `block0_head0_query` (first Q-projection, head-0 only; heads 1–11 all
    0 ULP) miscomputes; architecturally inert at seq=1 (`softmax(1,1)`).
    Task **#108 (P6e)**. **(c) BUG2** — past the overflow boundary,
@@ -178,8 +182,16 @@ To make golden-vs-RTL cosim possible on the production path:
    within the same or a later commit, so the pin is enforced at the
    content level: the SHA-1 git-blob hash of
    `software/taccel/golden_model/simulator.py` is
-   `7746e65598961ac8430f8eeece45d7ec976584cd` (the blob at `aa9a9c0`;
-   verified byte-identical at `HEAD` `3314043` and in the worktree).
+   `131d3ef1a6009519976cf99baf9157a434e67f6f` (**freeze §6 REVISION
+   2026-05-17, P6g / Option B, task #110**: the 0x18 `QUANT_FP32_INT8`
+   non-finite requant contract was made explicit per §7 item 8 Option B —
+   NaN→0, ±inf→±127/−128, finite-overflow→saturate. Numerically identical
+   to the prior `np.clip(...).astype(np.int8)` on the pinned numpy: all
+   gen-2 `.raw` fixtures regenerated **byte-identical**, only the
+   `meta.json` sha-stamp changed. Prior pin
+   `7746e65598961ac8430f8eeece45d7ec976584cd` (pre-P6g, blob at `aa9a9c0`).
+   New commit SHA is set by the user on external commit; this blob hash is
+   the authoritative enforced pin and is what the test recomputes).
    `software/tests/test_compare_rtl_golden.py::test_frozen_golden_sha_pin`
    recomputes this blob hash and **fails loud** on any drift — the gen-2
    conformance gate refuses to run a comparison against an unpinned
@@ -213,6 +225,62 @@ To make golden-vs-RTL cosim possible on the production path:
      the freeze already pins a golden SHA. Characterizing the band per
      op-class is the disciplined resolution the §6 revision mechanism is
      for. `expect_fp16_ulp` enforces these bands per op in `test_sfu.cpp`.
+8. **Non-finite requant contract — Option B CHOSEN & IMPLEMENTED
+   (2026-05-17, user pick; P6g / #110).** At
+   GPT-2 124M the W8A16 fp16 storage genuinely overflows in the MLP/attn
+   path (golden too). The requant op (`QUANT_FP32_INT8` 0x18 / the
+   `DEQUANT_ACCUM_*` int8-clamp paths — same idiom
+   `np.clip(np.round(x·s),-128,127).astype(np.int8)`) then has to map a
+   **non-finite** fp32 to int8. **Golden, measured (numpy 1.26.4):** the
+   `np.clip(…,-128,127)` saturates finite-overflow and ±inf → ±127/−128;
+   **NaN passes the clip and `NaN.astype(int8)` → 0**. RTL's 0x18
+   datapath does *not* reproduce this (hardware clip comparisons are
+   all-false for NaN → garbage int8, not 0). This is BUG2. Pick one
+   (each is mechanical; A and B converge on identical code/RTL, differ
+   only in how §7 reads; C changes the rule instead of the RTL):
+   - **Option A — pin the (current) golden semantics.** Make golden
+     explicit: `np.where(np.isfinite(x), np.clip(np.round(x·s),-128,127),
+     0).astype(np.int8)` (NaN→0, ±inf/overflow→saturate), numpy-version
+     independent; specify it in this §; RTL implements NaN→0 / saturate.
+   - **Option B — choose a hw-sane contract from scratch.** §7 specifies
+     NaN→0, ±inf→±127, overflow→saturate; golden enforced explicitly
+     (same patch as A); RTL implements it. Identical end state to A; only
+     this paragraph's framing differs (B = "designed", A = "pins numpy").
+   - **Option C — don't fix in RTL; characterize at logits.** Declare the
+     §5 well-posed region = "up to the first golden non-finite tensor";
+     past it, conformance is the logits-level metric (#109 / P6f). RTL's
+     non-finite handling is allowed to differ. The gelu-band move applied
+     to overflow; no RTL/golden code change, the metric moves instead.
+   Same §6 revision discipline as the §7 bands: this is a *characterized
+   contract decision*, not a silent relax.
+   **Decision & implementation (P6g / #110).** User chose **Option B**
+   (FPGA-deployment rationale: deterministic, explicitly-specified,
+   version-independent — A's "pin numpy `NaN.astype`" is the same
+   fragility the freeze rejected for gelu; C alone leaves silicon
+   behavior unspecified in a reachable regime). Implemented & staged:
+   golden `_exec_quant_fp32_int8` (:856) made explicit
+   `np.where(np.isnan(scaled), 0, np.clip(scaled,-128,127)).astype(int8)`
+   (NaN→0, ±inf/overflow→saturate); the synthesizable SV
+   `quantize_to_i8` (`sfu_engine.sv`) gets NaN→0 / ±inf→±127 guards;
+   the DPI `sfu_fp32_quantize_i8` kept consistent. **Behavior-preserving
+   on the pinned numpy** — all gen-2 `.raw` fixtures regenerated
+   byte-identical (only the `meta.json` sha-stamp changed); content pin
+   re-pinned (§6 revision, blob `131d3ef1…`). The contract is correct
+   and FPGA-deployable on its own merits.
+   **Empirical caveat (do not over-read):** implementing B did **not**
+   move the GPT-2 124M cosim boundary (identical `block0_residual1`
+   cascade, gNaN=rNaN=0 finite-vs-finite). **B is not BUG2's cause.**
+   P6h/#111 re-rooted and **bisected** BUG2: the functional out_proj is
+   `MATMUL@pc2131 → 0x1E@pc2141`, and the **INT32 ACCUM diverges
+   512/768 columns *before* the dequant** (golden vs RTL, max|Δ|≈1.6e5).
+   So **0x1E is innocent**, the non-finite contract is unrelated
+   (provably never fires functionally: 1177 0x18 calls, 0 non-finite),
+   and **BUG2's true root is the systolic-array 48-tile deep-K
+   accumulation** (attn-output projection, concat[768]@Wo[768×768]) — the
+   deep-K regime untested by P1–P5 / P6b-tiny. Root-cause+fix tracked as
+   **task #112 / P6i**. The Option B non-finite contract stands
+   independently as the correct, FPGA-deployable hardware behavior
+   regardless of BUG2.
 
 ## 5. Actions required to *complete* the freeze (owner: user — I do not commit)
 

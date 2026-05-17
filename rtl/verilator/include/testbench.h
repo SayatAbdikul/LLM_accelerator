@@ -84,6 +84,14 @@ extern "C" int sfu_fp32_quantize_i8(double value_r, double out_scale_r) {
     const float out_scale = static_cast<float>(out_scale_r);
     if (out_scale == 0.0f)
         return 0;
+    // Option B non-finite requant contract (isa_generation_freeze.md §7
+    // item 8, P6g/#110): NaN -> 0, +-inf -> +-127/-128. Kept consistent
+    // with the synthesizable SV quantize_to_i8 and golden so DPI-backed
+    // unit benches agree. Finite-overflow is saturated by the clamp below.
+    if (std::isnan(value_r))
+        return 0;
+    if (std::isinf(value_r))
+        return value_r > 0.0 ? 127 : -128;
     int q = sfu_round_half_even_fp32_scalar(static_cast<float>(value_r) / out_scale);
     q = std::clamp(q, -128, 127);
     return q;

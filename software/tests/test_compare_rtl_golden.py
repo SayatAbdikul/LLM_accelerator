@@ -51,9 +51,15 @@ from taccel.runtime.tiny_fixture import (
 # --------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GOLDEN_MODEL_PATH = REPO_ROOT / "software" / "taccel" / "golden_model" / "simulator.py"
-# git-blob SHA-1 of simulator.py at frozen commit aa9a9c0 (freeze §4.6/§6),
-# verified byte-identical at HEAD 3314043 and worktree on 2026-05-16.
-FROZEN_GOLDEN_BLOB_SHA = "7746e65598961ac8430f8eeece45d7ec976584cd"
+# git-blob SHA-1 of simulator.py. Freeze §6 REVISION 2026-05-17 (P6g /
+# Option B, task #110): the 0x18 QUANT_FP32_INT8 non-finite contract was
+# made explicit (NaN->0, +-inf->saturate); numerically identical to the
+# prior idiom on the pinned numpy (all gen-2 .raw fixtures byte-stable,
+# only the meta.json sha-stamp changed) but a source change, so the
+# content pin is re-pinned. Prior: 7746e65598961ac8430f8eeece45d7ec976584cd
+# (pre-P6g; freeze commit aa9a9c0). New commit SHA is set by the user on
+# external commit; this blob hash is the authoritative enforced pin.
+FROZEN_GOLDEN_BLOB_SHA = "131d3ef1a6009519976cf99baf9157a434e67f6f"
 
 # freeze §4.5: the conformance bundle is the GPT-2 W8A16 weight_only_int8_quarot
 # generation. Its FP32 sub-layer ops are the gen-2 ISA this freeze covers.
@@ -118,7 +124,7 @@ def test_frozen_golden_sha_pin():
     actual = _git_blob_sha1(GOLDEN_MODEL_PATH)
     assert actual == FROZEN_GOLDEN_BLOB_SHA, (
         "FROZEN GOLDEN DRIFT — gen-2 conformance is undefined.\n"
-        f"  expected blob {FROZEN_GOLDEN_BLOB_SHA} (freeze §6, commit aa9a9c0)\n"
+        f"  expected blob {FROZEN_GOLDEN_BLOB_SHA} (freeze §6 rev 2026-05-17, P6g/B)\n"
         f"  actual   blob {actual}\n"
         f"  file: {GOLDEN_MODEL_PATH}\n"
         "simulator.py changed since the freeze. Per freeze §6 this REQUIRES "

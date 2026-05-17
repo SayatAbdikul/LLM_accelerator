@@ -853,7 +853,16 @@ class Simulator:
 
         scale = np.float32(self.state.scale_regs[insn.sreg])
         src = mem.read_fp16_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
-        result = np.clip(np.round(src * scale), -128, 127).astype(np.int8)
+        # Option B non-finite requant contract (freeze §7.8): NaN -> 0,
+        # +-inf -> +-127/-128 (np.clip saturates them), finite-overflow ->
+        # saturate. Explicit so it does NOT depend on numpy's NaN->int cast
+        # (fragile across numpy versions / platforms); numerically identical
+        # to the prior `np.clip(...).astype(np.int8)` on the pinned numpy
+        # (NaN -> 0 either way) but version-independent and warning-free.
+        scaled = np.round(src * scale)
+        result = np.where(
+            np.isnan(scaled), np.float32(0.0), np.clip(scaled, -128, 127)
+        ).astype(np.int8)
         mem.write_int8_tile(self.state, insn.dst_buf, insn.dst_off, result)
         self.state.cycle_count += M * N
 
