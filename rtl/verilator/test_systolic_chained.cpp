@@ -494,6 +494,122 @@ void test_matmul_multitile_2x2x2() {
   TEST_PASS(name);
 }
 
+// P6k BUG2 reproducer. Faithfully mirrors the codegen tiled-matmul path
+// (emit_matmul_w8a16_large_weight_tiled): the SAME 32x32 data as the known-
+// exact test_matmul_multitile_2x2x2 (V1), but K is split into two MatmulInsn
+// (strip0 flags=0, strip1 flags=1) over a 2x2 OUTPUT-tile grid — exactly
+// out_proj/fc1/fc2's structure. Oracle = matmul_ref_32 (exact). Also builds
+// the PREDICTED-BUGGY ACCUM from the systolic_controller clear_acc model
+// (clear_acc suppressed for the whole flags=1 walk; single pe_acc carried
+// across all (m,n) tiles; drain overwrites) so we verify the SPECIFIC
+// failure shape, not merely "diverges". DIAGNOSTIC: never aborts the suite.
+void test_ksplit_accumulate_diagnostic() {
+  const char* name = "matmul_chained_ksplit_accumulate_DIAG";
+  Sim s;
+  int8_t a[32][32] = {};
+  int8_t b[32][32] = {};
+  int32_t exp[32][32] = {};
+  std::vector<uint64_t> prog;
+
+  // Identical generator to test_matmul_multitile_2x2x2 (the V1 contrast).
+  for (int i = 0; i < 32; ++i)
+    for (int j = 0; j < 32; ++j) {
+      a[i][j] = static_cast<int8_t>(((i * 7 + j * 5 + 3) % 11) - 5);
+      b[i][j] = static_cast<int8_t>(((i * 3 + j * 9 + 1) % 13) - 6);
+    }
+  matmul_ref_32(a, b, exp);  // correct answer (exact int32)
+
+  // Strip partials: exp == P0 (k 0..15) + P1 (k 16..31).
+  int32_t P0[32][32] = {}, P1[32][32] = {};
+  for (int i = 0; i < 32; ++i)
+    for (int j = 0; j < 32; ++j) {
+      int32_t s0 = 0, s1 = 0;
+      for (int k = 0; k < 16; ++k)  s0 += int32_t(a[i][k]) * int32_t(b[k][j]);
+      for (int k = 16; k < 32; ++k) s1 += int32_t(a[i][k]) * int32_t(b[k][j]);
+      P0[i][j] = s0; P1[i][j] = s1;
+    }
+
+  // Predicted-buggy ACCUM: pe_acc carried across all tiles, never cleared in
+  // the flags=1 walk; tile order (m0,n0)(m0,n1)(m1,n0)(m1,n1); MATMUL#1
+  // (flags=0, per-tile clear — correct) leaves pe = P0 block (m1,n1).
+  int32_t pe[16][16];
+  for (int r = 0; r < 16; ++r)
+    for (int c = 0; c < 16; ++c) pe[r][c] = P0[16 + r][16 + c];
+  int32_t predicted[32][32] = {};
+  const int order[4][2] = {{0, 0}, {0, 1}, {1, 0}, {1, 1}};
+  for (int t = 0; t < 4; ++t) {
+    int mt = order[t][0], nt = order[t][1];
+    for (int r = 0; r < 16; ++r)
+      for (int c = 0; c < 16; ++c) pe[r][c] += P1[mt * 16 + r][nt * 16 + c];
+    for (int r = 0; r < 16; ++r)
+      for (int c = 0; c < 16; ++c)
+        predicted[mt * 16 + r][nt * 16 + c] = pe[r][c];  // drain overwrites
+  }
+
+  // K-strips: A_k0=a[:,0:16] [32x16], A_k1=a[:,16:32]; B_k0=b[0:16,:] [16x32],
+  // B_k1=b[16:32,:]. Each strip 512 B = 32 units.
+  std::vector<uint8_t> ak0(32 * 16), ak1(32 * 16), bk0(16 * 32), bk1(16 * 32);
+  for (int r = 0; r < 32; ++r)
+    for (int c = 0; c < 16; ++c) {
+      ak0[r * 16 + c] = uint8_t(a[r][c]);
+      ak1[r * 16 + c] = uint8_t(a[r][16 + c]);
+    }
+  for (int r = 0; r < 16; ++r)
+    for (int c = 0; c < 32; ++c) {
+      bk0[r * 32 + c] = uint8_t(b[r][c]);
+      bk1[r * 32 + c] = uint8_t(b[16 + r][c]);
+    }
+  const uint64_t AK0 = 0x200000, AK1 = 0x208000, BK0 = 0x210000, BK1 = 0x218000;
+  write_dram_bytes(s.dram, AK0, ak0);
+  write_dram_bytes(s.dram, AK1, ak1);
+  write_dram_bytes(s.dram, BK0, bk0);
+  write_dram_bytes(s.dram, BK1, bk1);
+  append_load_sync(prog, 0, AK0, BUF_ABUF_ID, 0,  (32 * 16) / 16);
+  append_load_sync(prog, 0, AK1, BUF_ABUF_ID, 32, (32 * 16) / 16);
+  append_load_sync(prog, 1, BK0, BUF_WBUF_ID, 0,  (16 * 32) / 16);
+  append_load_sync(prog, 1, BK1, BUF_WBUF_ID, 32, (16 * 32) / 16);
+
+  prog.push_back(insn::CONFIG_TILE(2, 2, 1));
+  prog.push_back(insn::MATMUL(BUF_ABUF_ID, 0, BUF_WBUF_ID, 0, BUF_ACCUM_ID, 0, 0, 0));
+  prog.push_back(insn::SYNC(0b010));
+  prog.push_back(insn::CONFIG_TILE(2, 2, 1));
+  prog.push_back(insn::MATMUL(BUF_ABUF_ID, 32, BUF_WBUF_ID, 32, BUF_ACCUM_ID, 0, 0, 1));
+  prog.push_back(insn::SYNC(0b010));
+  prog.push_back(insn::HALT());
+
+  s.load_program(prog);
+  s.run(1500000);
+  expect_clean_halt(name, s.dut.get());
+
+  int32_t got[32][32];
+  for (int i = 0; i < 32; ++i)
+    for (int j = 0; j < 32; ++j)
+      got[i][j] = read_accum_32x32(s.dut.get(), 0, i, j);
+
+  int n_vs_exp = 0, n_vs_pred = 0;
+  for (int i = 0; i < 32; ++i)
+    for (int j = 0; j < 32; ++j) {
+      if (got[i][j] != exp[i][j]) n_vs_exp++;
+      if (got[i][j] != predicted[i][j]) n_vs_pred++;
+    }
+  std::printf("DIAG ksplit: mismatch vs CORRECT exp           = %d / 1024\n", n_vs_exp);
+  std::printf("DIAG ksplit: mismatch vs PREDICTED-BUGGY model = %d / 1024\n", n_vs_pred);
+  std::printf("DIAG [0][0]   exp=%d pred=%d got=%d\n", exp[0][0], predicted[0][0], got[0][0]);
+  std::printf("DIAG [0][16]  exp=%d pred=%d got=%d\n", exp[0][16], predicted[0][16], got[0][16]);
+  std::printf("DIAG [15][15] exp=%d pred=%d got=%d\n", exp[15][15], predicted[15][15], got[15][15]);
+  std::printf("DIAG [31][31] exp=%d pred=%d got=%d\n", exp[31][31], predicted[31][31], got[31][31]);
+  if (n_vs_exp > 0 && n_vs_pred == 0)
+    std::printf("DIAG VERDICT: ROOT-CAUSE LOCKED — RTL exactly matches the "
+                "clear_acc-suppressed cross-tile-leak model and diverges from correct.\n");
+  else if (n_vs_exp == 0)
+    std::printf("DIAG VERDICT: NO BUG — K-split flags=1 is correct here; "
+                "hypothesis REFUTED, do NOT patch.\n");
+  else
+    std::printf("DIAG VERDICT: DIVERGES but NOT exactly the predicted model "
+                "(vs_exp=%d vs_pred=%d) — investigate before patching.\n",
+                n_vs_exp, n_vs_pred);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -505,6 +621,7 @@ int main(int argc, char** argv) {
   test_matmul_random_regression();
   test_matmul_k4_boundary_stress();
   test_matmul_multitile_2x2x2();
+  test_ksplit_accumulate_diagnostic();
 
   std::printf("\n%d / %d tests passed\n", tests_pass, tests_run);
   return (tests_pass == tests_run) ? 0 : 1;

@@ -690,9 +690,28 @@ class CodeGenerator:
     def _large_weight_tile_plan(K_pad: int, N_pad: int) -> List[Tuple[int, int, int, int]]:
         """Return deterministic (k_start, k_len, n_start, n_len) tiles.
 
-        Tiles are sized for a 16-row activation strip.  `N_tile` is capped at
-        512 so the `d=384` FC1 case uses the intended 384x512 WBUF tile.  If the
-        full K dimension still does not fit, split K and use MATMUL accumulate.
+        Tiles are sized for a 16-row activation strip and capped at
+        `STAGE4_MAX_N_TILE` / ACCUM / ABUF.
+
+        **Full-K preference (no MATMUL flags=1).** Whenever a single
+        `[K_pad x n_tile]` INT8 weight tile fits WBUF for some
+        `n_tile >= TILE`, this returns `k_tile == K_pad` so the emitter
+        issues exactly one `MATMUL` (flags=0) per N-tile and never a
+        K-split accumulate. The RTL systolic controller's flags=1 path is
+        correct ONLY for a single 16x16 output tile (`clear_acc` is
+        suppressed for the whole multi-(m,n)-tile walk and `pe_acc` has no
+        per-tile preload) — see #115/#116. K-tiling is mathematically
+        identical (integer matmul is tiling-invariant), so a full-K tile is
+        a free, numerically-equivalent way to stay on the byte-exact-proven
+        flags=0 per-N-tile path. For GPT-2 124M this turns every
+        weight-tiled matmul (out_proj, fc1, lm_head; K_pad=768) into
+        flags=0-only; fc2 (K_pad=3072) stays K-split but takes the
+        large-input streaming path, which is flags=0-only by construction,
+        so flags=1 is never reached anywhere in the frozen bundle.
+
+        The K-split branch (flags=1 for a weight-tiled consumer) is
+        retained only for the full-K-infeasible regime (huge K_pad);
+        unreachable as flags=1 for GPT-2 124M, still #115-buggy until #116.
 
         Consumed by `_layout_weights` (DRAM staging) and the W8A16
         large-weight-tiled matmul emitter (`w8a16_emit.matmul`).
@@ -702,21 +721,41 @@ class CodeGenerator:
 
         max_n_by_accum = ACCUM_SIZE // (STAGE4_M_TILE * 4)
         max_n_by_abuf = ABUF_SIZE // STAGE4_M_TILE
-        n_tile = min(N_pad, STAGE4_MAX_N_TILE, max_n_by_accum, max_n_by_abuf)
-        n_tile = max(TILE, (n_tile // TILE) * TILE)
+        n_cap = min(N_pad, STAGE4_MAX_N_TILE, max_n_by_accum, max_n_by_abuf)
+        n_cap = max(TILE, (n_cap // TILE) * TILE)
 
-        while n_tile >= TILE:
-            k_tile = (WBUF_SIZE // n_tile) // TILE * TILE
-            if k_tile >= TILE:
-                break
-            n_tile //= 2
-            n_tile = (n_tile // TILE) * TILE
-        if n_tile < TILE:
-            raise MemoryError("Unable to choose a Stage 4 N tile that fits WBUF")
-
-        k_tile = max(TILE, (WBUF_SIZE // n_tile) // TILE * TILE)
-        k_tile = min(K_pad, k_tile)
-        k_tile = max(TILE, (k_tile // TILE) * TILE)
+        # Full-K is viable only when (a) some full-K weight tile fits WBUF
+        # and (b) one full-K activation strip is a modest ABUF transient.
+        # When (b) fails the input is streamed K-tile by K-tile (the
+        # fc2-style large-input path: flags=0 only, FP32 partial-sum
+        # accumulate — NOT the #115-buggy flags=1 path) and MUST keep a
+        # small k_tile, so we fall back to the K-split plan there. The plan
+        # must stay a pure function of (K_pad, N_pad) for staging<->emit
+        # symbol consistency, so the gate is purely K_pad-based.
+        full_k_fits_abuf = STAGE4_M_TILE * K_pad * 4 <= ABUF_SIZE
+        max_n_full_k = (WBUF_SIZE // K_pad) // TILE * TILE
+        if full_k_fits_abuf and max_n_full_k >= TILE:
+            n_tile = max(TILE, (min(n_cap, max_n_full_k) // TILE) * TILE)
+            k_tile = K_pad
+        else:
+            # Full-K infeasible (huge K, or K_pad alone exceeds WBUF at
+            # n_tile == TILE): split K. The weight-tiled consumer would use
+            # MATMUL flags=1 here (still #115-buggy until #116); the
+            # streaming consumer uses flags=0 and is correct. For GPT-2
+            # 124M only K=3072 fc2 lands here, and it takes the streaming
+            # (flags=0) path, so flags=1 is never reached.
+            n_tile = n_cap
+            while n_tile >= TILE:
+                k_tile = (WBUF_SIZE // n_tile) // TILE * TILE
+                if k_tile >= TILE:
+                    break
+                n_tile //= 2
+                n_tile = (n_tile // TILE) * TILE
+            if n_tile < TILE:
+                raise MemoryError("Unable to choose a Stage 4 N tile that fits WBUF")
+            k_tile = max(TILE, (WBUF_SIZE // n_tile) // TILE * TILE)
+            k_tile = min(K_pad, k_tile)
+            k_tile = max(TILE, (k_tile // TILE) * TILE)
 
         tiles: List[Tuple[int, int, int, int]] = []
         for n_start in range(0, N_pad, n_tile):

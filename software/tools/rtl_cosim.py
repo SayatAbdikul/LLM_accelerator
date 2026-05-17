@@ -235,10 +235,13 @@ def capture_golden(*, token_id: int = 0, smoke_decode_steps: int = 1,
 
 
 def run_rtl(program_bytes: bytes, csv_text: str, *, max_cycles: int = 5_000_000,
-            timeout_s: int = 1800):
+            timeout_s: int = 1800, dram_dump: tuple | None = None):
     """Run the patched prefill on Verilator run_program with snapshot capture;
-    return (summary, rtl_entries, rtl_data_bytes). timeout_s default 30min
-    (124M 1-tok prefill measured ~292s clean; headroom for divergent runs)."""
+    return (summary, rtl_entries, rtl_data_bytes[, dram_dump_bytes]).
+    timeout_s default 30min (124M 1-tok prefill ~292s clean).
+    dram_dump=(offset,size) -> also pass run_program's documented
+    --dram-dump-* (separate from the snapshot mechanism & from any
+    manifest augmentation) and return the dumped bytes as a 4th element."""
     import json
     import subprocess
     import tempfile
@@ -252,16 +255,20 @@ def run_rtl(program_bytes: bytes, csv_text: str, *, max_cycles: int = 5_000_000,
         td = Path(td)
         (td / "p.bin").write_bytes(program_bytes)
         (td / "snap.csv").write_text(csv_text)
-        cp = subprocess.run(
-            [str(RTL_BINARY),
-             "--program", str(td / "p.bin"),
-             "--json-out", str(td / "sum.json"),
-             "--snapshot-request", str(td / "snap.csv"),
-             "--snapshot-manifest-out", str(td / "man.json"),
-             "--snapshot-data-out", str(td / "data.bin"),
-             "--max-cycles", str(max_cycles)],
-            capture_output=True, text=True, timeout=timeout_s,
-        )
+        argv = [str(RTL_BINARY),
+                "--program", str(td / "p.bin"),
+                "--json-out", str(td / "sum.json"),
+                "--snapshot-request", str(td / "snap.csv"),
+                "--snapshot-manifest-out", str(td / "man.json"),
+                "--snapshot-data-out", str(td / "data.bin"),
+                "--max-cycles", str(max_cycles)]
+        if dram_dump is not None:
+            off, sz = int(dram_dump[0]), int(dram_dump[1])
+            argv += ["--dram-dump-offset", str(off),
+                     "--dram-dump-size", str(sz),
+                     "--dram-dump-out", str(td / "dram.bin")]
+        cp = subprocess.run(argv, capture_output=True, text=True,
+                            timeout=timeout_s)
         if cp.returncode != 0:
             raise RuntimeError(
                 f"run_program exited {cp.returncode}\n{cp.stderr[-2000:]}"
@@ -269,6 +276,9 @@ def run_rtl(program_bytes: bytes, csv_text: str, *, max_cycles: int = 5_000_000,
         summary = json.loads((td / "sum.json").read_text())
         manifest = json.loads((td / "man.json").read_text())
         data = (td / "data.bin").read_bytes()
+        if dram_dump is not None:
+            return (summary, manifest["entries"], data,
+                    (td / "dram.bin").read_bytes())
     return summary, manifest["entries"], data
 
 

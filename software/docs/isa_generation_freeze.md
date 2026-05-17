@@ -268,19 +268,74 @@ To make golden-vs-RTL cosim possible on the production path:
    re-pinned (§6 revision, blob `131d3ef1…`). The contract is correct
    and FPGA-deployable on its own merits.
    **Empirical caveat (do not over-read):** implementing B did **not**
-   move the GPT-2 124M cosim boundary (identical `block0_residual1`
-   cascade, gNaN=rNaN=0 finite-vs-finite). **B is not BUG2's cause.**
-   P6h/#111 re-rooted and **bisected** BUG2: the functional out_proj is
-   `MATMUL@pc2131 → 0x1E@pc2141`, and the **INT32 ACCUM diverges
-   512/768 columns *before* the dequant** (golden vs RTL, max|Δ|≈1.6e5).
-   So **0x1E is innocent**, the non-finite contract is unrelated
-   (provably never fires functionally: 1177 0x18 calls, 0 non-finite),
-   and **BUG2's true root is the systolic-array 48-tile deep-K
-   accumulation** (attn-output projection, concat[768]@Wo[768×768]) — the
-   deep-K regime untested by P1–P5 / P6b-tiny. Root-cause+fix tracked as
-   **task #112 / P6i**. The Option B non-finite contract stands
-   independently as the correct, FPGA-deployable hardware behavior
-   regardless of BUG2.
+   move the GPT-2 124M cosim boundary (`block0_residual1` 18188 ULP,
+   gNaN=rNaN=0 finite-vs-finite). **B is not BUG2's cause** (P6g:
+   provably 0 non-finite over 1177 functional 0x18 calls). **BUG2's
+   root is still OPEN — two roots refuted, each caught pre-fix by
+   instrument discipline:** (i) P6d "0x18 non-finite" → refuted by P6g
+   (zero cosim change); (ii) P6h "systolic MATMUL deep-K" → refuted by
+   P6i: the bisect relied on an **ACCUM-via-snapshot read that is
+   unreliable in RTL** (RTL ACCUM snapshots all-zeros / garbage at every
+   phase & pc, while the *same* matmul's downstream fp16 is P6c-proven
+   0-ULP exact ⇒ the real-datapath ACCUM is correct; only the snapshot
+   read is wrong; golden snapshot is self-consistent). No unit test
+   validates ACCUM *readback* (P5 gen-2 ACCUM tests preload ACCUM + read
+   ABUF; only `test_systolic_chained` validates post-MATMUL ACCUM). So
+   the MATMUL is **not** proven buggy. **(iii) "deep-K" also refuted; BUG2
+   LOCALIZED (P6j/#113)** via a clean control-validated `run_program
+   --dram-dump-*` probe to the **functional `out_proj`** chain
+   (`concat[768]@Wo[768×768]` → MATMUL@2131 → 0x1E@2141 → DMA-store):
+   diverges; downstream innocent. **(iv) BUG2 ROOT CAUSE LOCKED &amp; FIXED
+   — P6k / #115 (2026-05-17).** The "wide-N" framing (iii) was a proxy:
+   wide N merely makes the weight exceed WBUF, routing out_proj/fc1/
+   lm_head to the **tiled lowering** `emit_matmul_w8a16_large_weight_tiled`
+   (a *different* path from the byte-exact-proven simple `emit_matmul_w8a16`
+   that head Q/K/V use). `_large_weight_tile_plan(768,768)` = 2 N-tiles ×
+   2 K-tiles ⇒ the 2nd MatmulInsn is **flags=1** (K-split accumulate).
+   Real root: `systolic_controller.sv:344`
+   `clear_acc=(ST_INIT_TILE)&&!flags_accumulate_q` suppresses the
+   per-output-tile PE-accumulator clear for the **entire** multi-(m,n)-tile
+   walk when flags=1; `systolic_array` `pe_acc` has no per-tile preload and
+   DRAIN_WR overwrites (no RMW) ⇒ flags=1 is correct **only for a single
+   16×16 output tile**. **Proven** by
+   `rtl/verilator/test_systolic_chained.cpp::test_ksplit_accumulate_diagnostic`
+   (chained = 124M cosim mode): K-split flags0/flags1 on the same data as
+   the passing single-shot `test_matmul_multitile_2x2x2` (V1 known-exact
+   contrast) ⇒ **1014/1024 ≠ correct, 0/1024 == the predicted cross-tile-
+   leak model** (byte-exact the broken mechanism, all cells — not merely
+   "diverges"). Pre-existing `test_matmul_accumulate_flag` only covered the
+   single-tile degenerate-correct case (false confidence). **Fix S
+   shipped (#115):** `_large_weight_tile_plan` now prefers a full-K weight
+   tile (single MatmulInsn flags=0 per N-tile) whenever a full-K
+   activation strip fits ABUF — the frozen GPT-2 124M bundle now emits
+   **2340 MATMULs, 0 with flags=1** (out_proj/fc1/lm_head → full-K
+   flags=0; fc2 K=3072 → large-input *streaming* path, flags=0-only by
+   construction). K-tiling is integer-exact tiling-invariant ⇒ the golden
+   is **numerically identical** (frozen `.raw` fixtures byte-unchanged,
+   §6 simulator.py blob untouched). **VERIFIED — canonical 124M cosim
+   after S (controls `head1_query`/`concat` 0-ULP — instrument valid):
+   the canonical `block0_out_proj` *manifest node* is now 0-ULP
+   byte-exact to golden across all 768 cols / all 3 S N-tiles, including
+   the 48 NaN/overflow cols matched golden↔RTL.** Fix S fully resolved
+   the out_proj tiled-path miscompute (BUG2). The remaining
+   `block0_residual1` ~18139 ULP (finite, 0 NaN) is the FIRST node *past*
+   out_proj — which is precisely the W8A16 fp16 overflow boundary (§4.x /
+   P6c, pre-existing: golden itself saturates ±65504/NaN at out_proj
+   @124M). Per-tensor byte-match past the first golden overflow is
+   already documented ill-posed → **logits-level metric, task #109 /
+   P6f**; it is **not** BUG2 and not a regression. This run also proves
+   the entire pre-overflow datapath *through out_proj* is now byte-exact
+   (a major de-risking for #109). **BUG2 root-caused, fixed (S),
+   verified — #115 DONE.** The latent RTL flags=1-multi-tile HW
+   bug (FPGA generality) is tracked as **R-min / task #116** (controller
+   clear_acc-per-tile + DRAIN read-modify-write); the DIAGNOSTIC test is
+   its permanent regression evidence (flips to a hard assertion when #116
+   lands). Four bespoke-probe instrument failures across this saga, all
+   caught by the `block0_head1_query`/`multitile_2x2x2`=exact control;
+   only canonical `rc.*` + existing manifest + `--dram-dump-*` + the
+   unit-level `test_systolic_chained` ACCUM readback are trustworthy
+   (ACCUM-snapshot debt **#114**). The Option B non-finite contract stands
+   independently as the correct, FPGA-deployable behavior.
 
 ## 5. Actions required to *complete* the freeze (owner: user — I do not commit)
 
