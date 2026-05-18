@@ -1384,9 +1384,231 @@ static void test_g2_scale_chain() {
     TEST_PASS(name);
 }
 
+// ===================================================================
+// P6e / BUG1 reproducer. Mirrors head0_query's real flow: the FIRST
+// gen-2 scale-writing chain 0x1F(MAX_ABS_REDUCE -> scale_regs[sreg]) ->
+// SYNC(0b100) -> 0x18(QUANT, reads scale_regs[sreg]). The existing
+// test_g2_scale_chain has NO consumer reading the scale between the
+// SYNC and end-of-run, so it misses the first-instance scale-write ->
+// consumer VISIBILITY race. Here chain1 is that first chain; chain2 is
+// an IDENTICAL warm chain (different sreg) = in-binary known-exact
+// contrast. Predicted-buggy: QUANT reads scale_regs reset 0.0 ->
+// quantize_to_i8(out_scale==0.0)=0x00 -> int8 ALL ZERO. DIAGNOSTIC:
+// never aborts the suite; prints a verdict.
+static void bug1_build_X(std::vector<uint8_t>& x) {
+    // 16x64 fp16, contiguous rows*cols*2, LE. Varied sign/magnitude with
+    // one clear global max so scale=127/maxabs is well-defined and the
+    // quantization is non-degenerate (full INT8 range used).
+    x.assign(size_t(G2_M) * G2_N * 2, 0);
+    for (int i = 0; i < G2_M; ++i)
+        for (int j = 0; j < G2_N; ++j) {
+            double v = (double(((i * 7 + j * 3) % 17) - 8)) * 0.05;
+            if (i == 3 && j == 29) v = 1.75;          // unique max|.|
+            int bits = sfu_fp32_to_fp16_bits(v);
+            size_t o = (size_t(i) * G2_N + j) * 2;
+            x[o] = uint8_t(bits & 0xFF);
+            x[o + 1] = uint8_t((bits >> 8) & 0xFF);
+        }
+}
+
+static void test_bug1_scale_visibility_diagnostic() {
+    const char* name = "bug1_first_scale_write_visibility_DIAG";
+    const int GD = 160, D1 = 400, D2 = 520;   // ABUF unit offsets
+    const size_t I8 = size_t(G2_M) * G2_N;    // int8 bytes per chain
+    std::vector<uint8_t> X;
+    bug1_build_X(X);
+
+    auto run_variant = [&](bool with_prefix, const char* tag) {
+        SimHarness s;
+        sram_write_bytes(s.dut.get(), BUF_ABUF_ID, size_t(G2_S1) * 16, X);
+        std::vector<uint64_t> prog;
+        if (with_prefix) {
+            // A prior SFU op completing via SYNC(0b100) before the first
+            // scale-write 0x1F (mirrors ln1 LAYERNORM before head0_query's
+            // 0x1F). GELU (0x1B) has no src2; sreg 8 = unused.
+            prog.push_back(insn::CONFIG_TILE(1, 4, 1));
+            prog.push_back(insn::R_TYPE(0x1B, BUF_ABUF_ID, G2_S1, BUF_ABUF_ID,
+                                        0, BUF_ABUF_ID, GD, 8, 1));
+            prog.push_back(insn::SYNC(0b100));
+        }
+        // chain1: FIRST scale-writing chain (sreg 0 -> regs 0,1).
+        prog.push_back(insn::CONFIG_TILE(1, 4, 1));
+        prog.push_back(insn::R_TYPE(0x1F, BUF_ABUF_ID, G2_S1, BUF_ABUF_ID, 0,
+                                    BUF_ABUF_ID, 0, 0, 1));
+        prog.push_back(insn::SYNC(0b100));
+        prog.push_back(insn::R_TYPE(0x18, BUF_ABUF_ID, G2_S1, BUF_ABUF_ID, 0,
+                                    BUF_ABUF_ID, D1, 0, 1));
+        prog.push_back(insn::SYNC(0b100));
+        // chain2: IDENTICAL, warm (sreg 4 -> regs 4,5) = known-exact ref.
+        prog.push_back(insn::CONFIG_TILE(1, 4, 1));
+        prog.push_back(insn::R_TYPE(0x1F, BUF_ABUF_ID, G2_S1, BUF_ABUF_ID, 0,
+                                    BUF_ABUF_ID, 0, 4, 1));
+        prog.push_back(insn::SYNC(0b100));
+        prog.push_back(insn::R_TYPE(0x18, BUF_ABUF_ID, G2_S1, BUF_ABUF_ID, 0,
+                                    BUF_ABUF_ID, D2, 4, 1));
+        prog.push_back(insn::SYNC(0b100));
+        prog.push_back(insn::HALT());
+        s.load(prog);
+        s.run(300000);
+        if (s.dut->fault) { std::printf("DIAG %s: FAULT\n", tag); return; }
+
+        auto c1 = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, size_t(D1) * 16, I8);
+        auto c2 = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, size_t(D2) * 16, I8);
+        bool c1_zero = std::all_of(c1.begin(), c1.end(),
+                                   [](uint8_t b) { return b == 0; });
+        bool c2_zero = std::all_of(c2.begin(), c2.end(),
+                                   [](uint8_t b) { return b == 0; });
+        bool c1_eq_c2 = (c1 == c2);
+        uint16_t r0 = scale_reg(s, 0), r1 = scale_reg(s, 1);
+        uint16_t r4 = scale_reg(s, 4), r5 = scale_reg(s, 5);
+        bool regs_landed = (r0 == r4) && (r1 == r5) && (r0 != 0);
+        int nz1 = 0;
+        for (auto b : c1) if (b) ++nz1;
+        std::printf("DIAG %s: chain1_zero=%d chain2_zero=%d chain1==chain2=%d "
+                    "nz1=%d/%zu  sreg[0,1]=%04x,%04x [4,5]=%04x,%04x "
+                    "regs_landed=%d\n", tag, c1_zero, c2_zero, c1_eq_c2,
+                    nz1, I8, r0, r1, r4, r5, regs_landed);
+        if (!regs_landed || c2_zero)
+            std::printf("DIAG %s VERDICT: INSTRUMENT INVALID (warm chain/"
+                        "regs not sane) — inconclusive\n", tag);
+        else if (c1_zero && !c1_eq_c2)
+            std::printf("DIAG %s VERDICT: BUG1 REPRODUCED — first scale-write "
+                        "NOT visible to first consumer (chain1 int8 all-zero "
+                        "== predicted scale=0.0; chain2 warm correct)\n", tag);
+        else if (c1_eq_c2)
+            std::printf("DIAG %s VERDICT: not reproduced with this prefix "
+                        "(chain1 == warm chain2)\n", tag);
+        else
+            std::printf("DIAG %s VERDICT: chain1 wrong DIFFERENTLY (not the "
+                        "predicted all-zero) — investigate, do NOT patch\n",
+                        tag);
+    };
+
+    run_variant(false, "A_pure_cold");
+    run_variant(true, "B_prefix(GELU+SYNC then first 0x1F)");
+    (void)name;
+}
+
+// P6e/BUG1 FULL-CHAIN reproducer: head0_query's real op sequence
+// 0x1F(s)->SYNC->0x18(s)->SYNC->MATMUL(flags=0)->SYNC->0x1E(s+1) with
+// PRELOADED buffers (no DMA). chain1 = FIRST (cold); chain2 = identical
+// warm (s=4/5, separate ACCUM region) = in-binary known-exact contrast.
+// Captures int8 / ACCUM / 0x1E-out for both; first differing stage
+// localizes the first-instance bug. 0x1E reads scale_regs[s+1] = the
+// 0x1F PHASE-1 write (committed 1 cyc after phase-0, untested by the
+// 0x18-only repro). Predicted-buggy if phase-1 not visible: 0x1E =
+// pc*0.0*ACCUM + bias = the preloaded bias vector, bit-exact. DIAGNOSTIC.
+static void test_bug1_full_chain_diagnostic() {
+    const char* name = "bug1_full_chain_DIAG";
+    const int X1 = 0;                 // X fp16 16x64  (units; 128u)
+    const int I1 = 160, I2 = 240;     // int8 16x64    (64u each)
+    const int Q1 = 340, Q2 = 480;     // 0x1E out fp16 (128u each)
+    const int WB = 0;                 // WBUF weight 64x64 i8 (256u)
+    const int PCB = 300;              // WBUF 2N=128 fp16 (pc||bias) (16u)
+    const int AC1 = 0, AC2 = 256;     // ACCUM dst units (4096B apart)
+    const size_t I8 = size_t(G2_M) * G2_N;        // 1024
+    const size_t OB = size_t(G2_M) * G2_N * 2;    // 0x1E out bytes 2048
+    const size_t ACB = size_t(G2_M) * G2_N * 4;   // ACCUM bytes 4096
+
+    std::vector<uint8_t> X;
+    bug1_build_X(X);                              // 16x64 fp16
+
+    // Weight 64x64 int8 (K=64,N=64), deterministic.
+    std::vector<uint8_t> W(64 * 64);
+    for (int k = 0; k < 64; ++k)
+        for (int j = 0; j < 64; ++j)
+            W[k * 64 + j] = uint8_t(int8_t(((k * 5 + j * 3) % 13) - 6));
+    // src2 for 0x1E: 2N FP16 = [N pc-scale | N bias]. pc=1/128 (clean
+    // pow2); bias = distinctive ramp so predicted-buggy (==bias) is
+    // unambiguous and won't coincide with the real dequant.
+    std::vector<uint8_t> PCBv(2 * 64 * 2);
+    for (int j = 0; j < 64; ++j) {
+        int pc = sfu_fp32_to_fp16_bits(1.0 / 128.0);
+        int bs = sfu_fp32_to_fp16_bits(-2.0 + 0.05 * j);
+        PCBv[j * 2] = pc & 0xFF;            PCBv[j * 2 + 1] = (pc >> 8) & 0xFF;
+        PCBv[(64 + j) * 2] = bs & 0xFF;     PCBv[(64 + j) * 2 + 1] = (bs >> 8) & 0xFF;
+    }
+
+    SimHarness s;
+    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, size_t(X1) * 16, X);
+    sram_write_bytes(s.dut.get(), BUF_WBUF_ID, size_t(WB) * 16, W);
+    sram_write_bytes(s.dut.get(), BUF_WBUF_ID, size_t(PCB) * 16, PCBv);
+
+    auto chain = [&](int si, int i8dst, int acdst, int qdst) {
+        return std::vector<uint64_t>{
+            insn::CONFIG_TILE(1, 4, 1),
+            insn::R_TYPE(0x1F, BUF_ABUF_ID, X1, BUF_ABUF_ID, 0,
+                         BUF_ABUF_ID, 0, si, 1),
+            insn::SYNC(0b100),
+            insn::R_TYPE(0x18, BUF_ABUF_ID, X1, BUF_ABUF_ID, 0,
+                         BUF_ABUF_ID, i8dst, si, 1),
+            insn::SYNC(0b100),
+            insn::CONFIG_TILE(1, 4, 4),
+            insn::MATMUL(BUF_ABUF_ID, i8dst, BUF_WBUF_ID, WB,
+                         BUF_ACCUM_ID, acdst, 0, 0),
+            insn::SYNC(0b010),
+            insn::CONFIG_TILE(1, 4, 1),
+            insn::R_TYPE(0x1E, BUF_ACCUM_ID, acdst, BUF_WBUF_ID, PCB,
+                         BUF_ABUF_ID, qdst, si + 1, 1),
+            insn::SYNC(0b100),
+        };
+    };
+    std::vector<uint64_t> prog;
+    for (auto v : chain(0, I1, AC1, Q1)) prog.push_back(v);   // chain1 cold
+    for (auto v : chain(4, I2, AC2, Q2)) prog.push_back(v);   // chain2 warm
+    prog.push_back(insn::HALT());
+    s.load(prog);
+    s.run(400000);
+    if (s.dut->fault) { std::printf("DIAG %s: FAULT\n", name); return; }
+
+    auto i1 = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, size_t(I1) * 16, I8);
+    auto i2 = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, size_t(I2) * 16, I8);
+    auto a1 = sram_read_bytes(s.dut.get(), BUF_ACCUM_ID, size_t(AC1) * 16, ACB);
+    auto a2 = sram_read_bytes(s.dut.get(), BUF_ACCUM_ID, size_t(AC2) * 16, ACB);
+    auto q1 = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, size_t(Q1) * 16, OB);
+    auto q2 = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, size_t(Q2) * 16, OB);
+    bool i_eq = (i1 == i2), a_eq = (a1 == a2), q_eq = (q1 == q2);
+    // predicted-buggy: chain1 0x1E == bias broadcast (every 64-col row ==
+    // PCBv bias half). Compare row0 of q1 to the bias fp16 vector.
+    std::vector<uint8_t> bias_row(PCBv.begin() + 64 * 2, PCBv.end());
+    std::vector<uint8_t> q1_row0(q1.begin(), q1.begin() + 128);
+    bool q1_is_bias = (q1_row0 == bias_row);
+    uint16_t r0 = scale_reg(s, 0), r1 = scale_reg(s, 1);
+    uint16_t r4 = scale_reg(s, 4), r5 = scale_reg(s, 5);
+    bool regs_ok = (r0 == r4) && (r1 == r5) && (r0 != 0) && (r1 != 0);
+
+    std::printf("DIAG %s: int8_eq=%d ACCUM_eq=%d dequant_eq=%d  "
+                "chain1_0x1E==bias=%d  sreg[0,1]=%04x,%04x [4,5]=%04x,%04x "
+                "regs_ok=%d\n", name, i_eq, a_eq, q_eq, q1_is_bias,
+                r0, r1, r4, r5, regs_ok);
+    if (!regs_ok)
+        std::printf("DIAG %s VERDICT: INSTRUMENT INVALID (scale regs not "
+                    "sane/equal) — inconclusive\n", name);
+    else if (i_eq && a_eq && q_eq)
+        std::printf("DIAG %s VERDICT: NOT reproduced in fresh-sim full chain "
+                    "(all 3 stages chain1==chain2) — BUG1 needs full bundle "
+                    "context; DEFER (do NOT patch)\n", name);
+    else if (i_eq && a_eq && !q_eq)
+        std::printf("DIAG %s VERDICT: localized to 0x1E / sreg+1 phase-1 "
+                    "visibility (int8+ACCUM match, dequant differs)%s\n",
+                    name, q1_is_bias
+                    ? " — chain1==bias, predicted-buggy shape EXACT: ROOT LOCKED"
+                    : " — but chain1 != bias: wrong DIFFERENTLY, investigate");
+    else if (i_eq && !a_eq)
+        std::printf("DIAG %s VERDICT: localized to first-MATMUL cold-start "
+                    "(int8 match, ACCUM differs) — investigate that path\n",
+                    name);
+    else
+        std::printf("DIAG %s VERDICT: int8 already differs (0x18/phase-0) — "
+                    "contradicts prior repro; investigate, do NOT patch\n",
+                    name);
+}
+
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
 
+    test_bug1_scale_visibility_diagnostic();
+    test_bug1_full_chain_diagnostic();
     test_softmax_accum_large_row();
     test_layernorm_identity();
     test_layernorm_replay_probe();

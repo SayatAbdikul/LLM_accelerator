@@ -48,7 +48,7 @@ CONTROL_SV    := $(PKG) \
 
 .PHONY: all run_program test_decode test_control test_dma test_helpers test_sfu \
         test_systolic test_systolic_array_chained test_systolic_chained \
-        test_systolic_query test_systolic_qkt clean
+        test_systolic_query test_systolic_qkt test_addr_raw_hazard clean
 
 all: test_decode test_control test_dma test_helpers test_sfu test_systolic
 
@@ -262,6 +262,29 @@ $(BUILD_DIR)/test_systolic_qkt/Vtaccel_top: $(CONTROL_SV) test_systolic_qkt.cpp
 test_systolic_qkt: $(BUILD_DIR)/test_systolic_qkt/Vtaccel_top
 	@echo "--- Running focused QK^T regressions ---"
 	$(BUILD_DIR)/test_systolic_qkt/Vtaccel_top
+
+# -----------------------------------------------------------------------
+# test_addr_raw_hazard: BUG1 reproducer — SET_ADDR_HI → LOAD RAW hazard.
+# Requires 512 MB DRAM so both test regions (HI=0 and HI=1) are in-bounds.
+# Pre-fix:  raw_hazard_consecutive FAILS (stale HI sampled → wrong address).
+# Post-fix: all three sub-tests PASS.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_addr_raw_hazard/Vtaccel_top: $(CONTROL_SV) test_addr_raw_hazard.cpp
+	mkdir -p $(BUILD_DIR)/test_addr_raw_hazard
+	$(VERILATOR) $(VFLAGS) \
+	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
+	  -GDRAM_SIZE=536870912 \
+	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
+	  --top-module taccel_top \
+	  --Mdir $(BUILD_DIR)/test_addr_raw_hazard \
+	  $(CONTROL_SV) \
+	  test_addr_raw_hazard.cpp \
+	  -CFLAGS "-I$(CURDIR)/include $(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_addr_raw_hazard -f Vtaccel_top.mk
+
+test_addr_raw_hazard: $(BUILD_DIR)/test_addr_raw_hazard/Vtaccel_top
+	@echo "--- Running addr RAW hazard tests ---"
+	$(BUILD_DIR)/test_addr_raw_hazard/Vtaccel_top
 
 # -----------------------------------------------------------------------
 clean:

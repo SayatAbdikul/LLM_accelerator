@@ -30,6 +30,39 @@ FREEZE_PTQ_PRESET = "weight_only_int8_quarot"
 
 
 @dataclass
+class SerializedSequence:
+    """All data needed to run RTL for prefill + N teacher-forced decode steps.
+
+    run_program always starts execution at PC 0 (entry_point in the ProgramBinary
+    header is not used by the RTL). Decode ProgramBinaries therefore contain ONLY
+    the decode instruction bytes — local PC 0 maps to the first decode instruction.
+    Data is still placed at bundle_data_base (absolute DRAM offset) so that all
+    DMA SET_ADDR absolute references within the decode stream remain correct.
+
+    decode_manifest_local: local (0-based) decode PCs — used for RTL snapshot CSV
+    and compare() (both sides use the same local PCs once the decode binary starts at PC 0).
+    decode_manifest_abs: absolute decode PCs (decode_pc + local) — used for the golden
+    simulator which tracks absolute PCs across the full flat DRAM image.
+    """
+    bundle_data_base: int
+    bundle_kv_cache_base: int
+    bundle_kv_cache_size: int
+    bundle_decode_pc: int
+    bundle_decode_instrs_offset: int     # byte offset of decode stream in flat DRAM image
+    prefill_insn_count: int              # prefill-only insn_count (for max_cycles scaling)
+    n_decode_steps: int
+    token_id: int
+    step_tokens: list
+    prefill_program_bytes: bytes
+    prefill_manifest: Dict[int, list]
+    prefill_instr_image: bytes           # full flat instr region (for compare anchor lookup)
+    decode_instr_images: list            # bytes per step: ONLY decode instruction bytes
+    decode_data_template: bytes          # data section template (weights + zeroed KV)
+    decode_manifest_local: Dict[int, list]  # local decode PCs for RTL CSV + compare
+    decode_manifest_abs: Dict[int, list]    # absolute decode PCs for golden simulator
+
+
+@dataclass
 class SerializedPrefill:
     program_bytes: bytes
     trace_manifest: Dict[int, list]
@@ -438,6 +471,241 @@ def run_cosim(*, token_id: int = 0, smoke_decode_steps: int = 1,
         "insn_count": sp.insn_count,
         "token_id": token_id,
     }
+
+
+def capture_golden_sequence(*, token_ids=(0, 0, 0), payload=None,
+                            exclude_nodes=None):
+    """Teacher-forced golden run for prefill + len(token_ids)-1 decode steps.
+
+    token_ids[0] = prefill input; token_ids[i>=1] = decode input at position i.
+    Returns (golden_prefill_tensors, golden_decode_tensors_list, SerializedSequence).
+
+    Note: block_size=128 on the tiny fixture caps the sequence at 128 total tokens.
+    The plan's '257-tok' figure is infeasible for the tiny fixture; use N=2 for CI.
+
+    Key constraint: run_program always starts at PC 0 — it does not read the
+    entry_point field from the ProgramBinary header. Decode ProgramBinaries
+    therefore store ONLY the decode instruction bytes (local PC 0 = first decode
+    instruction), while data_base is kept at bundle.data_base so all DMA
+    SET_ADDR absolute references within the decode stream remain valid.
+    """
+    from taccel.assembler.assembler import ProgramBinary
+    from taccel.golden_model.simulator import Simulator
+    from taccel.runtime.calibration import build_calibration_scales
+    from taccel.runtime.host_runner import HostRunner
+    from taccel.runtime.tiny_fixture import build_stage3_tiny_decoder_bundle
+
+    n_decode_steps = len(token_ids) - 1
+    if n_decode_steps < 1:
+        raise ValueError("token_ids must have >= 2 tokens (1 prefill + 1+ decode)")
+
+    if payload is None:
+        payload = _load_tiny_payload()
+    scales = build_calibration_scales(payload)
+    tiny = build_stage3_tiny_decoder_bundle(
+        payload, smoke_decode_steps=n_decode_steps,
+        calibration_scales=scales, ptq_preset=FREEZE_PTQ_PRESET,
+    )
+    build_obj = tiny.build
+    bundle = build_obj.bundle
+
+    data_base = int(bundle.data_base)
+    kv_cache_base = int(bundle.kv_cache_base)
+    kv_cache_size = int(bundle.kv_cache_size_bytes)
+    decode_pc = int(bundle.decode_pc)
+    decode_instrs_offset = int(bundle.decode_instrs_offset)  # byte offset of decode stream
+    prefill_insn_count = int(bundle.prefill_pc) + len(bundle.prefill_instrs) // 8  # == len(prefill)//8
+
+    # decode_manifest_local: local (0-based) PCs within decode stream.
+    # golden simulator needs absolute PCs; RTL (starting at local PC 0) needs local PCs.
+    decode_manifest_local = dict(build_obj.decode_codegen.trace_manifest)
+    decode_manifest_abs = {
+        decode_pc + lpc: evs for lpc, evs in decode_manifest_local.items()
+    }
+    prefill_manifest = dict(build_obj.prefill_codegen.trace_manifest)
+
+    if exclude_nodes:
+        def _prune(m):
+            return {
+                pc: kept for pc, evs in m.items()
+                if (kept := [e for e in evs if e["node_name"] not in exclude_nodes])
+            }
+        prefill_manifest = _prune(prefill_manifest)
+        decode_manifest_local = _prune(decode_manifest_local)
+        decode_manifest_abs = _prune(decode_manifest_abs)
+
+    # Golden simulator prefill.
+    # HostRunner.__init__ -> load_bundle -> trace_manifest={}; re-call load_bundle
+    # after construction so the manifest injection lands on a clean slate.
+    sim = Simulator()
+    runner = HostRunner(bundle, simulator=sim)
+    sim.load_bundle(bundle)
+    sim.trace_manifest = prefill_manifest
+    sim.enable_trace()
+    runner.run_prefill([int(token_ids[0])])
+    golden_prefill = sim.get_trace_payload()["tensors"]
+
+    # Snapshot prefill instruction image and static data template.
+    image_after_prefill = bundle.materialize(reset_runtime=False)
+    prefill_instr_image = bytes(image_after_prefill[:data_base])
+    # Data section is purely static (weights + zeroed KV); runtime patches only
+    # touch instruction streams, so this template is invariant across all steps.
+    decode_data_template = bytes(image_after_prefill[data_base:])
+
+    pb_prefill = ProgramBinary(
+        instructions=prefill_instr_image,
+        data=decode_data_template,
+        entry_point=int(bundle.prefill_pc),  # == 0; run_program starts at PC 0
+        insn_count=int(bundle.insn_count),
+        data_base=data_base,
+        input_offset=0, pos_embed_patch_dram_offset=0,
+        pos_embed_cls_dram_offset=0, cls_token_dram_offset=0,
+        trace_manifest={}, compiler_manifest={},
+    )
+
+    # Golden decode steps (teacher-forced: token_ids[i+1] at position i+1).
+    step_tokens = [int(t) for t in token_ids[1:]]
+    golden_decode = []
+    decode_instr_images = []
+
+    for i, step_tok in enumerate(step_tokens):
+        # Inject the decode manifest at absolute PCs; enable_trace clears prior step.
+        sim.trace_manifest = decode_manifest_abs
+        sim.enable_trace()
+        runner.run_decode_step(step_tok, i + 1)
+        golden_decode.append(sim.get_trace_payload()["tensors"])
+
+        # Snapshot ONLY the decode instruction bytes for this step.
+        # run_program ignores entry_point and always starts at PC 0, so the RTL
+        # decode ProgramBinary must contain only the decode stream (local PC 0 =
+        # first decode instruction). data_base stays at bundle.data_base so
+        # absolute DRAM addresses embedded in SET_ADDR instructions are correct.
+        image_step = bundle.materialize(reset_runtime=False)
+        decode_only_bytes = bytes(image_step[decode_instrs_offset:data_base])
+        decode_instr_images.append(decode_only_bytes)
+        assert bytes(image_step[data_base:]) == decode_data_template, (
+            f"data section mutated at decode step {i}: "
+            "runtime patches must not touch the data region"
+        )
+
+    seq = SerializedSequence(
+        bundle_data_base=data_base,
+        bundle_kv_cache_base=kv_cache_base,
+        bundle_kv_cache_size=kv_cache_size,
+        bundle_decode_pc=decode_pc,
+        bundle_decode_instrs_offset=decode_instrs_offset,
+        prefill_insn_count=prefill_insn_count,
+        n_decode_steps=n_decode_steps,
+        token_id=int(token_ids[0]),
+        step_tokens=step_tokens,
+        prefill_program_bytes=pb_prefill.to_bytes(),
+        prefill_manifest=prefill_manifest,
+        prefill_instr_image=prefill_instr_image,
+        decode_instr_images=decode_instr_images,
+        decode_data_template=decode_data_template,
+        decode_manifest_local=decode_manifest_local,
+        decode_manifest_abs=decode_manifest_abs,
+    )
+    return golden_prefill, golden_decode, seq
+
+
+def run_cosim_sequence(*, token_ids=(0, 0, 0), payload=None,
+                       max_cycles=None, exclude_nodes=None):
+    """Multi-step RTL-vs-golden gate: prefill + len(token_ids)-1 decode steps.
+
+    KV state is threaded between RTL runs via --dram-dump-* (the KV cache
+    region is dumped after each run and injected into the next step's data
+    section). Returns a result dict; top-level 'divergence' is None on full
+    byte-match, or the first-divergence dict with an added 'decode_step' key.
+
+    Plan deviation from §B3 '257-tok': the tiny fixture block_size=128 caps
+    the sequence at 128 total tokens. token_ids defaults to [0,0,0] (prefill
+    + 2 decode steps) which is fast (<60 s total) and fully well-posed.
+
+    RTL constraint: run_program always starts execution at PC 0. Decode
+    ProgramBinaries therefore contain ONLY the decode instruction bytes; the
+    snapshot CSV uses local (0-based) decode PCs. data_base is preserved at
+    bundle.data_base so all DMA SET_ADDR absolute addresses remain correct.
+    """
+    from taccel.assembler.assembler import ProgramBinary
+
+    golden_prefill, golden_decode, seq = capture_golden_sequence(
+        token_ids=token_ids, payload=payload, exclude_nodes=exclude_nodes,
+    )
+    if max_cycles is None:
+        max_cycles = max(5_000_000, seq.prefill_insn_count * 3000)
+
+    csv_prefill = emit_snapshot_csv(seq.prefill_manifest)
+    # Decode CSV uses LOCAL (0-based) decode PCs — the RTL binary starts at PC 0.
+    csv_decode = emit_snapshot_csv(seq.decode_manifest_local)
+
+    # RTL prefill — dump KV region for threading into decode step 0.
+    summary_p, rtl_entries_p, rtl_data_p, kv_dump = run_rtl(
+        seq.prefill_program_bytes, csv_prefill, max_cycles=max_cycles,
+        dram_dump=(seq.bundle_kv_cache_base, seq.bundle_kv_cache_size),
+    )
+    divergence = compare(
+        golden_prefill, rtl_entries_p, rtl_data_p,
+        seq.prefill_instr_image, seq.prefill_manifest,
+    )
+    result = {
+        "summary_prefill": summary_p,
+        "divergence": divergence,
+        "n_events_prefill": sum(len(v) for v in seq.prefill_manifest.values()),
+        "n_rtl_captures_prefill": len(rtl_entries_p),
+        "n_decode_steps": seq.n_decode_steps,
+        "prefill_insn_count": seq.prefill_insn_count,
+        "token_id": seq.token_id,
+        "step_tokens": seq.step_tokens,
+        "step_results": [],
+    }
+    if divergence is not None:
+        return result
+
+    # RTL decode steps: ONLY decode instruction bytes; data_base preserved so
+    # absolute DRAM SET_ADDR references are correct; KV region overridden per step.
+    for i in range(seq.n_decode_steps):
+        data = bytearray(seq.decode_data_template)
+        kv_off = seq.bundle_kv_cache_base - seq.bundle_data_base
+        data[kv_off:kv_off + seq.bundle_kv_cache_size] = kv_dump
+
+        decode_insn_count = len(seq.decode_instr_images[i]) // 8
+        pb = ProgramBinary(
+            instructions=seq.decode_instr_images[i],
+            data=bytes(data),
+            entry_point=0,           # run_program always starts at PC 0
+            insn_count=decode_insn_count,
+            data_base=seq.bundle_data_base,  # absolute DRAM offset; unchanged
+            input_offset=0, pos_embed_patch_dram_offset=0,
+            pos_embed_cls_dram_offset=0, cls_token_dram_offset=0,
+            trace_manifest={}, compiler_manifest={},
+        )
+        decode_max_cycles = max(5_000_000, decode_insn_count * 3000)
+        summary_d, rtl_entries_d, rtl_data_d, kv_dump = run_rtl(
+            pb.to_bytes(), csv_decode, max_cycles=decode_max_cycles,
+            dram_dump=(seq.bundle_kv_cache_base, seq.bundle_kv_cache_size),
+        )
+        # compare() uses local decode PCs to look up RTL entries and node names
+        # to look up golden tensors — both are local-PC-agnostic on the golden side.
+        step_div = compare(
+            golden_decode[i], rtl_entries_d, rtl_data_d,
+            seq.decode_instr_images[i], seq.decode_manifest_local,
+        )
+        n_ev = sum(len(v) for v in seq.decode_manifest_local.values())
+        step_r = {
+            "step": i,
+            "token": seq.step_tokens[i],
+            "summary": summary_d,
+            "n_events": n_ev,
+            "n_rtl_captures": len(rtl_entries_d),
+            "divergence": step_div,
+        }
+        result["step_results"].append(step_r)
+        if step_div is not None:
+            result["divergence"] = {**step_div, "decode_step": i}
+            return result
+
+    return result
 
 
 if __name__ == "__main__":

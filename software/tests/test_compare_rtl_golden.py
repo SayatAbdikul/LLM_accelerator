@@ -287,3 +287,83 @@ def test_rtl_cosim_gen2_byte_match(token_id):
         f"(token={token_id}):\n"
         + json.dumps(res["divergence"], indent=2, default=str)
     )
+
+
+# --------------------------------------------------------------------------
+# Leg 4 — multi-step (prefill + decode) RTL-vs-golden byte-match (P6m)
+# --------------------------------------------------------------------------
+def test_rtl_cosim_gen2_multistep_tiny():
+    """Prefill + N teacher-forced decode steps on the tiny fixture; KV state
+    threaded between separate RTL runs via --dram-dump-*.
+
+    Scope:
+      * MODEL: tiny 2-layer nanoGPT (d128/l2), weight_only_int8_quarot.
+      * SEQUENCE: token_ids=[0,0,0] — 1 prefill + 2 decode steps (positions
+        1 and 2). Plan §B3 '257-tok' is infeasible on the tiny fixture
+        (block_size=128 caps total tokens at 128); N=2 is the CI-speed gate.
+      * CORRECTNESS: per-node byte-match within freeze §7 fp16-ULP bands
+        (0 for non-transcendental, ≤3 for gelu_new) for every captured node
+        in every step.
+    """
+    cosim = _load_rtl_cosim()
+    if not cosim.RTL_BINARY.exists():
+        pytest.skip(
+            f"run_program not built ({cosim.RTL_BINARY}); "
+            "build: make -C rtl/verilator run_program"
+        )
+    tool = _load_tool()
+    if not tool.DEFAULT_FIXTURE.exists():
+        pytest.skip(
+            "tiny nanoGPT fixture not generated; run "
+            "PYTHONPATH=software python software/tools/train_tiny_fixture.py"
+        )
+
+    TOKEN_IDS = [0, 0, 0]  # prefill tok + 2 teacher-forced decode toks
+    res = cosim.run_cosim_sequence(token_ids=TOKEN_IDS)
+
+    # Prefill must run clean.
+    sp = res["summary_prefill"]
+    assert sp.get("status") == "halted", f"RTL prefill did not halt: {sp}"
+    assert sp.get("fault") is False, f"RTL prefill fault: {sp}"
+    assert sp.get("forbidden_overlap_violation") is False, (
+        f"RTL prefill forbidden overlap: {sp}"
+    )
+    assert not sp.get("timeout"), f"RTL prefill timed out: {sp}"
+
+    # Non-vacuous prefill — must actually compare captured fragments.
+    assert res["n_events_prefill"] >= 50, f"too few prefill events: {res}"
+    assert res["n_rtl_captures_prefill"] == res["n_events_prefill"], (
+        f"prefill RTL captures {res['n_rtl_captures_prefill']} "
+        f"!= events {res['n_events_prefill']}"
+    )
+
+    # Freeze §4.5 bar: byte-match across all steps (prefill + all decode).
+    # Check divergence before step-level assertions: a divergence causes early
+    # return from run_cosim_sequence with fewer step_results than n_decode_steps.
+    assert res["divergence"] is None, (
+        "RTL-vs-golden FIRST DIVERGENCE on multi-step gen-2 bundle "
+        f"(token_ids={TOKEN_IDS}):\n"
+        + json.dumps(res["divergence"], indent=2, default=str)
+    )
+
+    # Each decode step ran clean and non-vacuous (divergence==None guarantees all ran).
+    assert len(res["step_results"]) == len(TOKEN_IDS) - 1, (
+        f"expected {len(TOKEN_IDS)-1} step results, got {len(res['step_results'])}"
+    )
+    for step_r in res["step_results"]:
+        sd = step_r["summary"]
+        assert sd.get("status") == "halted", (
+            f"step {step_r['step']} did not halt: {sd}"
+        )
+        assert sd.get("fault") is False, f"step {step_r['step']} fault: {sd}"
+        assert sd.get("forbidden_overlap_violation") is False, (
+            f"step {step_r['step']} forbidden overlap: {sd}"
+        )
+        assert not sd.get("timeout"), f"step {step_r['step']} timed out: {sd}"
+        assert step_r["n_events"] >= 50, (
+            f"step {step_r['step']}: too few events: {step_r['n_events']}"
+        )
+        assert step_r["n_rtl_captures"] == step_r["n_events"], (
+            f"step {step_r['step']}: captures {step_r['n_rtl_captures']} "
+            f"!= events {step_r['n_events']}"
+        )

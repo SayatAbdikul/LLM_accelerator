@@ -159,7 +159,77 @@ To make golden-vs-RTL cosim possible on the production path:
    0 ULP modulo the one bug above. **(b) BUG1** —
    `block0_head0_query` (first Q-projection, head-0 only; heads 1–11 all
    0 ULP) miscomputes; architecturally inert at seq=1 (`softmax(1,1)`).
-   Task **#108 (P6e)**. **(c) BUG2** — past the overflow boundary,
+   **P6e (2026-05-17) CONFIRMED the root cause** via a chain of 8
+   fidelity-gated / control-validated refutations (input/path,
+   int8/scale_regs[0], bias/0x1E-src2, scalar scale_regs[1],
+   wrong-weight-swap) culminating in Step3c: a non-perturbing
+   `cg._record_trace_event` probe of the *loaded* weight in WBUF under
+   the canonical cosim — ALL controls 0-ULP including `head0_key__wprobe`
+   byte-exact (validates the WBUF-snapshot instrument), while
+   **`head0_query__wprobe` is 48569/49152 bytes WRONG golden-vs-RTL**.
+   ⇒ **BUG1 = the FIRST matmul-weight DMA-load into WBUF is wrong in
+   RTL** (golden loads the same staged Wq correctly — same instruction
+   stream; golden reproduces head0_query at fid 1.9e-4 with the correct
+   Wq). The systolic array then computes correct_int8 @ WRONG_Wq →
+   the observed head0_query divergence. Scope: specifically the first
+   matmul-weight WBUF load — NOT generic first-WBUF (ln1 γ/β WBUF loads
+   ran earlier, 0-ULP), NOT large-load (head0_key Wk: same 49152 B /
+   same SET_ADDR+LOAD+SYNC1 structure, byte-EXACT). **Root mechanism
+   CONFIRMED BIT-EXACT (Step4/5, direct observation):** RTL's wrong
+   head0_query Wq == golden DRAM[`0x14c12ca0`] at 93.76% vs 1.19% at the
+   intended `0x4c12ca0`; addr-reg trace shows golden's `pc=51 LOAD` reads
+   `0x4c12ca0` (post-`SET_ADDR_HI`=0) while RTL reads `0x14c12ca0`
+   (pre-HI, stale HI=1). ⇒ **BUG1 = a `SET_ADDR_HI`(pc=50)→`LOAD`(pc=51)
+   address-register read-after-write hazard** — the consuming LOAD
+   samples the addr reg before the immediately-preceding `SET_ADDR_HI`
+   write is visible → stale HI=1 → wrong DRAM source → wrong Wq → wrong
+   matmul. (The earlier "port-A mux steal" fix-class was **refuted**: a
+   DMA back-pressure fix was a provable no-op — head0_query unchanged,
+   controls 0-ULP, no port-A contention; reverted, run_program rebuilt
+   clean. Lesson: never patch on inference — confirm the mechanism
+   directly.) seq=1-inert ⇒ decode/#109 item, NOT a §5 prefill-byte-match
+   blocker (freeze gate stays 4/4). FIX (scoped, HIGH-RISK shared
+   control-unit/addr-regfile): the LOAD/STORE consuming an addr reg must
+   see the preceding `SET_ADDR` write — control-unit dispatch stall until
+   commit / addr-regfile bypass / registered-after-commit base_addr.
+   MUST first build a bit-exact predicted-buggy unit repro
+   (`SET_ADDR_LO;SET_ADDR_HI;LOAD` ⇒ stale-HI; 2nd LOAD = known-good
+   control) to pin the exact race + confirm BEFORE patching, then
+   canonical 124M cosim + freeze gate 4/4 + suites. Task **#108 (P6e)**.
+   **P6l (2026-05-18, #108 DONE). BUG1 FIXED — corrected mechanism.**
+   The freeze doc's earlier "register-file RAW hazard" framing (stale HI=1
+   from `SET_ADDR_HI`→`LOAD`) was an incorrect mechanism attribution:
+   `SET_ADDR_HI`'s NBA register write commits at the posedge that ends its
+   S_ISSUE cycle; the S_FETCH stage plus AXI fetch latency before the next
+   `LOAD` reaches S_ISSUE spans ≥2 posedges — the write is fully visible. The "RTL reads 0x14c12ca0 (stale HI=1)" was a correct WBUF
+   content observation (the stale data *in WBUF* matched that address) but
+   a wrong mechanism attribution (no AXI read was issued to 0x14c12ca0
+   from pc=51; the DMA read was silently dropped, explained below). The
+   simple `SET_ADDR_HI`→`LOAD` unit reproducers never triggered the bug
+   because they had no concurrent DMA. **Confirmed root cause:**
+   `dma_dispatch = !sfu_busy` in `control_unit.sv` lacked a `!dma_busy`
+   guard. When a STORE DMA is active, the AXI write channel is independent
+   of `rd_inflight_q`, so instruction fetches proceed freely. A subsequent
+   LOAD reaches S_ISSUE with `dma_busy=1`, fires `dma_dispatch=1`, but the
+   DMA engine (in D_STORE_W, not D_IDLE) silently ignores the pulse. The
+   control unit advances; the Wq WBUF load never executes; WBUF retains the
+   stale Wk from the prior LOAD (which had used addr=0x14c12ca0, HI=1).
+   **Fix (`control_unit.sv`):** (i) combinational: `OP_LOAD, OP_STORE:
+   dma_dispatch = !sfu_busy && !dma_busy`; (ii) sequential S_ISSUE stall:
+   `if (sfu_busy || dma_busy) state <= S_ISSUE`. **ISA-contract change:**
+   LOAD/STORE now serialize through DMA idle. Previously they were
+   fire-and-forget (SYNC was the sole ordering point); a program issuing
+   LOAD while a prior STORE-DMA was still in-flight silently dropped the
+   LOAD. Programs that correctly bracket every LOAD/STORE with SYNC are
+   unaffected; this fix makes the ISA contract explicit and enforced in HW.
+   **Reproducer (bit-exact):** `rtl/verilator/test_addr_raw_hazard.cpp`
+   `test_dispatch_drop_via_store` — pre-fix: ABUF=0xBB (stale, second LOAD
+   dropped), FAIL; post-fix: ABUF=0xAA (correct), PASS. Full suite 6/6.
+   **Verified:** 124M cosim post-fix → `block0_head0_query` 0 fp16 ULP
+   (was 490 ULP); all controls 0-ULP; freeze gate 4/4
+   (`test_compare_rtl_golden.py`). #108 DONE. The decode path + logits
+   metric are tracked as **#109 (P6f)**.
+   **(c) BUG2** — past the overflow boundary,
    non-finite-operand handling in the requant path diverges (golden
    `np.clip`/cast-NaN vs RTL); a localized op-semantics edge for
    non-finite inputs, *not* a finite-path datapath error. Task **#107

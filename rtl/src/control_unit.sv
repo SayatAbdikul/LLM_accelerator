@@ -368,9 +368,11 @@ module control_unit
 
               // DMA is architecturally asynchronous. Once the dispatch pulse is
               // emitted, fetch/issue may continue and SYNC(001) becomes the
-              // ordering point.
+              // ordering point.  We must wait for the current DMA to reach D_IDLE
+              // before dispatching a new LOAD/STORE — the DMA engine silently drops
+              // dispatch pulses that arrive while it is active.
               OP_LOAD, OP_STORE: begin
-                if (sfu_busy) begin
+                if (sfu_busy || dma_busy) begin
                   state <= S_ISSUE;
                 end else begin
                   obs_retire_pulse  <= 1'b1;
@@ -580,7 +582,7 @@ module control_unit
               addr_hi_we = 1'b1;
 
             OP_LOAD, OP_STORE:
-              dma_dispatch = !sfu_busy;
+              dma_dispatch = !sfu_busy && !dma_busy;
 
             OP_MATMUL:
               sys_dispatch = tile_valid && !sfu_busy && !helper_busy;
