@@ -291,6 +291,26 @@ To make golden-vs-RTL cosim possible on the production path:
      arbiter — if real-data `exp` drift appears there it gets its own
      characterized band, same discipline. Band is fixture-asserted, not
      a universal claim.
+   - `LAYERNORM_FP32` (0x1A, `1/sqrt(var+eps)`) — fixture-measured BIT-EXACT
+     (0 ULP, see above) but **REVISION 2026-05-19 (P6f / #109): a measured
+     real-data band of ≤1 fp16 ULP applies on GPT-2 124M**. The #109
+     first-measurement (logits-level metric, `run_cosim_sequence_logits`;
+     `test_rtl_cosim_gpt2_124m_logits_metric`, opt-in PYTEST_124M) found the
+     first per-tensor divergence at a layernorm output — `block0_ln1` for
+     token `[464,3290,318]`, `block1_ln1` for token 0 — at **exactly 1 fp16
+     ULP** in BOTH independent token sets (golden 0.0265503 vs rtl 0.0265656;
+     numpy var/rsqrt vs the RTL/DPI libm path, same numpy-vs-libm class as
+     `gelu_new`). The boundary node is token-position-dependent; the ≤1-ULP
+     LayerNorm signature is consistent. This is the §7 "real-data drift gets
+     its OWN characterized band" clause exercised (same discipline as
+     `gelu_new` ≤3 ULP); it does NOT change `simulator.py` (golden SHA
+     untouched). Logits-level conformance past the W8A16 fp16-overflow
+     boundary (per-tensor byte-match is ill-posed there, §4.x / P6c) is the
+     `logits_metric` (argmax-agreement / finite-masked cosine / per-token
+     NLL→ppl); first 124M measurement: argmax-agree 1.0, min-cosine
+     0.99999, 0 non-finite (the PPL Δ is illustrative on the N=2 feasibility
+     probe, not a population estimate — pin the band on argmax/cosine). This
+     closes the #109 well-posedness gap in the §5 definition-of-done.
    - Bit-replicating numpy's tanh is rejected: numpy-version-fragile and
      the freeze already pins a golden SHA. Characterizing the band per
      op-class is the disciplined resolution the §6 revision mechanism is
@@ -404,8 +424,23 @@ To make golden-vs-RTL cosim possible on the production path:
    caught by the `block0_head1_query`/`multitile_2x2x2`=exact control;
    only canonical `rc.*` + existing manifest + `--dram-dump-*` + the
    unit-level `test_systolic_chained` ACCUM readback are trustworthy
-   (ACCUM-snapshot debt **#114**). The Option B non-finite contract stands
-   independently as the correct, FPGA-deployable behavior.
+   (ACCUM-snapshot debt **#114 — RESOLVED 2026-05-19**). **#114 DONE:**
+   reproducer (`rtl/verilator/test_accum_snapshot_readback.cpp`,
+   known-exact `read_accum_32x32` contrast) pinned the mechanism as
+   **capture TIMING, not the `accum_read_logical_i32` layout**:
+   `accum_read_logical_i32` is byte-exact on a settled ACCUM (post-halt
+   and at the systolic-draining SYNC retire) but reads all-zeros at the
+   MATMUL retire — `run_program` captured ACCUM at an anchor PC that
+   retires before the asynchronous `ST_DRAIN_WR` settles it (±1 cycle
+   cannot help — why P6h's `retire_cycle`/`retire_plus_1` both failed).
+   **Fix:** `taccel_top.sv` exposes `sys_busy` (`public_flat_rd`, pure
+   Verilator pragma); `run_program.cpp` defers a `buf_id==BUF_ACCUM`
+   capture until `sys_busy==0` (ACCUM-scoped — fp16/int8 capture timing
+   untouched; freeze gate 6/6 byte-identical, the safety net). The
+   reproducer is now a permanent hard regression (the freeze-named "no
+   unit test validates ACCUM readback" gap, closed). The Option B
+   non-finite contract stands independently as the correct, FPGA-deployable
+   behavior.
 
 ## 5. Actions required to *complete* the freeze (owner: user — I do not commit)
 
@@ -421,6 +456,27 @@ as the frozen baseline:
 
 After commit, any opcode change requires a new dated revision of this file
 and re-opens the gen-2 RTL contract.
+
+**Status (2026-05-19) — §5 definition-of-done MET; spec committed.** The §5
+spec files above were committed by the user (frozen baseline set). The three
+items that kept the definition-of-done formally open are resolved:
+- **#109 (P6f) DONE** — logits-level conformance metric delivered
+  (`rtl_cosim.run_cosim_sequence_logits` / `logits_metric`;
+  `test_rtl_cosim_gen2_logits_metric_tiny` CI-green metric self-validation;
+  `test_rtl_cosim_gpt2_124m_logits_metric` opt-in first measurement). The
+  per-tensor-ill-posed-past-overflow gap is closed by the §4-item-7
+  `LAYERNORM_FP32` ≤1-ULP real-data band + the logits metric (argmax/cosine).
+- **#116 (R-min) DONE** — RTL `flags=1` K-split multitile fixed
+  (`systolic_controller.sv` per-output-tile `clear_acc` + `ST_DRAIN_RD`
+  read-modify-write); `test_systolic_chained::matmul_chained_ksplit_accumulate`
+  flipped from DIAGNOSTIC to a hard assertion (0/1024 vs correct).
+- **#114 DONE** — ACCUM-snapshot readback fixed & permanently regressed
+  (see §4 item 8).
+The freeze gate (`test_compare_rtl_golden.py`) is **6/6 + 1 skipped**
+(124M opt-in) and byte-identical pre/post #116/#114 (frozen bundle emits 0
+`flags=1`, no ACCUM snapshots — the empirical behavior-neutrality safety net).
+Remaining open items are FPGA-realization (synthesizable SFU, part/perf
+target — `docs/accelerator_completion_review.md`), NOT freeze-contract items.
 
 ## 6. Cross-references
 

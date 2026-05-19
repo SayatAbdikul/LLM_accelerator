@@ -1,5 +1,11 @@
 # Freeze §5/§7 Revision STUB — #109 logits-level conformance metric
 
+> **SUPERSEDED 2026-05-19 — folded into `isa_generation_freeze.md`.** The
+> `LAYERNORM_FP32` ≤1-ULP real-data band + logits-metric are now in §4 item 7
+> (REVISION 2026-05-19); the §5 definition-of-done status note records #109
+> DONE. This file is retained only as the measurement-provenance record; it
+> is safe to delete. The text below is the original draft.
+
 **Status: DRAFT for the user to review, fill the Measurement section, and
 commit into `software/docs/isa_generation_freeze.md`.** This is a separate stub
 file by design: `isa_generation_freeze.md` and `simulator.py` are content-pinned

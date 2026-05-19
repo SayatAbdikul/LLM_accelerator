@@ -49,7 +49,9 @@ CONTROL_SV    := $(PKG) \
 .PHONY: all run_program test_decode test_control test_dma test_helpers test_sfu \
         test_systolic test_systolic_array_chained test_systolic_chained \
         test_systolic_query test_systolic_qkt test_addr_raw_hazard \
-        test_accum_snapshot_readback clean
+        test_accum_snapshot_readback test_fp32_add clean
+
+FP32_DIR := $(SRC_DIR)/fp32
 
 all: test_decode test_control test_dma test_helpers test_sfu test_systolic
 
@@ -244,6 +246,25 @@ $(BUILD_DIR)/test_accum_snapshot_readback/Vtaccel_top: $(CONTROL_SV) test_accum_
 test_accum_snapshot_readback: $(BUILD_DIR)/test_accum_snapshot_readback/Vtaccel_top
 	@echo "--- Running #114 ACCUM-snapshot readback reproducer ---"
 	$(BUILD_DIR)/test_accum_snapshot_readback/Vtaccel_top
+
+# -----------------------------------------------------------------------
+# test_fp32_add: synthesizable IEEE-754 binary32 adder, bit-exact gate.
+# Standalone — links ONLY fp32_add (no taccel_top); zero risk to the
+# proven byte-exact datapath. First brick of the synthesizable SFU library.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_fp32_add/Vfp32_add: $(FP32_DIR)/fp32_add.sv test_fp32_add.cpp
+	mkdir -p $(BUILD_DIR)/test_fp32_add
+	$(VERILATOR) $(VFLAGS) \
+	  --top-module fp32_add \
+	  --Mdir $(BUILD_DIR)/test_fp32_add \
+	  $(FP32_DIR)/fp32_add.sv \
+	  test_fp32_add.cpp \
+	  -CFLAGS "$(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_fp32_add -f Vfp32_add.mk
+
+test_fp32_add: $(BUILD_DIR)/test_fp32_add/Vfp32_add
+	@echo "--- Running synthesizable fp32_add bit-exact gate ---"
+	$(BUILD_DIR)/test_fp32_add/Vfp32_add
 
 # -----------------------------------------------------------------------
 # test_systolic_query: focused chained query-projection regression
