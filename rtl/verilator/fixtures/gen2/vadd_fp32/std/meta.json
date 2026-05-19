@@ -4,7 +4,7 @@
   "src1_off": 0,
   "src2_off": 512,
   "dst_off": 1024,
-  "frozen_golden_sha": "aa9a9c0fa389d77598acfe68f4ac1347bd9fc9ef",
+  "frozen_golden_sha": "5283d6222599a883d17a0b87a66991e900cbb403",
   "op": "vadd_fp32",
   "opcode": 25,
   "sreg": 0,
