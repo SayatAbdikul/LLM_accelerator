@@ -67,7 +67,11 @@ module systolic_controller
     ST_A_LOAD_REQ = 4'd6,
     ST_A_LOAD_LATCH = 4'd7,
     ST_DST_CLEAR_PREP = 4'd8,
-    ST_DST_CLEAR_WR   = 4'd9
+    ST_DST_CLEAR_WR   = 4'd9,
+    // #116: per-drain ACCUM read for the flags=1 (K-split accumulate)
+    // read-modify-write. Only entered when flags_accumulate_q; the flags=0
+    // path stays the single-cycle overwrite (byte-identical to pre-#116).
+    ST_DRAIN_RD   = 4'd10
   } state_t;
 
   state_t state;
@@ -95,7 +99,12 @@ module systolic_controller
   logic [15:0] drain_row_addr_q;
 
   logic step_en;
-  logic clear_acc;
+  // #116: public_flat_rd forces Verilator to materialize this net so the
+  // run_program debug headers (systolic_window_trace.h /
+  // systolic_debug_artifacts.h) can backdoor-read it. The post-#116
+  // clear_acc expression is simple enough that Verilator otherwise folds
+  // it away. Pure Verilator pragma — no RTL/synthesis semantic change.
+  logic clear_acc /* verilator public_flat_rd */;
   logic       inject_zero_data;
   logic [15:0] lane_row_idx;
   logic [127:0] a_row_data_q, b_row_data_q;
@@ -276,8 +285,15 @@ module systolic_controller
 
         ST_DRAIN_PREP: begin
           drain_row_addr_q <= tile_drain_base_q + ({5'h0, ntile_q} << 2);
-          state <= ST_DRAIN_WR;
+          // #116: flags=1 inserts an ACCUM read cycle before each write.
+          state <= flags_accumulate_q ? ST_DRAIN_RD : ST_DRAIN_WR;
         end
+
+        // #116: read cycle for the flags=1 read-modify-write. Address is held
+        // (drain_row_addr_q / drain_grp_q advance only in ST_DRAIN_WR), so the
+        // value latched into sram_a_rdata next cycle is the ACCUM word
+        // ST_DRAIN_WR is about to RMW. No counter advance here.
+        ST_DRAIN_RD: state <= ST_DRAIN_WR;
 
         ST_DRAIN_WR: begin
           if (drain_grp_q == 2'd3) begin
@@ -299,9 +315,13 @@ module systolic_controller
             end else begin
               drain_row_q <= drain_row_q + 5'd1;
               drain_row_addr_q <= drain_row_addr_q + ({5'h0, n_tiles_q} << 2);
+              // #116: continue — flags=1 re-reads before the next write;
+              // flags=0 stays in ST_DRAIN_WR (identical to pre-#116).
+              state <= flags_accumulate_q ? ST_DRAIN_RD : ST_DRAIN_WR;
             end
           end else begin
             drain_grp_q <= drain_grp_q + 2'd1;
+            state <= flags_accumulate_q ? ST_DRAIN_RD : ST_DRAIN_WR;
           end
         end
 
@@ -340,8 +360,14 @@ module systolic_controller
     sram_b_row = 16'h0;
 
     step_en = 1'b0;
-    // Clear accumulator at tile start unless accumulate mode is requested.
-    clear_acc = (state == ST_INIT_TILE) && !flags_accumulate_q;
+    // #116: clear the PE accumulators at the start of EVERY output tile,
+    // independent of flags_accumulate_q. ST_INIT_TILE is entered once per
+    // (m,n) output tile (the K-tile loop re-enters via ST_A_LOAD_REQ, never
+    // ST_INIT_TILE), so per-output-tile K-accumulation is unaffected. K-split
+    // accumulate (flags=1) now comes from the ST_DRAIN_WR read-modify-write
+    // into ACCUM, NOT from PE-accumulator persistence across tiles (which was
+    // correct only for a single 16x16 output tile — the latent multitile bug).
+    clear_acc = (state == ST_INIT_TILE);
 
     case (state)
       ST_A_LOAD_REQ: begin
@@ -368,16 +394,44 @@ module systolic_controller
         step_en = 1'b1;
       end
 
+      ST_DRAIN_RD: begin
+        // #116: K-split (flags=1) read-modify-write. Issue a synchronous read
+        // of the SAME ACCUM row ST_DRAIN_WR will write next cycle (the address
+        // is stable across the RD->WR pair: drain_row_addr_q / drain_grp_q only
+        // advance at the end of ST_DRAIN_WR). sram_a_rdata is valid one cycle
+        // later, in ST_DRAIN_WR. Only reached when flags_accumulate_q.
+        sram_a_en = 1'b1;
+        sram_a_we = 1'b0;
+        sram_a_buf = dst_buf_q;
+        sram_a_row = drain_row_addr_q + {14'h0, drain_grp_q};
+      end
+
       ST_DRAIN_WR: begin
         // Pack four neighboring INT32 accumulators into one 128-bit SRAM row.
         sram_a_en = 1'b1;
         sram_a_we = 1'b1;
         sram_a_buf = dst_buf_q;
         sram_a_row = drain_row_addr_q + {14'h0, drain_grp_q};
-        sram_a_wdata[31:0]   = acc_at(drain_row_q, {1'b0, drain_grp_q, 2'b00});
-        sram_a_wdata[63:32]  = acc_at(drain_row_q, {1'b0, drain_grp_q, 2'b00} + 5'd1);
-        sram_a_wdata[95:64]  = acc_at(drain_row_q, {1'b0, drain_grp_q, 2'b00} + 5'd2);
-        sram_a_wdata[127:96] = acc_at(drain_row_q, {1'b0, drain_grp_q, 2'b00} + 5'd3);
+        // flags=0: pure overwrite (byte-identical to pre-#116; this is the
+        // entire frozen GPT-2 124M bundle — 0 flags=1 MATMULs).
+        // flags=1: read-modify-write — ADD the PE partial into the ACCUM
+        // contents read in the preceding ST_DRAIN_RD cycle (sram_a_rdata).
+        // Signed 32-bit add, truncated/wrapped exactly like systolic_pe acc.
+        if (flags_accumulate_q) begin
+          sram_a_wdata[31:0]   = $signed(acc_at(drain_row_q, {1'b0, drain_grp_q, 2'b00}))
+                               + $signed(sram_a_rdata[31:0]);
+          sram_a_wdata[63:32]  = $signed(acc_at(drain_row_q, {1'b0, drain_grp_q, 2'b00} + 5'd1))
+                               + $signed(sram_a_rdata[63:32]);
+          sram_a_wdata[95:64]  = $signed(acc_at(drain_row_q, {1'b0, drain_grp_q, 2'b00} + 5'd2))
+                               + $signed(sram_a_rdata[95:64]);
+          sram_a_wdata[127:96] = $signed(acc_at(drain_row_q, {1'b0, drain_grp_q, 2'b00} + 5'd3))
+                               + $signed(sram_a_rdata[127:96]);
+        end else begin
+          sram_a_wdata[31:0]   = acc_at(drain_row_q, {1'b0, drain_grp_q, 2'b00});
+          sram_a_wdata[63:32]  = acc_at(drain_row_q, {1'b0, drain_grp_q, 2'b00} + 5'd1);
+          sram_a_wdata[95:64]  = acc_at(drain_row_q, {1'b0, drain_grp_q, 2'b00} + 5'd2);
+          sram_a_wdata[127:96] = acc_at(drain_row_q, {1'b0, drain_grp_q, 2'b00} + 5'd3);
+        end
       end
 
       ST_DST_CLEAR_WR: begin

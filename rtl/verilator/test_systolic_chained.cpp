@@ -504,7 +504,11 @@ void test_matmul_multitile_2x2x2() {
 // across all (m,n) tiles; drain overwrites) so we verify the SPECIFIC
 // failure shape, not merely "diverges". DIAGNOSTIC: never aborts the suite.
 void test_ksplit_accumulate_diagnostic() {
-  const char* name = "matmul_chained_ksplit_accumulate_DIAG";
+  // #116: was a DIAGNOSTIC (print-only) while the latent flags=1-multitile
+  // K-split accumulate bug was unfixed. Now a HARD regression assertion:
+  // the controller per-tile clear_acc + ST_DRAIN_WR read-modify-write fix
+  // must make this byte-exact to the correct K-split result.
+  const char* name = "matmul_chained_ksplit_accumulate";
   Sim s;
   int8_t a[32][32] = {};
   int8_t b[32][32] = {};
@@ -592,22 +596,27 @@ void test_ksplit_accumulate_diagnostic() {
       if (got[i][j] != exp[i][j]) n_vs_exp++;
       if (got[i][j] != predicted[i][j]) n_vs_pred++;
     }
-  std::printf("DIAG ksplit: mismatch vs CORRECT exp           = %d / 1024\n", n_vs_exp);
-  std::printf("DIAG ksplit: mismatch vs PREDICTED-BUGGY model = %d / 1024\n", n_vs_pred);
-  std::printf("DIAG [0][0]   exp=%d pred=%d got=%d\n", exp[0][0], predicted[0][0], got[0][0]);
-  std::printf("DIAG [0][16]  exp=%d pred=%d got=%d\n", exp[0][16], predicted[0][16], got[0][16]);
-  std::printf("DIAG [15][15] exp=%d pred=%d got=%d\n", exp[15][15], predicted[15][15], got[15][15]);
-  std::printf("DIAG [31][31] exp=%d pred=%d got=%d\n", exp[31][31], predicted[31][31], got[31][31]);
-  if (n_vs_exp > 0 && n_vs_pred == 0)
-    std::printf("DIAG VERDICT: ROOT-CAUSE LOCKED — RTL exactly matches the "
-                "clear_acc-suppressed cross-tile-leak model and diverges from correct.\n");
-  else if (n_vs_exp == 0)
-    std::printf("DIAG VERDICT: NO BUG — K-split flags=1 is correct here; "
-                "hypothesis REFUTED, do NOT patch.\n");
-  else
-    std::printf("DIAG VERDICT: DIVERGES but NOT exactly the predicted model "
-                "(vs_exp=%d vs_pred=%d) — investigate before patching.\n",
-                n_vs_exp, n_vs_pred);
+  std::printf("ksplit: mismatch vs CORRECT exp           = %d / 1024\n", n_vs_exp);
+  std::printf("ksplit: mismatch vs PREDICTED-BUGGY model = %d / 1024\n", n_vs_pred);
+  std::printf("ksplit [0][0]   exp=%d pred=%d got=%d\n", exp[0][0], predicted[0][0], got[0][0]);
+  std::printf("ksplit [0][16]  exp=%d pred=%d got=%d\n", exp[0][16], predicted[0][16], got[0][16]);
+  std::printf("ksplit [15][15] exp=%d pred=%d got=%d\n", exp[15][15], predicted[15][15], got[15][15]);
+  std::printf("ksplit [31][31] exp=%d pred=%d got=%d\n", exp[31][31], predicted[31][31], got[31][31]);
+  // #116 HARD GATE: K-split flags=1 multitile must be byte-exact to correct.
+  // Pre-fix this byte-matched the cross-tile-leak model (n_vs_exp=1014,
+  // n_vs_pred=0). Post-fix it must be n_vs_exp==0. If it regresses to the
+  // predicted-buggy model, surface that explicitly as the failure context.
+  if (n_vs_exp != 0) {
+    if (n_vs_pred == 0)
+      std::fprintf(stderr, "ksplit REGRESSION: RTL still matches the "
+                   "clear_acc-suppressed cross-tile-leak model (#116 unfixed)\n");
+    else
+      std::fprintf(stderr, "ksplit: diverges from correct (vs_exp=%d) and is "
+                   "NOT the known predicted model (vs_pred=%d)\n",
+                   n_vs_exp, n_vs_pred);
+    TEST_FAIL(name, "K-split flags=1 multitile accumulate not byte-exact");
+  }
+  TEST_PASS(name);
 }
 
 }  // namespace

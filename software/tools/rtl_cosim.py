@@ -60,6 +60,13 @@ class SerializedSequence:
     decode_data_template: bytes          # data section template (weights + zeroed KV)
     decode_manifest_local: Dict[int, list]  # local decode PCs for RTL CSV + compare
     decode_manifest_abs: Dict[int, list]    # absolute decode PCs for golden simulator
+    # --- #109 logits-metric extension (optional; default-None keeps the P6m
+    # run_cosim_sequence path byte-identical — it never reads these fields) ---
+    golden_logits: Optional[list] = None    # per teacher-forced step: fp32[vocab]
+    vocab_size: int = 0
+    logits_size: int = 0
+    prefill_logits_offset: int = 0
+    decode_logits_offset: int = 0
 
 
 @dataclass
@@ -473,6 +480,118 @@ def run_cosim(*, token_id: int = 0, smoke_decode_steps: int = 1,
     }
 
 
+# ---------------------------------------------------------------------------
+# #109 — logits-level conformance metric (past the fp16-overflow boundary)
+#
+# Per-tensor byte-match (compare()) is well-posed only BEFORE GPT-2 124M's first
+# fp16 overflow (block0_out_proj → ±65504/NaN; freeze §4.x / P6c). Past it the
+# golden itself saturates, so the conformance signal must be logits-level:
+# argmax-agreement, finite-masked cosine, and per-token NLL → perplexity.
+# Discipline (freeze §5/§7): propose the metric WITH its first measurement;
+# do NOT hard-code a guessed threshold.
+# ---------------------------------------------------------------------------
+def _logits_dtype_for(logits_size: int, vocab_size: int):
+    """Mirror tiny_fixture.run_tiny_decode_trace dtype inference EXACTLY:
+    pad_dim(vocab)*1=INT8, *2=FP16, *4=FP32 (W8A16 lm_head → FP16)."""
+    import numpy as np
+    from taccel.compiler.tiler import pad_dim
+
+    elem = max(1, int(logits_size) // pad_dim(int(vocab_size)))
+    return {1: np.int8, 2: np.float16, 4: np.float32}.get(elem, np.int8)
+
+
+def extract_logits(dump: bytes, logits_size: int, vocab_size: int, dtype):
+    """RTL logits from the HEAD of a combined logits+KV --dram-dump-* region
+    (proven P6f technique: one dump over [logits_offset, kv_end) carries both
+    the logits and the KV cache). Returns fp32[vocab_size]."""
+    import numpy as np
+
+    raw = bytes(dump[:int(logits_size)])
+    return np.frombuffer(raw, dtype=dtype)[: int(vocab_size)].astype(np.float32)
+
+
+def extract_kv(dump: bytes, kv_cache_base: int, dump_off: int,
+               kv_size: int) -> bytes:
+    """KV-cache TAIL of the same combined logits+KV dump (threaded to the
+    next decode step exactly as run_cosim_sequence threads the KV-only dump)."""
+    s = int(kv_cache_base) - int(dump_off)
+    return bytes(dump[s:s + int(kv_size)])
+
+
+def logits_metric(golden_logits, rtl_logits, targets, vocab_size: int) -> dict:
+    """Past-overflow conformance signal (freeze #109). Per teacher-forced step:
+    argmax agreement, finite-masked cosine, golden/RTL per-token NLL. Robust to
+    non-finite logits (the whole point of the metric) — non-finite NLL steps are
+    excluded from the perplexity aggregate and counted explicitly so the first
+    measurement characterizes (not hides) the post-overflow regime."""
+    import numpy as np
+    from taccel.runtime.gpt2_perplexity import (
+        perplexity_from_nlls,
+        stable_cross_entropy,
+    )
+
+    n = min(len(golden_logits), len(rtl_logits), len(targets))
+    per_step = []
+    n_argmax_agree = 0
+    g_nlls_fin, r_nlls_fin = [], []
+    n_nonfinite_g = n_nonfinite_r = 0
+    cosines_fin = []
+    max_abs_nll_delta = 0.0
+    for i in range(n):
+        g = np.asarray(golden_logits[i], dtype=np.float32)[: int(vocab_size)]
+        r = np.asarray(rtl_logits[i], dtype=np.float32)[: int(vocab_size)]
+        g_am, r_am = int(np.argmax(g)), int(np.argmax(r))
+        agree = g_am == r_am
+        n_argmax_agree += int(agree)
+        mask = np.isfinite(g) & np.isfinite(r)
+        gn, rn = float(np.linalg.norm(g[mask])), float(np.linalg.norm(r[mask]))
+        cos = (float(np.dot(g[mask], r[mask]) / (gn * rn))
+               if mask.any() and gn > 0.0 and rn > 0.0 else float("nan"))
+        if cos == cos:  # not NaN
+            cosines_fin.append(cos)
+        tgt = int(targets[i])
+        g_fin = bool(np.all(np.isfinite(g)))
+        r_fin = bool(np.all(np.isfinite(r)))
+        g_nll = (stable_cross_entropy(g, tgt, vocab_size=vocab_size)
+                 if g_fin else float("nan"))
+        r_nll = (stable_cross_entropy(r, tgt, vocab_size=vocab_size)
+                 if r_fin else float("nan"))
+        if g_fin:
+            g_nlls_fin.append(g_nll)
+        else:
+            n_nonfinite_g += 1
+        if r_fin:
+            r_nlls_fin.append(r_nll)
+        else:
+            n_nonfinite_r += 1
+        if g_fin and r_fin:
+            max_abs_nll_delta = max(max_abs_nll_delta, abs(g_nll - r_nll))
+        per_step.append({
+            "step": i, "target": tgt, "g_argmax": g_am, "rtl_argmax": r_am,
+            "argmax_agree": agree, "cosine": cos,
+            "g_nll": g_nll, "rtl_nll": r_nll,
+            "g_finite": g_fin, "rtl_finite": r_fin,
+        })
+
+    def _ppl(nlls):
+        return perplexity_from_nlls(nlls)[0] if nlls else float("nan")
+
+    ppl_g, ppl_r = _ppl(g_nlls_fin), _ppl(r_nlls_fin)
+    return {
+        "n_steps": n,
+        "argmax_agree_rate": (n_argmax_agree / n) if n else float("nan"),
+        "min_cosine": min(cosines_fin) if cosines_fin else float("nan"),
+        "ppl_golden": ppl_g,
+        "ppl_rtl": ppl_r,
+        "ppl_delta": (abs(ppl_g - ppl_r)
+                      if ppl_g == ppl_g and ppl_r == ppl_r else float("nan")),
+        "max_abs_nll_delta": max_abs_nll_delta,
+        "n_nonfinite_golden": n_nonfinite_g,
+        "n_nonfinite_rtl": n_nonfinite_r,
+        "per_step": per_step,
+    }
+
+
 def capture_golden_sequence(*, token_ids=(0, 0, 0), payload=None,
                             exclude_nodes=None):
     """Teacher-forced golden run for prefill + len(token_ids)-1 decode steps.
@@ -489,6 +608,8 @@ def capture_golden_sequence(*, token_ids=(0, 0, 0), payload=None,
     instruction), while data_base is kept at bundle.data_base so all DMA
     SET_ADDR absolute references within the decode stream remain valid.
     """
+    import numpy as np
+
     from taccel.assembler.assembler import ProgramBinary
     from taccel.golden_model.simulator import Simulator
     from taccel.runtime.calibration import build_calibration_scales
@@ -508,6 +629,13 @@ def capture_golden_sequence(*, token_ids=(0, 0, 0), payload=None,
     )
     build_obj = tiny.build
     bundle = build_obj.bundle
+
+    # #109: logits geometry + dtype for the combined logits+KV dump. Deriving
+    # the dtype (vs hard-coding fp16) keeps RTL↔golden interpretation identical
+    # to tiny_fixture.run_tiny_decode_trace for any W8A* preset.
+    vocab_size = int(tiny.config.vocab_size)
+    logits_size = int(tiny.logits_size)
+    logits_dtype = _logits_dtype_for(logits_size, vocab_size)
 
     data_base = int(bundle.data_base)
     kv_cache_base = int(bundle.kv_cache_base)
@@ -538,12 +666,18 @@ def capture_golden_sequence(*, token_ids=(0, 0, 0), payload=None,
     # HostRunner.__init__ -> load_bundle -> trace_manifest={}; re-call load_bundle
     # after construction so the manifest injection lands on a clean slate.
     sim = Simulator()
-    runner = HostRunner(bundle, simulator=sim)
+    # logits_dtype only changes the (otherwise-discarded) return of
+    # run_prefill/run_decode_step; trace tensors come from sim.get_trace_payload
+    # and are unaffected — so this is byte-neutral for the P6m tensor path.
+    runner = HostRunner(bundle, simulator=sim, logits_dtype=logits_dtype)
     sim.load_bundle(bundle)
     sim.trace_manifest = prefill_manifest
     sim.enable_trace()
-    runner.run_prefill([int(token_ids[0])])
+    g_log_prefill = runner.run_prefill([int(token_ids[0])])
     golden_prefill = sim.get_trace_payload()["tensors"]
+    golden_logits = [
+        np.asarray(g_log_prefill, dtype=np.float32)[:vocab_size]
+    ]
 
     # Snapshot prefill instruction image and static data template.
     image_after_prefill = bundle.materialize(reset_runtime=False)
@@ -572,8 +706,9 @@ def capture_golden_sequence(*, token_ids=(0, 0, 0), payload=None,
         # Inject the decode manifest at absolute PCs; enable_trace clears prior step.
         sim.trace_manifest = decode_manifest_abs
         sim.enable_trace()
-        runner.run_decode_step(step_tok, i + 1)
+        g_log_step = runner.run_decode_step(step_tok, i + 1)
         golden_decode.append(sim.get_trace_payload()["tensors"])
+        golden_logits.append(np.asarray(g_log_step, dtype=np.float32)[:vocab_size])
 
         # Snapshot ONLY the decode instruction bytes for this step.
         # run_program ignores entry_point and always starts at PC 0, so the RTL
@@ -605,6 +740,11 @@ def capture_golden_sequence(*, token_ids=(0, 0, 0), payload=None,
         decode_data_template=decode_data_template,
         decode_manifest_local=decode_manifest_local,
         decode_manifest_abs=decode_manifest_abs,
+        golden_logits=golden_logits,
+        vocab_size=vocab_size,
+        logits_size=logits_size,
+        prefill_logits_offset=int(bundle.prefill_logits_offset),
+        decode_logits_offset=int(bundle.decode_logits_offset),
     )
     return golden_prefill, golden_decode, seq
 
@@ -705,6 +845,108 @@ def run_cosim_sequence(*, token_ids=(0, 0, 0), payload=None,
             result["divergence"] = {**step_div, "decode_step": i}
             return result
 
+    return result
+
+
+def run_cosim_sequence_logits(*, token_ids, payload=None,
+                              max_cycles=None, exclude_nodes=None):
+    """#109: teacher-forced RTL↔golden gate that ALSO emits a logits-level
+    conformance metric (the past-fp16-overflow signal).
+
+    `token_ids` is the full sequence; teacher-forced -> inputs=token_ids[:-1],
+    targets=token_ids[1:]. Golden+RTL are run over `inputs` (1 prefill +
+    len(inputs)-1 decode); each position's logits are scored against `targets`.
+
+    Single combined --dram-dump-* over [logits_offset, kv_end) carries BOTH the
+    logits (head) and the KV cache (tail) per step — the KV tail is threaded
+    forward exactly as run_cosim_sequence threads the KV-only dump.
+
+    Returns: per-tensor `divergence` (None == byte-exact; the authoritative
+    gate PRE-overflow) PLUS `logits` (the logits_metric() dict; the
+    characterization signal PAST the overflow boundary, freeze #109).
+    """
+    from taccel.assembler.assembler import ProgramBinary
+    from taccel.runtime.gpt2_perplexity import teacher_forced_inputs_and_targets
+
+    inputs, targets = teacher_forced_inputs_and_targets(token_ids)
+
+    golden_prefill, golden_decode, seq = capture_golden_sequence(
+        token_ids=inputs, payload=payload, exclude_nodes=exclude_nodes,
+    )
+    if max_cycles is None:
+        max_cycles = max(5_000_000, seq.prefill_insn_count * 3000)
+
+    csv_prefill = emit_snapshot_csv(seq.prefill_manifest)
+    csv_decode = emit_snapshot_csv(seq.decode_manifest_local)
+
+    kv_end = seq.bundle_kv_cache_base + seq.bundle_kv_cache_size
+    dump_off_p = seq.prefill_logits_offset
+    dump_off_d = seq.decode_logits_offset
+
+    # RTL prefill — one combined dump: logits (head) + KV cache (tail).
+    summary_p, rtl_entries_p, rtl_data_p, dump_p = run_rtl(
+        seq.prefill_program_bytes, csv_prefill, max_cycles=max_cycles,
+        dram_dump=(dump_off_p, kv_end - dump_off_p),
+    )
+    divergence = compare(
+        golden_prefill, rtl_entries_p, rtl_data_p,
+        seq.prefill_instr_image, seq.prefill_manifest,
+    )
+    rtl_logits = [extract_logits(dump_p, seq.logits_size, seq.vocab_size,
+                                 _logits_dtype_for(seq.logits_size,
+                                                   seq.vocab_size))]
+    kv_dump = extract_kv(dump_p, seq.bundle_kv_cache_base, dump_off_p,
+                         seq.bundle_kv_cache_size)
+    result = {
+        "summary_prefill": summary_p,
+        "divergence": divergence,
+        "n_events_prefill": sum(len(v) for v in seq.prefill_manifest.values()),
+        "n_rtl_captures_prefill": len(rtl_entries_p),
+        "n_decode_steps": seq.n_decode_steps,
+        "token_ids": list(token_ids),
+        "targets": list(targets),
+        "step_results": [],
+    }
+
+    # RTL decode steps (KV threaded via the dump tail, same as run_cosim_sequence).
+    dtype = _logits_dtype_for(seq.logits_size, seq.vocab_size)
+    for i in range(seq.n_decode_steps):
+        data = bytearray(seq.decode_data_template)
+        kv_off = seq.bundle_kv_cache_base - seq.bundle_data_base
+        data[kv_off:kv_off + seq.bundle_kv_cache_size] = kv_dump
+
+        decode_insn_count = len(seq.decode_instr_images[i]) // 8
+        pb = ProgramBinary(
+            instructions=seq.decode_instr_images[i], data=bytes(data),
+            entry_point=0, insn_count=decode_insn_count,
+            data_base=seq.bundle_data_base, input_offset=0,
+            pos_embed_patch_dram_offset=0, pos_embed_cls_dram_offset=0,
+            cls_token_dram_offset=0, trace_manifest={}, compiler_manifest={},
+        )
+        summary_d, rtl_entries_d, rtl_data_d, dump_d = run_rtl(
+            pb.to_bytes(), csv_decode,
+            max_cycles=max(5_000_000, decode_insn_count * 3000),
+            dram_dump=(dump_off_d, kv_end - dump_off_d),
+        )
+        step_div = compare(
+            golden_decode[i], rtl_entries_d, rtl_data_d,
+            seq.decode_instr_images[i], seq.decode_manifest_local,
+        )
+        rtl_logits.append(extract_logits(dump_d, seq.logits_size,
+                                         seq.vocab_size, dtype))
+        kv_dump = extract_kv(dump_d, seq.bundle_kv_cache_base, dump_off_d,
+                             seq.bundle_kv_cache_size)
+        result["step_results"].append({
+            "step": i, "token": seq.step_tokens[i], "summary": summary_d,
+            "n_rtl_captures": len(rtl_entries_d), "divergence": step_div,
+        })
+        if step_div is not None and result["divergence"] is None:
+            result["divergence"] = {**step_div, "decode_step": i}
+
+    # Logits-level metric over ALL teacher-forced positions (the #109 signal).
+    result["logits"] = logits_metric(
+        seq.golden_logits, rtl_logits, targets, seq.vocab_size,
+    )
     return result
 
 

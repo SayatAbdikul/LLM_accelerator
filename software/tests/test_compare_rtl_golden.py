@@ -35,6 +35,7 @@ It has three legs, in increasing strength:
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -367,3 +368,136 @@ def test_rtl_cosim_gen2_multistep_tiny():
             f"step {step_r['step']}: captures {step_r['n_rtl_captures']} "
             f"!= events {step_r['n_events']}"
         )
+
+
+# --------------------------------------------------------------------------
+# Leg 5 — #109 logits-level conformance metric, validated on the tiny fixture
+# --------------------------------------------------------------------------
+def test_rtl_cosim_gen2_logits_metric_tiny():
+    """#109 metric self-validation. The tiny fixture has NO fp16 overflow, so
+    RTL↔golden logits must be perfectly in agreement: this test pins the
+    *correctness of the metric implementation itself* before it is trusted on
+    GPT-2 124M past the overflow boundary (the opt-in PYTEST_124M leg).
+
+    Asserts: pre-overflow per-tensor byte-match still holds (divergence is
+    None), AND argmax-agreement == 1.0, min cosine ≈ 1.0, ppl_delta == 0,
+    zero non-finite logits on either rail.
+    """
+    cosim = _load_rtl_cosim()
+    if not cosim.RTL_BINARY.exists():
+        pytest.skip(
+            f"run_program not built ({cosim.RTL_BINARY}); "
+            "build: make -C rtl/verilator run_program"
+        )
+    tool = _load_tool()
+    if not tool.DEFAULT_FIXTURE.exists():
+        pytest.skip(
+            "tiny nanoGPT fixture not generated; run "
+            "PYTHONPATH=software python software/tools/train_tiny_fixture.py"
+        )
+    torch = pytest.importorskip("torch")
+    payload = torch.load(tool.DEFAULT_FIXTURE, map_location="cpu")
+
+    # Real shakespeare-char tokens: 4-token sequence -> teacher-forced
+    # inputs len 3 (1 prefill + 2 decode), 3 scored targets (~3 RTL runs).
+    stoi = payload["stoi"]
+    sample = payload["text"][100:104]
+    token_ids = [int(stoi[c]) for c in sample]
+    assert len(token_ids) == 4, f"need 4 tokens, got {token_ids}"
+
+    res = cosim.run_cosim_sequence_logits(token_ids=token_ids, payload=payload)
+
+    # Prefill must run clean.
+    sp = res["summary_prefill"]
+    assert sp.get("status") == "halted", f"RTL prefill did not halt: {sp}"
+    assert sp.get("fault") is False, f"RTL prefill fault: {sp}"
+    assert sp.get("forbidden_overlap_violation") is False, (
+        f"RTL prefill forbidden overlap: {sp}"
+    )
+    assert not sp.get("timeout"), f"RTL prefill timed out: {sp}"
+    assert res["n_rtl_captures_prefill"] == res["n_events_prefill"], res
+
+    # Pre-overflow per-tensor byte-match must still hold on the tiny fixture.
+    assert res["divergence"] is None, (
+        "RTL-vs-golden per-tensor DIVERGENCE on tiny fixture "
+        f"(token_ids={token_ids}):\n"
+        + json.dumps(res["divergence"], indent=2, default=str)
+    )
+
+    # The logits metric must show perfect agreement (no overflow on tiny).
+    m = res["logits"]
+    assert m["n_steps"] == len(token_ids) - 1, m
+    assert m["n_nonfinite_golden"] == 0 and m["n_nonfinite_rtl"] == 0, (
+        f"unexpected non-finite logits on tiny fixture: {m}"
+    )
+    assert m["argmax_agree_rate"] == 1.0, f"argmax disagreement: {m}"
+    assert m["min_cosine"] >= 1.0 - 1e-4, f"cosine below 1: {m}"
+    assert m["ppl_delta"] == 0.0, f"ppl_delta != 0 (logits not bit-equal): {m}"
+    assert m["max_abs_nll_delta"] == 0.0, f"per-token NLL delta != 0: {m}"
+
+
+# --------------------------------------------------------------------------
+# Leg 6 — #109 GPT-2 124M logits-metric FIRST MEASUREMENT (opt-in, manual)
+# --------------------------------------------------------------------------
+GPT2_124M_FIXTURE = (
+    REPO_ROOT / "software" / "tests" / "fixtures" / "generated"
+    / "gpt2_converted_nanogpt.pt"
+)
+
+
+def test_rtl_cosim_gpt2_124m_logits_metric():
+    """#109 first measurement on the REAL GPT-2 124M weight_only_int8_quarot
+    bundle. OPT-IN / MANUAL (PYTEST_124M=1): ~5 min per RTL run; requires
+    run_program rebuilt with DRAM_SIZE>=1<<30 (the 16 MB default FAULT_DRAM_OOBs
+    on the ~392 MB 124M image).
+
+    Discipline (freeze §5/§7): this test DOES NOT assert a guessed perplexity
+    threshold. Per-tensor compare() is well-posed only PRE-overflow; past
+    block0_out_proj the golden itself saturates fp16. The job here is to
+    *measure* the logits-level conformance (argmax / cosine / ppl) and emit it
+    so the user can fill + commit the §6/§7 revision stub
+    (docs/isa_freeze_revision_109_stub.md). The hard assertions are only that
+    the 124M RTL run is clean and non-vacuous and the metric is computable.
+    """
+    if os.environ.get("PYTEST_124M") != "1":
+        pytest.skip("opt-in: set PYTEST_124M=1 (rebuild run_program "
+                    "DRAM_SIZE=1073741824 first; ~5 min/RTL run)")
+    if not GPT2_124M_FIXTURE.exists():
+        pytest.skip(f"GPT-2 124M checkpoint missing: {GPT2_124M_FIXTURE}")
+    cosim = _load_rtl_cosim()
+    if not cosim.RTL_BINARY.exists():
+        pytest.skip(f"run_program not built ({cosim.RTL_BINARY})")
+    torch = pytest.importorskip("torch")
+    payload = torch.load(GPT2_124M_FIXTURE, map_location="cpu")
+
+    # Minimal feasible teacher-forced sequence: 3 tokens -> 1 prefill + 1
+    # decode (~10 min total). Tokens are arbitrary valid ids — the metric is
+    # RTL-vs-golden agreement, and the fp16 overflow at block0_out_proj is
+    # input-independent (it is the W8A16 124M MLP dynamic range).
+    token_ids = [464, 3290, 318]
+    res = cosim.run_cosim_sequence_logits(
+        token_ids=token_ids, payload=payload, exclude_nodes={"lm_head"},
+    )
+
+    sp = res["summary_prefill"]
+    assert sp.get("status") == "halted", f"124M RTL prefill not clean: {sp}"
+    assert sp.get("fault") is False, f"124M RTL fault: {sp}"
+    assert sp.get("forbidden_overlap_violation") is False, sp
+    assert not sp.get("timeout"), f"124M RTL timed out: {sp}"
+    assert res["n_rtl_captures_prefill"] == res["n_events_prefill"], res
+
+    m = res["logits"]
+    assert m["n_steps"] == len(token_ids) - 1, m
+
+    # Emit the FIRST MEASUREMENT (recorded for the freeze stub; NOT thresholded).
+    boundary = res["divergence"]
+    print("\n==== #109 GPT-2 124M FIRST MEASUREMENT ====")
+    print("first per-tensor divergence (the fp16-overflow boundary; "
+          "expected at/after block0_out_proj — ill-posed past it, NOT a bug):")
+    print(json.dumps(boundary, indent=2, default=str))
+    print("logits-level conformance metric:")
+    print(json.dumps({k: v for k, v in m.items() if k != "per_step"},
+                      indent=2, default=str))
+    print("per-step:")
+    print(json.dumps(m["per_step"], indent=2, default=str))
+    print("==== paste into docs/isa_freeze_revision_109_stub.md §Measurement ====")
