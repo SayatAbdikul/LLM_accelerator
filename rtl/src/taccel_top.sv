@@ -242,7 +242,12 @@ module taccel_top
   logic       sys_sram_fault_now;
   logic       sys_sram_fault_latched;
 
-  logic sys_busy, sfu_busy, helper_busy;
+  // #114: public_flat_rd exposes the systolic-idle level so run_program's
+  // ACCUM snapshot capture can wait for ST_DRAIN_WR to settle ACCUM before
+  // reading (the snapshot anchor PC can retire mid-drain). Pure Verilator
+  // pragma — no RTL/synthesis semantic change (taccel_top house style).
+  logic sys_busy /* verilator public_flat_rd */;
+  logic sfu_busy, helper_busy;
 
   // -----------------------------------------------------------------------
   // Internal-only observability state used by the Verilator program runner.

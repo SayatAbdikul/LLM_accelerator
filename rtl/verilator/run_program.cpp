@@ -166,6 +166,11 @@ struct SnapshotCapture {
 struct PendingSnapshotCapture {
     SnapshotRequest req;
     uint64_t due_cycle = 0;
+    // #114: when true, capture when the systolic array is idle (ACCUM drain
+    // complete) instead of at due_cycle. Used only for buf_id==BUF_ACCUM —
+    // accum_read_logical_i32 is byte-exact on a settled ACCUM but reads
+    // all-zeros if the snapshot anchor PC retires before ST_DRAIN_WR runs.
+    bool wait_sys_idle = false;
 };
 
 uint16_t read_be16(const std::vector<uint8_t>& data, size_t off) {
@@ -1084,9 +1089,15 @@ int main(int argc, char** argv) {
             if (!want_snapshots || pending_snapshot_reqs.empty()) {
                 return;
             }
+            const bool sys_idle = !root->taccel_top__DOT__sys_busy;
             auto it = pending_snapshot_reqs.begin();
             while (it != pending_snapshot_reqs.end()) {
-                if (it->due_cycle <= cycle) {
+                // #114: ACCUM captures fire when the systolic drain has
+                // settled (sys_busy==0); all others fire at due_cycle.
+                const bool ready = it->wait_sys_idle
+                                       ? sys_idle
+                                       : (it->due_cycle <= cycle);
+                if (ready) {
                     capture_snapshot_request(it->req, cycle);
                     it = pending_snapshot_reqs.erase(it);
                 } else {
@@ -1103,7 +1114,19 @@ int main(int argc, char** argv) {
             while (next_snapshot_req < snapshot_requests.size() &&
                    snapshot_requests[next_snapshot_req].pc == retired_pc) {
                 const auto& req = snapshot_requests[next_snapshot_req];
-                if (req.capture_phase == "retire_plus_1") {
+                // #114: an ACCUM snapshot is meaningful only once the systolic
+                // ST_DRAIN_WR has written ACCUM. If systolic is still busy at
+                // the anchor retire (the producing matmul has not drained),
+                // defer until it goes idle; if already idle the drained value
+                // is present, so capture immediately (proven correct by
+                // test_accum_snapshot_readback: snap@sync == golden). Strictly
+                // buf==BUF_ACCUM-scoped — fp16/int8 capture timing is unchanged.
+                if (req.buf_id == tbutil::BUF_ACCUM_ID &&
+                    root->taccel_top__DOT__sys_busy) {
+                    PendingSnapshotCapture p{req, 0};
+                    p.wait_sys_idle = true;
+                    pending_snapshot_reqs.push_back(p);
+                } else if (req.capture_phase == "retire_plus_1") {
                     pending_snapshot_reqs.push_back(PendingSnapshotCapture{req, cycle + 1});
                 } else {
                     capture_snapshot_request(req, cycle);

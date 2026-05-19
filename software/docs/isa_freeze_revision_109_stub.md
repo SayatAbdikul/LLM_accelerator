@@ -109,9 +109,36 @@ than the freeze's documented "byte-EXACT (0 ULP) through `block0_out_proj`"
   evidence. This is a *characterized-contract* decision, not a silent relax —
   it does **not** change `simulator.py` (golden SHA untouched); it adds a
   per-op-class band in `_freeze7_band` / `expect_fp16_ulp`, mirroring gelu.
-- **Independent confirmation suggested:** rerun with P6c's original token to
-  confirm the boundary is token-dependent (expected: 0-ULP through out_proj
-  reproduces; the ≤1-ULP block0_ln1 drift is real-token-specific).
+- **Discriminating run DONE (2026-05-19, post-#116 binary, token_id=0,
+  single-token prefill, `run_cosim`):** clean run (halted, no fault, no
+  overlap, 976/976 captures); first per-tensor divergence =
+  **`block1_ln1`, pc 4320, fp16 ULP 1** (golden −0.0004210472,
+  rtl −0.00042128562). Conclusions:
+  1. **Token-dependence CONFIRMED.** The boundary node moves with input
+     (`block0_ln1` for `[464,3290,318]`, `block1_ln1` for token 0) — but in
+     **both** independent token sets the first divergence is a **LayerNorm at
+     exactly 1 fp16 ULP**. The mechanism is consistent; only the position
+     shifts. This strongly grounds the proposed `layernorm_fp32` ≤1-ULP
+     real-data band (two independent measurements, same 1-ULP signature).
+  2. **"Byte-exact through `block0_out_proj`" is token-specific.** With
+     token 0 it HOLDS (first divergence `block1_ln1` is in block 1, i.e.
+     *after* all of block 0 incl. out_proj — consistent with P6c). With real
+     tokens `[464,3290,318]` it does NOT (first divergence `block0_ln1`
+     precedes out_proj). The freeze/memory claim is true only for the P6c
+     token, not for arbitrary real input — exactly what §7's "e2e is the
+     final arbiter" clause exists to catch.
+  3. **#116 regression-neutrality EMPIRICALLY CONFIRMED on 124M.** The token-0
+     run used the **post-#116** binary; the only divergence is the expected
+     ≤1-ULP LayerNorm drift — no flags=1-class corruption (which would be
+     gross, not 1 ULP). Combined with the post-#116 frozen freeze gate (6/6,
+     0 ULP), #116 is regression-neutral on both the tiny and 124M paths.
+- **User: the recall memory needs narrowing too.** `gen2-rtl-conformance.md`
+  carries the verbatim claim "GPT-2-124M prefill byte-exact THROUGH out_proj"
+  (and its `description:` line). Per the discipline this file is not silently
+  edited; on accepting this revision, narrow that memory line to
+  *"...through out_proj **for the P6c token**; under arbitrary real tokens a
+  characterized ≤1-ULP `layernorm_fp32` real-data band applies (#109)"* so the
+  recalled context stays accurate.
 
 ### Reading the measurement (do not over-read the PPL)
 

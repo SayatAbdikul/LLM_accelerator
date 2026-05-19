@@ -48,7 +48,8 @@ CONTROL_SV    := $(PKG) \
 
 .PHONY: all run_program test_decode test_control test_dma test_helpers test_sfu \
         test_systolic test_systolic_array_chained test_systolic_chained \
-        test_systolic_query test_systolic_qkt test_addr_raw_hazard clean
+        test_systolic_query test_systolic_qkt test_addr_raw_hazard \
+        test_accum_snapshot_readback clean
 
 all: test_decode test_control test_dma test_helpers test_sfu test_systolic
 
@@ -224,6 +225,25 @@ $(BUILD_DIR)/test_systolic_chained/Vtaccel_top: $(CONTROL_SV) test_systolic_chai
 test_systolic_chained: $(BUILD_DIR)/test_systolic_chained/Vtaccel_top
 	@echo "--- Running chained top-level systolic tests ---"
 	$(BUILD_DIR)/test_systolic_chained/Vtaccel_top
+
+# -----------------------------------------------------------------------
+# test_accum_snapshot_readback: #114 ACCUM-snapshot readback reproducer
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_accum_snapshot_readback/Vtaccel_top: $(CONTROL_SV) test_accum_snapshot_readback.cpp
+	mkdir -p $(BUILD_DIR)/test_accum_snapshot_readback
+	$(VERILATOR) $(VFLAGS) \
+	  -GSYSTOLIC_ARCH_MODE=1 \
+	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
+	  --top-module taccel_top \
+	  --Mdir $(BUILD_DIR)/test_accum_snapshot_readback \
+	  $(CONTROL_SV) \
+	  test_accum_snapshot_readback.cpp \
+	  -CFLAGS "-I$(CURDIR)/include $(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_accum_snapshot_readback -f Vtaccel_top.mk
+
+test_accum_snapshot_readback: $(BUILD_DIR)/test_accum_snapshot_readback/Vtaccel_top
+	@echo "--- Running #114 ACCUM-snapshot readback reproducer ---"
+	$(BUILD_DIR)/test_accum_snapshot_readback/Vtaccel_top
 
 # -----------------------------------------------------------------------
 # test_systolic_query: focused chained query-projection regression
