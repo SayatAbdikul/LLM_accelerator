@@ -51,7 +51,10 @@ CONTROL_SV    := $(PKG) \
         test_systolic_query test_systolic_qkt test_addr_raw_hazard \
         test_accum_snapshot_readback test_fp32_add test_fp32_add_pipe \
         test_fp32_sub_pipe test_fp32_mul_pipe test_fp16_to_fp32_pipe \
-        test_fp32_add_pipe_lat3 synth-check clean
+        test_fp32_add_pipe_lat3 test_i32_to_fp32_pipe test_fp32_to_fp16_pipe \
+        test_fp32_quantize_i8_pipe test_fp32_div_pipe test_fp32_sqrt_pipe \
+        test_fp32_exp_pipe test_fp32_gelu_new_pipe test_fp32_gelu_pipe \
+        synth-check clean
 
 FP32_DIR := $(SRC_DIR)/fp32
 
@@ -368,6 +371,135 @@ $(BUILD_DIR)/test_fp16_to_fp32_pipe/Vfp16_to_fp32_pipe: $(FP32_DIR)/fp16_to_fp32
 test_fp16_to_fp32_pipe: $(BUILD_DIR)/test_fp16_to_fp32_pipe/Vfp16_to_fp32_pipe
 	@echo "--- Running EXHAUSTIVE fp16_to_fp32_pipe bit-exact gate ---"
 	$(BUILD_DIR)/test_fp16_to_fp32_pipe/Vfp16_to_fp32_pipe
+
+# -----------------------------------------------------------------------
+# test_i32_to_fp32_pipe: signed int32 -> fp32 RNE conversion gate.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_i32_to_fp32_pipe/Vi32_to_fp32_pipe: $(FP32_DIR)/i32_to_fp32.sv $(FP32_DIR)/i32_to_fp32_pipe.sv test_i32_to_fp32_pipe.cpp
+	mkdir -p $(BUILD_DIR)/test_i32_to_fp32_pipe
+	$(VERILATOR) $(VFLAGS) \
+	  --top-module i32_to_fp32_pipe \
+	  -I$(FP32_DIR) \
+	  --Mdir $(BUILD_DIR)/test_i32_to_fp32_pipe \
+	  $(FP32_DIR)/i32_to_fp32_pipe.sv \
+	  test_i32_to_fp32_pipe.cpp \
+	  -CFLAGS "$(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_i32_to_fp32_pipe -f Vi32_to_fp32_pipe.mk
+
+test_i32_to_fp32_pipe: $(BUILD_DIR)/test_i32_to_fp32_pipe/Vi32_to_fp32_pipe
+	@echo "--- Running i32_to_fp32_pipe bit-exact gate ---"
+	$(BUILD_DIR)/test_i32_to_fp32_pipe/Vi32_to_fp32_pipe
+
+# -----------------------------------------------------------------------
+# test_fp32_to_fp16_pipe: fp32 -> fp16 RNE rounding gate.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_fp32_to_fp16_pipe/Vfp32_to_fp16_pipe: $(FP32_DIR)/fp32_to_fp16.sv $(FP32_DIR)/fp32_to_fp16_pipe.sv test_fp32_to_fp16_pipe.cpp
+	mkdir -p $(BUILD_DIR)/test_fp32_to_fp16_pipe
+	$(VERILATOR) $(VFLAGS) \
+	  --top-module fp32_to_fp16_pipe \
+	  -I$(FP32_DIR) \
+	  --Mdir $(BUILD_DIR)/test_fp32_to_fp16_pipe \
+	  $(FP32_DIR)/fp32_to_fp16_pipe.sv \
+	  test_fp32_to_fp16_pipe.cpp \
+	  -CFLAGS "$(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_fp32_to_fp16_pipe -f Vfp32_to_fp16_pipe.mk
+
+test_fp32_to_fp16_pipe: $(BUILD_DIR)/test_fp32_to_fp16_pipe/Vfp32_to_fp16_pipe
+	@echo "--- Running fp32_to_fp16_pipe bit-exact gate ---"
+	$(BUILD_DIR)/test_fp32_to_fp16_pipe/Vfp32_to_fp16_pipe
+
+# -----------------------------------------------------------------------
+# test_fp32_quantize_i8_pipe: fp32 -> int8 RNE + Option-B non-finite gate.
+# Single-input variant; SFU integration does value/out_scale via fp32_div.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_fp32_quantize_i8_pipe/Vfp32_quantize_i8_pipe: $(FP32_DIR)/fp32_quantize_i8.sv $(FP32_DIR)/fp32_quantize_i8_pipe.sv test_fp32_quantize_i8_pipe.cpp
+	mkdir -p $(BUILD_DIR)/test_fp32_quantize_i8_pipe
+	$(VERILATOR) $(VFLAGS) \
+	  --top-module fp32_quantize_i8_pipe \
+	  -I$(FP32_DIR) \
+	  --Mdir $(BUILD_DIR)/test_fp32_quantize_i8_pipe \
+	  $(FP32_DIR)/fp32_quantize_i8_pipe.sv \
+	  test_fp32_quantize_i8_pipe.cpp \
+	  -CFLAGS "$(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_fp32_quantize_i8_pipe -f Vfp32_quantize_i8_pipe.mk
+
+test_fp32_quantize_i8_pipe: $(BUILD_DIR)/test_fp32_quantize_i8_pipe/Vfp32_quantize_i8_pipe
+	@echo "--- Running fp32_quantize_i8_pipe bit-exact gate ---"
+	$(BUILD_DIR)/test_fp32_quantize_i8_pipe/Vfp32_quantize_i8_pipe
+
+# -----------------------------------------------------------------------
+# test_fp32_div_pipe: IEEE-754 binary32 divide, bit-exact via exact integer
+# long-division on normalized 24-bit significands.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_fp32_div_pipe/Vfp32_div_pipe: $(FP32_DIR)/fp32_div.sv $(FP32_DIR)/fp32_div_pipe.sv test_fp32_div_pipe.cpp
+	mkdir -p $(BUILD_DIR)/test_fp32_div_pipe
+	$(VERILATOR) $(VFLAGS) \
+	  --top-module fp32_div_pipe \
+	  -I$(FP32_DIR) \
+	  --Mdir $(BUILD_DIR)/test_fp32_div_pipe \
+	  $(FP32_DIR)/fp32_div_pipe.sv \
+	  test_fp32_div_pipe.cpp \
+	  -CFLAGS "$(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_fp32_div_pipe -f Vfp32_div_pipe.mk
+
+test_fp32_div_pipe: $(BUILD_DIR)/test_fp32_div_pipe/Vfp32_div_pipe
+	@echo "--- Running fp32_div_pipe bit-exact gate ---"
+	$(BUILD_DIR)/test_fp32_div_pipe/Vfp32_div_pipe
+
+# -----------------------------------------------------------------------
+# test_fp32_sqrt_pipe: IEEE-754 binary32 sqrt via radix-2 digit-recurrence.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_fp32_sqrt_pipe/Vfp32_sqrt_pipe: $(FP32_DIR)/fp32_sqrt.sv $(FP32_DIR)/fp32_sqrt_pipe.sv test_fp32_sqrt_pipe.cpp
+	mkdir -p $(BUILD_DIR)/test_fp32_sqrt_pipe
+	$(VERILATOR) $(VFLAGS) \
+	  --top-module fp32_sqrt_pipe \
+	  -I$(FP32_DIR) \
+	  --Mdir $(BUILD_DIR)/test_fp32_sqrt_pipe \
+	  $(FP32_DIR)/fp32_sqrt_pipe.sv \
+	  test_fp32_sqrt_pipe.cpp \
+	  -CFLAGS "$(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_fp32_sqrt_pipe -f Vfp32_sqrt_pipe.mk
+
+test_fp32_sqrt_pipe: $(BUILD_DIR)/test_fp32_sqrt_pipe/Vfp32_sqrt_pipe
+	@echo "--- Running fp32_sqrt_pipe bit-exact gate ---"
+	$(BUILD_DIR)/test_fp32_sqrt_pipe/Vfp32_sqrt_pipe
+
+# -----------------------------------------------------------------------
+# test_fp32_exp_pipe: synthesizable fp32 exp, MEASURED-BAND gate (freeze §7).
+# Polynomial approximation + range reduction; reports ULP histogram vs libm.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_fp32_exp_pipe/Vfp32_exp_pipe: $(FP32_DIR)/fp32_exp.sv $(FP32_DIR)/fp32_exp_pipe.sv $(FP32_DIR)/fp32_add.sv $(FP32_DIR)/fp32_mul.sv test_fp32_exp_pipe.cpp
+	mkdir -p $(BUILD_DIR)/test_fp32_exp_pipe
+	$(VERILATOR) $(VFLAGS) \
+	  --top-module fp32_exp_pipe \
+	  -I$(FP32_DIR) \
+	  --Mdir $(BUILD_DIR)/test_fp32_exp_pipe \
+	  $(FP32_DIR)/fp32_exp_pipe.sv \
+	  test_fp32_exp_pipe.cpp \
+	  -CFLAGS "$(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_fp32_exp_pipe -f Vfp32_exp_pipe.mk
+
+test_fp32_exp_pipe: $(BUILD_DIR)/test_fp32_exp_pipe/Vfp32_exp_pipe
+	@echo "--- Running fp32_exp_pipe MEASURED-BAND gate ---"
+	$(BUILD_DIR)/test_fp32_exp_pipe/Vfp32_exp_pipe
+
+# -----------------------------------------------------------------------
+# test_fp32_gelu_new_pipe: synthesizable gen-2 GELU (tanh-poly), MEASURED-BAND.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_fp32_gelu_new_pipe/Vfp32_gelu_new_pipe: $(FP32_DIR)/fp32_gelu_new.sv $(FP32_DIR)/fp32_gelu_new_pipe.sv test_fp32_gelu_new_pipe.cpp
+	mkdir -p $(BUILD_DIR)/test_fp32_gelu_new_pipe
+	$(VERILATOR) $(VFLAGS) \
+	  --top-module fp32_gelu_new_pipe \
+	  -I$(FP32_DIR) \
+	  --Mdir $(BUILD_DIR)/test_fp32_gelu_new_pipe \
+	  $(FP32_DIR)/fp32_gelu_new_pipe.sv \
+	  test_fp32_gelu_new_pipe.cpp \
+	  -CFLAGS "$(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_fp32_gelu_new_pipe -f Vfp32_gelu_new_pipe.mk
+
+test_fp32_gelu_new_pipe: $(BUILD_DIR)/test_fp32_gelu_new_pipe/Vfp32_gelu_new_pipe
+	@echo "--- Running fp32_gelu_new_pipe MEASURED-BAND gate ---"
+	$(BUILD_DIR)/test_fp32_gelu_new_pipe/Vfp32_gelu_new_pipe
 
 # -----------------------------------------------------------------------
 # test_systolic_query: focused chained query-projection regression
