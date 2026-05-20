@@ -49,7 +49,9 @@ CONTROL_SV    := $(PKG) \
 .PHONY: all run_program test_decode test_control test_dma test_helpers test_sfu \
         test_systolic test_systolic_array_chained test_systolic_chained \
         test_systolic_query test_systolic_qkt test_addr_raw_hazard \
-        test_accum_snapshot_readback test_fp32_add clean
+        test_accum_snapshot_readback test_fp32_add test_fp32_add_pipe \
+        test_fp32_sub_pipe test_fp32_mul_pipe test_fp16_to_fp32_pipe \
+        test_fp32_add_pipe_lat3 synth-check clean
 
 FP32_DIR := $(SRC_DIR)/fp32
 
@@ -267,6 +269,107 @@ test_fp32_add: $(BUILD_DIR)/test_fp32_add/Vfp32_add
 	$(BUILD_DIR)/test_fp32_add/Vfp32_add
 
 # -----------------------------------------------------------------------
+# test_fp32_add_pipe: pipelined shell over the proven fp32_add core. Proves
+# the uniform fixed-latency valid handshake (Phase 1 of the synthesizable
+# SFU library). Standalone — links only the fp32 primitive files.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_fp32_add_pipe/Vfp32_add_pipe: $(FP32_DIR)/fp32_add.sv $(FP32_DIR)/fp32_add_pipe.sv test_fp32_add_pipe.cpp
+	mkdir -p $(BUILD_DIR)/test_fp32_add_pipe
+	$(VERILATOR) $(VFLAGS) \
+	  --top-module fp32_add_pipe \
+	  -I$(FP32_DIR) \
+	  --Mdir $(BUILD_DIR)/test_fp32_add_pipe \
+	  $(FP32_DIR)/fp32_add_pipe.sv \
+	  test_fp32_add_pipe.cpp \
+	  -CFLAGS "$(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_fp32_add_pipe -f Vfp32_add_pipe.mk
+
+test_fp32_add_pipe: $(BUILD_DIR)/test_fp32_add_pipe/Vfp32_add_pipe
+	@echo "--- Running synthesizable fp32_add_pipe handshake+bit-exact gate ---"
+	$(BUILD_DIR)/test_fp32_add_pipe/Vfp32_add_pipe
+
+# -----------------------------------------------------------------------
+# test_fp32_add_pipe_lat3: same gate built with LATENCY=3 (-GLATENCY=3).
+# Proves the shell parameterization works at deeper LATENCY — every
+# subsequent primitive's pipelined depth (div/sqrt/exp/tanh, all > 1) will
+# inherit this parameter. Catches handshake/in_flight-queue bugs that
+# LATENCY=1 happens to mask.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_fp32_add_pipe_lat3/Vfp32_add_pipe: $(FP32_DIR)/fp32_add.sv $(FP32_DIR)/fp32_add_pipe.sv test_fp32_add_pipe.cpp
+	mkdir -p $(BUILD_DIR)/test_fp32_add_pipe_lat3
+	$(VERILATOR) $(VFLAGS) \
+	  --top-module fp32_add_pipe \
+	  -GLATENCY=3 \
+	  -I$(FP32_DIR) \
+	  --Mdir $(BUILD_DIR)/test_fp32_add_pipe_lat3 \
+	  $(FP32_DIR)/fp32_add_pipe.sv \
+	  test_fp32_add_pipe.cpp \
+	  -CFLAGS "-DPIPE_LATENCY=3 $(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_fp32_add_pipe_lat3 -f Vfp32_add_pipe.mk
+
+test_fp32_add_pipe_lat3: $(BUILD_DIR)/test_fp32_add_pipe_lat3/Vfp32_add_pipe
+	@echo "--- Running fp32_add_pipe LATENCY=3 parameterization gate ---"
+	$(BUILD_DIR)/test_fp32_add_pipe_lat3/Vfp32_add_pipe
+
+# -----------------------------------------------------------------------
+# test_fp32_sub_pipe: synthesizable fp32 subtract via fp32_add core
+# (a - b == a + (-b); IEEE negate via sign-bit XOR). Bit-exact gate vs
+# the sfu_fp32_sub DPI golden.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_fp32_sub_pipe/Vfp32_sub_pipe: $(FP32_DIR)/fp32_add.sv $(FP32_DIR)/fp32_add_pipe.sv $(FP32_DIR)/fp32_sub_pipe.sv test_fp32_sub_pipe.cpp
+	mkdir -p $(BUILD_DIR)/test_fp32_sub_pipe
+	$(VERILATOR) $(VFLAGS) \
+	  --top-module fp32_sub_pipe \
+	  -I$(FP32_DIR) \
+	  --Mdir $(BUILD_DIR)/test_fp32_sub_pipe \
+	  $(FP32_DIR)/fp32_sub_pipe.sv \
+	  test_fp32_sub_pipe.cpp \
+	  -CFLAGS "$(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_fp32_sub_pipe -f Vfp32_sub_pipe.mk
+
+test_fp32_sub_pipe: $(BUILD_DIR)/test_fp32_sub_pipe/Vfp32_sub_pipe
+	@echo "--- Running synthesizable fp32_sub_pipe bit-exact gate ---"
+	$(BUILD_DIR)/test_fp32_sub_pipe/Vfp32_sub_pipe
+
+# -----------------------------------------------------------------------
+# test_fp32_mul_pipe: synthesizable IEEE-754 binary32 multiply, bit-exact
+# vs sfu_fp32_mul DPI golden (incl. inf*0 -> qNaN, subnormals, RNE).
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_fp32_mul_pipe/Vfp32_mul_pipe: $(FP32_DIR)/fp32_mul.sv $(FP32_DIR)/fp32_mul_pipe.sv test_fp32_mul_pipe.cpp
+	mkdir -p $(BUILD_DIR)/test_fp32_mul_pipe
+	$(VERILATOR) $(VFLAGS) \
+	  --top-module fp32_mul_pipe \
+	  -I$(FP32_DIR) \
+	  --Mdir $(BUILD_DIR)/test_fp32_mul_pipe \
+	  $(FP32_DIR)/fp32_mul_pipe.sv \
+	  test_fp32_mul_pipe.cpp \
+	  -CFLAGS "$(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_fp32_mul_pipe -f Vfp32_mul_pipe.mk
+
+test_fp32_mul_pipe: $(BUILD_DIR)/test_fp32_mul_pipe/Vfp32_mul_pipe
+	@echo "--- Running synthesizable fp32_mul_pipe bit-exact gate ---"
+	$(BUILD_DIR)/test_fp32_mul_pipe/Vfp32_mul_pipe
+
+# -----------------------------------------------------------------------
+# test_fp16_to_fp32_pipe: exact (no rounding) fp16->fp32 converter, EXHAUSTIVE
+# 65536-pattern gate vs the sfu_fp16_bits_to_fp32 DPI semantics.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_fp16_to_fp32_pipe/Vfp16_to_fp32_pipe: $(FP32_DIR)/fp16_to_fp32.sv $(FP32_DIR)/fp16_to_fp32_pipe.sv test_fp16_to_fp32_pipe.cpp
+	mkdir -p $(BUILD_DIR)/test_fp16_to_fp32_pipe
+	$(VERILATOR) $(VFLAGS) \
+	  --top-module fp16_to_fp32_pipe \
+	  -I$(FP32_DIR) \
+	  --Mdir $(BUILD_DIR)/test_fp16_to_fp32_pipe \
+	  $(FP32_DIR)/fp16_to_fp32_pipe.sv \
+	  test_fp16_to_fp32_pipe.cpp \
+	  -CFLAGS "$(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_fp16_to_fp32_pipe -f Vfp16_to_fp32_pipe.mk
+
+test_fp16_to_fp32_pipe: $(BUILD_DIR)/test_fp16_to_fp32_pipe/Vfp16_to_fp32_pipe
+	@echo "--- Running EXHAUSTIVE fp16_to_fp32_pipe bit-exact gate ---"
+	$(BUILD_DIR)/test_fp16_to_fp32_pipe/Vfp16_to_fp32_pipe
+
+# -----------------------------------------------------------------------
 # test_systolic_query: focused chained query-projection regression
 # -----------------------------------------------------------------------
 $(BUILD_DIR)/test_systolic_query/Vtaccel_top: $(CONTROL_SV) test_systolic_query.cpp
@@ -326,6 +429,31 @@ $(BUILD_DIR)/test_addr_raw_hazard/Vtaccel_top: $(CONTROL_SV) test_addr_raw_hazar
 test_addr_raw_hazard: $(BUILD_DIR)/test_addr_raw_hazard/Vtaccel_top
 	@echo "--- Running addr RAW hazard tests ---"
 	$(BUILD_DIR)/test_addr_raw_hazard/Vtaccel_top
+
+# -----------------------------------------------------------------------
+# synth-check: yosys generic-synthesis gate (no FPGA part). Proves the
+# design elaborates to synthesizable logic with zero behavioral (real/DPI)
+# constructs — the FPGA-demo roadmap Phase-2 definition of done. Single
+# source of truth for the file list is CONTROL_SV (the taccel_top design
+# set, tb/ excluded). Currently EXPECTED to fail on sfu_engine.sv +
+# blocking_helper_engine.sv (real storage + DPI-C); that red is the work
+# list. Goes green when the synthesizable-RTL effort is complete.
+# -----------------------------------------------------------------------
+SYNTH_DIR    := ../synth
+SYNTH_SCRIPT := $(SYNTH_DIR)/synth_check.ys
+SYNTH_BUILD  := $(BUILD_DIR)/synth
+SV2V_OUT     := $(SYNTH_BUILD)/design_full.v
+
+# sv2v adapts SystemVerilog (packages, enums, ANSI ports, import pkg::*) to
+# Verilog-2005 that yosys's built-in frontend parses. yosys then runs the
+# synth-check script (hierarchy -> synth -> check -> stat).
+$(SV2V_OUT): $(CONTROL_SV)
+	mkdir -p $(SYNTH_BUILD)
+	sv2v -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) $(CONTROL_SV) -w $(SV2V_OUT)
+
+synth-check: $(SV2V_OUT)
+	@echo "--- yosys generic synthesizability gate (taccel_top) ---"
+	yosys -p "read_verilog $(SV2V_OUT); script $(SYNTH_SCRIPT)"
 
 # -----------------------------------------------------------------------
 clean:

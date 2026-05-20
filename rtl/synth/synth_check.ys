@@ -1,0 +1,27 @@
+# Synthesizability gate for the TACCEL design — generic synth, NO FPGA part.
+#
+# File reads are supplied by the Makefile (single source of truth = CONTROL_SV,
+# the taccel_top design set with tb/ excluded) via:
+#   yosys -p "read_verilog -sv -I... <CONTROL_SV>" rtl/synth/synth_check.ys
+#
+# Definition of done (FPGA-demo roadmap Phase 2): this elaborates taccel_top to
+# a synthesizable netlist with ZERO behavioral constructs (no `real`, no DPI-C).
+# It is EXPECTED to fail today on sfu_engine.sv + blocking_helper_engine.sv
+# (real storage + import "DPI-C"). That red IS the precise work list and the
+# regression detector for the synthesizable-RTL effort.
+
+# Resolve the module hierarchy from the real top; loud early error on any
+# missing/unresolved module.
+hierarchy -check -top taccel_top
+
+# Generic, technology-independent synthesis (no FPGA part). Fails non-zero on
+# any construct it cannot map to synthesizable logic — which is exactly the
+# behavioral (real/DPI) surface we are eliminating.
+synth -top taccel_top
+
+# Structural sanity: assert on combinational loops, multiple drivers, etc.
+check -assert
+
+# First area/cell estimate — the number freeze §4.4 explicitly demands
+# ("no synthesis number exists; should be measured before RTL sign-off").
+stat
