@@ -72,10 +72,12 @@ module blocking_helper_engine
   input  logic         sram_b_fault
 );
 
+`ifndef SFU_SYNTH_NO_DPI
   import "DPI-C" function real sfu_fp32_round(input real value_r);
   import "DPI-C" function real sfu_fp32_mul(input real lhs_r, input real rhs_r);
   import "DPI-C" function real sfu_fp32_add(input real lhs_r, input real rhs_r);
   import "DPI-C" function int  sfu_fp32_quantize_i8(input real value_r, input real out_scale_r);
+`endif
 
   // State groups:
   //   H_FLAT_*   : BUF_COPY flat copy / memmove
@@ -306,6 +308,7 @@ module blocking_helper_engine
     end
   endfunction
 
+`ifndef SFU_SYNTH_NO_DPI
   function automatic real pow2_int(input integer exp_i);
     real v;
     integer j;
@@ -364,6 +367,7 @@ module blocking_helper_engine
         round_half_even = floor_i;
     end
   endfunction
+`endif
 
   function automatic logic [127:0] scale_mul_i8_row(
     input logic [127:0] row,
@@ -413,6 +417,7 @@ module blocking_helper_engine
     end
   endfunction
 
+`ifndef SFU_SYNTH_NO_DPI
   function automatic logic [127:0] dequant_add_pack(
     input logic [127:0] row0,
     input logic [127:0] row1,
@@ -457,6 +462,7 @@ module blocking_helper_engine
       dequant_add_pack = out_row;
     end
   endfunction
+`endif
 
   // Pack four ACCUM rows (4 x 4 x INT32) into one INT8 destination row.
   function automatic logic [127:0] requant_pack(
@@ -847,9 +853,11 @@ module blocking_helper_engine
 
     if (HELPER_SYNTH_MODE == 1)
       dq_write_data_w = synth_dq_write_data_w;
+`ifndef SFU_SYNTH_NO_DPI
     else
       dq_write_data_w = dequant_add_pack(rq_row0_q, rq_row1_q, rq_row2_q, rq_row3_q,
                                          skip_row_q, scale0_q, scale1_q);
+`endif
 
     if (src1_buf_q == BUF_ACCUM)
       scale_mul_write_data_w = scale_mul_i32_row(sram_b_rdata, scale0_q);

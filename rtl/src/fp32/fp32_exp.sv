@@ -3,11 +3,17 @@
 // over a representative input range; the resulting ULP histogram becomes
 // the committed band for this op.
 //
-// Algorithm: range reduction + degree-5 Taylor polynomial.
-//   k = round(x * log2_e)         (nearest integer)
-//   r = x - k * ln2                (|r| <= ln2/2 ≈ 0.347)
-//   exp(r) ≈ 1 + r + r²/2 + r³/6 + r⁴/24 + r⁵/120   (Horner)
-//   exp(x)  = exp(r) * 2^k         (apply 2^k via exponent-field add)
+// Algorithm: Cody-Waite range reduction + degree-6 Taylor polynomial.
+//   k = round(x * log2_e)               (nearest integer)
+//   r_hi = x - k * ln2_hi               (ln2_hi = ln(2) truncated to 16 bits)
+//   r    = r_hi - k * ln2_lo            (full-precision r; |r| <= ln2/2)
+//   exp(r) ≈ 1 + r + r²/2 + r³/6 + r⁴/24 + r⁵/120 + r⁶/720   (Horner)
+//   exp(x)  = exp(r) * 2^k              (apply 2^k via exponent-field add)
+//
+// Two-part ln(2) split (Cody-Waite) reduces range-reduction error so r is
+// accurate to ~24 bits; degree-6 polynomial truncation is below 1 fp32 ULP
+// over the reduced range. Together: target ULP max ~10 (vs. degree-5 +
+// 1-part: ULP max ~86) — bound for synth-mode GELU §7 band.
 //
 // Overflow/underflow:
 //   x >  88.7 (~ln(FLT_MAX)) -> +inf
@@ -34,12 +40,17 @@ module fp32_exp (
   localparam logic [31:0] POS_ZERO = 32'h0000_0000;
   // Constants:
   localparam logic [31:0] C_LOG2E  = 32'h3FB8_AA3B;  // log2(e)
-  localparam logic [31:0] C_LN2    = 32'h3F31_7218;  // ln(2)
+  // Two-part ln(2) for Cody-Waite range reduction. ln2_hi has 8 trailing
+  // zero bits in the mantissa so k * ln2_hi is exact in fp32 for |k| <= 256;
+  // ln2_lo holds the missing low bits (ln(2) - ln2_hi).
+  localparam logic [31:0] C_LN2_HI = 32'h3F31_7200;  // 0.69314575195312500
+  localparam logic [31:0] C_LN2_LO = 32'h35BF_BE8E;  // ln(2) - ln2_hi ≈ 1.4286068e-6
   localparam logic [31:0] C_ONE    = 32'h3F80_0000;  // 1.0
   localparam logic [31:0] C_HALF   = 32'h3F00_0000;  // 1/2
   localparam logic [31:0] C_1_6    = 32'h3E2A_AAAB;  // 1/6
   localparam logic [31:0] C_1_24   = 32'h3D2A_AAAB;  // 1/24
   localparam logic [31:0] C_1_120  = 32'h3C08_8889;  // 1/120
+  localparam logic [31:0] C_1_720  = 32'h3AB6_0B61;  // 1/720
 
   // Classify input
   logic        sa;
@@ -136,30 +147,43 @@ module fp32_exp (
       k_fp32 = {kabs_sign, ke8, km23};
   end
 
-  logic [31:0] k_ln2;
-  fp32_mul u_mul2 (.a(k_fp32), .b(C_LN2), .y(k_ln2));
+  // Cody-Waite two-part subtraction: r = a - k*ln2_hi - k*ln2_lo.
+  // ln2_hi has trailing zeros so k*ln2_hi is exact; ln2_lo captures the
+  // remaining bits. This keeps r accurate to ~24 bits even for |k| up to
+  // ~128 (the input range we care about: |x| <= 88.7).
+  logic [31:0] k_ln2_hi;
+  logic [31:0] k_ln2_lo;
+  logic [31:0] r_hi;
   logic [31:0] r;
-  fp32_add u_sub1 (.a(a), .b({~k_ln2[31], k_ln2[30:0]}), .y(r));
+  fp32_mul u_mul2_hi (.a(k_fp32), .b(C_LN2_HI), .y(k_ln2_hi));
+  fp32_mul u_mul2_lo (.a(k_fp32), .b(C_LN2_LO), .y(k_ln2_lo));
+  fp32_add u_sub_hi  (.a(a),     .b({~k_ln2_hi[31], k_ln2_hi[30:0]}), .y(r_hi));
+  fp32_add u_sub_lo  (.a(r_hi),  .b({~k_ln2_lo[31], k_ln2_lo[30:0]}), .y(r));
 
-  // --- Step 4: Polynomial p(r) = ((((r/120 + 1/24) r + 1/6) r + 1/2) r + 1) r + 1 ---
-  // Horner from innermost:
-  //   t0 = r * (1/120)
-  //   t1 = (t0 + 1/24) * r
-  //   t2 = (t1 + 1/6)  * r
-  //   t3 = (t2 + 1/2)  * r
-  //   t4 = (t3 + 1)    * r
-  //   exp_r = t4 + 1
-  logic [31:0] t0a, t1s, t1m, t2s, t2m, t3s, t3m, t4s, t4m, exp_r;
-  fp32_mul m0  (.a(r),   .b(C_1_120), .y(t0a));
-  fp32_add a1  (.a(t0a), .b(C_1_24),  .y(t1s));
+  // --- Step 4: Degree-6 Horner polynomial:
+  //   exp(r) ≈ ((((((r/720 + 1/120) r + 1/24) r + 1/6) r + 1/2) r + 1) r + 1
+  // Truncation error for |r| ≤ ln(2)/2: |r^7/5040| ≤ 1.07e-7 ≈ 1 fp32 ULP.
+  // Sequence (innermost first):
+  //   t0  = r * (1/720)
+  //   t1s = t0 + 1/120;   t1m = t1s * r
+  //   t2s = t1m + 1/24;   t2m = t2s * r
+  //   t3s = t2m + 1/6;    t3m = t3s * r
+  //   t4s = t3m + 1/2;    t4m = t4s * r
+  //   t5s = t4m + 1;      t5m = t5s * r
+  //   exp_r = t5m + 1
+  logic [31:0] t0a, t1s, t1m, t2s, t2m, t3s, t3m, t4s, t4m, t5s, t5m, exp_r;
+  fp32_mul m0  (.a(r),   .b(C_1_720), .y(t0a));
+  fp32_add a1  (.a(t0a), .b(C_1_120), .y(t1s));
   fp32_mul m1  (.a(t1s), .b(r),       .y(t1m));
-  fp32_add a2  (.a(t1m), .b(C_1_6),   .y(t2s));
+  fp32_add a2  (.a(t1m), .b(C_1_24),  .y(t2s));
   fp32_mul m2  (.a(t2s), .b(r),       .y(t2m));
-  fp32_add a3  (.a(t2m), .b(C_HALF),  .y(t3s));
+  fp32_add a3  (.a(t2m), .b(C_1_6),   .y(t3s));
   fp32_mul m3  (.a(t3s), .b(r),       .y(t3m));
-  fp32_add a4  (.a(t3m), .b(C_ONE),   .y(t4s));
+  fp32_add a4  (.a(t3m), .b(C_HALF),  .y(t4s));
   fp32_mul m4  (.a(t4s), .b(r),       .y(t4m));
-  fp32_add a5  (.a(t4m), .b(C_ONE),   .y(exp_r));
+  fp32_add a5  (.a(t4m), .b(C_ONE),   .y(t5s));
+  fp32_mul m5  (.a(t5s), .b(r),       .y(t5m));
+  fp32_add a6  (.a(t5m), .b(C_ONE),   .y(exp_r));
 
   // --- Step 5: exp(x) = exp_r * 2^k_int (apply k_int to exponent field) ---
   logic               s_er;

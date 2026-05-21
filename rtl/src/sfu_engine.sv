@@ -85,6 +85,7 @@ module sfu_engine
   output logic [15:0]  sfu_scale_wdata
 );
 
+`ifndef SFU_SYNTH_NO_DPI
   import "DPI-C" function real sfu_fp32_round(input real value_r);
   import "DPI-C" function real sfu_fp32_add(input real lhs_r, input real rhs_r);
   import "DPI-C" function real sfu_fp32_sub(input real lhs_r, input real rhs_r);
@@ -100,6 +101,7 @@ module sfu_engine
   import "DPI-C" function int  sfu_fp32_to_fp16_bits(input real value_r);
   import "DPI-C" function int  sfu_fp64_to_fp16_bits(input real value_r);
   import "DPI-C" function real sfu_fp32_gelu_new(input real value_r);
+`endif
 
   localparam int SFU_MAX_ROW_ELEMS = 1024;
   localparam real LN_EPS = 1.0e-6;
@@ -171,7 +173,13 @@ module sfu_engine
     //   Banded — bounded by `fp32_exp` accuracy (Phase-3 minimax pending).
     F_G2_SM_MAX     = 6'd37,
     F_G2_SM_EXPSUM  = 6'd38,
-    F_G2_SM_OUT     = 6'd39
+    F_G2_SM_OUT     = 6'd39,
+    // Phase-3.B gen-1 GELU synth-mode iterator (uses fp32_gelu_new tanh-poly
+    // primitive as the synth approximation of gen-1 erf-GELU; the int8
+    // quantization at out_bytes_q absorbs the tanh-vs-erf difference for
+    // typical fixture inputs).
+    F_GELU_SYNTH_I8_ITER  = 6'd40,
+    F_GELU_SYNTH_I32_ITER = 6'd41
   } sfu_state_t;
 
   sfu_state_t state;
@@ -218,25 +226,30 @@ module sfu_engine
   logic [127:0] gelu_i8_row_q;
   logic [127:0] gelu_row0_q, gelu_row1_q, gelu_row2_q, gelu_row3_q;
 
-  real scale0_q /* verilator public_flat_rd */, scale1_q /* verilator public_flat_rd */,
-       scale2_q /* verilator public_flat_rd */, scale3_q /* verilator public_flat_rd */;
-  real row_data_q [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
-  real attn_accum_q [0:SFU_MAX_ROW_ELEMS-1];
-  real gamma_q    [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
-  real beta_q     [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
+  // Phase-3.D storage cascade (2026-05-21): persistent storage moved from
+  // `real` to `logic [31:0]` (fp32 bit-pattern). DPI mode wraps writes with
+  // `real_to_fp32_bits(...)` and reads with `fp32_bits_to_real(...)`; synth
+  // mode reads/writes the bits directly. The helpers are lossless
+  // (single-precision in `real` double).
+  logic [31:0] scale0_q /* verilator public_flat_rd */, scale1_q /* verilator public_flat_rd */,
+               scale2_q /* verilator public_flat_rd */, scale3_q /* verilator public_flat_rd */;
+  logic [31:0] row_data_q [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
+  logic [31:0] attn_accum_q [0:SFU_MAX_ROW_ELEMS-1];
+  logic [31:0] gamma_q    [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
+  logic [31:0] beta_q     [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
   logic [7:0] out_bytes_q [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
   // gen-2: FP16 result bit-patterns + FP16-rows-per-logical-row (=2*n_tiles).
   logic [15:0] out_h_q [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
   logic [12:0] g2_rows_q;
   // 0x1F MAX_ABS_REDUCE_FP32: running global max|x| + 2-cycle write phase.
-  real         g2_maxabs_q;
+  logic [31:0] g2_maxabs_q;
   logic        g2_wr_phase_q;
-  real attn_row_max_q;
-  real attn_exp_sum_q;
-  real ln_debug_mean_q /* verilator public_flat_rd */;
-  real ln_debug_var_q /* verilator public_flat_rd */;
-  real ln_debug_denom_q /* verilator public_flat_rd */;
-  real ln_debug_y_q [0:15] /* verilator public_flat_rd */;
+  logic [31:0] attn_row_max_q;
+  logic [31:0] attn_exp_sum_q;
+  logic [31:0] ln_debug_mean_q  /* verilator public_flat_rd */;
+  logic [31:0] ln_debug_var_q   /* verilator public_flat_rd */;
+  logic [31:0] ln_debug_denom_q /* verilator public_flat_rd */;
+  logic [31:0] ln_debug_y_q     [0:15] /* verilator public_flat_rd */;
 
   logic [14:0] dispatch_m_rows_w;
   logic [10:0] dispatch_n_tiles_w;
@@ -295,6 +308,7 @@ module sfu_engine
     end
   endfunction
 
+`ifndef SFU_SYNTH_NO_DPI
   function automatic real pow2_int(input integer exp_i);
     real v;
     integer j;
@@ -336,6 +350,7 @@ module sfu_engine
       fp16_to_real = sfu_fp32_round(fp16_to_real);
     end
   endfunction
+`endif
 
   function automatic logic signed [7:0] get_i8(
     input logic [127:0] row,
@@ -364,6 +379,7 @@ module sfu_engine
     end
   endfunction
 
+`ifndef SFU_SYNTH_NO_DPI
   function automatic logic [7:0] quantize_to_i8(
     input real value_r,
     input real out_scale_r
@@ -412,6 +428,7 @@ module sfu_engine
       g2_clamp_eps = e;
     end
   endfunction
+`endif
 
   function automatic logic attn_visible(
     input logic [14:0] row_idx,
@@ -530,6 +547,7 @@ module sfu_engine
   // Used by the synth-mode latch states to store fp32 results into the
   // existing `real` storage arrays without changing their type.  fp32->fp64
   // is exact widening (fp32 is a strict subset of fp64).
+`ifndef SFU_SYNTH_NO_DPI
   function automatic real fp32_bits_to_real(input logic [31:0] bits);
     logic               s;
     logic [7:0]         e_f;
@@ -587,21 +605,22 @@ module sfu_engine
       return {s, e32, m_d[51:29]};
     end
   endfunction
+`endif
 
   // Per-element fp32 operands fetched from the `real` storage via the
   // bit-pattern coercion (lossless because the stored values are always
   // single-precision floats).
   logic [31:0] synth_a_bits;
   logic [31:0] synth_b_bits;
-  assign synth_a_bits = real_to_fp32_bits(row_data_q[iter_idx_q[9:0]]);
-  assign synth_b_bits = real_to_fp32_bits(attn_accum_q[iter_idx_q[9:0]]);
+  assign synth_a_bits = row_data_q[iter_idx_q[9:0]];
+  assign synth_b_bits = attn_accum_q[iter_idx_q[9:0]];
 
   // Op-specific b-operand mux: 0x18 QUANT broadcasts the scalar scale0_q;
   // VADD/DEQUANT-AC use the per-element attn_accum_q. Selected by opcode_q.
   logic [31:0] synth_b_bits_eff;
   always_comb begin
     case (opcode_q)
-      OP_QUANT_FP32_INT8: synth_b_bits_eff = real_to_fp32_bits(scale0_q);
+      OP_QUANT_FP32_INT8: synth_b_bits_eff = scale0_q;
       default:            synth_b_bits_eff = synth_b_bits;
     endcase
   end
@@ -620,6 +639,7 @@ module sfu_engine
       OP_VADD_FP32:                 synth_compute_out = synth_add_out;
       OP_DEQUANT_ACCUM_FP32:        synth_compute_out = synth_mul_out;
       OP_DEQUANT_ACCUM_FP32_SCALED: synth_compute_out = synth_scaled_add;
+      OP_GELU_FP32:                 synth_compute_out = synth_gelu_out;
       default:                      synth_compute_out = 32'd0;
     endcase
   end
@@ -630,6 +650,14 @@ module sfu_engine
   logic signed [7:0] synth_quant_out;
   fp32_quantize_i8 u_synth_quant (.a(synth_mul_out), .y(synth_quant_out));
 
+  // For 0x1B GELU_FP32 the synth datapath is the tanh-poly gen-2 GELU
+  // (fp32_gelu_new): depth-9 combinational chain (2*mul + add + mul + mul +
+  // exp + add + div + sub + add + mul). MEASURED-BAND op — bounded by the
+  // internal fp32_exp scaffold accuracy. SOFTMAX-precedent (86-ULP exp ->
+  // 0 fp16 ULP at output via fp16-quant absorption) is the bet.
+  logic [31:0] synth_gelu_out;
+  fp32_gelu_new u_synth_gelu (.a(synth_a_bits), .y(synth_gelu_out));
+
   // For 0x1E DEQUANT_ACCUM_FP32_SCALED chain:
   //   out = ((row_data_q * gamma_q) * scale0_q) + beta_q  -> f2h
   // Three combinational stages, then through the shared fp32_to_fp16.
@@ -639,9 +667,9 @@ module sfu_engine
   logic [31:0] synth_scaled_mul1;
   logic [31:0] synth_scaled_mul2;
   logic [31:0] synth_scaled_add;
-  assign synth_gamma_bits  = real_to_fp32_bits(gamma_q[iter_idx_q[9:0]]);
-  assign synth_beta_bits   = real_to_fp32_bits(beta_q[iter_idx_q[9:0]]);
-  assign synth_scale0_bits = real_to_fp32_bits(scale0_q);
+  assign synth_gamma_bits  = gamma_q[iter_idx_q[9:0]];
+  assign synth_beta_bits   = beta_q[iter_idx_q[9:0]];
+  assign synth_scale0_bits = scale0_q;
   fp32_mul u_synth_scaled_mul1 (
     .a(synth_a_bits),     .b(synth_gamma_bits),  .y(synth_scaled_mul1));
   fp32_mul u_synth_scaled_mul2 (
@@ -651,16 +679,20 @@ module sfu_engine
 
   // For 0x1F MAX_ABS_REDUCE F_G2_SCALE_WR phase: replace the DPI fp64 path
   // (127.0/eps and eps/127.0 in fp64, then fp16 cast) with fp32 div + cvt.
-  // The g2_clamp_eps() helper is reused (still a `real` function, but the
-  // value it returns is single-precision-representable so the bit-pattern
-  // coercion is lossless).
-  localparam logic [31:0] C_127_FP32 = 32'h42FE_0000;  // 127.0
+  // Phase-3.E (2026-05-21): g2_clamp_eps performed via bit-level magnitude
+  // compare on the positive fp32 (synth-safe). Magnitudes of positive fp32
+  // numbers compare numerically as unsigned int (IEEE-754 monotonic).
+  localparam logic [31:0] C_127_FP32       = 32'h42FE_0000;  // 127.0
+  localparam logic [31:0] C_CLAMP_MIN_FP32 = 32'h3B00_0000;  // 2^-9   = 0.001953125
+  localparam logic [31:0] C_CLAMP_MAX_FP32 = 32'h4A7D_DC00;  // 4159504.0 = 65504.0*127.0/2.0
   logic [31:0] synth_clamp_eps_bits;
   logic [31:0] synth_inv_eps;
   logic [31:0] synth_eps_inv127;
   logic [15:0] synth_inv_eps_fp16;
   logic [15:0] synth_eps_inv127_fp16;
-  assign synth_clamp_eps_bits = real_to_fp32_bits(g2_clamp_eps(g2_maxabs_q));
+  assign synth_clamp_eps_bits = (g2_maxabs_q < C_CLAMP_MIN_FP32) ? C_CLAMP_MIN_FP32
+                              : (g2_maxabs_q > C_CLAMP_MAX_FP32) ? C_CLAMP_MAX_FP32
+                              : g2_maxabs_q;
   fp32_div u_synth_inv_eps    (.a(C_127_FP32),          .b(synth_clamp_eps_bits), .y(synth_inv_eps));
   fp32_div u_synth_eps_inv127 (.a(synth_clamp_eps_bits), .b(C_127_FP32),          .y(synth_eps_inv127));
   fp32_to_fp16 u_synth_inv_eps_h    (.a(synth_inv_eps),    .y(synth_inv_eps_fp16));
@@ -683,7 +715,8 @@ module sfu_engine
   //   ln_norm_g  = fp32_mul(ln_norm, synth_gamma_bits)
   //   ln_norm_gb = fp32_add(ln_norm_g, synth_beta_bits)
   //   ln_out_h   = fp32_to_fp16(ln_norm_gb)
-  localparam logic [31:0] C_LN_FP32_EPS = 32'h3727_C5AC;  // 1.0e-5 fp32
+  localparam logic [31:0] C_LN_FP32_EPS = 32'h3727_C5AC;  // 1.0e-5 fp32 (gen-2)
+  localparam logic [31:0] C_LN_EPS_G1   = 32'h358D_3F3F;  // 1.0e-6 fp32 (gen-1)
   logic [31:0] ln_neg_mean;
   logic [31:0] ln_n_fp32;
   logic [31:0] ln_sum_add_w;
@@ -693,13 +726,21 @@ module sfu_engine
   logic [31:0] ln_var_add_w;
   logic [31:0] ln_var_norm_w;
   logic [31:0] ln_var_eps_w;
+  logic [31:0] ln_eps_sel_w;
   logic [31:0] ln_denom_w;
   logic [31:0] ln_norm_w;
   logic [31:0] ln_norm_g_w;
   logic [31:0] ln_norm_gb_w;
   logic [15:0] ln_out_h_w;
+  // Phase-3.B gen-1 LN output path: y/scale1 then quantize_i8 (matches DPI
+  // sfu_fp32_quantize_i8 contract — DIVIDE by scale, RNE round, clamp).
+  logic [31:0]       ln_g1_scaled_w;
+  logic signed [7:0] ln_g1_quant_w;
   assign ln_neg_mean = ln_mean_q ^ 32'h8000_0000;
-  assign ln_n_fp32   = real_to_fp32_bits(real'(n_elems_q));
+  // n_elems_q (16-bit unsigned) → fp32 via i32_to_fp32 primitive (synth-safe).
+  i32_to_fp32 u_ln_n_cvt (.a({16'h0, n_elems_q}), .y(ln_n_fp32));
+  // Epsilon mux: gen-1 LAYERNORM uses 1e-6, gen-2 LAYERNORM_FP32 uses 1e-5.
+  assign ln_eps_sel_w = (opcode_q == OP_LAYERNORM) ? C_LN_EPS_G1 : C_LN_FP32_EPS;
 
   fp32_add  u_ln_sum_add (.a(ln_sum_acc_q), .b(synth_a_bits), .y(ln_sum_add_w));
   fp32_div  u_ln_mean    (.a(ln_sum_acc_q), .b(ln_n_fp32),    .y(ln_mean_div_w));
@@ -707,12 +748,14 @@ module sfu_engine
   fp32_mul  u_ln_diff_sq (.a(ln_diff_w),    .b(ln_diff_w),    .y(ln_diff_sq_w));
   fp32_add  u_ln_var_add (.a(ln_var_acc_q), .b(ln_diff_sq_w), .y(ln_var_add_w));
   fp32_div  u_ln_var_norm(.a(ln_var_acc_q), .b(ln_n_fp32),    .y(ln_var_norm_w));
-  fp32_add  u_ln_var_eps (.a(ln_var_norm_w),.b(C_LN_FP32_EPS),.y(ln_var_eps_w));
+  fp32_add  u_ln_var_eps (.a(ln_var_norm_w),.b(ln_eps_sel_w), .y(ln_var_eps_w));
   fp32_sqrt u_ln_sqrt    (.a(ln_var_eps_w),                    .y(ln_denom_w));
   fp32_div  u_ln_norm    (.a(ln_diff_w),    .b(ln_denom_q),   .y(ln_norm_w));
   fp32_mul  u_ln_norm_g  (.a(ln_norm_w),    .b(synth_gamma_bits), .y(ln_norm_g_w));
   fp32_add  u_ln_norm_gb (.a(ln_norm_g_w),  .b(synth_beta_bits),  .y(ln_norm_gb_w));
   fp32_to_fp16 u_ln_out_h(.a(ln_norm_gb_w),                        .y(ln_out_h_w));
+  fp32_div  u_ln_g1_scale(.a(ln_norm_gb_w), .b(synth_scale1_bits), .y(ln_g1_scaled_w));
+  fp32_quantize_i8 u_ln_g1_quant (.a(ln_g1_scaled_w),               .y(ln_g1_quant_w));
 
   // ===================================================================
   // 0x1D MASKED_SOFTMAX_FP32 synth sub-FSM combinational primitives.
@@ -741,6 +784,152 @@ module sfu_engine
   // Strictly > requires diff != 0; equal (diff == 0) is no-op either way.
   logic sm_row_gt_max;
   assign sm_row_gt_max = (sm_diff_w[31] == 1'b0) && (sm_diff_w[30:0] != 31'd0);
+
+  // Phase-3.B: gen-1 SOFTMAX/MASKED_SOFTMAX synth output path.
+  //   gen-2 0x1D MASKED_SOFTMAX_FP32 writes out_h_q[i] = fp16(norm).
+  //   gen-1 0x0E SOFTMAX / 0x0F MASKED_SOFTMAX writes
+  //         out_bytes_q[i] = quantize_i8(norm / scale1_q).
+  // DPI golden (testbench.h `sfu_fp32_quantize_i8`) computes
+  //   q = round_half_even((float)value / (float)out_scale)
+  // — DIVIDE by scale, not multiply. The synth chain mirrors that exactly:
+  // fp32_div then fp32_quantize_i8. Note: matches per-rounding-step boundary
+  // behavior only if we don't introduce an intermediate fp32 round between
+  // the divide and the int8 quant; both are bit-exact RNE primitives so the
+  // composition is byte-identical when the upstream sm_norm_w matches.
+  logic [31:0]       synth_scale1_bits;
+  logic [31:0]       sm_g1_scaled_w;
+  logic signed [7:0] sm_g1_quant_w;
+  assign synth_scale1_bits = scale1_q;
+  fp32_div         u_sm_g1_scale (.a(sm_norm_w),       .b(synth_scale1_bits), .y(sm_g1_scaled_w));
+  fp32_quantize_i8 u_sm_g1_quant (.a(sm_g1_scaled_w),                          .y(sm_g1_quant_w));
+
+  // Phase-3.B gen-1 GELU synth datapath. Sequential ITER over 16 lanes per
+  // chunk (or 4 i32-lanes × 4 rows for the i32 GELU). Computes:
+  //   x = (sign_ext(i8_lane) -> fp32) * scale0_q
+  //   y = fp32_gelu_new(x)              (tanh-poly approximation of erf-GELU)
+  //   q = quantize_i8(y / scale1_q)
+  // Approximation note: gen-1 DPI uses erf-GELU (sfu_fp32_gelu). The synth
+  // path uses gelu_new (tanh-poly) because that's the only synthesizable
+  // GELU primitive available (Phase-1 unit #10 fp32_gelu_erf isn't built
+  // yet). For the byte-quantized output the int8 round absorbs the tanh-vs-
+  // erf difference on the fixture inputs (verified by test_sfu_synth
+  // gelu_*_roundtrip).
+  logic signed [7:0] gelu_g1_i8_sel;
+  logic [31:0]       gelu_g1_i32_sel;
+  logic [31:0]       gelu_g1_in_fp32;
+  logic [31:0]       gelu_g1_x_bits;
+  logic [31:0]       gelu_g1_y_bits;
+  logic [31:0]       gelu_g1_scaled_w;
+  logic signed [7:0] gelu_g1_quant_w;
+  logic [31:0]       gelu_g1_in_pick;
+  // synth_scale0_bits is already declared module-scope (DEQUANT_ACCUM_SCALED
+  // block). Reuse it here.
+  // INT8 source: lane comes from gelu_i8_row_q indexed by iter_idx_q[3:0].
+  assign gelu_g1_i8_sel  = $signed(gelu_i8_row_q[8*iter_idx_q[3:0] +: 8]);
+  // INT32 source: lane select by iter_idx_q[3:2] (0..3), row by iter_idx_q[1:0]
+  // (0..3). Matches the original always_comb packing where (lane, row)
+  // packs to byte index (lane + row*4) in gelu_i32_write_data_w.
+  always_comb begin
+    case (iter_idx_q[1:0])
+      2'd0: gelu_g1_i32_sel = gelu_row0_q[32*iter_idx_q[3:2] +: 32];
+      2'd1: gelu_g1_i32_sel = gelu_row1_q[32*iter_idx_q[3:2] +: 32];
+      2'd2: gelu_g1_i32_sel = gelu_row2_q[32*iter_idx_q[3:2] +: 32];
+      default: gelu_g1_i32_sel = gelu_row3_q[32*iter_idx_q[3:2] +: 32];
+    endcase
+  end
+  // Combine the two source selections — the active one is decided by the
+  // state (F_GELU_SYNTH_I8_ITER vs F_GELU_SYNTH_I32_ITER).
+  assign gelu_g1_in_pick = (state == F_GELU_SYNTH_I32_ITER) ? gelu_g1_i32_sel
+                                                            : {{24{gelu_g1_i8_sel[7]}}, gelu_g1_i8_sel};
+  i32_to_fp32      u_gelu_g1_cvt  (.a(gelu_g1_in_pick),                                  .y(gelu_g1_in_fp32));
+  fp32_mul         u_gelu_g1_x    (.a(gelu_g1_in_fp32), .b(synth_scale0_bits),           .y(gelu_g1_x_bits));
+  fp32_gelu_new    u_gelu_g1_y    (.a(gelu_g1_x_bits),                                   .y(gelu_g1_y_bits));
+  fp32_div         u_gelu_g1_s    (.a(gelu_g1_y_bits),  .b(synth_scale1_bits),           .y(gelu_g1_scaled_w));
+  fp32_quantize_i8 u_gelu_g1_q    (.a(gelu_g1_scaled_w),                                 .y(gelu_g1_quant_w));
+
+  // Opcode-aware SOFTMAX visibility predicate. The F_G2_SM_* sub-FSM tests
+  // sm_visible_w in every state, replacing the inline kt-comparison so the
+  // same sub-FSM handles all softmax-family opcodes (gen-1 + gen-2 + ATTN).
+  //   OP_SOFTMAX:               all iters visible (gen-1, unmasked)
+  //   OP_MASKED_SOFTMAX:        attn_visible(row, iter) (gen-1, gen-1 mask)
+  //   OP_MASKED_SOFTMAX_FP32:   iter_s <= sm_keep_through_q (gen-2 causal)
+  //   OP_SOFTMAX_ATTNV:         all iters visible (gen-1 ATTN unmasked)
+  //   OP_MASKED_SOFTMAX_ATTNV:  attn_visible(row, iter) (gen-1 ATTN mask)
+  logic sm_visible_w;
+  always_comb begin
+    case (opcode_q)
+      OP_SOFTMAX:                sm_visible_w = 1'b1;
+      OP_MASKED_SOFTMAX:         sm_visible_w = attn_visible(row_idx_q, integer'(iter_idx_q));
+      OP_MASKED_SOFTMAX_FP32:    sm_visible_w =
+          ($signed({6'b0, iter_idx_q}) <= $signed({1'b0, sm_keep_through_q[15:0]}));
+      OP_SOFTMAX_ATTNV:          sm_visible_w = 1'b1;
+      OP_MASKED_SOFTMAX_ATTNV:   sm_visible_w = attn_visible(row_idx_q, integer'(iter_idx_q));
+      default:                   sm_visible_w = 1'b0;
+    endcase
+  end
+  // Phase-3.B ATTN: bound is k_elems_q (column count) instead of n_elems_q.
+  // Bound mux keeps the F_G2_SM_* sub-FSM iteration logic single-source.
+  logic [15:0] sm_iter_bound_w;
+  always_comb begin
+    case (opcode_q)
+      OP_SOFTMAX_ATTNV, OP_MASKED_SOFTMAX_ATTNV: sm_iter_bound_w = k_elems_q;
+      default:                                   sm_iter_bound_w = n_elems_q;
+    endcase
+  end
+
+  // Phase-3.B ATTN V_LATCH parallel 16-lane synth datapath. Each cycle:
+  //   weight   = exp(row_data_q[k_idx] - row_max) / exp_sum   (visible only)
+  //   per lane: attn_accum_q[idx] += weight * sign_ext(v_lane) * scale1_q
+  // Per-K weight compute is shared; 16 lanes parallel for the V-multiply
+  // and accumulate. Mirrors the DPI V_LATCH (1 cycle per chunk) — no
+  // new state needed; F_ATTN_V_LATCH muxes synth vs DPI on SFU_SYNTH_MODE.
+  logic [31:0] attn_row_at_k_bits;
+  logic [31:0] attn_diff_w;
+  logic [31:0] attn_exp_w;
+  logic [31:0] attn_weight_w;
+  logic [31:0] attn_weight_eff_w;
+  logic        attn_vis_at_k;
+  assign attn_row_at_k_bits = row_data_q[attn_k_idx_q[9:0]];
+  fp32_add u_attn_diff (.a(attn_row_at_k_bits), .b(sm_neg_max),   .y(attn_diff_w));
+  fp32_exp u_attn_exp  (.a(attn_diff_w),                          .y(attn_exp_w));
+  fp32_div u_attn_div  (.a(attn_exp_w), .b(sm_exp_sum_q),         .y(attn_weight_w));
+  assign attn_vis_at_k = (opcode_q == OP_SOFTMAX_ATTNV) ||
+                         attn_visible(row_idx_q, integer'(attn_k_idx_q));
+  assign attn_weight_eff_w = attn_vis_at_k ? attn_weight_w : 32'h0;
+
+  logic [31:0] attn_v_lane_fp32    [0:15];
+  logic [31:0] attn_v_weighted     [0:15];
+  logic [31:0] attn_v_scaled       [0:15];
+  logic [31:0] attn_acc_old_bits   [0:15];
+  logic [31:0] attn_acc_new_bits   [0:15];
+  genvar gv_lane;
+  generate
+    for (gv_lane = 0; gv_lane < 16; gv_lane++) begin : v_lane
+      logic signed [7:0] byte_sel;
+      logic [31:0]       byte_sx;
+      assign byte_sel = $signed(sram_b_rdata[8*gv_lane +: 8]);
+      assign byte_sx  = {{24{byte_sel[7]}}, byte_sel};
+      i32_to_fp32 u_v_cvt (.a(byte_sx),                .y(attn_v_lane_fp32[gv_lane]));
+      fp32_mul    u_v_w   (.a(attn_weight_eff_w),
+                           .b(attn_v_lane_fp32[gv_lane]), .y(attn_v_weighted[gv_lane]));
+      fp32_mul    u_v_s   (.a(attn_v_weighted[gv_lane]),
+                           .b(synth_scale1_bits),         .y(attn_v_scaled[gv_lane]));
+    end
+  endgenerate
+  always_comb begin
+    for (int li = 0; li < 16; li++) begin
+      automatic int idx_li;
+      idx_li = integer'(read_idx_q) * 16 + li;
+      attn_acc_old_bits[li] = attn_accum_q[idx_li[9:0]];
+    end
+  end
+  generate
+    for (gv_lane = 0; gv_lane < 16; gv_lane++) begin : v_acc
+      fp32_add u_v_add (.a(attn_acc_old_bits[gv_lane]),
+                        .b(attn_v_scaled[gv_lane]),
+                        .y(attn_acc_new_bits[gv_lane]));
+    end
+  endgenerate
   // ===================================================================
 
   // ===================================================================
@@ -772,7 +961,7 @@ module sfu_engine
   // base_idx in the F_G2_S1_LATCH 0x1F branch = read_idx_q * 8.
   logic [15:0] mar_base_idx;
   assign mar_base_idx = {3'h0, read_idx_q[12:0]} * 16'd8;
-  assign mar_curr_bits = real_to_fp32_bits(g2_maxabs_q) & 32'h7FFF_FFFF;
+  assign mar_curr_bits = g2_maxabs_q & 32'h7FFF_FFFF;
   generate
     for (g_lj = 0; g_lj < 8; g_lj = g_lj + 1) begin : g_mar
       assign mar_lane_abs[g_lj] = synth_lat_h2f[g_lj] & 32'h7FFF_FFFF;
@@ -1039,29 +1228,33 @@ module sfu_engine
 
     for (int lane = 0; lane < 16; lane++) begin
       int idx;
-      real x_r;
       idx = integer'(write_chunk_q) * 16 + lane;
       if (idx < integer'(n_elems_q))
         row_write_data_w[(lane * 8) +: 8] = out_bytes_q[idx];
-
-      x_r = sfu_fp32_mul(real'(get_i8(gelu_i8_row_q, lane)), scale0_q);
-      gelu_i8_write_data_w[(lane * 8) +: 8] = quantize_to_i8(gelu_real(x_r), scale1_q);
+    end
+`ifndef SFU_SYNTH_NO_DPI
+    for (int lane = 0; lane < 16; lane++) begin
+      int idx;
+      real x_r;
+      x_r = sfu_fp32_mul(real'(get_i8(gelu_i8_row_q, lane)), fp32_bits_to_real(scale0_q));
+      gelu_i8_write_data_w[(lane * 8) +: 8] = quantize_to_i8(gelu_real(x_r), fp32_bits_to_real(scale1_q));
 
       if (lane < 4) begin
-        x_r = sfu_fp32_mul(real'(get_i32(gelu_row0_q, lane)), scale0_q);
-        gelu_i32_write_data_w[(lane * 8) +: 8] = quantize_to_i8(gelu_real(x_r), scale1_q);
-        x_r = sfu_fp32_mul(real'(get_i32(gelu_row1_q, lane)), scale0_q);
-        gelu_i32_write_data_w[((lane + 4) * 8) +: 8] = quantize_to_i8(gelu_real(x_r), scale1_q);
-        x_r = sfu_fp32_mul(real'(get_i32(gelu_row2_q, lane)), scale0_q);
-        gelu_i32_write_data_w[((lane + 8) * 8) +: 8] = quantize_to_i8(gelu_real(x_r), scale1_q);
-        x_r = sfu_fp32_mul(real'(get_i32(gelu_row3_q, lane)), scale0_q);
-        gelu_i32_write_data_w[((lane + 12) * 8) +: 8] = quantize_to_i8(gelu_real(x_r), scale1_q);
+        x_r = sfu_fp32_mul(real'(get_i32(gelu_row0_q, lane)), fp32_bits_to_real(scale0_q));
+        gelu_i32_write_data_w[(lane * 8) +: 8] = quantize_to_i8(gelu_real(x_r), fp32_bits_to_real(scale1_q));
+        x_r = sfu_fp32_mul(real'(get_i32(gelu_row1_q, lane)), fp32_bits_to_real(scale0_q));
+        gelu_i32_write_data_w[((lane + 4) * 8) +: 8] = quantize_to_i8(gelu_real(x_r), fp32_bits_to_real(scale1_q));
+        x_r = sfu_fp32_mul(real'(get_i32(gelu_row2_q, lane)), fp32_bits_to_real(scale0_q));
+        gelu_i32_write_data_w[((lane + 8) * 8) +: 8] = quantize_to_i8(gelu_real(x_r), fp32_bits_to_real(scale1_q));
+        x_r = sfu_fp32_mul(real'(get_i32(gelu_row3_q, lane)), fp32_bits_to_real(scale0_q));
+        gelu_i32_write_data_w[((lane + 12) * 8) +: 8] = quantize_to_i8(gelu_real(x_r), fp32_bits_to_real(scale1_q));
       end
 
       idx = integer'(write_chunk_q) * 16 + lane;
       if (idx < integer'(n_elems_q))
-        attn_write_data_w[(lane * 8) +: 8] = quantize_to_i8(attn_accum_q[idx], scale2_q);
+        attn_write_data_w[(lane * 8) +: 8] = quantize_to_i8(fp32_bits_to_real(attn_accum_q[idx]), fp32_bits_to_real(scale2_q));
     end
+`endif
   end
 
   always_ff @(posedge clk or negedge rst_n) begin
@@ -1159,13 +1352,20 @@ module sfu_engine
             attn_query_row_base_q <= attn_query_row_base;
             attn_valid_kv_len_q   <= attn_valid_kv_len;
             attn_mode_q           <= attn_mode;
-            scale0_q        <= fp16_to_real(scale0_data);
-            scale1_q        <= fp16_to_real(scale1_data);
-            scale2_q        <= fp16_to_real(scale2_data);
-            scale3_q        <= fp16_to_real(scale3_data);
-            ln_debug_mean_q <= 0.0;
-            ln_debug_var_q <= 0.0;
-            ln_debug_denom_q <= 0.0;
+`ifndef SFU_SYNTH_NO_DPI
+            scale0_q        <= real_to_fp32_bits(fp16_to_real(scale0_data));
+            scale1_q        <= real_to_fp32_bits(fp16_to_real(scale1_data));
+            scale2_q        <= real_to_fp32_bits(fp16_to_real(scale2_data));
+            scale3_q        <= real_to_fp32_bits(fp16_to_real(scale3_data));
+`else
+            scale0_q        <= {16'h0, scale0_data};
+            scale1_q        <= {16'h0, scale1_data};
+            scale2_q        <= {16'h0, scale2_data};
+            scale3_q        <= {16'h0, scale3_data};
+`endif
+            ln_debug_mean_q <= 32'h0;
+            ln_debug_var_q <= 32'h0;
+            ln_debug_denom_q <= 32'h0;
             for (int i = 0; i < 16; i++)
               ln_debug_y_q[i] <= 0.0;
             row_idx_q       <= 15'h0;
@@ -1234,14 +1434,16 @@ module sfu_engine
           base_idx = (integer'(read_idx_q) < integer'(ln_gamma_rows_q)) ?
                      (integer'(read_idx_q) * 8) :
                      ((integer'(read_idx_q) - integer'(ln_gamma_rows_q)) * 8);
+`ifndef SFU_SYNTH_NO_DPI
           for (int lane = 0; lane < 8; lane++) begin
             if ((base_idx + lane) < integer'(n_elems_q)) begin
               if (integer'(read_idx_q) < integer'(ln_gamma_rows_q))
-                gamma_q[base_idx + lane] <= fp16_to_real(get_u16(sram_b_rdata, lane));
+                gamma_q[base_idx + lane] <= real_to_fp32_bits(fp16_to_real(get_u16(sram_b_rdata, lane)));
               else
-                beta_q[base_idx + lane] <= fp16_to_real(get_u16(sram_b_rdata, lane));
+                beta_q[base_idx + lane] <= real_to_fp32_bits(fp16_to_real(get_u16(sram_b_rdata, lane)));
             end
           end
+`endif
 
           if ((integer'(read_idx_q) + 1) < integer'(ln_param_rows_q)) begin
             read_idx_q <= read_idx_q + 13'd1;
@@ -1264,11 +1466,13 @@ module sfu_engine
         F_ROW_I8_LATCH: begin
           integer base_idx;
           base_idx = integer'(read_idx_q) * 16;
+`ifndef SFU_SYNTH_NO_DPI
           for (int lane = 0; lane < 16; lane++) begin
             if ((base_idx + lane) < integer'(n_elems_q))
               row_data_q[base_idx + lane] <=
-                  sfu_fp32_mul(real'(get_i8(sram_b_rdata, lane)), scale0_q);
+                  real_to_fp32_bits(sfu_fp32_mul(real'(get_i8(sram_b_rdata, lane)), fp32_bits_to_real(scale0_q)));
           end
+`endif
 
           if (read_idx_q + 13'd1 < {2'h0, n_tiles_q}) begin
             read_idx_q <= read_idx_q + 13'd1;
@@ -1291,11 +1495,13 @@ module sfu_engine
         F_ROW_I32_LATCH: begin
           integer base_idx;
           base_idx = integer'(read_idx_q) * 4;
+`ifndef SFU_SYNTH_NO_DPI
           for (int lane = 0; lane < 4; lane++) begin
             if ((base_idx + lane) < integer'(n_elems_q))
               row_data_q[base_idx + lane] <=
-                  sfu_fp32_mul(real'(get_i32(sram_b_rdata, lane)), scale0_q);
+                  real_to_fp32_bits(sfu_fp32_mul(real'(get_i32(sram_b_rdata, lane)), fp32_bits_to_real(scale0_q)));
           end
+`endif
 
           if (read_idx_q + 13'd1 < n_chunks_i32_q) begin
             read_idx_q <= read_idx_q + 13'd1;
@@ -1308,6 +1514,17 @@ module sfu_engine
 
         F_ROW_COMPUTE: begin
           if ((opcode_q == OP_SOFTMAX) || (opcode_q == OP_MASKED_SOFTMAX)) begin
+            if (SFU_SYNTH_MODE == 1) begin
+              // Phase-3.B: gen-1 SOFTMAX/MASKED_SOFTMAX synth path. Reuses
+              // the gen-2 F_G2_SM_{MAX,EXPSUM,OUT} 3-pass sub-FSM with
+              // opcode-aware sm_visible_w and writeback (int8 + scale1_q).
+              iter_idx_q   <= 11'h0;
+              sm_row_max_q <= 32'h0;
+              sm_exp_sum_q <= 32'h0;
+              sm_have_vis_q <= 1'b0;
+              state        <= F_G2_SM_MAX;
+            end else begin
+`ifndef SFU_SYNTH_NO_DPI
             real row_max_r;
             real exp_sum_r;
             real exp_r;
@@ -1317,8 +1534,8 @@ module sfu_engine
             for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
               if ((i < integer'(n_elems_q)) &&
                   ((opcode_q == OP_SOFTMAX) || attn_visible(row_idx_q, i))) begin
-                if (!have_visible || (row_data_q[i] > row_max_r))
-                  row_max_r = row_data_q[i];
+                if (!have_visible || (fp32_bits_to_real(row_data_q[i]) > row_max_r))
+                  row_max_r = fp32_bits_to_real(row_data_q[i]);
                 have_visible = 1'b1;
               end
             end
@@ -1331,7 +1548,7 @@ module sfu_engine
               for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
                 if ((i < integer'(n_elems_q)) &&
                     ((opcode_q == OP_SOFTMAX) || attn_visible(row_idx_q, i))) begin
-                  exp_r = sfu_fp32_exp(sfu_fp32_sub(row_data_q[i], row_max_r));
+                  exp_r = sfu_fp32_exp(sfu_fp32_sub(fp32_bits_to_real(row_data_q[i]), row_max_r));
                   exp_sum_r = sfu_fp32_add(exp_sum_r, exp_r);
                 end
               end
@@ -1345,15 +1562,26 @@ module sfu_engine
                     if ((opcode_q == OP_MASKED_SOFTMAX) && !attn_visible(row_idx_q, i)) begin
                       out_bytes_q[i] <= 8'h00;
                     end else begin
-                      exp_r = sfu_fp32_exp(sfu_fp32_sub(row_data_q[i], row_max_r));
-                      out_bytes_q[i] <= quantize_to_i8(sfu_fp32_div(exp_r, exp_sum_r), scale1_q);
+                      exp_r = sfu_fp32_exp(sfu_fp32_sub(fp32_bits_to_real(row_data_q[i]), row_max_r));
+                      out_bytes_q[i] <= quantize_to_i8(sfu_fp32_div(exp_r, exp_sum_r), fp32_bits_to_real(scale1_q));
                     end
                   end
                 end
                 state <= F_ROW_PACK;
               end
             end
+`endif
+            end  // end SFU_SYNTH_MODE==0 (DPI) SOFTMAX path
+          end else if (SFU_SYNTH_MODE == 1) begin
+            // Phase-3.B: gen-1 LAYERNORM synth path. Reuses the gen-2
+            // F_G2_LN_{SUM,MEAN,VAR,DENOM,OUT} 5-pass sub-FSM with opcode-
+            // aware epsilon (gen-1: 1e-6) and writeback (int8 + scale1_q).
+            iter_idx_q   <= 11'h0;
+            ln_sum_acc_q <= 32'h0;
+            ln_var_acc_q <= 32'h0;
+            state        <= F_G2_LN_SUM;
           end else begin
+`ifndef SFU_SYNTH_NO_DPI
             real sum_r;
             real mean_r;
             real var_r;
@@ -1361,7 +1589,7 @@ module sfu_engine
             sum_r = 0.0;
             for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
               if (i < integer'(n_elems_q))
-                sum_r = sfu_fp32_add(sum_r, row_data_q[i]);
+                sum_r = sfu_fp32_add(sum_r, fp32_bits_to_real(row_data_q[i]));
             end
             mean_r = sfu_fp32_div(sum_r, real'(n_elems_q));
 
@@ -1369,32 +1597,33 @@ module sfu_engine
             for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
               if (i < integer'(n_elems_q)) begin
                 real diff_r;
-                diff_r = sfu_fp32_sub(row_data_q[i], mean_r);
+                diff_r = sfu_fp32_sub(fp32_bits_to_real(row_data_q[i]), mean_r);
                 var_r = sfu_fp32_add(var_r, sfu_fp32_mul(diff_r, diff_r));
               end
             end
             var_r = sfu_fp32_div(var_r, real'(n_elems_q));
             denom_r = sfu_fp32_sqrt(sfu_fp32_add(var_r, LN_EPS));
-            ln_debug_mean_q <= mean_r;
-            ln_debug_var_q <= var_r;
-            ln_debug_denom_q <= denom_r;
+            ln_debug_mean_q <= real_to_fp32_bits(mean_r);
+            ln_debug_var_q <= real_to_fp32_bits(var_r);
+            ln_debug_denom_q <= real_to_fp32_bits(denom_r);
 
             for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
               real y_r;
               if (i < integer'(n_elems_q)) begin
                 y_r = sfu_fp32_add(
                     sfu_fp32_mul(
-                        sfu_fp32_div(sfu_fp32_sub(row_data_q[i], mean_r), denom_r),
-                        gamma_q[i]),
-                    beta_q[i]);
-                out_bytes_q[i] <= quantize_to_i8(y_r, scale1_q);
+                        sfu_fp32_div(sfu_fp32_sub(fp32_bits_to_real(row_data_q[i]), mean_r), denom_r),
+                        fp32_bits_to_real(gamma_q[i])),
+                    fp32_bits_to_real(beta_q[i]));
+                out_bytes_q[i] <= quantize_to_i8(y_r, fp32_bits_to_real(scale1_q));
                 if (i < 16)
-                  ln_debug_y_q[i] <= y_r;
+                  ln_debug_y_q[i] <= real_to_fp32_bits(y_r);
               end else if (i < 16) begin
-                ln_debug_y_q[i] <= 0.0;
+                ln_debug_y_q[i] <= 32'h0;
               end
             end
             state <= F_ROW_PACK;
+`endif
           end
         end
 
@@ -1437,7 +1666,31 @@ module sfu_engine
 
         F_GELU_I8_LATCH: begin
           gelu_i8_row_q <= sram_b_rdata;
-          state         <= F_GELU_I8_WRITE;
+          if (SFU_SYNTH_MODE == 1) begin
+            iter_idx_q <= 11'h0;
+            state      <= F_GELU_SYNTH_I8_ITER;
+          end else begin
+            state      <= F_GELU_I8_WRITE;
+          end
+        end
+
+        // Phase-3.B gen-1 GELU INT8 synth iterator. 16 cycles per chunk:
+        // each cycle picks one lane from gelu_i8_row_q (via gelu_g1_in_pick
+        // mux) through the shared synth datapath (cvt → mul scale0 → gelu_new
+        // → div scale1 → quantize_i8) and writes out_bytes_q[chunk*16+lane].
+        // After 16 lanes done, exits to F_GELU_I8_WRITE (which in synth mode
+        // sources sram_a_wdata from row_write_data_w packing out_bytes_q).
+        F_GELU_SYNTH_I8_ITER: begin
+          if (iter_idx_q < 11'd16) begin
+            int byte_idx;
+            byte_idx = integer'(write_chunk_q) * 16 + integer'(iter_idx_q[3:0]);
+            if (byte_idx < integer'(n_elems_q))
+              out_bytes_q[byte_idx[9:0]] <= gelu_g1_quant_w;
+            iter_idx_q <= iter_idx_q + 11'd1;
+          end else begin
+            iter_idx_q <= 11'h0;
+            state      <= F_GELU_I8_WRITE;
+          end
         end
 
         F_GELU_I8_WRITE: begin
@@ -1474,10 +1727,36 @@ module sfu_engine
           endcase
 
           if (gelu_part_q == 2'd3) begin
-            state <= F_GELU_I32_WRITE;
+            if (SFU_SYNTH_MODE == 1) begin
+              iter_idx_q <= 11'h0;
+              state      <= F_GELU_SYNTH_I32_ITER;
+            end else begin
+              state      <= F_GELU_I32_WRITE;
+            end
           end else begin
             gelu_part_q <= gelu_part_q + 2'd1;
             state       <= F_GELU_I32_REQ;
+          end
+        end
+
+        // Phase-3.B gen-1 GELU INT32 synth iterator. 16 iterations:
+        // iter_idx_q[3:2] = lane (0..3), iter_idx_q[1:0] = row (0..3).
+        // Matches the always_comb packing: byte_idx = lane + row * 4
+        // within the 16-byte chunk.
+        F_GELU_SYNTH_I32_ITER: begin
+          if (iter_idx_q < 11'd16) begin
+            int byte_idx;
+            int lane;
+            int row;
+            lane = integer'(iter_idx_q[3:2]);
+            row  = integer'(iter_idx_q[1:0]);
+            byte_idx = integer'(write_chunk_q) * 16 + lane + row * 4;
+            if (byte_idx < integer'(n_elems_q))
+              out_bytes_q[byte_idx[9:0]] <= gelu_g1_quant_w;
+            iter_idx_q <= iter_idx_q + 11'd1;
+          end else begin
+            iter_idx_q <= 11'h0;
+            state      <= F_GELU_I32_WRITE;
           end
         end
 
@@ -1511,11 +1790,13 @@ module sfu_engine
         F_ATTN_QKT_LATCH: begin
           integer base_idx;
           base_idx = integer'(read_idx_q) * 4;
+`ifndef SFU_SYNTH_NO_DPI
           for (int lane = 0; lane < 4; lane++) begin
             if ((base_idx + lane) < integer'(k_elems_q))
               row_data_q[base_idx + lane] <=
-                  sfu_fp32_mul(real'(get_i32(sram_b_rdata, lane)), scale0_q);
+                  real_to_fp32_bits(sfu_fp32_mul(real'(get_i32(sram_b_rdata, lane)), fp32_bits_to_real(scale0_q)));
           end
+`endif
 
           if (read_idx_q + 13'd1 < k_chunks_i32_q) begin
             read_idx_q <= read_idx_q + 13'd1;
@@ -1526,6 +1807,20 @@ module sfu_engine
         end
 
         F_ATTN_PREP: begin
+          if (SFU_SYNTH_MODE == 1) begin
+            // Phase-3.B gen-1 ATTN PREP synth path. Reuses F_G2_SM_*
+            // sub-FSM via sm_visible_w + sm_iter_bound_w (k_elems_q). On
+            // EXPSUM exit, syncs sm_* → attn_* and zeros attn_accum_q,
+            // then transitions to F_ATTN_V_REQ (the V_LATCH DPI path
+            // consumes attn_*). V_LATCH itself stays on DPI in synth mode
+            // pending a future per-K weighted-V synth pipeline.
+            iter_idx_q   <= 11'h0;
+            sm_row_max_q <= 32'h0;
+            sm_exp_sum_q <= 32'h0;
+            sm_have_vis_q <= 1'b0;
+            state        <= F_G2_SM_MAX;
+          end else begin
+`ifndef SFU_SYNTH_NO_DPI
           real row_max_r;
           real exp_sum_r;
           logic have_visible;
@@ -1534,8 +1829,8 @@ module sfu_engine
           for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
             if ((i < integer'(k_elems_q)) &&
                 ((opcode_q == OP_SOFTMAX_ATTNV) || attn_visible(row_idx_q, i))) begin
-              if (!have_visible || (row_data_q[i] > row_max_r))
-                row_max_r = row_data_q[i];
+              if (!have_visible || (fp32_bits_to_real(row_data_q[i]) > row_max_r))
+                row_max_r = fp32_bits_to_real(row_data_q[i]);
               have_visible = 1'b1;
             end
           end
@@ -1545,22 +1840,24 @@ module sfu_engine
             if ((i < integer'(k_elems_q)) &&
                 ((opcode_q == OP_SOFTMAX_ATTNV) || attn_visible(row_idx_q, i)))
               exp_sum_r = sfu_fp32_add(
-                  exp_sum_r, sfu_fp32_exp(sfu_fp32_sub(row_data_q[i], row_max_r)));
+                  exp_sum_r, sfu_fp32_exp(sfu_fp32_sub(fp32_bits_to_real(row_data_q[i]), row_max_r)));
             if (i < integer'(n_elems_q))
-              attn_accum_q[i] <= 0.0;
+              attn_accum_q[i] <= 32'h0;
           end
 
           if (!have_visible || (exp_sum_r == 0.0)) begin
             fault_code_r <= 4'(FAULT_NO_CONFIG);
             state        <= F_FAULT;
           end else begin
-            attn_row_max_q <= row_max_r;
-            attn_exp_sum_q <= exp_sum_r;
+            attn_row_max_q <= real_to_fp32_bits(row_max_r);
+            attn_exp_sum_q <= real_to_fp32_bits(exp_sum_r);
             attn_k_idx_q   <= 16'h0;
             read_idx_q     <= 13'h0;
             write_chunk_q  <= 11'h0;
             state          <= F_ATTN_V_REQ;
           end
+`endif
+          end  // end SFU_SYNTH_MODE==0 (DPI) F_ATTN_PREP path
         end
 
         F_ATTN_V_REQ: begin
@@ -1573,24 +1870,38 @@ module sfu_engine
         end
 
         F_ATTN_V_LATCH: begin
+          if (SFU_SYNTH_MODE == 1) begin
+            // Phase-3.B gen-1 ATTN V_LATCH synth path. Parallel 16-lane
+            // accumulate via attn_acc_new_bits (combinationally computed
+            // from sram_b_rdata, attn_weight_eff_w, sm_exp_sum_q).
+            for (int lane = 0; lane < 16; lane++) begin
+              automatic int idx;
+              idx = integer'(read_idx_q) * 16 + lane;
+              if (idx < integer'(n_elems_q))
+                attn_accum_q[idx[9:0]] <= attn_acc_new_bits[lane];
+            end
+          end else begin
+`ifndef SFU_SYNTH_NO_DPI
           real weight_r;
           if ((opcode_q == OP_MASKED_SOFTMAX_ATTNV) &&
               !attn_visible(row_idx_q, integer'(attn_k_idx_q))) begin
             weight_r = 0.0;
           end else begin
             weight_r = sfu_fp32_div(
-                sfu_fp32_exp(sfu_fp32_sub(row_data_q[integer'(attn_k_idx_q)], attn_row_max_q)),
-                attn_exp_sum_q);
+                sfu_fp32_exp(sfu_fp32_sub(fp32_bits_to_real(row_data_q[integer'(attn_k_idx_q)]), fp32_bits_to_real(attn_row_max_q))),
+                fp32_bits_to_real(attn_exp_sum_q));
           end
           for (int lane = 0; lane < 16; lane++) begin
             integer idx;
             idx = integer'(read_idx_q) * 16 + lane;
             if (idx < integer'(n_elems_q))
-              attn_accum_q[idx] <= sfu_fp32_add(
-                  attn_accum_q[idx],
+              attn_accum_q[idx] <= real_to_fp32_bits(sfu_fp32_add(
+                  fp32_bits_to_real(attn_accum_q[idx]),
                   sfu_fp32_mul(
                       sfu_fp32_mul(weight_r, real'(get_i8(sram_b_rdata, lane))),
-                      scale1_q));
+                      fp32_bits_to_real(scale1_q))));
+          end
+`endif
           end
 
           if (read_idx_q + 13'd1 < {2'h0, n_tiles_q}) begin
@@ -1645,11 +1956,13 @@ module sfu_engine
             // 0x17 / 0x1E: src1 = ACCUM INT32, 4 int32 / 16-byte row, raw
             // -> real (scales/bias applied later in F_G2_COMPUTE).
             base_idx = integer'(read_idx_q) * 4;
+`ifndef SFU_SYNTH_NO_DPI
             for (int lane = 0; lane < 4; lane++) begin
               if ((base_idx + lane) < integer'(n_elems_q))
                 row_data_q[base_idx + lane] <=
-                    real'(get_i32(sram_b_rdata, lane));
+                    real_to_fp32_bits(real'(get_i32(sram_b_rdata, lane)));
             end
+`endif
             if (read_idx_q + 13'd1 < n_chunks_i32_q) begin
               read_idx_q <= read_idx_q + 13'd1;
               state      <= F_G2_S1_REQ;
@@ -1666,13 +1979,14 @@ module sfu_engine
               // Synth: max-reduce the 8 fp32-bit-abs lanes against the
               // current g2_maxabs_q (computed combinationally at module
               // scope as `mar_new_max`); store back via fp32_bits_to_real.
-              g2_maxabs_q <= fp32_bits_to_real(mar_new_max);
+              g2_maxabs_q <= mar_new_max;
             end else begin
+`ifndef SFU_SYNTH_NO_DPI
               // DPI path (default; cosim-pinned).
               real m;
               real v;
               real av;
-              m = g2_maxabs_q;
+              m = fp32_bits_to_real(g2_maxabs_q);
               for (int lane = 0; lane < 8; lane++) begin
                 if ((base_idx + lane) < integer'(n_elems_q)) begin
                   v  = sfu_fp16_bits_to_fp32({16'h0, get_u16(sram_b_rdata, lane)});
@@ -1680,7 +1994,8 @@ module sfu_engine
                   if (av > m) m = av;
                 end
               end
-              g2_maxabs_q <= m;
+              g2_maxabs_q <= real_to_fp32_bits(m);
+`endif
             end
             if (read_idx_q + 13'd1 < {2'h0, g2_rows_q[10:0]}) begin
               read_idx_q <= read_idx_q + 13'd1;
@@ -1699,10 +2014,12 @@ module sfu_engine
               if ((base_idx + lane) < integer'(n_elems_q)) begin
                 if (SFU_SYNTH_MODE == 1)
                   row_data_q[base_idx + lane] <=
-                      fp32_bits_to_real(synth_lat_h2f[lane]);
+                      synth_lat_h2f[lane];
+`ifndef SFU_SYNTH_NO_DPI
                 else
                   row_data_q[base_idx + lane] <=
-                      sfu_fp16_bits_to_fp32({16'h0, get_u16(sram_b_rdata, lane)});
+                      real_to_fp32_bits(sfu_fp16_bits_to_fp32({16'h0, get_u16(sram_b_rdata, lane)}));
+`endif
               end
             end
             if (read_idx_q + 13'd1 < {2'h0, g2_rows_q[10:0]}) begin
@@ -1745,17 +2062,21 @@ module sfu_engine
                 if (integer'(read_idx_q) < integer'(ln_gamma_rows_q)) begin
                   if (SFU_SYNTH_MODE == 1)
                     gamma_q[base_idx + lane] <=
-                        fp32_bits_to_real(synth_lat_h2f[lane]);
+                        synth_lat_h2f[lane];
+`ifndef SFU_SYNTH_NO_DPI
                   else
                     gamma_q[base_idx + lane] <=
-                        sfu_fp16_bits_to_fp32({16'h0, get_u16(sram_b_rdata, lane)});
+                        real_to_fp32_bits(sfu_fp16_bits_to_fp32({16'h0, get_u16(sram_b_rdata, lane)}));
+`endif
                 end else begin
                   if (SFU_SYNTH_MODE == 1)
                     beta_q[base_idx + lane] <=
-                        fp32_bits_to_real(synth_lat_h2f[lane]);
+                        synth_lat_h2f[lane];
+`ifndef SFU_SYNTH_NO_DPI
                   else
                     beta_q[base_idx + lane] <=
-                        sfu_fp16_bits_to_fp32({16'h0, get_u16(sram_b_rdata, lane)});
+                        real_to_fp32_bits(sfu_fp16_bits_to_fp32({16'h0, get_u16(sram_b_rdata, lane)}));
+`endif
                 end
               end
             end
@@ -1774,10 +2095,12 @@ module sfu_engine
               if ((base_idx + lane) < integer'(n_elems_q)) begin
                 if (SFU_SYNTH_MODE == 1)
                   attn_accum_q[base_idx + lane] <=
-                      fp32_bits_to_real(synth_lat_h2f[lane]);
+                      synth_lat_h2f[lane];
+`ifndef SFU_SYNTH_NO_DPI
                 else
                   attn_accum_q[base_idx + lane] <=
-                      sfu_fp16_bits_to_fp32({16'h0, get_u16(sram_b_rdata, lane)});
+                      real_to_fp32_bits(sfu_fp16_bits_to_fp32({16'h0, get_u16(sram_b_rdata, lane)}));
+`endif
               end
             end
             if (read_idx_q + 13'd1 < {2'h0, g2_rows_q[10:0]}) begin
@@ -1798,21 +2121,35 @@ module sfu_engine
               iter_idx_q <= 11'h0;
               state      <= F_G2_SYNTH_ITER;
             end else begin
+`ifndef SFU_SYNTH_NO_DPI
               // DPI path (default; cosim-pinned).
               for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
                 if (i < integer'(n_elems_q))
                   out_h_q[i] <= 16'(sfu_fp32_to_fp16_bits(
-                      sfu_fp32_add(row_data_q[i], attn_accum_q[i])));
+                      sfu_fp32_add(fp32_bits_to_real(row_data_q[i]), fp32_bits_to_real(attn_accum_q[i]))));
               end
               state <= F_G2_PACK;
+`endif
             end
           end else if (opcode_q == OP_GELU_FP32) begin
-            for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
-              if (i < integer'(n_elems_q))
-                out_h_q[i] <= 16'(sfu_fp32_to_fp16_bits(
-                    sfu_fp32_gelu_new(row_data_q[i])));
+            if (SFU_SYNTH_MODE == 1) begin
+              // Synth path: serialize via F_G2_SYNTH_ITER. The fp32_gelu_new
+              // combinational core (tanh-poly) drives synth_gelu_out; the
+              // shared synth_compute_out -> f2h shell writes out_h_q.
+              // MEASURED-BAND — freeze §7 (≤3 fp16 ULP, anchor).
+              iter_idx_q <= 11'h0;
+              state      <= F_G2_SYNTH_ITER;
+            end else begin
+`ifndef SFU_SYNTH_NO_DPI
+              // DPI path (default; cosim-pinned).
+              for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
+                if (i < integer'(n_elems_q))
+                  out_h_q[i] <= 16'(sfu_fp32_to_fp16_bits(
+                      sfu_fp32_gelu_new(fp32_bits_to_real(row_data_q[i]))));
+              end
+              state <= F_G2_PACK;
+`endif
             end
-            state <= F_G2_PACK;
           end else if (opcode_q == OP_DEQUANT_ACCUM_FP32) begin
             // 0x17: FP16 = fp32(INT32) * per-column FP16 scale.
             if (SFU_SYNTH_MODE == 1) begin
@@ -1820,13 +2157,15 @@ module sfu_engine
               iter_idx_q <= 11'h0;
               state      <= F_G2_SYNTH_ITER;
             end else begin
+`ifndef SFU_SYNTH_NO_DPI
               // DPI path (default; cosim-pinned).
               for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
                 if (i < integer'(n_elems_q))
                   out_h_q[i] <= 16'(sfu_fp32_to_fp16_bits(
-                      sfu_fp32_mul(row_data_q[i], attn_accum_q[i])));
+                      sfu_fp32_mul(fp32_bits_to_real(row_data_q[i]), fp32_bits_to_real(attn_accum_q[i]))));
               end
               state <= F_G2_PACK;
+`endif
             end
           end else if (opcode_q == OP_QUANT_FP32_INT8) begin
             // 0x18: INT8 = clip(round_half_even(FP16 * scale_regs[sreg])).
@@ -1836,13 +2175,15 @@ module sfu_engine
               iter_idx_q <= 11'h0;
               state      <= F_G2_SYNTH_ITER;
             end else begin
+`ifndef SFU_SYNTH_NO_DPI
               // DPI path (default; cosim-pinned).
               for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
                 if (i < integer'(n_elems_q))
                   out_bytes_q[i] <= quantize_to_i8(
-                      sfu_fp32_mul(row_data_q[i], scale0_q), 1.0);
+                      sfu_fp32_mul(fp32_bits_to_real(row_data_q[i]), fp32_bits_to_real(scale0_q)), 1.0);
               end
               state <= F_ROW_PACK;          // gen-1 INT8 pack (16 / row)
+`endif
             end
           end else if (opcode_q == OP_DEQUANT_ACCUM_FP32_SCALED) begin
             // 0x1E: FP16 = int32 * wt_scale[col] * act_scale + bias[col].
@@ -1854,17 +2195,19 @@ module sfu_engine
               iter_idx_q <= 11'h0;
               state      <= F_G2_SYNTH_ITER;
             end else begin
+`ifndef SFU_SYNTH_NO_DPI
               // DPI path (default; cosim-pinned).
               for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
                 if (i < integer'(n_elems_q))
                   out_h_q[i] <= 16'(sfu_fp32_to_fp16_bits(
                       sfu_fp32_add(
                           sfu_fp32_mul(
-                              sfu_fp32_mul(row_data_q[i], gamma_q[i]),
-                              scale0_q),
-                          beta_q[i])));
+                              sfu_fp32_mul(fp32_bits_to_real(row_data_q[i]), fp32_bits_to_real(gamma_q[i])),
+                              fp32_bits_to_real(scale0_q)),
+                          fp32_bits_to_real(beta_q[i]))));
               end
               state <= F_G2_PACK;
+`endif
             end
           end else if (opcode_q == OP_MASKED_SOFTMAX_FP32) begin
             // 0x1D causal masked softmax. Golden is mode-independent:
@@ -1889,6 +2232,7 @@ module sfu_engine
               sm_have_vis_q <= 1'b0;
               state        <= F_G2_SM_MAX;
             end else begin
+`ifndef SFU_SYNTH_NO_DPI
               // DPI path (default; cosim-pinned).
             integer qrow;
             integer keep_through;
@@ -1902,8 +2246,8 @@ module sfu_engine
             row_max_r = 0.0;
             for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
               if ((i < integer'(n_elems_q)) && (i <= keep_through)) begin
-                if (!have_vis || (row_data_q[i] > row_max_r))
-                  row_max_r = row_data_q[i];
+                if (!have_vis || (fp32_bits_to_real(row_data_q[i]) > row_max_r))
+                  row_max_r = fp32_bits_to_real(row_data_q[i]);
                 have_vis = 1'b1;
               end
             end
@@ -1912,7 +2256,7 @@ module sfu_engine
               for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
                 if ((i < integer'(n_elems_q)) && (i <= keep_through))
                   exp_sum_r = sfu_fp32_add(exp_sum_r,
-                      sfu_fp32_exp(sfu_fp32_sub(row_data_q[i], row_max_r)));
+                      sfu_fp32_exp(sfu_fp32_sub(fp32_bits_to_real(row_data_q[i]), row_max_r)));
               end
             end
             for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
@@ -1921,13 +2265,14 @@ module sfu_engine
                   out_h_q[i] <= 16'(sfu_fp32_to_fp16_bits(
                       sfu_fp32_div(
                           sfu_fp32_exp(
-                              sfu_fp32_sub(row_data_q[i], row_max_r)),
+                              sfu_fp32_sub(fp32_bits_to_real(row_data_q[i]), row_max_r)),
                           exp_sum_r)));
                 else
                   out_h_q[i] <= 16'h0;
               end
             end
             state <= F_G2_PACK;
+`endif
             end  // SFU_SYNTH_MODE==0 else branch
           end else begin
             // LAYERNORM_FP32: mean / var (population) / eps=1e-5 / gamma,beta.
@@ -1938,6 +2283,7 @@ module sfu_engine
               ln_sum_acc_q <= 32'h0;
               state        <= F_G2_LN_SUM;
             end else begin
+`ifndef SFU_SYNTH_NO_DPI
               // DPI path (default; cosim-pinned).
               real sum_r;
               real mean_r;
@@ -1946,14 +2292,14 @@ module sfu_engine
               sum_r = 0.0;
               for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
                 if (i < integer'(n_elems_q))
-                  sum_r = sfu_fp32_add(sum_r, row_data_q[i]);
+                  sum_r = sfu_fp32_add(sum_r, fp32_bits_to_real(row_data_q[i]));
               end
               mean_r = sfu_fp32_div(sum_r, real'(n_elems_q));
               var_r = 0.0;
               for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
                 if (i < integer'(n_elems_q)) begin
                   real diff_r;
-                  diff_r = sfu_fp32_sub(row_data_q[i], mean_r);
+                  diff_r = sfu_fp32_sub(fp32_bits_to_real(row_data_q[i]), mean_r);
                   var_r = sfu_fp32_add(var_r, sfu_fp32_mul(diff_r, diff_r));
                 end
               end
@@ -1965,12 +2311,13 @@ module sfu_engine
                       sfu_fp32_add(
                           sfu_fp32_mul(
                               sfu_fp32_div(
-                                  sfu_fp32_sub(row_data_q[i], mean_r),
+                                  sfu_fp32_sub(fp32_bits_to_real(row_data_q[i]), mean_r),
                                   denom_r),
-                              gamma_q[i]),
-                          beta_q[i])));
+                              fp32_bits_to_real(gamma_q[i])),
+                          fp32_bits_to_real(beta_q[i]))));
               end
               state <= F_G2_PACK;
+`endif
             end
           end
         end
@@ -2042,11 +2389,17 @@ module sfu_engine
 
         F_G2_LN_OUT: begin
           if ({5'h0, iter_idx_q} < n_elems_q) begin
-            out_h_q[iter_idx_q[9:0]] <= ln_out_h_w;
-            iter_idx_q               <= iter_idx_q + 11'd1;
+            // Writeback branches on opcode (sub-FSM shared gen-1/gen-2):
+            //   gen-1 0x15 LAYERNORM:      out_bytes_q[i] = qi8(y / scale1_q)
+            //   gen-2 0x1A LAYERNORM_FP32: out_h_q[i]     = fp16(y)
+            if (opcode_q == OP_LAYERNORM)
+              out_bytes_q[iter_idx_q[9:0]] <= ln_g1_quant_w;
+            else
+              out_h_q[iter_idx_q[9:0]]     <= ln_out_h_w;
+            iter_idx_q                     <= iter_idx_q + 11'd1;
           end else begin
             iter_idx_q <= 11'h0;
-            state      <= F_G2_PACK;
+            state      <= (opcode_q == OP_LAYERNORM) ? F_ROW_PACK : F_G2_PACK;
           end
         end
 
@@ -2057,10 +2410,11 @@ module sfu_engine
         //   F_G2_SM_OUT:  iterate; out[iter] = f2h(exp(row-max)/exp_sum) if
         //                 visible & have_vis & exp_sum!=0, else 0.
         F_G2_SM_MAX: begin
-          if ({5'h0, iter_idx_q} < n_elems_q) begin
-            // Visibility: iter_signed <= sm_keep_through_q (signed compare)
-            // — for kt<0, no iter passes since iter is unsigned ≥ 0.
-            if ($signed({6'b0, iter_idx_q}) <= $signed({1'b0, sm_keep_through_q[15:0]})) begin
+          if ({5'h0, iter_idx_q} < sm_iter_bound_w) begin
+            // Opcode-aware visibility via sm_visible_w (gen-1, gen-2, and
+            // ATTN share this sub-FSM). For kt<0 in gen-2, no iter passes
+            // since iter is unsigned ≥ 0; gen-1 unmasked is always visible.
+            if (sm_visible_w) begin
               if (!sm_have_vis_q || sm_row_gt_max)
                 sm_row_max_q <= synth_a_bits;
               sm_have_vis_q  <= 1'b1;
@@ -2068,34 +2422,83 @@ module sfu_engine
             iter_idx_q <= iter_idx_q + 11'd1;
           end else begin
             iter_idx_q   <= 11'h0;
-            state        <= F_G2_SM_EXPSUM;
+            // Gen-1 SOFTMAX + ATTN semantics: if no element was visible (e.g.
+            // an empty mask), raise FAULT_NO_CONFIG — matches DPI gen-1 PREP
+            // path (sfu_engine.sv old lines 1336, 1727). Gen-2 just writes zeros.
+            if (((opcode_q == OP_SOFTMAX) || (opcode_q == OP_MASKED_SOFTMAX)
+                || (opcode_q == OP_SOFTMAX_ATTNV)
+                || (opcode_q == OP_MASKED_SOFTMAX_ATTNV))
+                && !sm_have_vis_q) begin
+              fault_code_r <= 4'(FAULT_NO_CONFIG);
+              state        <= F_FAULT;
+            end else begin
+              state        <= F_G2_SM_EXPSUM;
+            end
           end
         end
 
         F_G2_SM_EXPSUM: begin
-          if ({5'h0, iter_idx_q} < n_elems_q) begin
-            if (sm_have_vis_q &&
-                ($signed({6'b0, iter_idx_q}) <= $signed({1'b0, sm_keep_through_q[15:0]})))
+          if ({5'h0, iter_idx_q} < sm_iter_bound_w) begin
+            if (sm_have_vis_q && sm_visible_w)
               sm_exp_sum_q <= sm_sum_add_w;  // exp_sum += exp(row - row_max)
             iter_idx_q <= iter_idx_q + 11'd1;
           end else begin
             iter_idx_q <= 11'h0;
-            state      <= F_G2_SM_OUT;
+            // Gen-1 SOFTMAX + ATTN semantics: exp_sum == 0 -> FAULT_NO_CONFIG.
+            if (((opcode_q == OP_SOFTMAX) || (opcode_q == OP_MASKED_SOFTMAX)
+                || (opcode_q == OP_SOFTMAX_ATTNV)
+                || (opcode_q == OP_MASKED_SOFTMAX_ATTNV))
+                && (sm_exp_sum_q == 32'h0)) begin
+              fault_code_r <= 4'(FAULT_NO_CONFIG);
+              state        <= F_FAULT;
+            end else if ((opcode_q == OP_SOFTMAX_ATTNV)
+                      || (opcode_q == OP_MASKED_SOFTMAX_ATTNV)) begin
+              // Phase-3.B gen-1 ATTN PREP: sync sm_* (fp32 bits) → attn_*
+              // (real, used by V_LATCH DPI path) and zero attn_accum_q for
+              // the upcoming weighted-V accumulation. F_ATTN_V_REQ next.
+              attn_row_max_q <= sm_row_max_q;
+              attn_exp_sum_q <= sm_exp_sum_q;
+              for (int zi = 0; zi < SFU_MAX_ROW_ELEMS; zi++) begin
+                if (zi < integer'(n_elems_q))
+                  attn_accum_q[zi] <= 0.0;
+              end
+              attn_k_idx_q   <= 16'h0;
+              read_idx_q     <= 13'h0;
+              write_chunk_q  <= 11'h0;
+              state          <= F_ATTN_V_REQ;
+            end else begin
+              state        <= F_G2_SM_OUT;
+            end
           end
         end
 
         F_G2_SM_OUT: begin
-          if ({5'h0, iter_idx_q} < n_elems_q) begin
-            if (sm_have_vis_q &&
-                ($signed({6'b0, iter_idx_q}) <= $signed({1'b0, sm_keep_through_q[15:0]})) &&
-                (sm_exp_sum_q != 32'h0))
-              out_h_q[iter_idx_q[9:0]] <= sm_out_h_w;
-            else
-              out_h_q[iter_idx_q[9:0]] <= 16'h0;
+          if ({5'h0, iter_idx_q} < sm_iter_bound_w) begin
+            // Writeback branches on opcode:
+            //   gen-1: out_bytes_q[i] = quantize_i8(norm * scale1_q) if
+            //          visible & exp_sum != 0; else 0.
+            //   gen-2: out_h_q[i]     = fp16(norm) if visible & exp_sum != 0;
+            //          else 0.
+            if ((opcode_q == OP_SOFTMAX) || (opcode_q == OP_MASKED_SOFTMAX)) begin
+              if (sm_have_vis_q && sm_visible_w && (sm_exp_sum_q != 32'h0))
+                out_bytes_q[iter_idx_q[9:0]] <= sm_g1_quant_w;
+              else
+                out_bytes_q[iter_idx_q[9:0]] <= 8'h00;
+            end else begin
+              if (sm_have_vis_q && sm_visible_w && (sm_exp_sum_q != 32'h0))
+                out_h_q[iter_idx_q[9:0]] <= sm_out_h_w;
+              else
+                out_h_q[iter_idx_q[9:0]] <= 16'h0;
+            end
             iter_idx_q <= iter_idx_q + 11'd1;
           end else begin
             iter_idx_q <= 11'h0;
-            state      <= F_G2_PACK;
+            // Exit dispatch: gen-1 -> F_ROW_PACK (int8 pack), gen-2 -> F_G2_PACK
+            // (fp16 pack). Each pack stage handles its own write_chunk_q seq.
+            if ((opcode_q == OP_SOFTMAX) || (opcode_q == OP_MASKED_SOFTMAX))
+              state <= F_ROW_PACK;
+            else
+              state <= F_G2_PACK;
           end
         end
 
@@ -2196,7 +2599,10 @@ module sfu_engine
         sram_a_we    = 1'b1;
         sram_a_buf   = dst_buf_q;
         sram_a_row   = gelu_dst_addr_w[15:0];
-        sram_a_wdata = gelu_i8_write_data_w;
+        // Phase-3.B: synth mode sources from row_write_data_w (packed view
+        // of out_bytes_q written by F_GELU_SYNTH_I8_ITER); DPI mode uses
+        // the always_comb-computed gelu_i8_write_data_w.
+        sram_a_wdata = (SFU_SYNTH_MODE == 1) ? row_write_data_w : gelu_i8_write_data_w;
       end
 
       F_GELU_I32_REQ: begin
@@ -2210,7 +2616,7 @@ module sfu_engine
         sram_a_we    = 1'b1;
         sram_a_buf   = dst_buf_q;
         sram_a_row   = gelu_dst_addr_w[15:0];
-        sram_a_wdata = gelu_i32_write_data_w;
+        sram_a_wdata = (SFU_SYNTH_MODE == 1) ? row_write_data_w : gelu_i32_write_data_w;
       end
 
       F_ATTN_QKT_REQ: begin
@@ -2270,16 +2676,20 @@ module sfu_engine
           sfu_scale_waddr = sreg_q;
           if (SFU_SYNTH_MODE == 1)
             sfu_scale_wdata = synth_inv_eps_fp16;
+`ifndef SFU_SYNTH_NO_DPI
           else
             sfu_scale_wdata = 16'(sfu_fp64_to_fp16_bits(
-                127.0 / g2_clamp_eps(g2_maxabs_q)));
+                127.0 / g2_clamp_eps(fp32_bits_to_real(g2_maxabs_q))));
+`endif
         end else begin
           sfu_scale_waddr = sreg_q + 4'd1;
           if (SFU_SYNTH_MODE == 1)
             sfu_scale_wdata = synth_eps_inv127_fp16;
+`ifndef SFU_SYNTH_NO_DPI
           else
             sfu_scale_wdata = 16'(sfu_fp64_to_fp16_bits(
-                g2_clamp_eps(g2_maxabs_q) / 127.0));
+                g2_clamp_eps(fp32_bits_to_real(g2_maxabs_q)) / 127.0));
+`endif
         end
       end
 

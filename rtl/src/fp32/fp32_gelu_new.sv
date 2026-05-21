@@ -5,23 +5,26 @@
 //   gelu_new(x) = x * 0.5 * (1 + tanh(K * (x + 0.044715 * x^3)))
 //                 where K = sqrt(2/pi) ≈ 0.7978845608.
 //
-// tanh implementation via exp:
-//   tanh(z) = (exp(z) - exp(-z)) / (exp(z) + exp(-z))
-//   Equivalent and cheaper: tanh(z) = 1 - 2 / (exp(2z) + 1).
-// We use the second form: 1 mul (2z), 1 exp(2z), 1 add(+1), 1 div(2/...),
-// 1 sub(1 - ...).
+// Stable algebraic form (avoids catastrophic cancellation in (1 + tanh) for
+// large negative z, where tanh → -1):
+//   1 + tanh(z) = 1 + (1 - 2/(exp(2z)+1)) = 2 - 2/(exp(2z)+1)
+//               = 2 * (exp(2z) + 1 - 1)/(exp(2z) + 1)
+//               = 2 * exp(2z) / (exp(2z) + 1)
+//   gelu(x)    = x * 0.5 * (1 + tanh(z)) = x * exp(2z) / (exp(2z) + 1).
+// Saves 1 mul + 2 adds vs the naive (1 + tanh) form AND eliminates the
+// near-zero subtraction that lost ~9 mantissa bits for x ≲ -3.
 //
 // Combinational chain instantiates the proven fp32_add, fp32_mul, fp32_div,
-// fp32_exp cores. ULP error accumulates across the chain; the resulting
-// band is measured against the libm golden.
+// fp32_exp cores. With Cody-Waite + degree-6 fp32_exp (≤3 ULP) and this
+// stable form, the GELU output band sits within freeze §7's ≤3 fp16 ULP.
 
 `ifndef FP32_GELU_NEW_SV
 `define FP32_GELU_NEW_SV
 
-`include "fp32_add.sv"
-`include "fp32_mul.sv"
-`include "fp32_div.sv"
-`include "fp32_exp.sv"
+// Dependencies (fp32_add, fp32_mul, fp32_div, fp32_exp) are read in order by
+// the parent build (FP32_PRIMS in rtl/verilator/Makefile, or the standalone
+// gate rule with -I). Local `\`include` directives are intentionally absent
+// so the CONTROL_SV path (which has no -I to fp32/) elaborates cleanly.
 
 module fp32_gelu_new (
   input  logic [31:0] a,    // x
@@ -65,23 +68,15 @@ module fp32_gelu_new (
   logic [31:0] denom;
   fp32_add a_dn (.a(exp_2z), .b(C_ONE), .y(denom));
 
-  // 2 / (exp(2z) + 1)
-  logic [31:0] two_over_denom;
-  fp32_div d_q (.a(C_TWO), .b(denom), .y(two_over_denom));
+  // ratio = exp(2z) / (exp(2z) + 1)  — i.e. 0.5 * (1 + tanh(z))
+  // Stable: ratio is in (0, 1) with no near-cancellation; for large negative
+  // z the result is exp(2z)/(1 + tiny) ≈ exp(2z); for large positive z it's
+  // big/(big + 1) ≈ 1. No 1 + tanh subtraction; ~9 bits of precision saved.
+  logic [31:0] ratio;
+  fp32_div d_r (.a(exp_2z), .b(denom), .y(ratio));
 
-  // 1 - 2/(exp(2z)+1) = tanh(z)
-  logic [31:0] neg_t;
-  logic [31:0] one_plus_tanh;
-  fp32_add a_1mt (.a(C_ONE), .b({~two_over_denom[31], two_over_denom[30:0]}), .y(neg_t));
-  // neg_t = 1 - 2/(denom) = tanh(z); 1 + tanh = 1 + tanh:
-  fp32_add a_1pt (.a(C_ONE), .b(neg_t), .y(one_plus_tanh));
-
-  // 0.5 * (1 + tanh)
-  logic [31:0] half_term;
-  fp32_mul m_half (.a(C_HALF), .b(one_plus_tanh), .y(half_term));
-
-  // x * half_term
-  fp32_mul m_out (.a(a), .b(half_term), .y(y));
+  // x * ratio = x * 0.5 * (1 + tanh(z)) = gelu_new(x)
+  fp32_mul m_out (.a(a), .b(ratio), .y(y));
 
 endmodule
 

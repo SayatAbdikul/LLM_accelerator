@@ -41,7 +41,8 @@ FP32_PRIMS    := $(SRC_DIR)/fp32/fp32_add.sv \
                  $(SRC_DIR)/fp32/fp16_to_fp32.sv \
                  $(SRC_DIR)/fp32/i32_to_fp32.sv \
                  $(SRC_DIR)/fp32/fp32_quantize_i8.sv \
-                 $(SRC_DIR)/fp32/fp32_exp.sv
+                 $(SRC_DIR)/fp32/fp32_exp.sv \
+                 $(SRC_DIR)/fp32/fp32_gelu_new.sv
 CONTROL_SV    := $(PKG) \
                  $(FP32_PRIMS) \
                  $(SRC_DIR)/decode_unit.sv \
@@ -684,7 +685,7 @@ SV2V_OUT     := $(SYNTH_BUILD)/design_full.v
 # synth-check script (hierarchy -> synth -> check -> stat).
 $(SV2V_OUT): $(CONTROL_SV)
 	mkdir -p $(SYNTH_BUILD)
-	sv2v -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) $(CONTROL_SV) -w $(SV2V_OUT)
+	sv2v -DSFU_SYNTH_NO_DPI -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) $(CONTROL_SV) -w $(SV2V_OUT)
 
 synth-check: $(SV2V_OUT)
 	@echo "--- yosys generic synthesizability gate (taccel_top) ---"

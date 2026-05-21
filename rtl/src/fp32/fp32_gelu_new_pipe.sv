@@ -1,5 +1,12 @@
 `ifndef FP32_GELU_NEW_PIPE_SV
 `define FP32_GELU_NEW_PIPE_SV
+// Standalone-gate dependency order. CONTROL_SV reads these via FP32_PRIMS
+// in rtl/verilator/Makefile (deps listed before fp32_gelu_new.sv), so the
+// fp32_gelu_new.sv file itself has no `\`include` directives.
+`include "fp32_add.sv"
+`include "fp32_mul.sv"
+`include "fp32_div.sv"
+`include "fp32_exp.sv"
 `include "fp32_gelu_new.sv"
 module fp32_gelu_new_pipe #(parameter int unsigned LATENCY = 1) (
   input  logic clk, input logic rst_n,
