@@ -1,0 +1,27 @@
+# Phase-3 control-plane synthesizability gate (yosys, generic; no FPGA part).
+#
+# Reads the design WITHOUT sfu_engine.sv / blocking_helper_engine.sv (those
+# black-boxed via blackbox_stubs.v at the top of the yosys -p command). Runs
+# the lightweight synthesis pipeline that proves elaboration + procedural
+# decode + structural sanity, but skips ABC tech-mapping (which is slow on
+# the unmapped 4MB SRAM cell arrays and yields vendor-specific gates that
+# aren't useful at this stage — `synth-check-full` will do the area pass
+# once BRAM mapping is in place).
+#
+# Returns 0 iff the control plane is synthesizable.
+
+hierarchy -check -top taccel_top
+
+# Convert procedural -> RTLIL (this is where non-synth constructs fail).
+proc
+
+# Structural simplification (flatten then optimize) — keeps the design
+# compact without ABC. Use `opt -fast` to skip the most expensive passes.
+flatten
+opt -fast
+
+# Structural sanity: no combinational loops, no multi-drivers, etc.
+check -assert
+
+# Generic cell/area summary (pre-tech-mapping; vendor-independent).
+stat

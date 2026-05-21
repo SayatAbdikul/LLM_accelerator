@@ -30,15 +30,18 @@ module systolic_array
   logic [7:0] b_vec [0:SYS_DIM-1];
   logic [7:0] a_edge_vec [0:SYS_DIM-1];
   logic [7:0] b_edge_vec [0:SYS_DIM-1];
-  logic [7:0] a_skew [0:SYS_DIM-1][0:SYS_DIM-2];
-  logic [7:0] b_skew [0:SYS_DIM-1][0:SYS_DIM-2];
+  // Phase-3: packed 2D arrays for yosys-built-in SV frontend compatibility.
+  // All accesses are [i][j] element-style; packed semantics are equivalent.
+  // Originally `[0:N-1][0:M-1]` unpacked.
+  logic [SYS_DIM-1:0][SYS_DIM-2:0][7:0]  a_skew;
+  logic [SYS_DIM-1:0][SYS_DIM-2:0][7:0]  b_skew;
 
   // PE-local state and interconnect signals.
-  logic [31:0] pe_acc [0:SYS_DIM-1][0:SYS_DIM-1];
-  logic [7:0] pe_a_in  [0:SYS_DIM-1][0:SYS_DIM-1];
-  logic [7:0] pe_b_in  [0:SYS_DIM-1][0:SYS_DIM-1];
-  logic [7:0] pe_a_out [0:SYS_DIM-1][0:SYS_DIM-1];
-  logic [7:0] pe_b_out [0:SYS_DIM-1][0:SYS_DIM-1];
+  logic [SYS_DIM-1:0][SYS_DIM-1:0][31:0] pe_acc;
+  logic [SYS_DIM-1:0][SYS_DIM-1:0][7:0]  pe_a_in;
+  logic [SYS_DIM-1:0][SYS_DIM-1:0][7:0]  pe_b_in;
+  logic [SYS_DIM-1:0][SYS_DIM-1:0][7:0]  pe_a_out;
+  logic [SYS_DIM-1:0][SYS_DIM-1:0][7:0]  pe_b_out;
 
   genvar i, j;
   // Unpack the incoming 128-bit rows into 16 signed INT8 lanes and select the

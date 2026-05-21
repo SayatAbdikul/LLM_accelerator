@@ -88,7 +88,10 @@ module systolic_controller
   logic [1:0]  drain_grp_q;
   logic [31:0] dst_clear_row_idx_q;
   logic [31:0] dst_clear_total_rows_q;
-  logic [7:0]  a_tile_scratch [0:SYS_DIM-1][0:SYS_DIM-1];
+  // Phase-3: packed 2D so yosys's built-in SV frontend can elaborate. All
+  // accesses are [i][j] element-style (no row-slice ops) so the conversion
+  // is value-semantic-equivalent. Originally `[0:15][0:15]` unpacked.
+  logic [SYS_DIM-1:0][SYS_DIM-1:0][7:0] a_tile_scratch;
 
   // Row-major drain address tracking.
   // tile_drain_base_q = dst_off + mtile * n_tiles * 64 (advances by n_tiles*64 per M-tile).

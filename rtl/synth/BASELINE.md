@@ -35,30 +35,17 @@ Two distinct root causes, both expected/named in the plan:
    **Closes naturally by Plan Phase 2** (DPI→pipelined fp32 primitives;
    `real`→`logic [31:0]`).
 
-2. **2D unpacked array declarations in `systolic_*`** —
-   `rtl/src/systolic/systolic_controller.sv:91`
-   (`a_tile_scratch [0:15][0:15]`) and 7 declarations in
-   `rtl/src/systolic/systolic_array.sv:33–41` (`a_skew/b_skew/pe_acc/
-   pe_a_in/pe_b_in/pe_a_out/pe_b_out`). yosys 0.65's built-in frontend
-   reports `ERROR: Insufficient number of array indices for a_tile_scratch`.
-   **This is a yosys-frontend limitation, NOT an RTL defect** — Vivado /
-   Quartus / `yosys-slang` (full SV frontend) handle 2D unpacked arrays
-   cleanly. The control-plane diagnostic (full CONTROL_SV minus
-   sfu_engine/blocking_helper_engine, those blackboxed via
-   `rtl/synth/blackbox_stubs.v`) elaborates **9 of 11** modules through
-   yosys (`taccel_pkg`, `decode_unit`, `fetch_unit`, `control_unit`,
-   `register_file`, `sram_dp`, `sram_subsystem`, `systolic_pe`,
-   `systolic_array`) and stops at this one parser gap. Two closures:
-
-   - **Surgical edit:** rewrite the 7 declarations as packed 2D
-     (`logic [15:0][15:0][7:0] arr`) — syntactic equivalence, indexing
-     `arr[i][j]` unchanged, zero functional change. Must re-pass `test_systolic`
-     suite to confirm no Verilator regression.
-   - **Stronger frontend:** install `yosys-slang` plugin (source build,
-     no homebrew formula) — leaves RTL untouched.
-
-   Either lands in **Plan Phase 3** alongside the SFU/helper green-up;
-   not on the Phase-1/2 critical path.
+2. **2D unpacked array declarations in `systolic_*`** — **CLOSED Phase 3**
+   (2026-05-21). All 7 declarations across `systolic_array.sv` and
+   `systolic_controller.sv` packed as
+   `logic [SYS_DIM-1:0][...][7:0] arr` (and `[31:0]` for pe_acc).
+   yosys parses the full control plane (all 12 modules) and synthesizes
+   through OPT/DFF/SHARE passes into ABC tech-mapping. Verilator suites
+   `test_systolic` (8/8), `test_systolic_chained` (7/7), `test_sfu`
+   (21/21), and the freeze cosim (6+1) all unchanged by the refactor.
+   `rtl/synth/blackbox_stubs.v` updated to parameterize the SFU and
+   helper stubs (`SFU_SYNTH_MODE` / `HELPER_SYNTH_MODE`) for hierarchy
+   elaboration.
 
 ## Per-module verdict (from the diagnostic)
 

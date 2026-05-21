@@ -9,7 +9,9 @@
 // still contain real/DPI behavioral code.
 
 (* blackbox *)
-module sfu_engine (
+module sfu_engine #(
+  parameter SFU_SYNTH_MODE = 0
+) (
   input  wire         clk,
   input  wire         rst_n,
   input  wire         dispatch,
@@ -53,7 +55,9 @@ module sfu_engine (
 endmodule
 
 (* blackbox *)
-module blocking_helper_engine (
+module blocking_helper_engine #(
+  parameter HELPER_SYNTH_MODE = 0
+) (
   input  wire         clk,
   input  wire         rst_n,
   input  wire         dispatch,

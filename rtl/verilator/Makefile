@@ -67,7 +67,7 @@ CONTROL_SV    := $(PKG) \
         test_fp32_quantize_i8_pipe test_fp32_div_pipe test_fp32_sqrt_pipe \
         test_fp32_exp_pipe test_fp32_gelu_new_pipe test_fp32_gelu_pipe \
         test_fp32_alu_pipe test_sfu_synth test_helpers_synth \
-        test_sfu_helper_synth synth-check clean
+        test_sfu_helper_synth synth-check synth-check-ctrl clean
 
 FP32_DIR := $(SRC_DIR)/fp32
 
@@ -689,6 +689,36 @@ $(SV2V_OUT): $(CONTROL_SV)
 synth-check: $(SV2V_OUT)
 	@echo "--- yosys generic synthesizability gate (taccel_top) ---"
 	yosys -p "read_verilog $(SV2V_OUT); script $(SYNTH_SCRIPT)"
+
+# -----------------------------------------------------------------------
+# synth-check-ctrl: control-plane synthesizability gate (Phase-3).
+# Reads CONTROL_SV MINUS sfu_engine.sv + blocking_helper_engine.sv, with
+# those stubbed via rtl/synth/blackbox_stubs.v. Proves the entire control
+# plane (decode/fetch/control/regfile/sram/systolic/dma/top) elaborates
+# and structurally synthesizes through yosys. Lightweight pipeline
+# (proc/flatten/opt-fast/check/stat) — skips ABC tech-mapping for speed.
+# -----------------------------------------------------------------------
+SV2V_CTRL := $(SYNTH_BUILD)/design_ctrl.v
+CTRL_SV   := $(PKG) \
+             $(SRC_DIR)/decode_unit.sv \
+             $(SRC_DIR)/fetch_unit.sv \
+             $(SRC_DIR)/control_unit.sv \
+             $(SRC_DIR)/memory/register_file.sv \
+             $(SRC_DIR)/memory/sram_dp.sv \
+             $(SRC_DIR)/memory/sram_subsystem.sv \
+             $(SRC_DIR)/systolic/systolic_pe.sv \
+             $(SRC_DIR)/systolic/systolic_array.sv \
+             $(SRC_DIR)/systolic/systolic_controller.sv \
+             $(SRC_DIR)/dma_engine.sv \
+             $(SRC_DIR)/taccel_top.sv
+
+$(SV2V_CTRL): $(CTRL_SV)
+	mkdir -p $(SYNTH_BUILD)
+	sv2v -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) $(CTRL_SV) -w $(SV2V_CTRL)
+
+synth-check-ctrl: $(SV2V_CTRL)
+	@echo "--- yosys control-plane synth-check (SFU/helper blackboxed) ---"
+	yosys -p "read_verilog -lib $(SYNTH_DIR)/blackbox_stubs.v; read_verilog $(SV2V_CTRL); script $(SYNTH_DIR)/synth_check_ctrl.ys"
 
 # -----------------------------------------------------------------------
 clean:
