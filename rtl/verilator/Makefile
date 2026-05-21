@@ -31,7 +31,19 @@ BUILD_DIR     := build
 # Source file lists
 PKG           := $(INCLUDE_DIR)/taccel_pkg.sv
 DECODE_SV     := $(PKG) $(SRC_DIR)/decode_unit.sv $(TB_DIR)/tb_decode_unit.sv
+# Phase-2 synth primitives (used by sfu_engine.sv SFU_SYNTH_MODE=1 path;
+# always elaborated, dead-folded by synth in mode=0).
+FP32_PRIMS    := $(SRC_DIR)/fp32/fp32_add.sv \
+                 $(SRC_DIR)/fp32/fp32_mul.sv \
+                 $(SRC_DIR)/fp32/fp32_div.sv \
+                 $(SRC_DIR)/fp32/fp32_sqrt.sv \
+                 $(SRC_DIR)/fp32/fp32_to_fp16.sv \
+                 $(SRC_DIR)/fp32/fp16_to_fp32.sv \
+                 $(SRC_DIR)/fp32/i32_to_fp32.sv \
+                 $(SRC_DIR)/fp32/fp32_quantize_i8.sv \
+                 $(SRC_DIR)/fp32/fp32_exp.sv
 CONTROL_SV    := $(PKG) \
+                 $(FP32_PRIMS) \
                  $(SRC_DIR)/decode_unit.sv \
                  $(SRC_DIR)/fetch_unit.sv \
                  $(SRC_DIR)/control_unit.sv \
@@ -54,7 +66,8 @@ CONTROL_SV    := $(PKG) \
         test_fp32_add_pipe_lat3 test_i32_to_fp32_pipe test_fp32_to_fp16_pipe \
         test_fp32_quantize_i8_pipe test_fp32_div_pipe test_fp32_sqrt_pipe \
         test_fp32_exp_pipe test_fp32_gelu_new_pipe test_fp32_gelu_pipe \
-        synth-check clean
+        test_fp32_alu_pipe test_sfu_synth test_helpers_synth \
+        test_sfu_helper_synth synth-check clean
 
 FP32_DIR := $(SRC_DIR)/fp32
 
@@ -171,6 +184,74 @@ $(BUILD_DIR)/test_sfu/Vtaccel_top: $(CONTROL_SV) test_sfu.cpp
 test_sfu: $(BUILD_DIR)/test_sfu/Vtaccel_top
 	@echo "--- Running SFU tests ---"
 	$(BUILD_DIR)/test_sfu/Vtaccel_top
+
+# -----------------------------------------------------------------------
+# test_sfu_synth: same SFU regressions with SFU_SYNTH_MODE=1. Migrated ops
+# (currently: 0x19 VADD_FP32) take the synthesizable path through the
+# fp32_add + fp32_to_fp16 primitives; unmigrated ops fall back to DPI.
+# Used to gate each Phase-2 op migration; the canonical gate is the
+# vadd_fp32 fixture under this build.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_sfu_synth/Vtaccel_top: $(CONTROL_SV) test_sfu.cpp
+	mkdir -p $(BUILD_DIR)/test_sfu_synth
+	$(VERILATOR) $(VFLAGS) \
+	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
+	  -GSFU_SYNTH_MODE=1 \
+	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
+	  --top-module taccel_top \
+	  --Mdir $(BUILD_DIR)/test_sfu_synth \
+	  $(CONTROL_SV) \
+	  test_sfu.cpp \
+	  -CFLAGS "-I$(CURDIR)/include $(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_sfu_synth -f Vtaccel_top.mk
+
+test_sfu_synth: $(BUILD_DIR)/test_sfu_synth/Vtaccel_top
+	@echo "--- Running SFU tests with SFU_SYNTH_MODE=1 (Phase-2 synth path) ---"
+	$(BUILD_DIR)/test_sfu_synth/Vtaccel_top
+
+# -----------------------------------------------------------------------
+# test_helpers_synth: helper regressions with HELPER_SYNTH_MODE=1. Currently
+# migrates the dequant_add_pack op via 16-lane parallel fp32 primitive chain.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_helpers_synth/Vtaccel_top: $(CONTROL_SV) test_helpers.cpp
+	mkdir -p $(BUILD_DIR)/test_helpers_synth
+	$(VERILATOR) $(VFLAGS) \
+	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
+	  -GHELPER_SYNTH_MODE=1 \
+	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
+	  --top-module taccel_top \
+	  --Mdir $(BUILD_DIR)/test_helpers_synth \
+	  $(CONTROL_SV) \
+	  test_helpers.cpp \
+	  -CFLAGS "-I$(CURDIR)/include $(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_helpers_synth -f Vtaccel_top.mk
+
+test_helpers_synth: $(BUILD_DIR)/test_helpers_synth/Vtaccel_top
+	@echo "--- Running helper tests with HELPER_SYNTH_MODE=1 (Phase-2 synth path) ---"
+	$(BUILD_DIR)/test_helpers_synth/Vtaccel_top
+
+# -----------------------------------------------------------------------
+# test_sfu_helper_synth: BOTH SFU and HELPER on synth paths simultaneously.
+# Catches cross-mode interactions; this is the Phase-2 "full synth path"
+# gate for ops/state-machines that have been migrated.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_sfu_helper_synth/Vtaccel_top: $(CONTROL_SV) test_sfu.cpp
+	mkdir -p $(BUILD_DIR)/test_sfu_helper_synth
+	$(VERILATOR) $(VFLAGS) \
+	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
+	  -GSFU_SYNTH_MODE=1 \
+	  -GHELPER_SYNTH_MODE=1 \
+	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
+	  --top-module taccel_top \
+	  --Mdir $(BUILD_DIR)/test_sfu_helper_synth \
+	  $(CONTROL_SV) \
+	  test_sfu.cpp \
+	  -CFLAGS "-I$(CURDIR)/include $(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_sfu_helper_synth -f Vtaccel_top.mk
+
+test_sfu_helper_synth: $(BUILD_DIR)/test_sfu_helper_synth/Vtaccel_top
+	@echo "--- Running SFU tests with BOTH SFU_SYNTH_MODE=1 and HELPER_SYNTH_MODE=1 ---"
+	$(BUILD_DIR)/test_sfu_helper_synth/Vtaccel_top
 
 # -----------------------------------------------------------------------
 # test_systolic: verilate taccel_top (with systolic) + compile + run
@@ -474,7 +555,7 @@ $(BUILD_DIR)/test_fp32_exp_pipe/Vfp32_exp_pipe: $(FP32_DIR)/fp32_exp.sv $(FP32_D
 	  --top-module fp32_exp_pipe \
 	  -I$(FP32_DIR) \
 	  --Mdir $(BUILD_DIR)/test_fp32_exp_pipe \
-	  $(FP32_DIR)/fp32_exp_pipe.sv \
+	  $(FP32_DIR)/fp32_add.sv $(FP32_DIR)/fp32_mul.sv $(FP32_DIR)/fp32_exp.sv $(FP32_DIR)/fp32_exp_pipe.sv \
 	  test_fp32_exp_pipe.cpp \
 	  -CFLAGS "$(CXXFLAGS)"
 	$(MAKE) -C $(BUILD_DIR)/test_fp32_exp_pipe -f Vfp32_exp_pipe.mk
@@ -500,6 +581,28 @@ $(BUILD_DIR)/test_fp32_gelu_new_pipe/Vfp32_gelu_new_pipe: $(FP32_DIR)/fp32_gelu_
 test_fp32_gelu_new_pipe: $(BUILD_DIR)/test_fp32_gelu_new_pipe/Vfp32_gelu_new_pipe
 	@echo "--- Running fp32_gelu_new_pipe MEASURED-BAND gate ---"
 	$(BUILD_DIR)/test_fp32_gelu_new_pipe/Vfp32_gelu_new_pipe
+
+# -----------------------------------------------------------------------
+# test_fp32_alu_pipe: shared synthesizable fp32 ALU integration gate.
+# Phase-2 building block — composes the Phase-1 primitives behind a single
+# op-coded handshake. Each op verified vs its native primitive's golden;
+# the test asserts (1) mux routes correctly per op, (2) LATENCY contract
+# holds across mixed-op streams, (3) op_out is forwarded to the FSM.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_fp32_alu_pipe/Vfp32_alu_pipe: $(FP32_DIR)/fp32_alu_pipe.sv $(FP32_DIR)/fp32_add.sv $(FP32_DIR)/fp32_mul.sv $(FP32_DIR)/fp32_div.sv $(FP32_DIR)/fp32_sqrt.sv $(FP32_DIR)/fp16_to_fp32.sv $(FP32_DIR)/fp32_to_fp16.sv $(FP32_DIR)/i32_to_fp32.sv $(FP32_DIR)/fp32_quantize_i8.sv test_fp32_alu_pipe.cpp
+	mkdir -p $(BUILD_DIR)/test_fp32_alu_pipe
+	$(VERILATOR) $(VFLAGS) \
+	  --top-module fp32_alu_pipe \
+	  -I$(FP32_DIR) \
+	  --Mdir $(BUILD_DIR)/test_fp32_alu_pipe \
+	  $(FP32_DIR)/fp32_alu_pipe.sv \
+	  test_fp32_alu_pipe.cpp \
+	  -CFLAGS "$(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_fp32_alu_pipe -f Vfp32_alu_pipe.mk
+
+test_fp32_alu_pipe: $(BUILD_DIR)/test_fp32_alu_pipe/Vfp32_alu_pipe
+	@echo "--- Running fp32_alu_pipe integration gate ---"
+	$(BUILD_DIR)/test_fp32_alu_pipe/Vfp32_alu_pipe
 
 # -----------------------------------------------------------------------
 # test_systolic_query: focused chained query-projection regression

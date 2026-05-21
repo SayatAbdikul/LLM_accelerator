@@ -26,7 +26,13 @@
 
 module blocking_helper_engine
   import taccel_pkg::*;
-(
+#(
+  // Phase-2 migration toggle for the DEQUANT_ADD path (the only DPI-using
+  // op in this engine). 0 = behavioral DPI path (default, cosim-pinned);
+  // 1 = synthesizable RTL path using Phase-1 fp16_to_fp32 / i32_to_fp32 /
+  // fp32_mul / fp32_add / fp32_quantize_i8 primitives in 16-lane parallel.
+  parameter int HELPER_SYNTH_MODE = 0
+) (
   input  logic         clk,
   input  logic         rst_n,
 
@@ -763,6 +769,59 @@ module blocking_helper_engine
   assign trans_dst_data_w  = trans_col_data_w;
   assign trans_dst_merge_w = trans_partial_row_w;
 
+  // ===================================================================
+  // Phase-2 HELPER_SYNTH_MODE=1: synthesizable dequant_add_pack via
+  // 16-lane parallel chain of Phase-1 primitives. Mirrors the DPI path
+  // value-for-value:
+  //   acc_scale_fp32  = fp16_to_fp32(scale0_q)
+  //   skip_scale_fp32 = fp16_to_fp32(scale1_q)
+  //   per lane (0..15):
+  //     src_fp32     = i32_to_fp32(src_i32)
+  //     skip_fp32    = i32_to_fp32(sign_extend_i8(skip_i8))   // exact
+  //     acc_term     = fp32_mul(src_fp32, acc_scale_fp32)
+  //     skip_term    = fp32_mul(skip_fp32, skip_scale_fp32)
+  //     sum          = fp32_add(acc_term, skip_term)
+  //     out[lane]    = fp32_quantize_i8(sum)                   // already clamps
+  // ===================================================================
+  logic [31:0]  synth_dq_acc_scale_bits;
+  logic [31:0]  synth_dq_skip_scale_bits;
+  fp16_to_fp32 u_synth_dq_h2f_acc  (.a(scale0_q), .y(synth_dq_acc_scale_bits));
+  fp16_to_fp32 u_synth_dq_h2f_skip (.a(scale1_q), .y(synth_dq_skip_scale_bits));
+
+  logic [127:0] synth_dq_write_data_w;
+  genvar g_lane;
+  generate
+    for (g_lane = 0; g_lane < 16; g_lane = g_lane + 1) begin : g_synth_dq
+      logic signed [31:0] src_i32_l;
+      logic signed [7:0]  skip_i8_l;
+      logic signed [31:0] skip_i32_l;
+      logic [31:0]        src_fp32_l;
+      logic [31:0]        skip_fp32_l;
+      logic [31:0]        acc_term_l;
+      logic [31:0]        skip_term_l;
+      logic [31:0]        sum_l;
+      logic signed [7:0]  q_i8_l;
+      always_comb begin
+        case (g_lane[3:2])
+          2'd0:    src_i32_l = rq_row0_q[(g_lane[1:0] * 32) +: 32];
+          2'd1:    src_i32_l = rq_row1_q[(g_lane[1:0] * 32) +: 32];
+          2'd2:    src_i32_l = rq_row2_q[(g_lane[1:0] * 32) +: 32];
+          default: src_i32_l = rq_row3_q[(g_lane[1:0] * 32) +: 32];
+        endcase
+        skip_i8_l  = skip_row_q[(g_lane * 8) +: 8];
+        skip_i32_l = {{24{skip_i8_l[7]}}, skip_i8_l};
+      end
+      i32_to_fp32      u_src    (.a(src_i32_l),       .y(src_fp32_l));
+      i32_to_fp32      u_skp    (.a(skip_i32_l),      .y(skip_fp32_l));
+      fp32_mul         u_acc_mul(.a(src_fp32_l),  .b(synth_dq_acc_scale_bits),  .y(acc_term_l));
+      fp32_mul         u_skp_mul(.a(skip_fp32_l), .b(synth_dq_skip_scale_bits), .y(skip_term_l));
+      fp32_add         u_dq_add (.a(acc_term_l), .b(skip_term_l), .y(sum_l));
+      fp32_quantize_i8 u_dq_q   (.a(sum_l),                       .y(q_i8_l));
+      assign synth_dq_write_data_w[(g_lane * 8) +: 8] = q_i8_l;
+    end
+  endgenerate
+  // ===================================================================
+
   always_comb begin
     rqpc_write_data_w = 128'h0;
     dq_write_data_w = 128'h0;
@@ -786,8 +845,11 @@ module blocking_helper_engine
         rqpc_write_data_w[(lane * 8) +: 8] = scaled[7:0];
     end
 
-    dq_write_data_w = dequant_add_pack(rq_row0_q, rq_row1_q, rq_row2_q, rq_row3_q,
-                                       skip_row_q, scale0_q, scale1_q);
+    if (HELPER_SYNTH_MODE == 1)
+      dq_write_data_w = synth_dq_write_data_w;
+    else
+      dq_write_data_w = dequant_add_pack(rq_row0_q, rq_row1_q, rq_row2_q, rq_row3_q,
+                                         skip_row_q, scale0_q, scale1_q);
 
     if (src1_buf_q == BUF_ACCUM)
       scale_mul_write_data_w = scale_mul_i32_row(sram_b_rdata, scale0_q);

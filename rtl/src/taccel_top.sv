@@ -40,7 +40,14 @@ module taccel_top
   import taccel_pkg::*;
 #(
   parameter int SYSTOLIC_ARCH_MODE = SYS_MODE_DEFAULT,
-  parameter int DRAM_SIZE = 1 << 24
+  parameter int DRAM_SIZE = 1 << 24,
+  // Phase-2 SFU migration toggle, propagated to sfu_engine. 0 = behavioral
+  // real+DPI (default, cosim-pinned); 1 = synthesizable RTL path for
+  // migrated ops (gen-2 compute + latches + 0x1F).
+  parameter int SFU_SYNTH_MODE = 0,
+  // Phase-2 blocking_helper toggle. 0 = DPI (default), 1 = synthesizable
+  // dequant_add_pack via 16-lane parallel Phase-1 primitive chain.
+  parameter int HELPER_SYNTH_MODE = 0
 )
 (
   input  logic        clk,
@@ -744,7 +751,9 @@ module taccel_top
     .attn_mode          (attn_mode)
   );
 
-  blocking_helper_engine u_helper (
+  blocking_helper_engine #(
+    .HELPER_SYNTH_MODE(HELPER_SYNTH_MODE)
+  ) u_helper (
     .clk            (clk),
     .rst_n          (rst_n),
     .dispatch       (helper_dispatch),
@@ -780,7 +789,9 @@ module taccel_top
     .sram_b_fault   (helper_sram_b_en & sram_b_fault)
   );
 
-  sfu_engine u_sfu (
+  sfu_engine #(
+    .SFU_SYNTH_MODE(SFU_SYNTH_MODE)
+  ) u_sfu (
     .clk            (clk),
     .rst_n          (rst_n),
     .dispatch       (sfu_dispatch),

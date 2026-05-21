@@ -21,8 +21,9 @@
 `ifndef FP32_EXP_SV
 `define FP32_EXP_SV
 
-`include "fp32_add.sv"
-`include "fp32_mul.sv"
+// fp32_add.sv and fp32_mul.sv must be in the read order before this file.
+// Phase-1 standalone gates `include them here when building isolated;
+// CONTROL_SV / FP32_PRIMS reads them in order.
 
 module fp32_exp (
   input  logic [31:0] a,
