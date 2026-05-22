@@ -28,6 +28,13 @@ SYSTOLIC_DIR  := $(SRC_DIR)/systolic
 TB_DIR        := $(SRC_DIR)/tb
 BUILD_DIR     := build
 
+# R6 (2026-05-23): sfu_engine.sv was partitioned into sibling .svh files
+# (sfu_dpi_helpers.svh, sfu_synth_datapath.svh, sfu_g1_compute.svh,
+# sfu_attn.svh, sfu_g2_compute.svh) via `include directives. Verilator
+# needs `-I$(SRC_DIR)` to resolve them since they are NOT in include/
+# or systolic/. Added as a VFLAGS extension so every target picks it up.
+VFLAGS += -I$(SRC_DIR)
+
 # Source file lists
 PKG           := $(INCLUDE_DIR)/taccel_pkg.sv
 DECODE_SV     := $(PKG) $(SRC_DIR)/decode_unit.sv $(TB_DIR)/tb_decode_unit.sv
@@ -61,7 +68,10 @@ CONTROL_SV    := $(PKG) \
 
 .PHONY: all run_program test_decode test_control test_dma test_helpers test_sfu \
         test_systolic test_systolic_array_chained test_systolic_chained \
-        test_systolic_query test_systolic_qkt test_addr_raw_hazard \
+        test_systolic_query test_systolic_qkt \
+        test_systolic_qkt_basic test_systolic_qkt_replay \
+        test_systolic_qkt_padded test_systolic_qkt_history \
+        test_addr_raw_hazard \
         test_accum_snapshot_readback test_fp32_add test_fp32_add_pipe \
         test_fp32_sub_pipe test_fp32_mul_pipe test_fp16_to_fp32_pipe \
         test_fp32_add_pipe_lat3 test_i32_to_fp32_pipe test_fp32_to_fp16_pipe \
@@ -625,23 +635,39 @@ test_systolic_query: $(BUILD_DIR)/test_systolic_query/Vtaccel_top
 	$(BUILD_DIR)/test_systolic_query/Vtaccel_top
 
 # -----------------------------------------------------------------------
-# test_systolic_qkt: focused QK^T prep + matmul regressions
+# test_systolic_qkt_{basic,replay,padded,history}: R4-split QK^T regressions.
+# The pre-split monolithic test_systolic_qkt.cpp (3,672 LOC, 31 tests) was
+# divided 2026-05-22 into four topic-based translation units. Shared helpers
+# live in include/systolic_qkt_utils.h. Each split file builds its own
+# Verilator-wrapped binary; the aggregate `test_systolic_qkt` target runs
+# all four for backward-compat with scripts that invoked the old name.
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_systolic_qkt/Vtaccel_top: $(CONTROL_SV) test_systolic_qkt.cpp
-	mkdir -p $(BUILD_DIR)/test_systolic_qkt
-	$(VERILATOR) $(VFLAGS) \
+define QKT_SPLIT_RULES
+$$(BUILD_DIR)/test_systolic_qkt_$(1)/Vtaccel_top: $$(CONTROL_SV) test_systolic_qkt_$(1).cpp include/systolic_qkt_utils.h
+	mkdir -p $$(BUILD_DIR)/test_systolic_qkt_$(1)
+	$$(VERILATOR) $$(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=1 \
-	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
+	  -I$$(INCLUDE_DIR) -I$$(SYSTOLIC_DIR) \
 	  --top-module taccel_top \
-	  --Mdir $(BUILD_DIR)/test_systolic_qkt \
-	  $(CONTROL_SV) \
-	  test_systolic_qkt.cpp \
-	  -CFLAGS "-I$(CURDIR)/include $(CXXFLAGS)"
-	$(MAKE) -C $(BUILD_DIR)/test_systolic_qkt -f Vtaccel_top.mk
+	  --Mdir $$(BUILD_DIR)/test_systolic_qkt_$(1) \
+	  $$(CONTROL_SV) \
+	  test_systolic_qkt_$(1).cpp \
+	  -CFLAGS "-I$$(CURDIR)/include $$(CXXFLAGS)"
+	$$(MAKE) -C $$(BUILD_DIR)/test_systolic_qkt_$(1) -f Vtaccel_top.mk
 
-test_systolic_qkt: $(BUILD_DIR)/test_systolic_qkt/Vtaccel_top
-	@echo "--- Running focused QK^T regressions ---"
-	$(BUILD_DIR)/test_systolic_qkt/Vtaccel_top
+test_systolic_qkt_$(1): $$(BUILD_DIR)/test_systolic_qkt_$(1)/Vtaccel_top
+	@echo "--- Running QK^T $(1) regressions ---"
+	$$(BUILD_DIR)/test_systolic_qkt_$(1)/Vtaccel_top
+endef
+
+$(eval $(call QKT_SPLIT_RULES,basic))
+$(eval $(call QKT_SPLIT_RULES,replay))
+$(eval $(call QKT_SPLIT_RULES,padded))
+$(eval $(call QKT_SPLIT_RULES,history))
+
+# Aggregate target — runs all four split binaries.
+test_systolic_qkt: test_systolic_qkt_basic test_systolic_qkt_replay \
+                   test_systolic_qkt_padded test_systolic_qkt_history
 
 # -----------------------------------------------------------------------
 # test_addr_raw_hazard: BUG1 reproducer — SET_ADDR_HI → LOAD RAW hazard.

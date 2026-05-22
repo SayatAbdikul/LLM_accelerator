@@ -438,20 +438,24 @@ inline SystolicHiddenSnapshot capture_hidden_snapshot_record(
       (snapshot.state == SYSTOLIC_TRACE_ST_DST_CLEAR_PREP) ||
       (snapshot.state == SYSTOLIC_TRACE_ST_DST_CLEAR_WR);
 
-  for (int row = 0; row < 16; ++row) {
-    for (int col = 0; col < 16; ++col) {
-      snapshot.a_tile_scratch[row][col] =
-          root->taccel_top__DOT__u_systolic__DOT__a_tile_scratch[row][col];
-      snapshot.pe_acc[row][col] =
-          static_cast<int32_t>(root->taccel_top__DOT__u_systolic__DOT__u_array__DOT__pe_acc[row][col]);
-    }
-    for (int skew = 0; skew < 15; ++skew) {
-      snapshot.a_skew[row][skew] =
-          root->taccel_top__DOT__u_systolic__DOT__u_array__DOT__a_skew[row][skew];
-      snapshot.b_skew[row][skew] =
-          root->taccel_top__DOT__u_systolic__DOT__u_array__DOT__b_skew[row][skew];
-    }
-  }
+  // Commit 8518ca7 (2026-05-21) repacked `a_tile_scratch` (systolic_controller.sv:94),
+  // `pe_acc`/`a_skew`/`b_skew` (systolic_array.sv) from unpacked 2D to packed 2D
+  // arrays for yosys SV-frontend compatibility. None carry `verilator
+  // public_flat_rd`, so Verilator no longer exposes them as nested-array
+  // members on `Vtaccel_top___024root` (`pe_acc` is fully inlined away).
+  // The hidden-snapshot capture below is debug-only output; no test
+  // asserts on these four fields, and `maybe_write_hidden_snapshot`
+  // serializes them via JSON only when RTL_QKT_HIDDEN_SNAPSHOT_OUT is set.
+  // Leaving the fields at their default-zero initialization preserves
+  // the JSON schema (zero matrices appear) without modifying RTL.
+  // R4 (2026-05-22): bundled pre-existing fix per the refactor plan.
+  // To re-enable real capture: add `/* verilator public_flat_rd */` to
+  // the four SV declarations, then port these loops to decode the
+  // packed-VlWide encoding Verilator now generates.
+  (void)snapshot.a_tile_scratch;
+  (void)snapshot.pe_acc;
+  (void)snapshot.a_skew;
+  (void)snapshot.b_skew;
   return snapshot;
 }
 
