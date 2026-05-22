@@ -12,7 +12,7 @@ the two ablations the plan calls for:
   * base quarot vs plain          — does QuaRot's residual-stream rotation
                                      already Gaussianize the KV (making Π
                                      redundant)?
-Writes a JSON + a markdown table to software/logs/turboquant_kv/.
+Writes a JSON + a markdown table to software/archive/logs/turboquant_kv/.
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ FIXTURE = Path("software/tests/fixtures/generated/gpt2_converted_nanogpt.pt")
 TOKENIZER_DIR = Path("software/tests/fixtures/generated/hf_gpt2")
 CALIB_TEXT = Path("software/tests/fixtures/generated/wikitext2_stage5_calibration.txt")
 EVAL_TEXT = Path("software/tests/fixtures/generated/wikitext2_stage5_eval.txt")
-OUT = Path("software/logs/turboquant_kv")
+OUT = Path("software/archive/logs/turboquant_kv")
 SEED = 20260515
 D_HEAD = 64
 MAX_TOKENS = 33  # fast grid; rerun the winner at 257 via the L3 slow gate

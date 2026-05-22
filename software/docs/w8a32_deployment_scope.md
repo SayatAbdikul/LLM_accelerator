@@ -179,7 +179,7 @@ your goal was just "see the number" — Phase 1 already delivered that.
   `software/taccel/runtime/gpt2_perplexity.py:run_weight_only_int8_teacher_forced_logits`,
   `software/taccel/runtime/stage5_ptq.py` (`weight_only_int8` preset),
   `software/tests/test_weight_only_int8_perplexity.py`.
-- Phase 1 artifact: `software/logs/w8a32/weight_only_int8_257tok.json`
+- Phase 1 artifact: `software/archive/logs/w8a32/weight_only_int8_257tok.json`
   (`fake_quant_perplexity = 53.4212` PPL at 257-tok / 256-ctx).
 - Phase A campaign context:
   `software/docs/ptq_phase_a_findings.md` (the W8A8 6,174 PPL ceiling

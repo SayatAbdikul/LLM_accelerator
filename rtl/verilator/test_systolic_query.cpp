@@ -11,16 +11,7 @@
 
 using namespace systolic_test;
 
-static int tests_run = 0;
-static int tests_pass = 0;
-
-#define TEST_PASS(name) do { \
-  std::printf("PASS: %s\n", name); tests_pass++; tests_run++; \
-} while (0)
-
-#define TEST_FAIL(name, msg) do { \
-  std::fprintf(stderr, "FAIL: %s - %s\n", name, msg); std::exit(1); \
-} while (0)
+#include "test_runner.h"
 
 namespace {
 

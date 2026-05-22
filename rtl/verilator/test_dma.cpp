@@ -22,13 +22,7 @@
 #include <memory>
 #include <vector>
 
-static int tests_run  = 0;
-static int tests_pass = 0;
-
-#define TEST_PASS(name) do { \
-    printf("PASS: %s\n", name); tests_pass++; tests_run++; } while(0)
-#define TEST_FAIL(name, msg) do { \
-    fprintf(stderr, "FAIL: %s — %s\n", name, msg); std::exit(1); } while(0)
+#include "test_runner.h"
 
 using tbutil::SimHarness;
 using tbutil::sram_write_row;
