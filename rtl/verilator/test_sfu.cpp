@@ -670,10 +670,18 @@ static void test_layernorm_replay_probe() {
         }
 
         if (!checked_compute && state == F_ROW_PACK && row_idx == 0 && write_chunk == 0) {
+            // R9 (2026-05-23): ln_debug_*_q probes gated behind SFU_DEBUG_LN.
+            // Default test_sfu builds don't define it (cell-count savings in
+            // synth-check); to re-enable, build with
+            // `make CXXFLAGS_EXTRA="-DSFU_DEBUG_LN" VFLAGS_EXTRA="+define+SFU_DEBUG_LN" test_sfu`
+            // and ensure the fixture (RTL_QKT_REPLAY_DIR) is set.
+#ifdef SFU_DEBUG_LN
             compare_real("row_compute", "mean", r->taccel_top__DOT__u_sfu__DOT__ln_debug_mean_q, row0_ref.mean, 1.0e-5f);
             compare_real("row_compute", "var", r->taccel_top__DOT__u_sfu__DOT__ln_debug_var_q, row0_ref.var, 1.0e-5f);
             compare_real("row_compute", "denom", r->taccel_top__DOT__u_sfu__DOT__ln_debug_denom_q, row0_ref.denom, 1.0e-5f);
+#endif
             for (int i = 0; i < 16; ++i) {
+#ifdef SFU_DEBUG_LN
                 const float got_y = r->taccel_top__DOT__u_sfu__DOT__ln_debug_y_q[i];
                 const float exp_y = row0_ref.y_prefix[size_t(i)];
                 if (!close_enough(got_y, exp_y, 1.0e-5f)) {
@@ -681,6 +689,7 @@ static void test_layernorm_replay_probe() {
                                  i, got_y, exp_y);
                     TEST_FAIL(name, "replay probe mismatch");
                 }
+#endif
                 const uint8_t got_out = r->taccel_top__DOT__u_sfu__DOT__out_bytes_q[i];
                 const uint8_t exp_out = row0_ref.out_row_bytes[size_t(i)];
                 if (got_out != exp_out) {

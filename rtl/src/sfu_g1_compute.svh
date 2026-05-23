@@ -98,9 +98,11 @@
             end
             var_r = sfu_fp32_div(var_r, real'(n_elems_q));
             denom_r = sfu_fp32_sqrt(sfu_fp32_add(var_r, LN_EPS));
+`ifdef SFU_DEBUG_LN
             ln_debug_mean_q <= real_to_fp32_bits(mean_r);
             ln_debug_var_q <= real_to_fp32_bits(var_r);
             ln_debug_denom_q <= real_to_fp32_bits(denom_r);
+`endif
 
             for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
               real y_r;
@@ -111,11 +113,16 @@
                         fp32_bits_to_real(gamma_q[i])),
                     fp32_bits_to_real(beta_q[i]));
                 out_bytes_q[i] <= quantize_to_i8(y_r, fp32_bits_to_real(scale1_q));
+`ifdef SFU_DEBUG_LN
                 if (i < 16)
                   ln_debug_y_q[i] <= real_to_fp32_bits(y_r);
-              end else if (i < 16) begin
+`endif
+              end
+`ifdef SFU_DEBUG_LN
+              else if (i < 16) begin
                 ln_debug_y_q[i] <= 32'h0;
               end
+`endif
             end
             state <= F_ROW_PACK;
 `endif

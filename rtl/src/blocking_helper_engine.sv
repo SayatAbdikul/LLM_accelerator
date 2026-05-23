@@ -72,12 +72,13 @@ module blocking_helper_engine
   input  logic         sram_b_fault
 );
 
-`ifndef SFU_SYNTH_NO_DPI
-  import "DPI-C" function real sfu_fp32_round(input real value_r);
-  import "DPI-C" function real sfu_fp32_mul(input real lhs_r, input real rhs_r);
-  import "DPI-C" function real sfu_fp32_add(input real lhs_r, input real rhs_r);
-  import "DPI-C" function int  sfu_fp32_quantize_i8(input real value_r, input real out_scale_r);
-`endif
+// R8 (2026-05-23): DPI imports + pow2_int/fp16_to_real shared with
+// sfu_engine.sv via this `include. The .svh declares a superset of the
+// DPI imports this module needs (was: sfu_fp32_round/mul/add/quantize_i8);
+// the extras are harmless — DPI imports only declare the binding, they
+// don't generate code. Local `round_half_even` (below) is unique to this
+// module and stays inline.
+`include "sfu_dpi_helpers.svh"
 
   // State groups:
   //   H_FLAT_*   : BUF_COPY flat copy / memmove
@@ -309,48 +310,9 @@ module blocking_helper_engine
   endfunction
 
 `ifndef SFU_SYNTH_NO_DPI
-  function automatic real pow2_int(input integer exp_i);
-    real v;
-    integer j;
-    begin
-      v = 1.0;
-      if (exp_i >= 0) begin
-        for (j = 0; j < exp_i; j++)
-          v = v * 2.0;
-      end else begin
-        for (j = 0; j < -exp_i; j++)
-          v = v * 0.5;
-      end
-      pow2_int = v;
-    end
-  endfunction
-
-  function automatic real fp16_to_real(input logic [15:0] bits);
-    logic sign_bit;
-    logic [4:0] exp_bits;
-    logic [9:0] frac_bits;
-    real sign_r;
-    begin
-      sign_bit = bits[15];
-      exp_bits = bits[14:10];
-      frac_bits = bits[9:0];
-      sign_r = sign_bit ? -1.0 : 1.0;
-
-      if ((exp_bits == 5'h0) && (frac_bits == 10'h0)) begin
-        fp16_to_real = 0.0;
-      end else if (exp_bits == 5'h0) begin
-        fp16_to_real = sign_r * (real'(frac_bits) / 1024.0) * pow2_int(-14);
-      end else if (exp_bits == 5'h1F) begin
-        fp16_to_real = sign_r * 65504.0;
-      end else begin
-        fp16_to_real = sign_r *
-                       (1.0 + (real'(frac_bits) / 1024.0)) *
-                       pow2_int(integer'(exp_bits) - 15);
-      end
-      fp16_to_real = sfu_fp32_round(fp16_to_real);
-    end
-  endfunction
-
+  // R8 (2026-05-23): pow2_int + fp16_to_real removed — now sourced from
+  // sfu_dpi_helpers.svh `included near the top of this module. Verbatim
+  // copies eliminated to avoid drift.
   function automatic integer round_half_even(input real value_r);
     integer floor_i;
     real frac_r;

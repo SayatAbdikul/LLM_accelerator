@@ -230,10 +230,16 @@ module sfu_engine
   logic        g2_wr_phase_q;
   logic [31:0] attn_row_max_q;
   logic [31:0] attn_exp_sum_q;
+  // R9 (2026-05-23): gen-1 LAYERNORM intermediate probes. Cell-cost only
+  // useful when test_sfu.cpp `test_layernorm_replay_probe` runs (which is
+  // env-gated on RTL_QKT_REPLAY_DIR); synth-check builds drop them so the
+  // gate's cell count reflects the deployable design.
+`ifdef SFU_DEBUG_LN
   logic [31:0] ln_debug_mean_q  /* verilator public_flat_rd */;
   logic [31:0] ln_debug_var_q   /* verilator public_flat_rd */;
   logic [31:0] ln_debug_denom_q /* verilator public_flat_rd */;
   logic [31:0] ln_debug_y_q     [0:15] /* verilator public_flat_rd */;
+`endif
 
   logic [14:0] dispatch_m_rows_w;
   logic [10:0] dispatch_n_tiles_w;
@@ -749,9 +755,11 @@ module sfu_engine
       scale3_q       <= 0.0;
       attn_row_max_q <= 0.0;
       attn_exp_sum_q <= 0.0;
+`ifdef SFU_DEBUG_LN
       ln_debug_mean_q <= 0.0;
       ln_debug_var_q <= 0.0;
       ln_debug_denom_q <= 0.0;
+`endif
       for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
         row_data_q[i] <= 0.0;
         attn_accum_q[i] <= 0.0;
@@ -760,8 +768,10 @@ module sfu_engine
         out_bytes_q[i] <= 8'h00;
         out_h_q[i]    <= 16'h0;
       end
+`ifdef SFU_DEBUG_LN
       for (int i = 0; i < 16; i++)
         ln_debug_y_q[i] <= 0.0;
+`endif
     end else begin
       case (state)
         F_IDLE: begin
@@ -801,11 +811,13 @@ module sfu_engine
             scale2_q        <= {16'h0, scale2_data};
             scale3_q        <= {16'h0, scale3_data};
 `endif
+`ifdef SFU_DEBUG_LN
             ln_debug_mean_q <= 32'h0;
             ln_debug_var_q <= 32'h0;
             ln_debug_denom_q <= 32'h0;
             for (int i = 0; i < 16; i++)
               ln_debug_y_q[i] <= 0.0;
+`endif
             row_idx_q       <= 15'h0;
             read_idx_q      <= 13'h0;
             write_chunk_q   <= 11'h0;
