@@ -71,26 +71,21 @@ class CodeGenerator:
                  model_config: Optional[ModelConfig] = None,
                  stream_name: str = "prefill",
                  kv_layout: Optional[KVCacheLayout] = None,
-                 use_fp16_activations: bool = False,
+                 use_fp16_activations: bool = True,  # DEPRECATED: always True now; kept for back-compat
                  biases: Optional[Dict[str, np.ndarray]] = None):
         """
         Args:
             weight_data: name → (quantized_data, per_channel_scales)
             calibration_scales: tensor_name → per-tensor activation scale
             prescaled_biases: name → INT32 pre-scaled bias array
-            use_fp16_activations: When True, sub-layer ops (LAYERNORM_FP32,
-                GELU_FP32, SOFTMAX_FP32, MASKED_SOFTMAX_FP32, VADD_FP32)
-                and matmul nodes lower through `w8a16_emit.py` — the
-                W8A16 path: INT8 weights + FP16 activations, bias folded
-                into DEQUANT_ACCUM_FP32_SCALED via 2N FP16 src2 layout.
-                The W8A8 INT8-round-trip optimizations
-                (dequant_add residual, requant_pc, gelu_from_accum,
-                fused_softmax_attnv) are force-disabled in W8A16 mode.
-                (Field name "use_fp16_activations" is retained for backward
-                compat; semantically it now selects the W8A16 path.)
-            biases: Optional map of bias_name → FP32 1-D vector.
-                Used only when `use_fp16_activations=True`. The codegen stages
-                each FP32 bias folded into the
+            use_fp16_activations: DEPRECATED — kept for signature back-compat.
+                Always treated as True. The W8A16 path is the only deployment
+                surface; W8A8 INT8-round-trip optimizations (dequant_add residual,
+                requant_pc, gelu_from_accum, fused_softmax_attnv) were retired
+                with the DeiT tooling and stripped from RTL silicon 2026-05-23
+                (see software/docs/isa_generation_freeze.md §3/§4).
+            biases: Optional map of bias_name → FP32 1-D vector. The codegen
+                stages each FP32 bias folded into the
                 `__w8a16_pc_scale_and_bias` combined 2N FP16 blob
                 consumed by DEQUANT_ACCUM_FP32_SCALED.
 
@@ -111,21 +106,17 @@ class CodeGenerator:
         # without a corresponding FP32 staging entry.
         self.biases: Dict[str, np.ndarray] = dict(biases or {})
         # W8A8 (INT8-activation) path was retired with the DeiT/RTL tooling.
-        # W8A16 is the only activation precision now; the parameter is kept
-        # for signature compatibility but always resolves True.
+        # W8A16 is the only activation precision now; field kept for back-compat
+        # (always True) so any external code reading cg.use_fp16_activations
+        # continues to work. Phase-A cleanup 2026-05-23 retired the W8A8 emission
+        # branches; Phase-B will strip the corresponding gen-1 RTL.
         self.use_fp16_activations = True
-        # W8A16: FP16 storage (2 bytes/elem) on all ABUF tiles produced
-        # by R-type opcodes 0x17-0x1F; flags[0]=1 selects the FP16 path
-        # at instruction-emit time. Both values are constants now that
-        # the W8A32 (FP32-storage) path has been removed.
         self.fp_precision = "fp16"
         self.elem_bytes: int = 2
         self.fp_precision_flag: int = 1
-        if self.use_fp16_activations:
-            # M2 design contract: in W8A32 mode the INT8-round-trip
-            # optimizations are off — they're optimizations of behavior
-            # the W8A32 path doesn't have. Force-disable so downstream
-            # codegen doesn't fall through to an INT8-optimized branch.
+        # W8A16 force-disables the W8A8-only INT8-round-trip optimizations.
+        # These optimizations targeted the now-retired gen-1 SFU path.
+        if True:  # always — kept as a block for readability
             gelu_from_accum = False
             gelu_from_accum_blocks = set()
             dequant_add_residual1_blocks = set()

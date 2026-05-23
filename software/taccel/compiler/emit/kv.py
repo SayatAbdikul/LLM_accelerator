@@ -46,7 +46,7 @@ def kv_transfer_bytes(cg: "CodeGenerator", node: IRNode, *,
     elem_bytes = 1
     if cg.kv_layout is not None:
         elem_bytes = int(cg.kv_layout.elem_bytes)
-    elif cg.use_fp16_activations:
+    else:
         elem_bytes = 4
     return tokens * cg.config.d_head * elem_bytes
 
@@ -113,12 +113,12 @@ def emit_kv_load(cg: "CodeGenerator", node: IRNode) -> None:
             # QUANT's INT8 destination, corrupting the FP16 K source at offsets
             # [192..256] and producing NaN-decoded INT8 byte pairs (e.g. 0x09
             # 0xfc -> FP16 NaN). See tools/debug_w8a16_nan.py for the trace.
-            tile_elem_bytes = cg.elem_bytes if cg.use_fp16_activations else 1
+            tile_elem_bytes = cg.elem_bytes
             alloc_bytes = max(alloc_bytes, rows * cols * tile_elem_bytes)
         # M4-debug: large W8A32 kv_load tiles (256-token K/V FP32 cache
         # at GPT-2 scale = 64 KB) fragment under first-fit. Compact
         # before the alloc to expose a contiguous free region.
-        if dst_buf == BUF_ABUF and cg.use_fp16_activations and alloc_bytes > 16 * 1024:
+        if dst_buf == BUF_ABUF and alloc_bytes > 16 * 1024:
             cg._compact_abuf()
         alloc = cg.mem.abuf.alloc(node.name, alloc_bytes)
         dst_off = alloc.offset_units
@@ -200,7 +200,7 @@ def emit_logits_store(cg: "CodeGenerator", node: IRNode) -> None:
     # M3-D + M2-W8A16: W8A{32,16} lm_head output is FP-precision
     # (FP32=4 or FP16=2 bytes/elem) — both the DMA xfer size and
     # the row stride scale by self.elem_bytes.
-    elem_bytes = cg.elem_bytes if cg.use_fp16_activations else 1
+    elem_bytes = cg.elem_bytes
     size_bytes = int(node.attrs.get(
         "xfer_bytes", store_rows * cols_pad * elem_bytes,
     ))
