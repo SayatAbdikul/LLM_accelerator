@@ -68,16 +68,29 @@ LAYERNORM_FP32 25, HALT 1.
 These 13 opcodes are **not emitted** by the gen-2 toolchain. The opcode enum,
 assemblers (`isa/instructions.py`), and golden model keep them for
 back-compat / non-causal models, but **the gen-2 RTL is NOT required to
-implement them** and MAY treat them as illegal:
+implement them** and MAY treat them as illegal. **REVISION 2026-05-23
+(Phase B):** the MAY-clause has been partially exercised — the 6 gen-1 SFU
+ops (and pre-existing 0x1C) are now stripped from RTL silicon and trap as
+`FAULT_ILLEGAL_OP` at decode; the 5 gen-1 helper-engine ops remain RTL-legal
+(`blocking_helper_engine.sv` still implements them). Detail:
 
-- **Superseded gen-1 sub-layer ops** (replaced by their FP32 analogue):
-  0x0B REQUANT, 0x0C SCALE_MUL, 0x0D VADD (→0x19), 0x0F LAYERNORM (→0x1A),
-  0x10 GELU (→0x1B), 0x11 REQUANT_PC, 0x13 DEQUANT_ADD,
-  0x15 MASKED_SOFTMAX (→0x1D).
-- **Non-causal only** (no current frontend; GPT-2 is causal):
-  0x0E SOFTMAX, 0x12 SOFTMAX_ATTNV, 0x1C SOFTMAX_FP32.
-- **Unused fused-causal variant** (toolchain chose unfused 0x1D + separate
-  attn·V matmul; no FP32 fused analogue defined): 0x16 MASKED_SOFTMAX_ATTNV.
+- **STRIPPED from RTL silicon — Phase B 2026-05-23.** `decode_unit.sv` traps
+  these as `FAULT_ILLEGAL_OP`; `sfu_engine.sv` no longer implements their
+  state machines; `sfu_g1_compute.svh` + `sfu_attn.svh` deleted. Software ISA
+  retains them for historical bundle replay (the Python `isa/`, assembler,
+  and golden model still encode/decode/execute them):
+  - 0x0E SOFTMAX, 0x0F LAYERNORM (→0x1A), 0x10 GELU (→0x1B),
+    0x12 SOFTMAX_ATTNV, 0x15 MASKED_SOFTMAX (→0x1D),
+    0x16 MASKED_SOFTMAX_ATTNV (no FP32 fused analogue).
+  - 0x1C SOFTMAX_FP32 — pre-existing reserved (non-causal, no causal-LM
+    consumer); was already illegal pre-Phase-B.
+- **Still legal in RTL** (helper-engine handled, non-normative per gen-2
+  toolchain emission). The 2026-05-23 plan initially listed these in the
+  strip set; on execution they were correctly identified as helper-engine
+  ops (not SFU), and rolled back — `blocking_helper_engine.sv` retains
+  their case arms:
+  - 0x0B REQUANT, 0x0C SCALE_MUL, 0x0D VADD (→0x19),
+    0x11 REQUANT_PC, 0x13 DEQUANT_ADD.
 - **Retained no-op:** 0x00 NOP — keep as a defined decode-to-no-op
   (conventional, zero RTL cost); not emitted but not deprecated.
 
@@ -441,6 +454,63 @@ To make golden-vs-RTL cosim possible on the production path:
    unit test validates ACCUM readback" gap, closed). The Option B
    non-finite contract stands independently as the correct, FPGA-deployable
    behavior.
+9. **Phase B SFU silicon strip — DONE 2026-05-23 (companion item to §3
+   REVISION 2026-05-23).** With the gen-2 conformance work (items 5–8) and
+   the §5 definition-of-done met, the 6 gen-1 SFU opcodes (§3) were stripped
+   from RTL silicon — exercising the §3 MAY-clause for the SFU-handled
+   subset. Specifically:
+   - `decode_unit.sv:38` traps `0x0E/0x0F/0x10/0x12/0x15/0x16` (plus
+     pre-existing `0x1C`) as `FAULT_ILLEGAL_OP` before SFU dispatch.
+   - `sfu_engine.sv` deleted: ~280 LOC of gen-1 state bodies (`F_LN_PARAM_*`,
+     `F_ROW_I8_*`, `F_ROW_I32_*`, `F_GELU_I8_*`, `F_GELU_I32_*`,
+     `F_GELU_SYNTH_I8/I32_ITER`, `F_ATTN_QKT_REQ`, `F_ATTN_V_REQ`,
+     `F_ATTN_WRITE`); F_IDLE gen-1 dispatch arms; gen-1 dispatch flags
+     (`dispatch_softmax_*`/`dispatch_gelu_*`/`dispatch_layernorm_w`/
+     `dispatch_*softmax_attnv*`); gen-1 SRAM-arbiter arms; gen-1
+     `dispatch_unsupported_w` case arms.
+   - **DELETED files**: `rtl/src/sfu_g1_compute.svh` (130 LOC),
+     `rtl/src/sfu_attn.svh` (135 LOC).
+   - `taccel_pkg.sv` `FAULT_ILLEGAL_OP` comment + `// STRIPPED` markings on
+     the 6 ops.
+   - `rtl/verilator/test_sfu.cpp`: 9 gen-1 test functions deleted (lines
+     441–1134); test count **21 → 11**; `G2_*` constants + `expect_fp16_ulp`
+     helper recovered from the deleted block. `test_sfu_synth.cpp` shares
+     the same TU; same delta.
+   - **KEPT (shared with gen-2)**: `F_ROW_PACK` / `F_ROW_WRITE` (gen-2 0x18
+     `QUANT_FP32_INT8` reaches them via `sfu_g2_compute.svh:84`/`:241`); the
+     `F_G2_LN_*` / `F_G2_SM_*` shared sub-FSMs (their gen-1-aware writeback
+     branches remain as dead-but-elaborated code — deferred to a future
+     cosim-gated cleanup pass); `attn_accum_q[]` (used by gen-2 VADD);
+     `row_i32_addr_w` (used by gen-2 0x17/0x1E).
+   - **Synth-check hashes (`make synth-check` / `synth-check-ctrl`):**
+     whole-design **97873ef4a2 → 4006339cfc** (cell drop from removed FSM
+     logic); control-plane **18e3144b40 → d13c694b63** (decode_unit
+     illegal-opcode extension; SFU is blackboxed in this build via
+     `rtl/synth/blackbox_stubs.v`).
+   - **Freeze gate preserved.** `pytest test_compare_rtl_golden.py` =
+     **6 passed + 1 skipped byte-identical** pre/post Phase B (the gen-2
+     frozen bundle never emits the stripped opcodes; the safety-net empirical
+     behavior-neutrality predicted by §5 holds). Full gate matrix:
+     pytest 125+1, `test_sfu`/`test_sfu_synth` 11/11 each (down from 21/21),
+     `test_helpers`/`test_helpers_synth` 19/19 each (helper opcodes stayed
+     legal).
+   - **Scope correction vs the original plan.** The 2026-05-23 plan listed
+     11 gen-1 ops for the strip; on execution, 5 of those
+     (`0x0B`/`0x0C`/`0x0D`/`0x11`/`0x13`) are handled by
+     `blocking_helper_engine.sv`, not `sfu_engine.sv` — making them illegal
+     at decode broke `test_helpers::vadd_int8_saturating`. The 5 helper-engine
+     ops were rolled back to legal (§3 lists them as "Still legal in RTL"
+     above). A future Phase B' could symmetrically strip the helper-engine
+     gen-1 paths (~50–100 LOC helper case-arm cleanup + ~9 `test_helpers.cpp`
+     test functions); not blocking the freeze.
+   - **Software ISA unchanged.** `software/taccel/isa/`, `assembler/`, and
+     `golden_model/simulator.py` all still implement the 6 stripped ops;
+     historical bundles parse and replay in software (only `run_program`
+     rejects them now). `test_isa_encoding.py` / `test_assembler.py` round
+     trips green unchanged.
+
+   The §5 definition-of-done remains MET — Phase B exercised the §3 MAY
+   clause without changing the §5 substantive conformance property.
 
 ## 5. Actions required to *complete* the freeze (owner: user — I do not commit)
 
@@ -474,7 +544,9 @@ items that kept the definition-of-done formally open are resolved:
   (see §4 item 8).
 The freeze gate (`test_compare_rtl_golden.py`) is **6/6 + 1 skipped**
 (124M opt-in) and byte-identical pre/post #116/#114 (frozen bundle emits 0
-`flags=1`, no ACCUM snapshots — the empirical behavior-neutrality safety net).
+`flags=1`, no ACCUM snapshots — the empirical behavior-neutrality safety net)
+**and pre/post Phase B 2026-05-23** (gen-2 frozen bundle never emits any of
+the 6 stripped gen-1 SFU opcodes; same safety-net mechanism — see §4 item 9).
 Remaining open items are FPGA-realization (synthesizable SFU, part/perf
 target — `docs/accelerator_completion_review.md`), NOT freeze-contract items.
 
