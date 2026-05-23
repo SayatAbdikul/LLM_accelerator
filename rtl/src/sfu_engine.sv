@@ -253,14 +253,9 @@ module sfu_engine
   logic [15:0] dispatch_src1_rows_w;
   logic [15:0] dispatch_src2_rows_w;
   logic [15:0] dispatch_dst_rows_w;
-  logic        dispatch_softmax_accum_w;
-  logic        dispatch_softmax_int8_w;
-  logic        dispatch_layernorm_w;
-  logic        dispatch_gelu_accum_w;
-  logic        dispatch_gelu_int8_w;
-  logic        dispatch_softmax_attnv_w;
-  logic        dispatch_masked_softmax_w;
-  logic        dispatch_masked_softmax_attnv_w;
+  // 2026-05-23 Phase B: gen-1 dispatch flags (dispatch_softmax_*,
+  // dispatch_layernorm_w, dispatch_gelu_*, dispatch_*softmax_attnv*)
+  // stripped along with their consumers.
   logic        dispatch_attn_context_bad_w;
   logic        dispatch_unsupported_w;
   logic        dispatch_sram_oob_w;
@@ -355,35 +350,10 @@ module sfu_engine
   assign dispatch_src2_rows_w     = buf_rows(src2_buf);
   assign dispatch_dst_rows_w      = buf_rows(dst_buf);
 
-  assign dispatch_softmax_accum_w = ((opcode == OP_SOFTMAX) ||
-                                     (opcode == OP_MASKED_SOFTMAX)) &&
-                                    (src1_buf == BUF_ACCUM) &&
-                                    (dst_buf != BUF_ACCUM);
-  assign dispatch_softmax_int8_w  = ((opcode == OP_SOFTMAX) ||
-                                     (opcode == OP_MASKED_SOFTMAX)) &&
-                                    (src1_buf != BUF_ACCUM) &&
-                                    (dst_buf != BUF_ACCUM);
-  assign dispatch_layernorm_w     = (opcode == OP_LAYERNORM) &&
-                                    (src1_buf == BUF_ABUF) &&
-                                    (src2_buf == BUF_WBUF) &&
-                                    (dst_buf != BUF_ACCUM);
-  assign dispatch_gelu_accum_w    = (opcode == OP_GELU) &&
-                                    (src1_buf == BUF_ACCUM) &&
-                                    (dst_buf != BUF_ACCUM);
-  assign dispatch_gelu_int8_w     = (opcode == OP_GELU) &&
-                                    (src1_buf == BUF_ABUF) &&
-                                    (dst_buf != BUF_ACCUM);
-  assign dispatch_softmax_attnv_w = (opcode == OP_SOFTMAX_ATTNV) &&
-                                    (src1_buf == BUF_ACCUM) &&
-                                    (src2_buf != BUF_ACCUM) &&
-                                    (dst_buf != BUF_ACCUM);
-  assign dispatch_masked_softmax_w = (opcode == OP_MASKED_SOFTMAX);
-  assign dispatch_masked_softmax_attnv_w = (opcode == OP_MASKED_SOFTMAX_ATTNV) &&
-                                           (src1_buf == BUF_ACCUM) &&
-                                           (src2_buf != BUF_ACCUM) &&
-                                           (dst_buf != BUF_ACCUM);
-  assign dispatch_attn_key_cols_w = (opcode == OP_MASKED_SOFTMAX_ATTNV) ?
-                                    dispatch_k_elems_w : dispatch_n_elems_w;
+  // 2026-05-23 Phase B: gen-1 dispatch flag assigns stripped along with
+  // their consumers. attn_key_cols simplifies — only OP_MASKED_SOFTMAX_FP32
+  // (the `else` branch of the old ternary) remains as a consumer.
+  assign dispatch_attn_key_cols_w = dispatch_n_elems_w;
 
   // gen-2 FP32 shared datapath detection (FP16 storage, ABUF I/O).
   logic        dispatch_g2_vadd_w;
@@ -432,9 +402,10 @@ module sfu_engine
 
   always_comb begin
     dispatch_attn_context_bad_w = 1'b0;
-    if ((opcode == OP_MASKED_SOFTMAX) ||
-        (opcode == OP_MASKED_SOFTMAX_ATTNV) ||
-        (opcode == OP_MASKED_SOFTMAX_FP32)) begin
+    // 2026-05-23 Phase B: only gen-2 OP_MASKED_SOFTMAX_FP32 remains in the
+    // attn-context-bad check; gen-1 OP_MASKED_SOFTMAX/OP_MASKED_SOFTMAX_ATTNV
+    // are now illegal at decode and never reach SFU dispatch.
+    if (opcode == OP_MASKED_SOFTMAX_FP32) begin
       dispatch_attn_context_bad_w = !attn_valid ||
                                     (attn_mode == 2'b00) ||
                                     (attn_valid_kv_len == 12'h000);
@@ -456,76 +427,11 @@ module sfu_engine
     dispatch_src2_need_rows_w = 32'd0;
     dispatch_dst_need_rows_w  = 32'd0;
 
+    // 2026-05-23 Phase B: gen-1 SFU dispatch_unsupported case arms
+    // (OP_SOFTMAX, OP_MASKED_SOFTMAX, OP_LAYERNORM, OP_GELU, OP_SOFTMAX_ATTNV,
+    // OP_MASKED_SOFTMAX_ATTNV) stripped — those opcodes are now illegal at
+    // decode and never reach SFU dispatch.
     case (opcode)
-      OP_SOFTMAX, OP_MASKED_SOFTMAX: begin
-        if (sreg == 4'hF)
-          dispatch_unsupported_w = 1'b1;
-        if (!(dispatch_softmax_accum_w || dispatch_softmax_int8_w))
-          dispatch_unsupported_w = 1'b1;
-        if (integer'(dispatch_n_elems_w) > SFU_MAX_ROW_ELEMS)
-          dispatch_unsupported_w = 1'b1;
-
-        if (dispatch_softmax_accum_w)
-          dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_n_chunks_i32_w;
-        else if (dispatch_softmax_int8_w)
-          dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_n_tiles_w;
-        dispatch_dst_need_rows_w = dispatch_m_rows_w * dispatch_n_tiles_w;
-      end
-
-      OP_LAYERNORM: begin
-        if (sreg == 4'hF)
-          dispatch_unsupported_w = 1'b1;
-        if (!dispatch_layernorm_w)
-          dispatch_unsupported_w = 1'b1;
-        if (integer'(dispatch_n_elems_w) > SFU_MAX_ROW_ELEMS)
-          dispatch_unsupported_w = 1'b1;
-
-        dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_n_tiles_w;
-        dispatch_src2_need_rows_w = {16'h0, dispatch_ln_param_rows_w};
-        dispatch_dst_need_rows_w  = dispatch_m_rows_w * dispatch_n_tiles_w;
-      end
-
-      OP_GELU: begin
-        if (sreg == 4'hF)
-          dispatch_unsupported_w = 1'b1;
-        if (!(dispatch_gelu_accum_w || dispatch_gelu_int8_w))
-          dispatch_unsupported_w = 1'b1;
-
-        if (dispatch_gelu_accum_w)
-          dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_n_chunks_i32_w;
-        else if (dispatch_gelu_int8_w)
-          dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_n_tiles_w;
-        dispatch_dst_need_rows_w = dispatch_m_rows_w * dispatch_n_tiles_w;
-      end
-
-      OP_SOFTMAX_ATTNV: begin
-        if (sreg > 4'd12)
-          dispatch_unsupported_w = 1'b1;
-        if (!dispatch_softmax_attnv_w)
-          dispatch_unsupported_w = 1'b1;
-        if ((integer'(dispatch_k_elems_w) > SFU_MAX_ROW_ELEMS) ||
-            (integer'(dispatch_n_elems_w) > SFU_MAX_ROW_ELEMS))
-          dispatch_unsupported_w = 1'b1;
-
-        dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_k_chunks_i32_w;
-        dispatch_src2_need_rows_w = dispatch_k_elems_w * dispatch_n_tiles_w;
-        dispatch_dst_need_rows_w  = dispatch_m_rows_w * dispatch_n_tiles_w;
-      end
-
-      OP_MASKED_SOFTMAX_ATTNV: begin
-        if (sreg > 4'd12)
-          dispatch_unsupported_w = 1'b1;
-        if (!dispatch_masked_softmax_attnv_w)
-          dispatch_unsupported_w = 1'b1;
-        if ((integer'(dispatch_k_elems_w) > SFU_MAX_ROW_ELEMS) ||
-            (integer'(dispatch_n_elems_w) > SFU_MAX_ROW_ELEMS))
-          dispatch_unsupported_w = 1'b1;
-
-        dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_k_chunks_i32_w;
-        dispatch_src2_need_rows_w = dispatch_k_elems_w * dispatch_n_tiles_w;
-        dispatch_dst_need_rows_w  = dispatch_m_rows_w * dispatch_n_tiles_w;
-      end
-
       OP_VADD_FP32: begin
         if (!dispatch_g2_vadd_w)
           dispatch_unsupported_w = 1'b1;
@@ -835,26 +741,9 @@ module sfu_engine
               state        <= F_FAULT;
             end else begin
               case (opcode)
-                OP_SOFTMAX, OP_MASKED_SOFTMAX: begin
-                  if (src1_buf == BUF_ACCUM)
-                    state <= F_ROW_I32_REQ;
-                  else
-                    state <= F_ROW_I8_REQ;
-                end
-
-                OP_LAYERNORM:
-                  state <= F_LN_PARAM_REQ;
-
-                OP_GELU: begin
-                  if (src1_buf == BUF_ACCUM)
-                    state <= F_GELU_I32_REQ;
-                  else
-                    state <= F_GELU_I8_REQ;
-                end
-
-                OP_SOFTMAX_ATTNV, OP_MASKED_SOFTMAX_ATTNV:
-                  state <= F_ATTN_QKT_REQ;
-
+                // 2026-05-23 Phase B: gen-1 SFU dispatch arms stripped.
+                // Gen-1 opcodes (0x0E/0x0F/0x10/0x12/0x15/0x16) are now
+                // illegal at decode_unit; they never reach this case.
                 OP_VADD_FP32, OP_LAYERNORM_FP32, OP_GELU_FP32,
                 OP_DEQUANT_ACCUM_FP32, OP_QUANT_FP32_INT8,
                 OP_MASKED_SOFTMAX_FP32, OP_DEQUANT_ACCUM_FP32_SCALED,
@@ -870,99 +759,11 @@ module sfu_engine
           end
         end
 
-        F_LN_PARAM_REQ: begin
-          if (sram_b_fault) begin
-            fault_code_r <= 4'(FAULT_SRAM_OOB);
-            state        <= F_FAULT;
-          end else begin
-            state <= F_LN_PARAM_LATCH;
-          end
-        end
-
-        F_LN_PARAM_LATCH: begin
-          integer base_idx;
-          base_idx = (integer'(read_idx_q) < integer'(ln_gamma_rows_q)) ?
-                     (integer'(read_idx_q) * 8) :
-                     ((integer'(read_idx_q) - integer'(ln_gamma_rows_q)) * 8);
-`ifndef SFU_SYNTH_NO_DPI
-          for (int lane = 0; lane < 8; lane++) begin
-            if ((base_idx + lane) < integer'(n_elems_q)) begin
-              if (integer'(read_idx_q) < integer'(ln_gamma_rows_q))
-                gamma_q[base_idx + lane] <= real_to_fp32_bits(fp16_to_real(get_u16(sram_b_rdata, lane)));
-              else
-                beta_q[base_idx + lane] <= real_to_fp32_bits(fp16_to_real(get_u16(sram_b_rdata, lane)));
-            end
-          end
-`endif
-
-          if ((integer'(read_idx_q) + 1) < integer'(ln_param_rows_q)) begin
-            read_idx_q <= read_idx_q + 13'd1;
-            state      <= F_LN_PARAM_REQ;
-          end else begin
-            read_idx_q <= 13'h0;
-            state      <= F_ROW_I8_REQ;
-          end
-        end
-
-        F_ROW_I8_REQ: begin
-          if (sram_b_fault) begin
-            fault_code_r <= 4'(FAULT_SRAM_OOB);
-            state        <= F_FAULT;
-          end else begin
-            state <= F_ROW_I8_LATCH;
-          end
-        end
-
-        F_ROW_I8_LATCH: begin
-          integer base_idx;
-          base_idx = integer'(read_idx_q) * 16;
-`ifndef SFU_SYNTH_NO_DPI
-          for (int lane = 0; lane < 16; lane++) begin
-            if ((base_idx + lane) < integer'(n_elems_q))
-              row_data_q[base_idx + lane] <=
-                  real_to_fp32_bits(sfu_fp32_mul(real'(get_i8(sram_b_rdata, lane)), fp32_bits_to_real(scale0_q)));
-          end
-`endif
-
-          if (read_idx_q + 13'd1 < {2'h0, n_tiles_q}) begin
-            read_idx_q <= read_idx_q + 13'd1;
-            state      <= F_ROW_I8_REQ;
-          end else begin
-            write_chunk_q <= 11'h0;
-            state         <= F_ROW_COMPUTE;
-          end
-        end
-
-        F_ROW_I32_REQ: begin
-          if (sram_b_fault) begin
-            fault_code_r <= 4'(FAULT_SRAM_OOB);
-            state        <= F_FAULT;
-          end else begin
-            state <= F_ROW_I32_LATCH;
-          end
-        end
-
-        F_ROW_I32_LATCH: begin
-          integer base_idx;
-          base_idx = integer'(read_idx_q) * 4;
-`ifndef SFU_SYNTH_NO_DPI
-          for (int lane = 0; lane < 4; lane++) begin
-            if ((base_idx + lane) < integer'(n_elems_q))
-              row_data_q[base_idx + lane] <=
-                  real_to_fp32_bits(sfu_fp32_mul(real'(get_i32(sram_b_rdata, lane)), fp32_bits_to_real(scale0_q)));
-          end
-`endif
-
-          if (read_idx_q + 13'd1 < n_chunks_i32_q) begin
-            read_idx_q <= read_idx_q + 13'd1;
-            state      <= F_ROW_I32_REQ;
-          end else begin
-            write_chunk_q <= 11'h0;
-            state         <= F_ROW_COMPUTE;
-          end
-        end
-
-`include "sfu_g1_compute.svh"
+        // 2026-05-23 Phase B: gen-1 LN_PARAM / ROW_I8 / ROW_I32 state bodies
+        // stripped (OP_LAYERNORM/SOFTMAX/MASKED_SOFTMAX illegal at decode).
+        // The `include "sfu_g1_compute.svh"` (gen-1 F_ROW_COMPUTE body) is
+        // also removed. F_ROW_PACK / F_ROW_WRITE stay — gen-2 0x18
+        // QUANT_FP32_INT8 uses them too (int8 pack format).
         F_ROW_PACK: begin
           row_write_q <= row_write_data_w;
           state <= F_ROW_WRITE;
@@ -979,177 +780,22 @@ module sfu_engine
             row_idx_q     <= row_idx_q + 15'd1;
             read_idx_q    <= 13'h0;
             write_chunk_q <= 11'h0;
-            if (opcode_q == OP_QUANT_FP32_INT8)
-              state <= F_G2_S1_REQ;          // gen-2 0x18 next-row FP16 read
-            else if (((opcode_q == OP_SOFTMAX) || (opcode_q == OP_MASKED_SOFTMAX)) &&
-                (src1_buf_q == BUF_ACCUM))
-              state <= F_ROW_I32_REQ;
-            else
-              state <= F_ROW_I8_REQ;
+            // 2026-05-23 Phase B: only gen-2 OP_QUANT_FP32_INT8 (0x18) reaches
+            // F_ROW_WRITE now; the gen-1 SOFTMAX/MASKED_SOFTMAX next-row arms
+            // (-> F_ROW_I32_REQ / F_ROW_I8_REQ) were stripped along with their
+            // states. Loop directly back to F_G2_S1_REQ for the next FP16 row.
+            state <= F_G2_S1_REQ;
           end else begin
             state <= F_IDLE;
           end
         end
 
-        F_GELU_I8_REQ: begin
-          if (sram_b_fault) begin
-            fault_code_r <= 4'(FAULT_SRAM_OOB);
-            state        <= F_FAULT;
-          end else begin
-            state <= F_GELU_I8_LATCH;
-          end
-        end
-
-        F_GELU_I8_LATCH: begin
-          gelu_i8_row_q <= sram_b_rdata;
-          if (SFU_SYNTH_MODE == 1) begin
-            iter_idx_q <= 11'h0;
-            state      <= F_GELU_SYNTH_I8_ITER;
-          end else begin
-            state      <= F_GELU_I8_WRITE;
-          end
-        end
-
-        // Phase-3.B gen-1 GELU INT8 synth iterator. 16 cycles per chunk:
-        // each cycle picks one lane from gelu_i8_row_q (via gelu_g1_in_pick
-        // mux) through the shared synth datapath (cvt → mul scale0 → gelu_new
-        // → div scale1 → quantize_i8) and writes out_bytes_q[chunk*16+lane].
-        // After 16 lanes done, exits to F_GELU_I8_WRITE (which in synth mode
-        // sources sram_a_wdata from row_write_data_w packing out_bytes_q).
-        F_GELU_SYNTH_I8_ITER: begin
-          if (iter_idx_q < 11'd16) begin
-            int byte_idx;
-            byte_idx = integer'(write_chunk_q) * 16 + integer'(iter_idx_q[3:0]);
-            if (byte_idx < integer'(n_elems_q))
-              out_bytes_q[byte_idx[9:0]] <= gelu_g1_quant_w;
-            iter_idx_q <= iter_idx_q + 11'd1;
-          end else begin
-            iter_idx_q <= 11'h0;
-            state      <= F_GELU_I8_WRITE;
-          end
-        end
-
-        F_GELU_I8_WRITE: begin
-          if (sram_a_fault) begin
-            fault_code_r <= 4'(FAULT_SRAM_OOB);
-            state        <= F_FAULT;
-          end else if (write_chunk_q + 11'd1 < n_tiles_q) begin
-            write_chunk_q <= write_chunk_q + 11'd1;
-            state         <= F_GELU_I8_REQ;
-          end else if (row_idx_q + 15'd1 < m_rows_q) begin
-            row_idx_q     <= row_idx_q + 15'd1;
-            write_chunk_q <= 11'h0;
-            state         <= F_GELU_I8_REQ;
-          end else begin
-            state <= F_IDLE;
-          end
-        end
-
-        F_GELU_I32_REQ: begin
-          if (sram_b_fault) begin
-            fault_code_r <= 4'(FAULT_SRAM_OOB);
-            state        <= F_FAULT;
-          end else begin
-            state <= F_GELU_I32_LATCH;
-          end
-        end
-
-        F_GELU_I32_LATCH: begin
-          case (gelu_part_q)
-            2'd0: gelu_row0_q <= sram_b_rdata;
-            2'd1: gelu_row1_q <= sram_b_rdata;
-            2'd2: gelu_row2_q <= sram_b_rdata;
-            default: gelu_row3_q <= sram_b_rdata;
-          endcase
-
-          if (gelu_part_q == 2'd3) begin
-            if (SFU_SYNTH_MODE == 1) begin
-              iter_idx_q <= 11'h0;
-              state      <= F_GELU_SYNTH_I32_ITER;
-            end else begin
-              state      <= F_GELU_I32_WRITE;
-            end
-          end else begin
-            gelu_part_q <= gelu_part_q + 2'd1;
-            state       <= F_GELU_I32_REQ;
-          end
-        end
-
-        // Phase-3.B gen-1 GELU INT32 synth iterator. 16 iterations:
-        // iter_idx_q[3:2] = lane (0..3), iter_idx_q[1:0] = row (0..3).
-        // Matches the always_comb packing: byte_idx = lane + row * 4
-        // within the 16-byte chunk.
-        F_GELU_SYNTH_I32_ITER: begin
-          if (iter_idx_q < 11'd16) begin
-            int byte_idx;
-            int lane;
-            int row;
-            lane = integer'(iter_idx_q[3:2]);
-            row  = integer'(iter_idx_q[1:0]);
-            byte_idx = integer'(write_chunk_q) * 16 + lane + row * 4;
-            if (byte_idx < integer'(n_elems_q))
-              out_bytes_q[byte_idx[9:0]] <= gelu_g1_quant_w;
-            iter_idx_q <= iter_idx_q + 11'd1;
-          end else begin
-            iter_idx_q <= 11'h0;
-            state      <= F_GELU_I32_WRITE;
-          end
-        end
-
-        F_GELU_I32_WRITE: begin
-          if (sram_a_fault) begin
-            fault_code_r <= 4'(FAULT_SRAM_OOB);
-            state        <= F_FAULT;
-          end else if (write_chunk_q + 11'd1 < n_tiles_q) begin
-            write_chunk_q <= write_chunk_q + 11'd1;
-            gelu_part_q   <= 2'h0;
-            state         <= F_GELU_I32_REQ;
-          end else if (row_idx_q + 15'd1 < m_rows_q) begin
-            row_idx_q     <= row_idx_q + 15'd1;
-            write_chunk_q <= 11'h0;
-            gelu_part_q   <= 2'h0;
-            state         <= F_GELU_I32_REQ;
-          end else begin
-            state <= F_IDLE;
-          end
-        end
-
-        F_ATTN_QKT_REQ: begin
-          if (sram_b_fault) begin
-            fault_code_r <= 4'(FAULT_SRAM_OOB);
-            state        <= F_FAULT;
-          end else begin
-            state <= F_ATTN_QKT_LATCH;
-          end
-        end
-
-`include "sfu_attn.svh"
-        F_ATTN_V_REQ: begin
-          if (sram_b_fault) begin
-            fault_code_r <= 4'(FAULT_SRAM_OOB);
-            state        <= F_FAULT;
-          end else begin
-            state <= F_ATTN_V_LATCH;
-          end
-        end
-
-        F_ATTN_WRITE: begin
-          if (sram_a_fault) begin
-            fault_code_r <= 4'(FAULT_SRAM_OOB);
-            state        <= F_FAULT;
-          end else if (write_chunk_q + 11'd1 < n_tiles_q) begin
-            write_chunk_q <= write_chunk_q + 11'd1;
-            state         <= F_ATTN_WRITE;
-          end else if (row_idx_q + 15'd1 < m_rows_q) begin
-            row_idx_q     <= row_idx_q + 15'd1;
-            read_idx_q    <= 13'h0;
-            write_chunk_q <= 11'h0;
-            state         <= F_ATTN_QKT_REQ;
-          end else begin
-            state <= F_IDLE;
-          end
-        end
-
+        // 2026-05-23 Phase B: gen-1 GELU INT8/INT32 state bodies stripped
+        // (OP_GELU 0x10 illegal at decode). The F_GELU_SYNTH_I8_ITER and
+        // F_GELU_SYNTH_I32_ITER synth-mode iterators went with them.
+        // 2026-05-23 Phase B: gen-1 ATTN_QKT/PREP/V/WRITE state bodies
+        // stripped (OP_SOFTMAX_ATTNV 0x12 / OP_MASKED_SOFTMAX_ATTNV 0x16
+        // illegal at decode). The `include "sfu_attn.svh"` is also removed.
         // ----------------------------------------------------------------
         // gen-2 FP32 shared datapath (0x19 VADD / 0x1A LN / 0x1B GELU).
         // FP16 storage (8 elems / 16-byte row), FP32 internal. src1 is an
@@ -1391,81 +1037,18 @@ module sfu_engine
     sfu_scale_wdata = 16'h0;
 
     case (state)
-      F_LN_PARAM_REQ: begin
-        sram_b_en  = 1'b1;
-        sram_b_buf = src2_buf_q;
-        sram_b_row = ln_param_addr_w[15:0];
-      end
-
-      F_ROW_I8_REQ: begin
-        sram_b_en  = 1'b1;
-        sram_b_buf = src1_buf_q;
-        sram_b_row = row_i8_addr_w[15:0];
-      end
-
-      F_ROW_I32_REQ: begin
-        sram_b_en  = 1'b1;
-        sram_b_buf = src1_buf_q;
-        sram_b_row = row_i32_addr_w[15:0];
-      end
-
+      // 2026-05-23 Phase B: gen-1 SRAM-port arbiter arms stripped
+      // (F_LN_PARAM_REQ, F_ROW_I8_REQ, F_ROW_I32_REQ, F_GELU_I8_REQ/WRITE,
+      // F_GELU_I32_REQ/WRITE, F_ATTN_QKT_REQ, F_ATTN_V_REQ, F_ATTN_WRITE).
+      // The states stay in the enum (unreachable; reduced cell-count from
+      // missing arm logic) so dead refs in sub-FSM gen-1-aware branches
+      // still elaborate. F_ROW_WRITE arm stays — gen-2 0x18 reaches it.
       F_ROW_WRITE: begin
         sram_a_en    = 1'b1;
         sram_a_we    = 1'b1;
         sram_a_buf   = dst_buf_q;
         sram_a_row   = row_dst_addr_w[15:0];
         sram_a_wdata = row_write_q;
-      end
-
-      F_GELU_I8_REQ: begin
-        sram_b_en  = 1'b1;
-        sram_b_buf = src1_buf_q;
-        sram_b_row = gelu_i8_addr_w[15:0];
-      end
-
-      F_GELU_I8_WRITE: begin
-        sram_a_en    = 1'b1;
-        sram_a_we    = 1'b1;
-        sram_a_buf   = dst_buf_q;
-        sram_a_row   = gelu_dst_addr_w[15:0];
-        // Phase-3.B: synth mode sources from row_write_data_w (packed view
-        // of out_bytes_q written by F_GELU_SYNTH_I8_ITER); DPI mode uses
-        // the always_comb-computed gelu_i8_write_data_w.
-        sram_a_wdata = (SFU_SYNTH_MODE == 1) ? row_write_data_w : gelu_i8_write_data_w;
-      end
-
-      F_GELU_I32_REQ: begin
-        sram_b_en  = 1'b1;
-        sram_b_buf = src1_buf_q;
-        sram_b_row = gelu_acc_addr_w[15:0];
-      end
-
-      F_GELU_I32_WRITE: begin
-        sram_a_en    = 1'b1;
-        sram_a_we    = 1'b1;
-        sram_a_buf   = dst_buf_q;
-        sram_a_row   = gelu_dst_addr_w[15:0];
-        sram_a_wdata = (SFU_SYNTH_MODE == 1) ? row_write_data_w : gelu_i32_write_data_w;
-      end
-
-      F_ATTN_QKT_REQ: begin
-        sram_b_en  = 1'b1;
-        sram_b_buf = src1_buf_q;
-        sram_b_row = attn_qkt_addr_w[15:0];
-      end
-
-      F_ATTN_V_REQ: begin
-        sram_b_en  = 1'b1;
-        sram_b_buf = src2_buf_q;
-        sram_b_row = attn_v_addr_w[15:0];
-      end
-
-      F_ATTN_WRITE: begin
-        sram_a_en    = 1'b1;
-        sram_a_we    = 1'b1;
-        sram_a_buf   = dst_buf_q;
-        sram_a_row   = row_dst_addr_w[15:0];
-        sram_a_wdata = attn_write_data_w;
       end
 
       F_G2_S1_REQ: begin

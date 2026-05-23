@@ -30,18 +30,23 @@ package taccel_pkg;
     OP_STORE       = 5'h08,
     OP_BUF_COPY    = 5'h09,
     OP_MATMUL      = 5'h0A,
+    // 2026-05-23 Phase B: gen-1 SFU opcodes (0x0E/0x0F/0x10/0x12/0x15/0x16)
+    // STRIPPED from RTL silicon — decode_unit traps them as FAULT_ILLEGAL_OP.
+    // The 5 gen-1 helper opcodes (0x0B/0x0C/0x0D/0x11/0x13) stay legal —
+    // blocking_helper_engine still implements them (non-normative per
+    // freeze §3, but kept for completeness / W8A8 paths).
     OP_REQUANT     = 5'h0B,
     OP_SCALE_MUL   = 5'h0C,
     OP_VADD        = 5'h0D,
-    OP_SOFTMAX     = 5'h0E,
-    OP_LAYERNORM   = 5'h0F,
-    OP_GELU        = 5'h10,
+    OP_SOFTMAX     = 5'h0E,   // STRIPPED — illegal at decode (gen-1 SFU)
+    OP_LAYERNORM   = 5'h0F,   // STRIPPED — illegal at decode (gen-1 SFU)
+    OP_GELU        = 5'h10,   // STRIPPED — illegal at decode (gen-1 SFU)
     OP_REQUANT_PC  = 5'h11,
-    OP_SOFTMAX_ATTNV = 5'h12,
+    OP_SOFTMAX_ATTNV = 5'h12, // STRIPPED — illegal at decode (gen-1 SFU)
     OP_DEQUANT_ADD = 5'h13,
     OP_CONFIG_ATTN = 5'h14,
-    OP_MASKED_SOFTMAX = 5'h15,
-    OP_MASKED_SOFTMAX_ATTNV = 5'h16,
+    OP_MASKED_SOFTMAX = 5'h15,        // STRIPPED — illegal at decode (gen-1 SFU)
+    OP_MASKED_SOFTMAX_ATTNV = 5'h16,  // STRIPPED — illegal at decode (gen-1 SFU)
     // gen-2 (W8A32 Phase 3 (c.1)) FP32 sub-layer opcodes — frozen ISA
     // (software/docs/isa_generation_freeze.md). FP16 storage / FP32 internal.
     OP_DEQUANT_ACCUM_FP32        = 5'h17,
@@ -96,7 +101,9 @@ package taccel_pkg;
   // -------------------------------------------------------------------------
   typedef enum logic [3:0] {
     FAULT_NONE       = 4'h0,
-    FAULT_ILLEGAL_OP = 4'h1,   // reserved opcode 0x17-0x1F / malformed encoding
+    FAULT_ILLEGAL_OP = 4'h1,   // stripped gen-1 SFU opcodes (0x0E, 0x0F,
+                               //   0x10, 0x12, 0x15, 0x16) + reserved
+                               //   0x1C SOFTMAX_FP32 / malformed encoding
     FAULT_DRAM_OOB   = 4'h2,   // DRAM address out of bounds
     FAULT_SRAM_OOB   = 4'h3,   // SRAM offset out of bounds
     FAULT_NO_CONFIG  = 4'h4,   // compute instruction without CONFIG_TILE

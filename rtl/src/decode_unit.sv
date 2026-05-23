@@ -29,13 +29,23 @@ module decode_unit
   assign opcode_raw = insn_data[63:59];
 
   // -------------------------------------------------------------------------
-  // Illegal opcode: only 0x1C SOFTMAX_FP32 stays reserved (gen-2 ISA freeze —
-  // non-causal, no current frontend consumer). 0x00-0x16 and the gen-2 FP32
-  // ops 0x17-0x1B/0x1D-0x1F are all legal. (opcode_raw is 5-bit so the
-  // formerly "> 0x16" range is now legal except 0x1C.)
+  // Illegal opcodes — 2026-05-23 ISA-reduction Phase B:
+  //   Gen-1 SFU ops (0x0E SOFTMAX, 0x0F LAYERNORM, 0x10 GELU,
+  //   0x12 SOFTMAX_ATTNV, 0x15 MASKED_SOFTMAX, 0x16 MASKED_SOFTMAX_ATTNV)
+  //   stripped from RTL silicon. Plus pre-existing reserved 0x1C
+  //   (non-causal SOFTMAX_FP32, no frontend consumer).
+  //   The 5 gen-1 helper-engine ops (0x0B REQUANT, 0x0C SCALE_MUL,
+  //   0x0D VADD, 0x11 REQUANT_PC, 0x13 DEQUANT_ADD) STAY LEGAL — the
+  //   blocking_helper_engine still implements them; non-normative per
+  //   freeze §3 but kept silicon-side for the W8A8 / debug paths.
+  //   Legal: 0x00-0x0D infra+helper, 0x11/0x13 helper, 0x14 CONFIG_ATTN,
+  //          gen-2 FP32 ops 0x17-0x1B / 0x1D-0x1F.
   // -------------------------------------------------------------------------
   logic illegal_opcode;
-  assign illegal_opcode = (opcode_raw == 5'h1C);
+  assign illegal_opcode = (opcode_raw == 5'h0E) || (opcode_raw == 5'h0F) ||
+                          (opcode_raw == 5'h10) || (opcode_raw == 5'h12) ||
+                          (opcode_raw == 5'h15) || (opcode_raw == 5'h16) ||
+                          (opcode_raw == 5'h1C);
 
   // CONFIG_ATTN has reserved bits [32:0], matching the software decoder.
   logic illegal_attn_reserved;
@@ -51,10 +61,12 @@ module decode_unit
     illegal_buf = 1'b0;
     if (!illegal_opcode) begin
       case (opcode_raw)
-        // R-type: check src1, src2, dst
-        5'h0A, 5'h0B, 5'h0C, 5'h0D, 5'h0E,
-        5'h0F, 5'h10, 5'h11, 5'h12, 5'h13,
-        5'h15, 5'h16,
+        // R-type: check src1, src2, dst. 2026-05-23 Phase B: stripped
+        // gen-1 SFU R-type ops (0x0E/0x0F/0x10/0x12/0x15/0x16) are trapped
+        // by illegal_opcode above and never reach this case. The 5 gen-1
+        // helper R-type ops (0x0B/0x0C/0x0D/0x11/0x13) STAY here — the
+        // helper engine still handles them.
+        5'h0A, 5'h0B, 5'h0C, 5'h0D, 5'h11, 5'h13,
         // gen-2 FP32 R-type ops (0x1C excluded — illegal_opcode handles it)
         5'h17, 5'h18, 5'h19, 5'h1A, 5'h1B,
         5'h1D, 5'h1E, 5'h1F: begin
