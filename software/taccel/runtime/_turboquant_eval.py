@@ -62,7 +62,33 @@ def prepare(
     calibration_n_seqs: int = 32,
     calibration_seq_len: int = 64,
     calibration_percentile: float = 99.9,
+    cache_dir: Optional[Path] = None,
 ) -> Prepared:
+    # Disk cache: when `cache_dir` is set, the full `Prepared` is cached
+    # keyed by all inputs that affect it (fixture mtime+size, preset,
+    # corpus shape, eval/calib text mtime+size, plus content SHA256 of
+    # the source files that govern calibration semantics — see
+    # _prep_cache._SOURCE_FILES). First call with a given key takes the
+    # usual 5–25 min and writes the cache; subsequent identical calls
+    # unpickle in ~1 s. Default None preserves existing behavior.
+    if cache_dir is not None:
+        from ._prep_cache import cache_path_for, compute_cache_key, save, try_load
+        _cache_key = compute_cache_key(
+            fixture, tokenizer_dir, eval_text,
+            max_tokens=max_tokens,
+            ptq_preset=ptq_preset,
+            calibration_text=calibration_text,
+            calibration_n_seqs=calibration_n_seqs,
+            calibration_seq_len=calibration_seq_len,
+            calibration_percentile=calibration_percentile,
+        )
+        _cache_path = cache_path_for(Path(cache_dir), _cache_key)
+        _cached = try_load(_cache_path)
+        if _cached is not None:
+            return _cached
+    else:
+        _cache_path = None
+
     import torch
 
     from .calibration import (
@@ -117,13 +143,18 @@ def prepare(
         )
         scales = apply_stage5_ptq_scale_policy(scales, payload["model_args"], preset)
     _, targets = teacher_forced_inputs_and_targets(eval_ids)
-    return Prepared(
+    prepared = Prepared(
         payload=payload, scales=scales, eval_ids=eval_ids, targets=targets,
         vocab=int(payload["model_args"]["vocab_size"]), preset_name=preset.name,
         weight_bitwidth=int(getattr(preset, "weight_bitwidth", 8)),
         lm_head_bitwidth=getattr(preset, "lm_head_bitwidth", None),
         weight_overrides=weight_overrides,
     )
+    if _cache_path is not None:
+        # Atomic save (write to .tmp then rename) so a concurrent reader
+        # never sees a partial file. ~200-300 MB gzipped on the W4 stack.
+        save(prepared, _cache_path)
+    return prepared
 
 
 def ppl_for(prepared: Prepared, kv_quant=None) -> RefPPLResult:
@@ -164,6 +195,7 @@ def reference_ppl(
     calibration_n_seqs: int = 32,
     calibration_seq_len: int = 64,
     calibration_percentile: float = 99.9,
+    cache_dir: Optional[Path] = None,
 ) -> RefPPLResult:
     """One-shot convenience: prepare() + ppl_for()."""
     prepared = prepare(
@@ -172,5 +204,6 @@ def reference_ppl(
         calibration_n_seqs=calibration_n_seqs,
         calibration_seq_len=calibration_seq_len,
         calibration_percentile=calibration_percentile,
+        cache_dir=cache_dir,
     )
     return ppl_for(prepared, kv_quant=kv_quant)
