@@ -7,7 +7,7 @@ public compiler surface or the smaller Stage 3/4 fixtures.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Mapping, Sequence
+from typing import Dict, Mapping, Optional, Sequence
 
 
 @dataclass(frozen=True)
@@ -63,6 +63,20 @@ class Stage5PTQPreset:
     # first. Default False keeps `weight_only_int8` zero-calibration and
     # byte-identical to its recorded baseline.
     weight_only_int8_calibrate: bool = False
+    # W4A16 (plan, 2026-05-23). When `weight_bitwidth=4` the per-channel
+    # symmetric weight quant clips to [-8, +7] and stores in `np.int8`
+    # (the bundle compiler packs to nibbles at emit time). Default 8 keeps
+    # every existing preset byte-identical. The compat check below treats
+    # any `weight_bitwidth != 8` as W8A8-transform-incompatible (same set
+    # of offenders as `weight_only_int8=True`). QuaRot stays allowed.
+    weight_bitwidth: int = 8
+    # lm_head precision override. None ⇒ max(weight_bitwidth, 8). Per the
+    # W4 ablation in [[w4a16-phase1-quality]], W4 lm_head alone destroys
+    # the model (40,306 PPL on GPT-2 124M); keeping lm_head at W8 brings
+    # the W4 PPL into the feasible range (73-75 with no rotation; <65
+    # with QuaRot per the rerun on 2026-05-23). Set explicitly to 4 only
+    # for ablation / research; production W4 paths leave this None.
+    lm_head_bitwidth: Optional[int] = None
 
 
 def _preset(
@@ -91,7 +105,20 @@ def _preset(
     awq_target_modules: Sequence[str] = ("c_attn", "c_fc", "lm_head"),
     weight_only_int8: bool = False,
     weight_only_int8_calibrate: bool = False,
+    weight_bitwidth: int = 8,
+    lm_head_bitwidth: Optional[int] = None,
 ) -> Stage5PTQPreset:
+    if weight_bitwidth not in (4, 8):
+        # Plan locks Phase 1 to INT4 / INT8; per-group / NF4 are out of scope.
+        raise ValueError(
+            f"Stage5 preset {name!r}: weight_bitwidth must be 4 or 8, got "
+            f"{weight_bitwidth}"
+        )
+    if lm_head_bitwidth is not None and lm_head_bitwidth not in (4, 8):
+        raise ValueError(
+            f"Stage5 preset {name!r}: lm_head_bitwidth must be 4 or 8 or None, "
+            f"got {lm_head_bitwidth}"
+        )
     preset = Stage5PTQPreset(
         name=name,
         activation_percentile_nodes=dict(activation_percentile_nodes or {}),
@@ -117,8 +144,10 @@ def _preset(
         awq_target_modules=tuple(str(v) for v in awq_target_modules),
         weight_only_int8=bool(weight_only_int8),
         weight_only_int8_calibrate=bool(weight_only_int8_calibrate),
+        weight_bitwidth=int(weight_bitwidth),
+        lm_head_bitwidth=(int(lm_head_bitwidth) if lm_head_bitwidth is not None else None),
     )
-    if preset.weight_only_int8:
+    if preset.weight_only_int8 or preset.weight_bitwidth != 8:
         # The weight-only path rejects the *calibration-dependent* W8A8
         # transforms (per-channel requant, bias correction, output-aware
         # searches, AWQ) — those mutate per-tensor activation scales or
@@ -158,13 +187,22 @@ def _preset(
         if preset.awq_enabled:
             offenders.append("awq_enabled")
         if offenders:
+            # Preserve the historical "weight_only_int8=True is incompatible"
+            # substring so the existing test_weight_only_int8_rejects_w8a8_field
+            # regex (`match="weight_only_int8=True is incompatible"`) keeps
+            # matching unchanged. The W4-only header is only emitted when the
+            # caller went straight to weight_bitwidth=4 without the W8 flag.
+            if preset.weight_only_int8:
+                header = "weight_only_int8=True"
+            else:
+                header = f"weight_bitwidth={preset.weight_bitwidth} (W4A16)"
             raise ValueError(
-                f"Stage5 preset {name!r}: weight_only_int8=True is "
-                f"incompatible with the calibration-dependent W8A8 "
-                f"transforms; got {sorted(offenders)} set. This path has "
-                f"no W8A8 calibration; AWQ/BC/output-aware searches/"
-                f"per-channel requant only apply to W8A8. (Data-free "
-                f"QuaRot is allowed and composes with weight_only_int8.)"
+                f"Stage5 preset {name!r}: {header} is incompatible with the "
+                f"calibration-dependent W8A8 transforms; got "
+                f"{sorted(offenders)} set. This path has no W8A8 "
+                f"calibration; AWQ/BC/output-aware searches/per-channel "
+                f"requant only apply to W8A8. (Data-free QuaRot is allowed "
+                f"and composes with weight-only paths.)"
             )
     return preset
 
@@ -668,6 +706,38 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         weight_only_int8_calibrate=True,
         quarot_enabled=True,
         quarot_kind="random_orthogonal",
+    ),
+    # ----------------------------------------------------------------------
+    # W4A16 perplexity ladder (plan, 2026-05-23):
+    #   weight_only_int4            — RTN per-channel symmetric (Tier A
+    #                                  baseline; ~62 MB weight DRAM saving
+    #                                  on GPT-2 124M vs the W8 path).
+    #   weight_only_int4_calibrated — +real QKT/attn_v calibration scales.
+    #   weight_only_int4_quarot     — +data-free residual-stream rotation
+    #                                  (random_orthogonal) on top. This is
+    #                                  the production W4A16 target.
+    # All three keep `weight_only_int8=True` so the eval pipeline reuses
+    # the W8A16 branch logic verbatim; only the per-tensor `bitwidth=4`
+    # changes. The 2× weight DRAM saving comes from this single switch.
+    # ----------------------------------------------------------------------
+    "weight_only_int4": _preset(
+        "weight_only_int4",
+        weight_only_int8=True,
+        weight_bitwidth=4,
+    ),
+    "weight_only_int4_calibrated": _preset(
+        "weight_only_int4_calibrated",
+        weight_only_int8=True,
+        weight_only_int8_calibrate=True,
+        weight_bitwidth=4,
+    ),
+    "weight_only_int4_quarot": _preset(
+        "weight_only_int4_quarot",
+        weight_only_int8=True,
+        weight_only_int8_calibrate=True,
+        quarot_enabled=True,
+        quarot_kind="random_orthogonal",
+        weight_bitwidth=4,
     ),
 }
 

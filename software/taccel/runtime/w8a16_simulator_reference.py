@@ -75,22 +75,39 @@ def _pad_to_multiple(arr: np.ndarray, axis: int, multiple: int = 16) -> np.ndarr
     return np.pad(arr, pad_width, mode="constant", constant_values=0)
 
 
-def _quant_w_per_channel_int8(w_fp32: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Quantize FP32 weight `[K, N]` to INT8 with per-column FP16 scales.
+def _quant_w_per_channel(w_fp32: np.ndarray, *, bitwidth: int = 8) -> tuple[np.ndarray, np.ndarray]:
+    """Quantize FP32 weight `[K, N]` to signed integer with per-column FP16 scales.
 
-    Mirrors `_torch_qdq_per_channel` math but returns the raw INT8 +
+    Mirrors `_torch_qdq_per_channel` math but returns the raw integer +
     scales (no QDQ back to FP32). The simulator-backed codegen consumes
     these directly via `weight_data`.
+
+    Storage is always ``np.int8`` regardless of ``bitwidth`` — INT4 values
+    (``bitwidth=4``) live in the low nibble. Default ``bitwidth=8`` keeps
+    every existing callsite byte-identical (W4A16 plan Phase 1).
     """
     if w_fp32.ndim != 2:
         raise ValueError(f"expected 2-D weight, got shape {w_fp32.shape}")
+    if bitwidth < 2 or bitwidth > 8:
+        raise ValueError(f"bitwidth must be in [2, 8], got {bitwidth}")
+    qmax = (1 << (bitwidth - 1)) - 1   # 127 (INT8) or 7 (INT4)
+    qmin = -(1 << (bitwidth - 1))      # -128 (INT8) or -8 (INT4)
     max_per_col = np.maximum(np.max(np.abs(w_fp32), axis=0), 1e-8)
-    w_scales = (max_per_col / 127.0).astype(np.float16)
+    w_scales = (max_per_col / float(qmax)).astype(np.float16)
     w_int8 = np.clip(
         np.round(w_fp32 / w_scales.astype(np.float32).reshape(1, -1)),
-        -128, 127,
+        qmin, qmax,
     ).astype(np.int8)
     return w_int8, w_scales
+
+
+def _quant_w_per_channel_int8(w_fp32: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Back-compat alias for ``_quant_w_per_channel(..., bitwidth=8)``.
+
+    Kept so external/test imports stay green; new internal callers should
+    use ``_quant_w_per_channel(..., bitwidth=cfg)`` directly.
+    """
+    return _quant_w_per_channel(w_fp32, bitwidth=8)
 
 
 def _w8a16_dynamic_matmul(
@@ -146,11 +163,33 @@ class NanoGPTW8A16SimulatorReference:
 
     def __init__(self, payload: dict, *, default_act_scale: float = 6.0 / 127.0,
                  calibration_scales: Optional[Dict[str, float]] = None,
-                 kv_quant: Optional[TurboQuantKV] = None) -> None:
+                 kv_quant: Optional[TurboQuantKV] = None,
+                 weight_bitwidth: int = 8,
+                 lm_head_bitwidth: Optional[int] = None,
+                 weight_overrides: Optional[Dict[str, tuple]] = None) -> None:
         # kv_quant=None → exact FP16 KV behavior, byte-identical baseline.
         # When set, the KV cache stores the lossy TurboQuant round-trip.
+        # weight_bitwidth=8 (default) preserves the W8A16 contract
+        # byte-identical; weight_bitwidth=4 selects W4A16 per-channel.
+        #
+        # lm_head_bitwidth: optional override for the LM head specifically.
+        # If None, defaults to:
+        #   - weight_bitwidth itself when weight_bitwidth >= 8 (no change),
+        #   - **8** when weight_bitwidth < 8 (standard W4 practice: lm_head
+        #     row scale is dominated by one outlier per vocab token, so
+        #     per-channel W4 destroys the discriminative info → near-random
+        #     logits. Empirically verified on GPT-2 124M 2026-05-23: W4
+        #     lm_head gives 40,306 PPL while W8 lm_head + W4 blocks gives
+        #     73.59 PPL — a 548× difference traced to lm_head alone).
+        # Pass lm_head_bitwidth=weight_bitwidth explicitly to force full-W4
+        # (research / ablation only — not production).
         self.kv_quant = kv_quant
         self.payload = payload
+        self.weight_bitwidth = int(weight_bitwidth)
+        if lm_head_bitwidth is None:
+            self.lm_head_bitwidth = max(int(weight_bitwidth), 8)
+        else:
+            self.lm_head_bitwidth = int(lm_head_bitwidth)
         cfg = payload["model_args"]
         sd = payload["state_dict"]
         self.n_layer = int(cfg["n_layer"])
@@ -163,6 +202,35 @@ class NanoGPTW8A16SimulatorReference:
         self.inv_sqrt_d_head = self.d_head ** -0.5
         self.default_act_scale = float(default_act_scale)
         self.calibration_scales = dict(calibration_scales or {})
+        # Local bound for terser callsite spelling below. Two flavors:
+        #   _qpc       — block weights at self.weight_bitwidth
+        #   _qpc_head  — lm_head specifically (at self.lm_head_bitwidth)
+        # When `weight_overrides` is provided and the sd-key is in it, the
+        # override (int8, fp16_scales) is used INSTEAD of internal RTN —
+        # this is how GPTQ-quantized weights are injected without losing
+        # GPTQ's per-element rounding decisions to the simulator's
+        # re-quantization round-trip (W4A16 Tier B).
+        self._weight_overrides = dict(weight_overrides or {})
+
+        def _qpc_for(key, w):
+            ov = self._weight_overrides.get(key)
+            if ov is not None:
+                return ov  # (int8_tensor, fp16_scales) already; same shape contract
+            return _quant_w_per_channel(w, bitwidth=self.weight_bitwidth)
+
+        def _qpc_head_for(key, w):
+            ov = self._weight_overrides.get(key)
+            if ov is not None:
+                return ov
+            return _quant_w_per_channel(w, bitwidth=self.lm_head_bitwidth)
+
+        # Back-compat: keep the bare lambdas for callers that don't pass keys.
+        _qpc = lambda w: _quant_w_per_channel(w, bitwidth=self.weight_bitwidth)
+        _qpc_head = lambda w: _quant_w_per_channel(w, bitwidth=self.lm_head_bitwidth)
+        self._quant_w = _qpc
+        self._quant_w_head = _qpc_head
+        self._qpc_for = _qpc_for
+        self._qpc_head_for = _qpc_head_for
 
         # Embeddings stay FP32 (the codegen DMAs FP32 token/pos embed
         # tiles in W8A32 mode — see _emit_embedding_lookup).
@@ -176,8 +244,9 @@ class NanoGPTW8A16SimulatorReference:
         # `lm_head` as `x @ W.T` where W is [vocab, d_model]. So store
         # the transposed-shape INT8: w_int8 is [d_model, vocab].
         lm_head_fp32 = np.asarray(sd["lm_head.weight"], dtype=np.float32)
-        self.lm_head_w_int8, self.lm_head_w_scales = _quant_w_per_channel_int8(
-            lm_head_fp32.T
+        # lm_head uses the head-specific bitwidth (default W8 even under W4).
+        self.lm_head_w_int8, self.lm_head_w_scales = self._qpc_head_for(
+            "lm_head.weight", lm_head_fp32.T,
         )
         # Optional lm_head bias (created by the LN-fold rotation flow).
         lm_head_bias = sd.get("lm_head.bias")
@@ -217,9 +286,12 @@ class NanoGPTW8A16SimulatorReference:
                     sd[f"{head_prefix}.bias_h{head_idx}_value"], dtype=np.float32
                 )
                 # Store INT8 + FP16 scales (transposed to [K, N] = [d_model, d_head]).
-                q_int8, q_scales = _quant_w_per_channel_int8(q_fp32.T)
-                k_int8, k_scales = _quant_w_per_channel_int8(k_fp32.T)
-                v_int8, v_scales = _quant_w_per_channel_int8(v_fp32.T)
+                q_int8, q_scales = self._qpc_for(
+                    f"{head_prefix}.weight_h{head_idx}_query", q_fp32.T)
+                k_int8, k_scales = self._qpc_for(
+                    f"{head_prefix}.weight_h{head_idx}_key", k_fp32.T)
+                v_int8, v_scales = self._qpc_for(
+                    f"{head_prefix}.weight_h{head_idx}_value", v_fp32.T)
                 layer["heads"].append({
                     "q_int8": q_int8, "q_scales": q_scales, "q_b": q_b,
                     "k_int8": k_int8, "k_scales": k_scales, "k_b": k_b,
@@ -228,23 +300,20 @@ class NanoGPTW8A16SimulatorReference:
             c_proj_fp32 = np.asarray(
                 sd[f"{prefix}.attn.c_proj.weight"], dtype=np.float32
             )
-            layer["c_proj_int8"], layer["c_proj_scales"] = _quant_w_per_channel_int8(
-                c_proj_fp32.T
-            )
+            layer["c_proj_int8"], layer["c_proj_scales"] = self._qpc_for(
+                f"{prefix}.attn.c_proj.weight", c_proj_fp32.T)
             layer["c_proj_b"] = np.asarray(
                 sd[f"{prefix}.attn.c_proj.bias"], dtype=np.float32
             )
             fc_fp32 = np.asarray(sd[f"{prefix}.mlp.c_fc.weight"], dtype=np.float32)
-            layer["fc1_int8"], layer["fc1_scales"] = _quant_w_per_channel_int8(
-                fc_fp32.T
-            )
+            layer["fc1_int8"], layer["fc1_scales"] = self._qpc_for(
+                f"{prefix}.mlp.c_fc.weight", fc_fp32.T)
             layer["fc1_b"] = np.asarray(
                 sd[f"{prefix}.mlp.c_fc.bias"], dtype=np.float32
             )
             proj_fp32 = np.asarray(sd[f"{prefix}.mlp.c_proj.weight"], dtype=np.float32)
-            layer["fc2_int8"], layer["fc2_scales"] = _quant_w_per_channel_int8(
-                proj_fp32.T
-            )
+            layer["fc2_int8"], layer["fc2_scales"] = self._qpc_for(
+                f"{prefix}.mlp.c_proj.weight", proj_fp32.T)
             layer["fc2_b"] = np.asarray(
                 sd[f"{prefix}.mlp.c_proj.bias"], dtype=np.float32
             )

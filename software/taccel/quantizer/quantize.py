@@ -1,34 +1,66 @@
-"""Per-channel symmetric INT8 weight quantization."""
+"""Per-channel symmetric signed-integer weight quantization (default INT8).
+
+INT4 support: pass ``bitwidth=4`` to any of the public entry points
+(``quantize_tensor``, ``quantize_tensor_clipped``, ``gptq_quantize``,
+``adaround_greedy``, ``quantize_weights``).  Storage is always ``np.int8``
+regardless of bitwidth — INT4 values are clipped to ``[-8, +7]`` and live
+in the low nibble of the INT8 byte.  The bundle compiler packs two INT4
+values per byte at emit time; this module never packs.  Default
+``bitwidth=8`` keeps every W8A16 callsite byte-identical (W4A16 plan
+Phase 1).
+"""
 import numpy as np
 from typing import Any, Dict, Optional, Tuple
 
 
-def quantize_tensor(tensor: np.ndarray, per_channel: bool = True) -> Tuple[np.ndarray, np.ndarray]:
-    """Quantize a 2D tensor to INT8 with per-channel symmetric quantization.
+def _qrange(bitwidth: int) -> Tuple[int, int]:
+    """Return signed-symmetric (qmin, qmax) for ``bitwidth`` bits.
+
+    ``bitwidth=8`` → (-128, 127); ``bitwidth=4`` → (-8, 7).
+    """
+    if bitwidth < 2 or bitwidth > 8:
+        raise ValueError(f"bitwidth must be in [2, 8], got {bitwidth}")
+    qmax = (1 << (bitwidth - 1)) - 1
+    qmin = -(1 << (bitwidth - 1))
+    return qmin, qmax
+
+
+def quantize_tensor(
+    tensor: np.ndarray,
+    per_channel: bool = True,
+    bitwidth: int = 8,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Quantize a 2D tensor to signed integer with per-channel symmetric quantization.
 
     Args:
         tensor: FP32 tensor of shape [out_channels, in_features]
         per_channel: if True, compute scale per output channel
+        bitwidth: bits per quantized value (8 = INT8 [-128,127],
+            4 = INT4 stored in INT8 storage as [-8,+7]). Default 8 preserves
+            the historical W8A16 contract byte-identical.
 
     Returns:
-        (int8_tensor, scales): quantized tensor and per-channel FP16 scales
+        (int8_tensor, scales): quantized tensor (always ``np.int8`` storage)
+        and per-channel FP16 scales.
     """
     if tensor.ndim == 1:
         tensor = tensor.reshape(1, -1)
 
+    qmin, qmax = _qrange(bitwidth)
+
     if per_channel:
-        # Per-channel: scale[ch] = max(abs(W[ch,:])) / 127
+        # Per-channel: scale[ch] = max(abs(W[ch,:])) / qmax
         max_vals = np.max(np.abs(tensor), axis=1)
         max_vals = np.maximum(max_vals, 1e-8)  # avoid division by zero
-        scales = max_vals / 127.0
+        scales = max_vals / float(qmax)
     else:
         # Per-tensor
         max_val = max(np.max(np.abs(tensor)), 1e-8)
-        scales = np.full(tensor.shape[0], max_val / 127.0)
+        scales = np.full(tensor.shape[0], max_val / float(qmax))
 
     # Quantize
     scales_expanded = scales.reshape(-1, 1)
-    q = np.clip(np.round(tensor / scales_expanded), -128, 127).astype(np.int8)
+    q = np.clip(np.round(tensor / scales_expanded), qmin, qmax).astype(np.int8)
 
     return q, scales.astype(np.float16)
 
@@ -56,8 +88,13 @@ def quantize_tensor_clipped(
     per_channel: bool = True,
     n_candidates: int = 25,
     alpha_min: float = 0.5,
+    bitwidth: int = 8,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Quantize a tensor with clip-search, optionally minimizing output MSE."""
+    """Quantize a tensor with clip-search, optionally minimizing output MSE.
+
+    See :func:`quantize_tensor` for the ``bitwidth`` semantics. Default 8
+    preserves the historical W8A16 clipped-search contract byte-identical.
+    """
     tensor = np.asarray(tensor, dtype=np.float32)
     if tensor.ndim == 1:
         tensor = tensor.reshape(1, -1)
@@ -65,6 +102,9 @@ def quantize_tensor_clipped(
         raise ValueError("n_candidates must be >= 1")
     if not (0.0 < alpha_min <= 1.0):
         raise ValueError("alpha_min must be in (0, 1]")
+
+    qmin, qmax = _qrange(bitwidth)
+    qmax_f = float(qmax)
 
     alphas = np.linspace(alpha_min, 1.0, n_candidates, dtype=np.float32)
     calib_rows = _flatten_calibration_inputs(calibration_inputs)
@@ -76,10 +116,10 @@ def quantize_tensor_clipped(
         max_vals = np.maximum(np.max(np.abs(tensor), axis=1), 1e-8).astype(np.float32)
         best_scores = np.full(tensor.shape[0], np.inf, dtype=np.float32)
         best_q = None
-        best_scales = np.full(tensor.shape[0], max_vals / 127.0, dtype=np.float32)
+        best_scales = np.full(tensor.shape[0], max_vals / qmax_f, dtype=np.float32)
         for alpha in alphas:
-            scales = np.maximum(alpha * max_vals, 1e-8) / 127.0
-            q = np.clip(np.round(tensor / scales.reshape(-1, 1)), -128, 127).astype(np.int8)
+            scales = np.maximum(alpha * max_vals, 1e-8) / qmax_f
+            q = np.clip(np.round(tensor / scales.reshape(-1, 1)), qmin, qmax).astype(np.int8)
             dq = q.astype(np.float32) * scales.reshape(-1, 1)
             diff = dq - tensor
             if gram is not None:
@@ -98,10 +138,10 @@ def quantize_tensor_clipped(
     max_val = max(float(np.max(np.abs(tensor))), 1e-8)
     best_score = float("inf")
     best_q = None
-    best_scale = max_val / 127.0
+    best_scale = max_val / qmax_f
     for alpha in alphas:
-        scale = max(alpha * max_val, 1e-8) / 127.0
-        q = np.clip(np.round(tensor / scale), -128, 127).astype(np.int8)
+        scale = max(alpha * max_val, 1e-8) / qmax_f
+        q = np.clip(np.round(tensor / scale), qmin, qmax).astype(np.int8)
         dq = q.astype(np.float32) * np.float32(scale)
         diff = dq - tensor
         if gram is not None:
@@ -123,8 +163,9 @@ def gptq_quantize(
     per_channel: bool = True,
     percdamp: float = 0.01,
     blocksize: int = 128,
+    bitwidth: int = 8,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """GPTQ (Frantar et al. 2022) per-channel symmetric INT8 quantization.
+    """GPTQ (Frantar et al. 2022) per-channel symmetric signed-integer quantization.
 
     Quantizes the input dimension column-by-column, propagating each column's
     rounding error into the unquantized columns via the inverse Hessian
@@ -146,9 +187,12 @@ def gptq_quantize(
         blocksize: process columns in lazy panels of this width to keep the
             running update on a small slice of the weight matrix at a time
             (perf only — does not change the result).
+        bitwidth: see :func:`quantize_tensor`. Default 8 preserves the
+            historical W8A16 GPTQ contract byte-identical.
 
     Returns:
-        `(int8_tensor, fp16_scales)` matching the `quantize_tensor` contract.
+        `(int8_tensor, fp16_scales)` matching the `quantize_tensor` contract
+        (storage is always ``np.int8`` regardless of ``bitwidth``).
     """
     tensor = np.asarray(tensor, dtype=np.float32)
     if tensor.ndim == 1:
@@ -163,10 +207,13 @@ def gptq_quantize(
     if blocksize <= 0:
         raise ValueError("blocksize must be positive")
 
+    qmin, qmax = _qrange(bitwidth)
+    qmax_f = float(qmax)
+
     calib_rows = _flatten_calibration_inputs(calibration_inputs)
     if calib_rows is None or calib_rows.shape[0] == 0:
         # No calibration data → fall back to RTN, same as quantize_tensor.
-        return quantize_tensor(tensor, per_channel=per_channel)
+        return quantize_tensor(tensor, per_channel=per_channel, bitwidth=bitwidth)
     if calib_rows.shape[1] != in_dim:
         raise ValueError(
             f"calibration input dim {calib_rows.shape[1]} != tensor in_dim {in_dim}"
@@ -177,10 +224,10 @@ def gptq_quantize(
     # same scale even if the GPTQ-perturbed columns reduce the row maxima.
     if per_channel:
         max_vals = np.maximum(np.max(np.abs(tensor), axis=1), 1e-8).astype(np.float32)
-        scales = max_vals / np.float32(127.0)
+        scales = max_vals / np.float32(qmax_f)
     else:
         m = max(float(np.max(np.abs(tensor))), 1e-8)
-        scales = np.full(out_dim, m / 127.0, dtype=np.float32)
+        scales = np.full(out_dim, m / qmax_f, dtype=np.float32)
 
     # Hessian over the input dimension. Use float64 for the linear-algebra
     # step — Cholesky on a 768- or 3072-wide matrix is cheap and the extra
@@ -236,8 +283,8 @@ def gptq_quantize(
             # Round-to-nearest with per-channel scale, then dequantize.
             q_int = np.clip(
                 np.round(w_j / scales64[:, 0]),
-                -128,
-                127,
+                qmin,
+                qmax,
             ).astype(np.int8)
             q_dq = q_int.astype(np.float64) * scales64[:, 0]
             err = (w_j - q_dq) / d
@@ -266,6 +313,7 @@ def adaround_greedy(
     frac_lo: float = 0.3,
     frac_hi: float = 0.7,
     max_accepts_per_channel: Optional[int] = None,
+    bitwidth: int = 8,
 ) -> np.ndarray:
     """Greedily flip rounding direction for near-boundary weights.
 
@@ -273,6 +321,8 @@ def adaround_greedy(
     from an existing quantization (`q_init`, typically from clip search), then
     consider moving each near-half-LSB weight to the alternative adjacent
     integer if doing so improves the layer's output MSE on calibration inputs.
+
+    ``bitwidth`` controls the integer clip range (default 8 = INT8 [-128,127]).
     """
     tensor = np.asarray(tensor, dtype=np.float32)
     q = np.asarray(q_init, dtype=np.int8).copy()
@@ -281,6 +331,8 @@ def adaround_greedy(
         q = q.reshape(1, -1)
     if tensor.shape != q.shape:
         raise ValueError("tensor and q_init must have the same shape")
+
+    qmin, qmax = _qrange(bitwidth)
 
     calib_rows = _flatten_calibration_inputs(calibration_inputs)
     if calib_rows is None:
@@ -304,7 +356,7 @@ def adaround_greedy(
 
         alt_q = q[ch].astype(np.int16).copy()
         delta_int = np.where(continuous > q[ch].astype(np.float32), 1, -1).astype(np.int16)
-        alt_q[candidates] = np.clip(alt_q[candidates] + delta_int[candidates], -128, 127)
+        alt_q[candidates] = np.clip(alt_q[candidates] + delta_int[candidates], qmin, qmax)
         candidates = candidates[alt_q[candidates] != q[ch, candidates].astype(np.int16)]
         if candidates.size == 0:
             continue
@@ -345,11 +397,18 @@ def dequantize_tensor(q: np.ndarray, scales: np.ndarray) -> np.ndarray:
 def quantize_weights(
     state_dict: dict,
     quantization_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+    *,
+    bitwidth: int = 8,
 ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
     """Quantize all weight tensors in a state dict.
 
     Returns dict mapping weight names → (int8_tensor, scale_per_channel_fp16).
     Conv2d patch embedding is reshaped to 2D before quantizing.
+
+    ``bitwidth`` is the global default applied to every weight matrix;
+    individual entries can override it via ``quantization_overrides[name]
+    ["bitwidth"]``. Storage is always ``np.int8`` regardless. Default 8
+    preserves the historical W8A16 contract byte-identical.
     """
     result = {}
     overrides = quantization_overrides or {}
@@ -366,12 +425,14 @@ def quantize_weights(
                 t = t.reshape(t.shape[0], -1)
             override = overrides.get(name)
             if override is not None:
+                tensor_bw = int(override.get("bitwidth", bitwidth))
                 q, scales = quantize_tensor_clipped(
                     t,
                     calibration_inputs=override.get("calibration_inputs"),
                     per_channel=bool(override.get("per_channel", True)),
                     n_candidates=int(override.get("n_candidates", 25)),
                     alpha_min=float(override.get("alpha_min", 0.5)),
+                    bitwidth=tensor_bw,
                 )
                 if override.get("adaround"):
                     q = adaround_greedy(
@@ -382,9 +443,10 @@ def quantize_weights(
                         frac_lo=float(override.get("adaround_frac_lo", 0.3)),
                         frac_hi=float(override.get("adaround_frac_hi", 0.7)),
                         max_accepts_per_channel=override.get("adaround_max_accepts_per_channel"),
+                        bitwidth=tensor_bw,
                     )
             else:
-                q, scales = quantize_tensor(t)
+                q, scales = quantize_tensor(t, bitwidth=bitwidth)
             result[name] = (q, scales)
         elif 'bias' in name and t.ndim == 1:
             # 1D biases are LayerNorm beta — store as FP16 to match gamma convention.

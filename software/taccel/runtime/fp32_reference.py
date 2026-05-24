@@ -327,19 +327,26 @@ class NanoGPTFP32Reference:
 # ---------------------------------------------------------------------------
 
 
-def _weight_only_qdq_per_channel(arr: np.ndarray) -> np.ndarray:
-    """Symmetric per-row INT8 quantise → dequantise back to FP32.
+def _weight_only_qdq_per_channel(arr: np.ndarray, *, bitwidth: int = 8) -> np.ndarray:
+    """Symmetric per-row signed-integer quantise → dequantise back to FP32.
 
     One scale per output channel (i.e. per row). No padding, no mean-scale
     averaging — this is the path the diagnostic proved at 53.42 PPL. The
     codebase's mean-scale dequant (`_linear_components`) is the opposite
     extreme; it is catastrophic in pure FP32 (~1.3e+19 PPL) without the
     activation INT8 clipping that absorbs it in the W8A8 pipeline.
+
+    ``bitwidth=8`` (default) is the historical INT8 path; ``bitwidth=4``
+    is the W4A16 QDQ ceiling-builder. Storage is always ``np.int8``.
     """
+    if bitwidth < 2 or bitwidth > 8:
+        raise ValueError(f"bitwidth must be in [2, 8], got {bitwidth}")
+    qmax = (1 << (bitwidth - 1)) - 1
+    qmin = -(1 << (bitwidth - 1))
     arr = np.asarray(arr, dtype=np.float32)
     max_abs = np.maximum(np.max(np.abs(arr), axis=1, keepdims=True), 1e-10)
-    scale = max_abs / 127.0
-    q = np.clip(np.round(arr / scale), -128, 127).astype(np.int8)
+    scale = max_abs / float(qmax)
+    q = np.clip(np.round(arr / scale), qmin, qmax).astype(np.int8)
     return (q.astype(np.float32) * scale).astype(np.float32)
 
 
@@ -371,9 +378,9 @@ def _weight_only_qdq_per_tensor_embedding(arr: np.ndarray) -> np.ndarray:
     return _fq_embedding(arr).astype(np.float32)
 
 
-def _torch_qdq_per_channel(torch, t):
+def _torch_qdq_per_channel(torch, t, *, bitwidth: int = 8):
     arr = t.detach().cpu().to(dtype=torch.float32).numpy()
-    return torch.from_numpy(_weight_only_qdq_per_channel(arr))
+    return torch.from_numpy(_weight_only_qdq_per_channel(arr, bitwidth=bitwidth))
 
 
 def _torch_qdq_mean_scale(torch, t):
@@ -390,30 +397,39 @@ def build_weight_only_int8_reference(
     payload: Mapping[str, object],
     *,
     weight_mode: str = "per_channel",
+    bitwidth: int = 8,
+    lm_head_bitwidth: Optional[int] = None,
 ) -> NanoGPTFP32Reference:
-    """Build a `NanoGPTFP32Reference` whose linear weights are INT8 QDQ.
+    """Build a `NanoGPTFP32Reference` whose linear weights are signed-integer QDQ.
 
-    This is the W8A32 reference path: INT8 weight storage (per-channel
-    scales by default, padded to 16 wide for the matmul tile), FP32
-    activations and FP32 inter-layer storage everywhere else. The
-    diagnostic at `software/tools/diagnose_weight_only_qdq_ceiling.py`
-    proved this achieves 53.42 PPL on `gpt2_converted_nanogpt.pt` at
-    257-tok / 256-ctx, vs an FP32 ceiling of 53.69 PPL.
+    This is the W8A32 reference path (when ``bitwidth=8``, the default):
+    INT8 weight storage (per-channel scales by default, padded to 16 wide
+    for the matmul tile), FP32 activations and FP32 inter-layer storage
+    everywhere else. The diagnostic at
+    ``software/tools/diagnose_weight_only_qdq_ceiling.py`` proved this
+    achieves 53.42 PPL on ``gpt2_converted_nanogpt.pt`` at 257-tok / 256-ctx,
+    vs an FP32 ceiling of 53.69 PPL.
 
-    Embeddings (`wte`, `wpe`) use the codebase's per-tensor INT8 path to
-    match the deployed bundle's embedding scheme. Linear weights
-    (`lm_head`, per-head Q/K/V, `c_proj`, `fc_w`, `proj_w`) use per-row
-    symmetric INT8 quant with no mean-scale averaging.
+    ``bitwidth=4`` selects the W4A32 QDQ-ceiling variant (see
+    :func:`build_weight_only_int4_reference` for the W4A16 plan Phase 1
+    entry point). Embeddings (``wte``, ``wpe``) stay INT8 per-tensor —
+    not the W4 target.
+
+    Linear weights (``lm_head``, per-head Q/K/V, ``c_proj``, ``fc_w``,
+    ``proj_w``) use per-row symmetric signed-integer quant with no
+    mean-scale averaging.
 
     Args:
-        payload: Loaded checkpoint dict with keys `state_dict` and
-            `model_args`. Same shape as `evaluate_gpt2_perplexity` consumes.
-        weight_mode: Either ``"per_channel"`` (W8A32 production path) or
+        payload: Loaded checkpoint dict with keys ``state_dict`` and
+            ``model_args``. Same shape as ``evaluate_gpt2_perplexity`` consumes.
+        weight_mode: Either ``"per_channel"`` (production path) or
             ``"mean_scale"`` (diagnostic-only; matches the catastrophic
-            mean-scale approximation isolated in `_linear_components`).
+            mean-scale approximation isolated in ``_linear_components``).
+            ``"mean_scale"`` ignores ``bitwidth``.
+        bitwidth: 8 (default, INT8) or 4 (INT4). Embeddings always INT8.
 
     Returns:
-        A `NanoGPTFP32Reference` ready for `.incremental_logits_trace(...)`.
+        A ``NanoGPTFP32Reference`` ready for ``.incremental_logits_trace(...)``.
     """
     import torch  # local import keeps the FP32 module CPU-load cheap
 
@@ -421,14 +437,27 @@ def build_weight_only_int8_reference(
         raise ValueError(
             f"weight_mode must be 'per_channel' or 'mean_scale', got {weight_mode!r}"
         )
-    linear_qdq = (
-        _torch_qdq_per_channel if weight_mode == "per_channel" else _torch_qdq_mean_scale
-    )
+    # lm_head defaults to W8 even when bitwidth=4 (see W4A16 plan ablation
+    # 2026-05-23: W4 lm_head alone gives 40,306 PPL on GPT-2 124M because
+    # each vocab token's row scale is dominated by a single outlier and
+    # W4 zeros out the discriminative tail; keeping lm_head at W8 brings
+    # the W4 PPL into the feasible 73-75 range).
+    head_bw = lm_head_bitwidth if lm_head_bitwidth is not None else max(bitwidth, 8)
+
+    if weight_mode == "per_channel":
+        def linear_qdq(torch, t):
+            return _torch_qdq_per_channel(torch, t, bitwidth=bitwidth)
+
+        def head_qdq(torch, t):
+            return _torch_qdq_per_channel(torch, t, bitwidth=head_bw)
+    else:
+        linear_qdq = _torch_qdq_mean_scale  # bitwidth ignored by mean-scale path
+        head_qdq = _torch_qdq_mean_scale
 
     ref = NanoGPTFP32Reference(payload["state_dict"], payload["model_args"])
     ref.wte = _torch_qdq_per_tensor_embedding(torch, ref.wte)
     ref.wpe = _torch_qdq_per_tensor_embedding(torch, ref.wpe)
-    ref.lm_head_w = linear_qdq(torch, ref.lm_head_w)
+    ref.lm_head_w = head_qdq(torch, ref.lm_head_w)
 
     for layer in ref.layers:
         new_heads = []
@@ -447,3 +476,25 @@ def build_weight_only_int8_reference(
         layer["proj_w"] = linear_qdq(torch, layer["proj_w"])
         # LN weights/biases stay FP32 (small tensors, not the bottleneck).
     return ref
+
+
+def build_weight_only_int4_reference(
+    payload: Mapping[str, object],
+    *,
+    weight_mode: str = "per_channel",
+) -> NanoGPTFP32Reference:
+    """Build a W4A32 ceiling reference (per-channel symmetric INT4 weight QDQ).
+
+    Thin wrapper around :func:`build_weight_only_int8_reference` with
+    ``bitwidth=4``. Embeddings (``wte``, ``wpe``) stay INT8 per-tensor —
+    not the W4 target. This is the W4A16-plan Phase 1 "ceiling" reference
+    used to compare against the dynamic-INT8-activation
+    ``NanoGPTW8A16SimulatorReference`` path for W4A16 quality measurement.
+    """
+    if weight_mode != "per_channel":
+        raise ValueError(
+            f"W4 reference only supports weight_mode='per_channel', got {weight_mode!r}"
+        )
+    return build_weight_only_int8_reference(
+        payload, weight_mode="per_channel", bitwidth=4,
+    )

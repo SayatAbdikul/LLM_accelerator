@@ -27,6 +27,14 @@ class Prepared:
     targets: list
     vocab: int
     preset_name: str
+    # W4A16 plan (2026-05-23). Default 8 keeps every existing call site
+    # byte-identical to the W8A16 baseline; W4 presets set this to 4 and
+    # the simulator reference per-channel-quants weights to [-8, +7].
+    weight_bitwidth: int = 8
+    # lm_head specifically — defaults to max(weight_bitwidth, 8). The
+    # ablation in [[w4a16-phase1-quality]] shows W4 lm_head is the entire
+    # PPL killer (548× difference); keep it at W8 under W4 block weights.
+    lm_head_bitwidth: Optional[int] = None
 
 
 @dataclass
@@ -89,6 +97,8 @@ def prepare(
     return Prepared(
         payload=payload, scales=scales, eval_ids=eval_ids, targets=targets,
         vocab=int(payload["model_args"]["vocab_size"]), preset_name=preset.name,
+        weight_bitwidth=int(getattr(preset, "weight_bitwidth", 8)),
+        lm_head_bitwidth=getattr(preset, "lm_head_bitwidth", None),
     )
 
 
@@ -101,6 +111,8 @@ def ppl_for(prepared: Prepared, kv_quant=None) -> RefPPLResult:
 
     ref = NanoGPTW8A16SimulatorReference(
         prepared.payload, calibration_scales=prepared.scales, kv_quant=kv_quant,
+        weight_bitwidth=prepared.weight_bitwidth,
+        lm_head_bitwidth=prepared.lm_head_bitwidth,
     )
     logits = ref.run_teacher_forced(prepared.eval_ids)
     nlls = [
