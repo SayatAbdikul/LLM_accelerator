@@ -73,6 +73,28 @@ class TestConfigInstructions:
     def test_config_tile_zero(self):
         dec = round_trip(ConfigTileInsn(M=0, N=0, K=0))
         assert dec.M == 0 and dec.N == 0 and dec.K == 0
+        # Default weight_int4 must be False so W8 bundles stay bit-identical.
+        assert dec.weight_int4 is False
+
+    def test_config_tile_weight_int4_round_trip(self):
+        """W4A16 plan Phase 2 (2026-05-24): CONFIG_TILE bit [28] selects W4 weights."""
+        from taccel.isa.opcodes import C_WEIGHT_INT4_SHIFT
+        from taccel.isa.encoding import encode
+        # weight_int4=False: bit [28] must be 0; encoding bit-identical to default.
+        baseline = int.from_bytes(encode(ConfigTileInsn(M=12, N=12, K=3)), "little")
+        same_explicit = int.from_bytes(
+            encode(ConfigTileInsn(M=12, N=12, K=3, weight_int4=False)), "little")
+        assert baseline == same_explicit, (
+            "weight_int4=False default must encode bit-identically to omitting it"
+        )
+        assert ((baseline >> C_WEIGHT_INT4_SHIFT) & 0x1) == 0
+        # weight_int4=True: bit [28] set; round-trip preserves it; M/N/K unchanged.
+        dec = round_trip(ConfigTileInsn(M=12, N=12, K=3, weight_int4=True))
+        assert dec.M == 12 and dec.N == 12 and dec.K == 3
+        assert dec.weight_int4 is True
+        # Combined with edge-case M/N/K.
+        dec_max = round_trip(ConfigTileInsn(M=1023, N=1023, K=1023, weight_int4=True))
+        assert dec_max.M == 1023 and dec_max.weight_int4 is True
 
     def test_config_attn_roundtrip_boundaries(self):
         for mode in range(4):

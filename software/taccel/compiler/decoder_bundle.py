@@ -13,6 +13,91 @@ from .model_config import ModelConfig
 from .tiler import pad_dim
 
 
+# ---------------------------------------------------------------------------
+# INT4 weight pack / unpack (W4A16 plan Phase 2, 2026-05-24).
+#
+# Used by `_layout_weights` to serialize per-channel INT4 weight tensors as
+# packed bytes (2 nibbles per byte) into the bundle DRAM blob, and by the
+# golden model `read_int4_tile` to unpack at consumption time. The RTL
+# `weight_unpack.sv` module (Phase 3) MUST mirror this layout exactly.
+#
+# Canonical layout (the spec; do not change without updating golden + RTL):
+#   * Input: signed INT4 values in [-8, +7], stored as `np.int8` (the values
+#     live in the low nibble; the sign-extended high nibble is ignored).
+#   * Shape contract: the LAST dimension must be even (we pack 2 nibbles
+#     per byte along it; if odd, the caller pads with a zero element).
+#   * Byte layout: byte `b[i]` packs `arr[..., 2*i]` in the LOW nibble
+#     (bits [3:0]) and `arr[..., 2*i + 1]` in the HIGH nibble (bits [7:4]).
+#     Negative values use two's-complement (`v & 0x0F` for the LSN field).
+#   * Output dtype: `np.uint8`, shape = input shape with last dim halved.
+#
+# Worked example (1D, 4 elements):
+#   in  = [+3, -2, +7, -8]          (np.int8)
+#   bytes:
+#     b[0] = (-2 & 0x0F) << 4 | (+3 & 0x0F) = 0xE0 | 0x03 = 0xE3
+#     b[1] = (-8 & 0x0F) << 4 | (+7 & 0x0F) = 0x80 | 0x07 = 0x87
+#   out = [0xE3, 0x87]              (np.uint8)
+# ---------------------------------------------------------------------------
+
+
+def pack_int4(arr: np.ndarray) -> np.ndarray:
+    """Pack signed INT4 values (stored as int8 in [-8, +7]) into nibbles.
+
+    See the module-level layout spec above. The last dimension of ``arr``
+    must be even.
+    """
+    arr = np.asarray(arr)
+    if arr.dtype != np.int8:
+        raise TypeError(
+            f"pack_int4 expects np.int8 input (values in [-8, +7]); "
+            f"got dtype={arr.dtype}"
+        )
+    if arr.size and (int(arr.min()) < -8 or int(arr.max()) > 7):
+        raise ValueError(
+            f"pack_int4 expects values in [-8, +7]; "
+            f"got [{int(arr.min())}, {int(arr.max())}]"
+        )
+    if arr.shape[-1] % 2 != 0:
+        raise ValueError(
+            f"pack_int4 expects last-dim even; got shape={arr.shape}"
+        )
+    # Reinterpret as unsigned, then mask the high nibble (sign extension noise).
+    lo = arr[..., 0::2].astype(np.uint8) & np.uint8(0x0F)
+    hi = arr[..., 1::2].astype(np.uint8) & np.uint8(0x0F)
+    return (lo | (hi << np.uint8(4))).astype(np.uint8)
+
+
+def unpack_int4(packed: np.ndarray, *, last_dim: Optional[int] = None) -> np.ndarray:
+    """Unpack INT4 nibbles to signed int8 in [-8, +7].
+
+    Inverse of :func:`pack_int4`. ``last_dim`` lets the caller specify an
+    odd unpacked length (the highest nibble of the final byte is then
+    dropped); default doubles the packed last dim.
+    """
+    packed = np.asarray(packed)
+    if packed.dtype != np.uint8:
+        raise TypeError(
+            f"unpack_int4 expects np.uint8 input; got dtype={packed.dtype}"
+        )
+    lo = packed & np.uint8(0x0F)
+    hi = (packed >> np.uint8(4)) & np.uint8(0x0F)
+    # Sign-extend 4-bit values: bit3=1 → subtract 16.
+    lo_s = lo.astype(np.int16) - (((lo & np.uint8(0x08)) != 0).astype(np.int16) * 16)
+    hi_s = hi.astype(np.int16) - (((hi & np.uint8(0x08)) != 0).astype(np.int16) * 16)
+    out_shape = packed.shape[:-1] + (packed.shape[-1] * 2,)
+    out = np.empty(out_shape, dtype=np.int8)
+    out[..., 0::2] = lo_s.astype(np.int8)
+    out[..., 1::2] = hi_s.astype(np.int8)
+    if last_dim is not None:
+        if last_dim < 0 or last_dim > out.shape[-1]:
+            raise ValueError(
+                f"unpack_int4 last_dim={last_dim} out of range "
+                f"[0, {out.shape[-1]}]"
+            )
+        out = out[..., :last_dim]
+    return out
+
+
 @dataclass
 class DecoderBundleBuild:
     bundle: ProgramBundle

@@ -77,6 +77,16 @@ class Stage5PTQPreset:
     # with QuaRot per the rerun on 2026-05-23). Set explicitly to 4 only
     # for ablation / research; production W4 paths leave this None.
     lm_head_bitwidth: Optional[int] = None
+    # W4A16 production pipeline (plan Phase 1.8, 2026-05-24). When
+    # `apply_awq_gptq=True`, `_turboquant_eval.prepare()` runs
+    # `software/taccel/runtime/w4_quant.py::apply_w4_awq_gptq` to mutate
+    # the state_dict (AWQ — using the existing `awq_alpha` field at line 46
+    # for the AWQ blend exponent; production W4 sets it to 0.40 instead
+    # of the canonical 0.5) and build a `weight_overrides` map (GPTQ-inject)
+    # that bypasses the simulator's internal RTN. The W4 AWQ path is
+    # SEPARATE from the W8A8 AWQ at line 45 (`awq_enabled`) — they share
+    # only the alpha knob, not the dispatch.
+    apply_awq_gptq: bool = False
 
 
 def _preset(
@@ -107,6 +117,7 @@ def _preset(
     weight_only_int8_calibrate: bool = False,
     weight_bitwidth: int = 8,
     lm_head_bitwidth: Optional[int] = None,
+    apply_awq_gptq: bool = False,
 ) -> Stage5PTQPreset:
     if weight_bitwidth not in (4, 8):
         # Plan locks Phase 1 to INT4 / INT8; per-group / NF4 are out of scope.
@@ -146,6 +157,7 @@ def _preset(
         weight_only_int8_calibrate=bool(weight_only_int8_calibrate),
         weight_bitwidth=int(weight_bitwidth),
         lm_head_bitwidth=(int(lm_head_bitwidth) if lm_head_bitwidth is not None else None),
+        apply_awq_gptq=bool(apply_awq_gptq),
     )
     if preset.weight_only_int8 or preset.weight_bitwidth != 8:
         # The weight-only path rejects the *calibration-dependent* W8A8
@@ -738,6 +750,22 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         quarot_enabled=True,
         quarot_kind="random_orthogonal",
         weight_bitwidth=4,
+    ),
+    # ----------------------------------------------------------------------
+    # W4A16 PRODUCTION preset (plan Phase 1.8, 2026-05-24). The empirical
+    # winner of the W4 quality ladder on GPT-2 124M: AWQ(α=0.40, c_attn +
+    # c_fc + lm_head) + GPTQ-inject (block weights only; lm_head stays at
+    # W8 via lm_head_bitwidth default) + Stage5 QKT/attn_v static calib.
+    # No QuaRot (intrinsically hurts W4 per [[w4a16-phase1-quality]]).
+    # End-to-end 257-tok PPL = 63.04 (gate ≤ 65). See [[w4a16-phase1-quality]].
+    # ----------------------------------------------------------------------
+    "weight_only_int4_awq_gptq": _preset(
+        "weight_only_int4_awq_gptq",
+        weight_only_int8=True,
+        weight_only_int8_calibrate=True,
+        weight_bitwidth=4,
+        apply_awq_gptq=True,
+        awq_alpha=0.40,
     ),
 }
 

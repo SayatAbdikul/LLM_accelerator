@@ -46,6 +46,10 @@ def execute_matmul(state, insn):
     m_tiles = state.tile_config[0] + 1
     n_tiles = state.tile_config[1] + 1
     k_tiles = state.tile_config[2] + 1
+    # W4A16 plan Phase 2 (2026-05-24): tile_config[3] (if present) is the
+    # `weight_int4` flag from CONFIG_TILE bit [28]. Default False keeps
+    # the INT8 weight read path unchanged for all W8 bundles.
+    weight_int4 = bool(state.tile_config[3]) if len(state.tile_config) > 3 else False
 
     M = m_tiles * TILE
     N = n_tiles * TILE
@@ -53,9 +57,16 @@ def execute_matmul(state, insn):
 
     accumulate = bool(insn.flags & 1)
 
-    # Read source tiles
+    # Read source tiles. src2 (weights) is INT8 by default; if the current
+    # tile config has weight_int4, src2 is read as packed nibbles and
+    # unpacked to INT8 [-8,+7]. The INT32 matmul arithmetic below is
+    # bit-identical either way (the unpacked INT4 values fit in INT8 with
+    # sign extension).
     src1 = memory.read_int8_tile(state, insn.src1_buf, insn.src1_off, M, K)
-    src2 = memory.read_int8_tile(state, insn.src2_buf, insn.src2_off, K, N)
+    if weight_int4:
+        src2 = memory.read_int4_tile(state, insn.src2_buf, insn.src2_off, K, N)
+    else:
+        src2 = memory.read_int8_tile(state, insn.src2_buf, insn.src2_off, K, N)
 
     # Read existing accumulator if accumulating
     if accumulate:

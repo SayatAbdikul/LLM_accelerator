@@ -62,6 +62,50 @@ def read_int8_tile(state, buf_id: int, offset_units: int, rows: int, cols: int) 
     return data.reshape(rows, cols)
 
 
+def read_int4_tile(state, buf_id: int, offset_units: int, rows: int, cols: int) -> np.ndarray:
+    """Read a packed INT4 tile from SRAM buffer (W4A16 plan Phase 2, 2026-05-24).
+
+    Layout MUST mirror `decoder_bundle.pack_int4` exactly (the RTL
+    `weight_unpack.sv` Phase 3 module will mirror it too):
+      * 2 nibbles per byte; byte `b[i]` packs element `[..., 2*i]` in the
+        LOW nibble and `[..., 2*i + 1]` in the HIGH nibble (two's-complement
+        signed values, then masked with 0x0F).
+      * Reads `rows * cols / 2` packed bytes, unpacks to `(rows, cols)`
+        np.int8 with sign-extended values in [-8, +7].
+      * `cols` must be even (we pack along the row).
+
+    Args mirror :func:`read_int8_tile`: ``offset_units`` is in 16-byte units;
+    ``rows`` × ``cols`` is the UNPACKED logical shape (not the packed byte
+    count). Use this from :mod:`golden_model.systolic.execute_matmul` when
+    the dispatched matmul's tile config has ``weight_int4=True``.
+    """
+    if cols % 2 != 0:
+        raise ValueError(f"read_int4_tile requires even cols, got {cols}")
+    _check_sram_bounds(buf_id, offset_units)
+    byte_offset = offset_units * UNIT
+    total_bytes = rows * cols // 2
+
+    if buf_id == BUF_ACCUM:
+        raise ValueError("read_int4_tile not valid for ACCUM buffer (W4 only applies to WBUF weights)")
+
+    buf = state.get_buffer(buf_id)
+    end = byte_offset + total_bytes
+    if end > len(buf):
+        raise SRAMAccessError(buf_id, offset_units, BUFFER_MAX_OFF[buf_id])
+
+    packed = np.frombuffer(buf[byte_offset:end], dtype=np.uint8).copy()
+    packed = packed.reshape(rows, cols // 2)
+    # Unpack 2 nibbles per byte → (rows, cols) np.int8 with sign extension.
+    lo = packed & np.uint8(0x0F)
+    hi = (packed >> np.uint8(4)) & np.uint8(0x0F)
+    lo_s = lo.astype(np.int16) - (((lo & np.uint8(0x08)) != 0).astype(np.int16) * 16)
+    hi_s = hi.astype(np.int16) - (((hi & np.uint8(0x08)) != 0).astype(np.int16) * 16)
+    out = np.empty((rows, cols), dtype=np.int8)
+    out[:, 0::2] = lo_s.astype(np.int8)
+    out[:, 1::2] = hi_s.astype(np.int8)
+    return out
+
+
 def write_int8_tile(state, buf_id: int, offset_units: int, data: np.ndarray):
     """Write an INT8 tile to SRAM buffer."""
     _check_sram_bounds(buf_id, offset_units)

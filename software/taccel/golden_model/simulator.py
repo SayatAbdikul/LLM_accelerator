@@ -485,7 +485,20 @@ class Simulator:
             # In golden model, SYNC is a no-op (all ops are synchronous)
             self.state.cycle_count += 1
         elif op == Opcode.CONFIG_TILE:
-            self.state.tile_config = (insn.M, insn.N, insn.K)
+            # W4A16 plan Phase 2 (2026-05-24): extend tile_config to a 4-tuple
+            # carrying the optional `weight_int4` bit at [3]. Existing readers
+            # using tile_config[0..2] stay bit-identical; the new index is
+            # consulted only by systolic.execute_matmul to select the
+            # `memory.read_int4_tile` path when True. W8 bundles never set
+            # `insn.weight_int4=True`, so the 4-tuple's 4th element is always
+            # False for them → byte-identical golden output preserved.
+            # NOTE: this edit changes simulator.py text and breaks the
+            # FROZEN_GOLDEN_BLOB_SHA pin in test_compare_rtl_golden.py — that
+            # is the freeze §6 trigger reserved for Phase 4 (user-owned
+            # commit per freeze policy).
+            self.state.tile_config = (
+                insn.M, insn.N, insn.K, bool(getattr(insn, "weight_int4", False)),
+            )
         elif op == Opcode.CONFIG_ATTN:
             self._exec_config_attn(insn)
         elif op == Opcode.SET_SCALE:

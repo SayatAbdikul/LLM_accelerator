@@ -251,7 +251,11 @@ def emit_matmul_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     cg._emit(SyncInsn(resource_mask=0b001))
 
     # ----- Stage 4: MATMUL (INT8 × INT8 → INT32 ACCUM) -----
-    cg._emit(ConfigTileInsn(M=m_tiles - 1, N=N_pad // TILE - 1, K=k_tiles - 1))
+    # W4A16 plan Phase 2: set CONFIG_TILE bit [28] when the weight is INT4.
+    cg._emit(ConfigTileInsn(
+        M=m_tiles - 1, N=N_pad // TILE - 1, K=k_tiles - 1,
+        weight_int4=(cg.weight_dtypes.get(weight_name) == "int4"),
+    ))
     cg._emit(MatmulInsn(
         src1_buf=BUF_ABUF, src1_off=int8_scratch.offset_units,
         src2_buf=BUF_WBUF, src2_off=w_alloc.offset_units,
@@ -479,8 +483,10 @@ def emit_matmul_w8a16_large_weight_tiled(
             # INT8 activation is laid out [M_pad, K_pad] row-major; the
             # k_start byte-offset into the row is the column offset
             # times 1 byte/elem.
+            # W4A16 plan Phase 2: set CONFIG_TILE bit [28] for INT4 weights.
             cg._emit(ConfigTileInsn(
                 M=m_tiles - 1, N=n_tile_units - 1, K=(k_len // TILE) - 1,
+                weight_int4=(cg.weight_dtypes.get(weight_name) == "int4"),
             ))
             # `src1_off` in units; INT8 row stride = K_pad bytes = K_pad/16 units.
             # The K-strip starts at column k_start, byte offset k_start within row.
@@ -738,8 +744,10 @@ def _emit_matmul_w8a16_large_input_streaming(
 
             # Stage 5: INT8 × INT8 MATMUL (flags=0 — each K-tile resets
             # ACCUM because we dequant per-K-tile and FP32 accumulate).
+            # W4A16 plan Phase 2: set CONFIG_TILE bit [28] for INT4 weights.
             cg._emit(ConfigTileInsn(
                 M=m_tiles - 1, N=n_tile_units - 1, K=k_tiles_units - 1,
+                weight_int4=(cg.weight_dtypes.get(weight_name) == "int4"),
             ))
             cg._emit(MatmulInsn(
                 src1_buf=BUF_ABUF, src1_off=int8_tile_alloc.offset_units,

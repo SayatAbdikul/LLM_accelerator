@@ -252,3 +252,74 @@ def test_decoder_bundle_reserves_codegen_temp_before_logits_and_kv_cache():
     assert build.bundle.temp_size == generated_temp
     assert build.bundle.logits_base >= build.bundle.temp_base + build.bundle.temp_size
     assert build.bundle.kv_cache_base >= build.bundle.logits_base + build.bundle.logits_size
+
+
+# ---------------------------------------------------------------------------
+# W4A16 plan Phase 2 — INT4 nibble pack/unpack helpers (2026-05-24)
+# ---------------------------------------------------------------------------
+
+import pytest
+
+from taccel.compiler.decoder_bundle import pack_int4, unpack_int4
+
+
+def test_pack_int4_worked_example():
+    """The docstring's worked example must round-trip exactly."""
+    arr = np.array([+3, -2, +7, -8], dtype=np.int8)
+    packed = pack_int4(arr)
+    assert packed.dtype == np.uint8
+    assert packed.tolist() == [0xE3, 0x87]
+    back = unpack_int4(packed)
+    assert back.dtype == np.int8
+    assert back.tolist() == arr.tolist()
+
+
+def test_pack_int4_round_trip_random():
+    rng = np.random.default_rng(20260524)
+    for shape in [(64,), (16, 32), (4, 16, 64), (3, 8, 128)]:
+        arr = rng.integers(-8, 8, size=shape, dtype=np.int8)
+        packed = pack_int4(arr)
+        # Last dim halves.
+        expected_packed_shape = shape[:-1] + (shape[-1] // 2,)
+        assert packed.shape == expected_packed_shape
+        assert packed.dtype == np.uint8
+        back = unpack_int4(packed)
+        assert back.shape == shape
+        assert back.dtype == np.int8
+        assert np.array_equal(back, arr), (
+            f"round-trip failed for shape {shape}"
+        )
+
+
+def test_pack_int4_boundary_values():
+    """All 16 representable values round-trip."""
+    arr = np.array(list(range(-8, 8)), dtype=np.int8)  # 16 values, even count
+    packed = pack_int4(arr)
+    assert packed.shape == (8,)
+    back = unpack_int4(packed)
+    assert back.tolist() == arr.tolist()
+
+
+def test_pack_int4_rejects_out_of_range():
+    with pytest.raises(ValueError, match=r"values in \[-8, \+7\]"):
+        pack_int4(np.array([8], dtype=np.int8))  # last_dim=1 also odd; test the value check
+    with pytest.raises(ValueError, match=r"values in \[-8, \+7\]"):
+        pack_int4(np.array([-9, 0], dtype=np.int8))
+
+
+def test_pack_int4_rejects_wrong_dtype():
+    with pytest.raises(TypeError, match="np.int8"):
+        pack_int4(np.array([1, 2], dtype=np.int16))
+
+
+def test_pack_int4_rejects_odd_last_dim():
+    with pytest.raises(ValueError, match="last-dim even"):
+        pack_int4(np.array([1, 2, 3], dtype=np.int8))  # length 3 is odd, in range
+
+
+def test_unpack_int4_last_dim_truncation():
+    """Caller can request odd-length output via `last_dim` (drops final nibble)."""
+    arr = np.array([+3, -2, +7, -8], dtype=np.int8)
+    packed = pack_int4(arr)
+    back = unpack_int4(packed, last_dim=3)
+    assert back.tolist() == [+3, -2, +7]

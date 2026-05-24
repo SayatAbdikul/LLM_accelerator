@@ -293,6 +293,12 @@ class ConfigTileInsn(Instruction):
     M: int = 0  # tile count (0-based encoded: value V means V+1 tiles)
     N: int = 0
     K: int = 0
+    # W4A16 plan Phase 2 (2026-05-24). False (default) → INT8 weights
+    # (current behaviour, byte-identical). True → INT4-packed weights
+    # in WBUF, unpacked to INT8 at read time via `weight_unpack.sv`
+    # (Phase 3 RTL) / `golden_model/memory.read_int4_tile` (Phase 2 golden).
+    # Encoded at bit [28] (see `C_WEIGHT_INT4_SHIFT` in opcodes.py).
+    weight_int4: bool = False
 
     def __post_init__(self):
         for name, val in [("M", self.M), ("N", self.N), ("K", self.K)]:

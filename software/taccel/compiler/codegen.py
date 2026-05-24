@@ -72,7 +72,8 @@ class CodeGenerator:
                  stream_name: str = "prefill",
                  kv_layout: Optional[KVCacheLayout] = None,
                  use_fp16_activations: bool = True,  # DEPRECATED: always True now; kept for back-compat
-                 biases: Optional[Dict[str, np.ndarray]] = None):
+                 biases: Optional[Dict[str, np.ndarray]] = None,
+                 weight_dtypes: Optional[Dict[str, str]] = None):
         """
         Args:
             weight_data: name → (quantized_data, per_channel_scales)
@@ -88,12 +89,21 @@ class CodeGenerator:
                 stages each FP32 bias folded into the
                 `__w8a16_pc_scale_and_bias` combined 2N FP16 blob
                 consumed by DEQUANT_ACCUM_FP32_SCALED.
+            weight_dtypes: Optional sidecar map `name → "int8" | "int4"`
+                (default missing entries treated as "int8"). When a weight's
+                dtype is "int4", `_layout_weights` packs the np.int8 storage
+                via `decoder_bundle.pack_int4` before staging into the DRAM
+                blob (2 nibbles per byte; layout per the `pack_int4`
+                docstring — the RTL `weight_unpack.sv` and golden
+                `memory.read_int4_tile` mirror this exact format).
+                W4A16 plan Phase 2 (2026-05-24).
 
         Element size is FP16 (2 bytes/element) throughout the W8A16
         datapath; `self.elem_bytes = 2` and `self.fp_precision_flag = 1`
         are hardcoded.
         """
         self.weight_data = weight_data
+        self.weight_dtypes = dict(weight_dtypes or {})
         self.config = model_config or deit_tiny_config()
         if stream_name not in ("prefill", "decode"):
             raise ValueError("stream_name must be 'prefill' or 'decode'")
@@ -242,7 +252,17 @@ class CodeGenerator:
         return self.instructions, bytes(self.dram_blob)
 
     def _layout_weights(self, graph: IRGraph):
-        """Pack all weights into DRAM data blob."""
+        """Pack all weights into DRAM data blob.
+
+        W4A16 plan Phase 2: when `self.weight_dtypes.get(name) == "int4"`,
+        pack the np.int8 storage (values in [-8, +7]) via
+        `decoder_bundle.pack_int4` before staging — 2 nibbles per byte,
+        last dim halved. The per-channel FP16 scales are NOT packed
+        (they stay 2 bytes each). Default (missing entries) treats every
+        weight as INT8, preserving byte-identical W8 bundle layout.
+        """
+        from .decoder_bundle import pack_int4
+
         forced_stage4_weights = {
             node.inputs[1]
             for node in graph.nodes
@@ -250,7 +270,18 @@ class CodeGenerator:
         }
         offset = 0
         for name, (data, scales) in self.weight_data.items():
-            blob = data.tobytes()
+            if self.weight_dtypes.get(name) == "int4":
+                if not (isinstance(data, np.ndarray) and data.dtype == np.int8
+                        and data.ndim >= 1 and data.shape[-1] % 2 == 0):
+                    raise ValueError(
+                        f"weight {name!r} marked int4 but storage is "
+                        f"dtype={getattr(data, 'dtype', '?')} shape="
+                        f"{getattr(data, 'shape', '?')}; require np.int8 "
+                        f"with even last-dim and values in [-8, +7]"
+                    )
+                blob = pack_int4(data).tobytes()
+            else:
+                blob = data.tobytes()
             self.dram_layout[name] = offset
             self.dram_blob.extend(blob)
             offset += len(blob)
@@ -280,11 +311,23 @@ class CodeGenerator:
             ):
                 continue
             K_pad, N_pad = int(data.shape[0]), int(data.shape[1])
+            is_int4 = self.weight_dtypes.get(name) == "int4"
             for k_start, k_len, n_start, n_len in self._large_weight_tile_plan(K_pad, N_pad):
                 tile_name = self._large_weight_tile_symbol(name, k_start, k_len, n_start, n_len)
                 self.dram_layout[tile_name] = offset
                 tile = np.ascontiguousarray(data[k_start:k_start + k_len, n_start:n_start + n_len])
-                blob = tile.astype(np.int8, copy=False).tobytes()
+                if is_int4:
+                    # Pack along N (the last dim of the row-major tile).
+                    # n_len is already guaranteed even by the tile plan; if
+                    # ever odd we'd need padding (raise so we notice).
+                    if tile.shape[-1] % 2 != 0:
+                        raise ValueError(
+                            f"int4 stage-4 tile {tile_name} has odd last-dim "
+                            f"{tile.shape[-1]}; needs padding"
+                        )
+                    blob = pack_int4(tile.astype(np.int8, copy=False)).tobytes()
+                else:
+                    blob = tile.astype(np.int8, copy=False).tobytes()
                 self.dram_blob.extend(blob)
                 offset += len(blob)
 

@@ -239,6 +239,16 @@ A_IMM28_SHIFT = 29
 C_M_SHIFT = 49
 C_N_SHIFT = 39
 C_K_SHIFT = 29
+# W4A16 plan Phase 2 (2026-05-24). Bit [28] of a CONFIG_TILE instruction
+# selects W4 weight interpretation for the NEXT matmul: when set, the
+# weight tiles in WBUF are read as packed INT4 nibbles (2 per byte,
+# layout per `decoder_bundle.pack_int4`) and unpacked to INT8 lanes
+# before the systolic INT8×INT8 matmul. Bits [27:0] remain reserved-zero.
+# The bit lives inside the existing C-type field allocation (M/N/K
+# occupy [58:29], leaving [28:0] free) so adding it is encoder-additive
+# and does NOT widen the instruction word. Default 0 keeps every existing
+# W8 CONFIG_TILE bit-identical. See plan §3.1 + [[w4a16-phase1-quality]].
+C_WEIGHT_INT4_SHIFT = 28
 
 # ATTN-type CONFIG_ATTN fields
 ATTN_QUERY_ROW_BASE_SHIFT = 47
