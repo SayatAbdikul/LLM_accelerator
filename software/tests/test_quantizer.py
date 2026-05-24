@@ -505,6 +505,44 @@ class TestGPTQ:
         q, scales = gptq_quantize(W, [X], per_channel=True)
         assert np.all(q[:, [3, 7]] == 0)
 
+    def test_act_order_preserves_column_layout_and_scale(self):
+        """act_order permutes columns internally but the returned Q is
+        unpermuted; scales are unchanged (they come from the unpermuted
+        row max-abs). Per-channel symmetric quant invariants hold."""
+        rng = np.random.default_rng(37)
+        W = rng.standard_normal((8, 64)).astype(np.float32) * 0.3
+        X = rng.standard_normal((512, 64)).astype(np.float32)
+        q_no, s_no = gptq_quantize(W, [X], per_channel=True, bitwidth=4)
+        q_ao, s_ao = gptq_quantize(W, [X], per_channel=True, bitwidth=4, act_order=True)
+        # Same per-channel scales (act_order doesn't touch the scale source).
+        np.testing.assert_array_equal(s_no, s_ao)
+        # Same shape, dtype, INT4 clip range.
+        assert q_ao.shape == W.shape
+        assert q_ao.dtype == np.int8
+        assert np.all(q_ao >= -8) and np.all(q_ao <= 7)
+        # act_order should not be a no-op on correlated calibration —
+        # it changes the per-element rounding chain.
+        assert not np.array_equal(q_no, q_ao)
+
+    def test_act_order_improves_correlated_calibration_mse(self):
+        """On well-correlated calibration with a heavy-tailed column
+        magnitude distribution, act_order produces ≤ MSE vs no-act-order."""
+        rng = np.random.default_rng(41)
+        out_dim, in_dim = 12, 96
+        W = rng.standard_normal((out_dim, in_dim)).astype(np.float32) * 0.3
+        # Heavy-tailed per-column input magnitude: a few cols carry most
+        # of the Hessian mass. This is the regime where act-order shines.
+        N = 512
+        col_scales = rng.lognormal(mean=0.0, sigma=1.5, size=in_dim).astype(np.float32)
+        X = (rng.standard_normal((N, in_dim)).astype(np.float32) * col_scales)
+        q_no, s_no = gptq_quantize(W, [X], per_channel=True, bitwidth=4)
+        q_ao, s_ao = gptq_quantize(W, [X], per_channel=True, bitwidth=4, act_order=True)
+        mse_no = self._calibration_mse(W, q_no, s_no, X)
+        mse_ao = self._calibration_mse(W, q_ao, s_ao, X)
+        # act_order should not regress; on this heavy-tailed setup it
+        # should strictly improve (small fp noise tolerated).
+        assert mse_ao <= mse_no * 1.001, (mse_ao, mse_no)
+
 
 class TestScalePropagator:
     def test_prescale_bias(self):

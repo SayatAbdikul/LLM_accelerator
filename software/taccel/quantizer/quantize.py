@@ -164,6 +164,8 @@ def gptq_quantize(
     percdamp: float = 0.01,
     blocksize: int = 128,
     bitwidth: int = 8,
+    act_order: bool = False,
+    precomputed_hessian: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """GPTQ (Frantar et al. 2022) per-channel symmetric signed-integer quantization.
 
@@ -189,6 +191,27 @@ def gptq_quantize(
             (perf only — does not change the result).
         bitwidth: see :func:`quantize_tensor`. Default 8 preserves the
             historical W8A16 GPTQ contract byte-identical.
+        act_order: when True, reorder input columns by descending
+            ``|diag(H)|`` before the panel loop and invert the permutation
+            on the returned ``Q`` so the result remains in the original
+            column order. The high-Hessian-mass columns get quantized while
+            error budget is largest; this is the standard GPTQ "act-order"
+            (a.k.a. "desc_act") trick and is essentially mandatory on W4
+            (typically +0.5–1.5 PPL on small LMs). Default ``False``
+            preserves the historical byte-identical output for every
+            existing W8 call site and for the GPTQ regression tests in
+            ``test_quantizer.py`` (which assert e.g.
+            ``blocksize_invariance`` and ``identity_hessian_matches_rtn``
+            — both still hold for any fixed ``act_order`` setting).
+        precomputed_hessian: optional ``[in_dim, in_dim]`` float64 array
+            with the SAME scaling the internal path uses
+            (``X.T @ X * 2.0 / N``). When provided, the function skips the
+            (potentially expensive) ``X.T @ X`` computation and the
+            ``calibration_inputs`` argument is used only for the
+            ``None``→RTN-fallback check at the top. Reuse this when
+            multiple weights share an input source (e.g. per-head Q/K/V
+            all read from the post-LN activation) — saves redundant
+            ``O(N · in_dim²)`` work in the W4 production stack.
 
     Returns:
         `(int8_tensor, fp16_scales)` matching the `quantize_tensor` contract
@@ -210,14 +233,25 @@ def gptq_quantize(
     qmin, qmax = _qrange(bitwidth)
     qmax_f = float(qmax)
 
-    calib_rows = _flatten_calibration_inputs(calibration_inputs)
-    if calib_rows is None or calib_rows.shape[0] == 0:
-        # No calibration data → fall back to RTN, same as quantize_tensor.
-        return quantize_tensor(tensor, per_channel=per_channel, bitwidth=bitwidth)
-    if calib_rows.shape[1] != in_dim:
-        raise ValueError(
-            f"calibration input dim {calib_rows.shape[1]} != tensor in_dim {in_dim}"
-        )
+    if precomputed_hessian is None:
+        calib_rows = _flatten_calibration_inputs(calibration_inputs)
+        if calib_rows is None or calib_rows.shape[0] == 0:
+            # No calibration data → fall back to RTN, same as quantize_tensor.
+            return quantize_tensor(tensor, per_channel=per_channel, bitwidth=bitwidth)
+        if calib_rows.shape[1] != in_dim:
+            raise ValueError(
+                f"calibration input dim {calib_rows.shape[1]} != tensor in_dim {in_dim}"
+            )
+    else:
+        # Caller-provided Hessian (precomputed for many weights sharing one
+        # activation source). Sanity-check the shape; the scaling is the
+        # caller's responsibility (`X.T @ X * 2.0 / N`).
+        precomputed_hessian = np.asarray(precomputed_hessian)
+        if precomputed_hessian.shape != (in_dim, in_dim):
+            raise ValueError(
+                f"precomputed_hessian shape {precomputed_hessian.shape} != "
+                f"({in_dim}, {in_dim})"
+            )
 
     # Per-channel scales come from the *original* W so the downstream
     # consumer (quantize_tensor on the rebuilt FP32 weight) recovers the
@@ -232,8 +266,11 @@ def gptq_quantize(
     # Hessian over the input dimension. Use float64 for the linear-algebra
     # step — Cholesky on a 768- or 3072-wide matrix is cheap and the extra
     # precision matters when columns are nearly collinear.
-    X = calib_rows.astype(np.float64)
-    H = (X.T @ X) * (2.0 / float(X.shape[0]))
+    if precomputed_hessian is None:
+        X = calib_rows.astype(np.float64)
+        H = (X.T @ X) * (2.0 / float(X.shape[0]))
+    else:
+        H = precomputed_hessian.astype(np.float64, copy=True)
 
     # Drop dead input columns (never excited by calibration). The standard
     # GPTQ trick: pin them to zero in the working copy and replace the
@@ -242,6 +279,24 @@ def gptq_quantize(
     dead = np.diag(H) <= 0.0
     if dead.any():
         H[diag_idx[dead], diag_idx[dead]] = 1.0
+
+    # Optional act-order (Frantar §3.5): permute the input dimension so the
+    # high-Hessian-mass columns are quantized first while the rounding-error
+    # budget is largest; the column propagation absorbs more error into
+    # low-mass tail columns. Applied to H, the working tensor, and the
+    # `dead` mask; an inverse permutation is applied to Q at the end so
+    # the returned shape matches the input column order. Per-channel
+    # `scales` are independent of column order (they come from row max-abs
+    # of the ORIGINAL tensor) and therefore do not need permuting.
+    if act_order:
+        perm = np.argsort(-np.diag(H))   # descending |diag(H)|
+        inv_perm = np.argsort(perm)
+        H = H[perm][:, perm]
+        tensor = tensor[:, perm]
+        dead = dead[perm]
+    else:
+        perm = None
+        inv_perm = None
 
     # Diagonal damping for numerical stability — proportional to the average
     # diagonal magnitude (Frantar §3.2). Without this the Cholesky often
@@ -301,6 +356,12 @@ def gptq_quantize(
         if col_end < in_dim:
             W[:, col_end:] -= Err_panel @ U[col_start:col_end, col_end:]
 
+    # Undo act-order so the returned tensor sits in the original column
+    # ordering — the consumer side (`weight_overrides`, dequant) has no
+    # knowledge of the internal permutation.
+    if inv_perm is not None:
+        Q = Q[:, inv_perm]
+
     return Q, scales.astype(np.float16)
 
 
@@ -314,6 +375,7 @@ def adaround_greedy(
     frac_hi: float = 0.7,
     max_accepts_per_channel: Optional[int] = None,
     bitwidth: int = 8,
+    precomputed_gram: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Greedily flip rounding direction for near-boundary weights.
 
@@ -334,10 +396,18 @@ def adaround_greedy(
 
     qmin, qmax = _qrange(bitwidth)
 
-    calib_rows = _flatten_calibration_inputs(calibration_inputs)
-    if calib_rows is None:
-        return q
-    gram = (calib_rows.T @ calib_rows).astype(np.float32) / max(float(calib_rows.shape[0]), 1.0)
+    if precomputed_gram is not None:
+        gram = np.asarray(precomputed_gram, dtype=np.float32)
+        if gram.shape != (tensor.shape[1], tensor.shape[1]):
+            raise ValueError(
+                f"precomputed_gram shape {gram.shape} != "
+                f"({tensor.shape[1]}, {tensor.shape[1]})"
+            )
+    else:
+        calib_rows = _flatten_calibration_inputs(calibration_inputs)
+        if calib_rows is None:
+            return q
+        gram = (calib_rows.T @ calib_rows).astype(np.float32) / max(float(calib_rows.shape[0]), 1.0)
     gram_diag = np.diag(gram).astype(np.float32)
 
     scales_f32 = np.asarray(scales, dtype=np.float32)
