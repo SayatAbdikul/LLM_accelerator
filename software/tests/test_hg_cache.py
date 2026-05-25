@@ -1,14 +1,12 @@
 """Unit tests for ``software.taccel.runtime._hg_cache``.
 
-The cache stores per-(layer, source) Hessian (float64) and activation-mean
-(float32) tensors on disk for ``apply_w4_awq_gptq``. These tests cover the
-save/load round trip, key-derivation behavior, and invalidation triggers
-without exercising the full W4 pipeline (which has its own preset gate
-in `test_stage5_ptq_presets.py` for byte-identity).
+The cache stores per-(layer, source) Hessian (float64) tensors on disk for
+``apply_w4_awq_gptq``. These tests cover the save/load round trip,
+key-derivation behavior, and invalidation triggers without exercising the
+full W4 pipeline (which has its own preset gate elsewhere for byte-identity).
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import numpy as np
@@ -17,33 +15,27 @@ import pytest
 from taccel.runtime import _hg_cache as hg
 
 
-def _toy_pair(d_in: int = 8, seed: int = 0):
-    """Build a small (hessians, x_means) pair with two source names."""
+def _toy_hessians(d_in: int = 8, seed: int = 0):
+    """Build a small dict of two symmetric Hessians for round-trip tests."""
     rng = np.random.default_rng(seed)
     H1 = rng.standard_normal((d_in, d_in)).astype(np.float64)
     H1 = (H1 + H1.T)  # symmetric, like X.T @ X
     H2 = rng.standard_normal((d_in, d_in)).astype(np.float64)
     H2 = (H2 + H2.T)
-    x1 = rng.standard_normal(d_in).astype(np.float32)
-    x2 = rng.standard_normal(d_in).astype(np.float32)
-    return (
-        {"block0_ln1": H1, "block0_concat": H2},
-        {"block0_ln1": x1, "block0_concat": x2},
-    )
+    return {"block0_ln1": H1, "block0_concat": H2}
 
 
 def test_save_load_roundtrip(tmp_path: Path):
-    hessians, x_means = _toy_pair()
+    hessians = _toy_hessians()
     cache_path = tmp_path / "k.npz"
-    hg.save(hessians, x_means, cache_path)
+    hg.save(hessians, cache_path)
 
     loaded = hg.try_load(cache_path)
     assert loaded is not None
-    H_loaded, G_loaded, X_loaded = loaded
+    H_loaded, G_loaded = loaded
     assert set(H_loaded) == set(hessians)
     for name in hessians:
         np.testing.assert_array_equal(H_loaded[name], hessians[name])
-        np.testing.assert_array_equal(X_loaded[name], x_means[name])
         # Gram is derived: gram = hessian / 2.0 in float32.
         np.testing.assert_array_equal(
             G_loaded[name], (hessians[name] * 0.5).astype(np.float32)
@@ -60,20 +52,13 @@ def test_try_load_returns_none_for_corrupt_file(tmp_path: Path):
     assert hg.try_load(p) is None
 
 
-def test_save_rejects_mismatched_keys(tmp_path: Path):
-    hessians = {"block0_ln1": np.zeros((4, 4))}
-    x_means = {"block1_ln2": np.zeros(4, dtype=np.float32)}
-    with pytest.raises(ValueError):
-        hg.save(hessians, x_means, tmp_path / "x.npz")
-
-
 def test_save_atomic_no_tmp_leftover(tmp_path: Path):
-    hessians, x_means = _toy_pair()
+    hessians = _toy_hessians()
     cache_path = tmp_path / "k.npz"
-    hg.save(hessians, x_means, cache_path)
+    hg.save(hessians, cache_path)
     assert cache_path.exists()
-    # The .tmp must not be visible after a clean save.
-    assert not (cache_path.with_suffix(".npz.tmp")).exists()
+    # The .tmp.npz must not be visible after a clean save.
+    assert not (cache_path.with_name(cache_path.stem + ".tmp.npz")).exists()
 
 
 def test_cache_key_stable_for_same_inputs(tmp_path: Path):
@@ -159,7 +144,6 @@ def test_cache_key_invalidates_on_source_file_edit(tmp_path: Path):
     Drive this through a fake repo_root pointing at tmp_path so we can
     rewrite a tracked source without touching the real repo files.
     """
-    # Lay out the tracked _SOURCE_FILES under tmp_path with stub content.
     for relpath in hg._SOURCE_FILES:
         p = tmp_path / relpath
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -174,7 +158,6 @@ def test_cache_key_invalidates_on_source_file_edit(tmp_path: Path):
         awq_targets=("c_attn",), repo_root=tmp_path,
     )
 
-    # Edit one tracked file.
     target = tmp_path / hg._SOURCE_FILES[0]
     target.write_text("# stub v2 — changed\n")
 
@@ -185,20 +168,11 @@ def test_cache_key_invalidates_on_source_file_edit(tmp_path: Path):
     assert k0 != k1
 
 
-def test_try_load_rejects_partial_schema(tmp_path: Path):
-    """If a .npz has H_* arrays but no matching X_* arrays (or vice versa),
-    the load is treated as a miss so the caller recomputes both."""
-    cache_path = tmp_path / "partial.npz"
-    np.savez(cache_path, H_only_h=np.zeros((4, 4)))
+def test_try_load_rejects_empty_npz(tmp_path: Path):
+    """An .npz with no H_* arrays is a miss (not a half-success)."""
+    cache_path = tmp_path / "empty.npz"
+    np.savez(cache_path, other=np.zeros(4))
     assert hg.try_load(cache_path) is None
-
-    cache_path2 = tmp_path / "mismatched.npz"
-    np.savez(
-        cache_path2,
-        H_a=np.zeros((4, 4)),
-        X_b=np.zeros(4, dtype=np.float32),  # different source name from H
-    )
-    assert hg.try_load(cache_path2) is None
 
 
 def test_cache_path_for_uses_npz_suffix(tmp_path: Path):

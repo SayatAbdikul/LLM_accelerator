@@ -1,43 +1,38 @@
-"""Disk cache for the per-(layer, source) Hessian + activation-mean vectors
-used by ``apply_w4_awq_gptq``.
+"""Disk cache for the per-(layer, source) Hessian matrices used by
+``apply_w4_awq_gptq``.
 
 Background
 ----------
 Inside ``w4_quant.apply_w4_awq_gptq``, after AWQ folds and FP32 activation
 capture, we precompute one Hessian (``H = X^T X * 2/N``) and one gram
-(``X^T X / N``) per (layer, source). The capture phase runs a full FP32
-forward over ``n_seqs * seq_len`` tokens; the Hessian phase is a dense
-``[d_in, d_in]`` matmul per source. On the Tier-1 65K-token corpus the two
-together cost minutes — and are repeated every fresh process even though
-they depend only on (fixture, calibration text, AWQ params, source-code
-that-affects-the-capture).
-
-Bias correction also needs the captured activations, but only through
-``np.mean(X @ (W - W_dq).T, axis=0)``. By linearity that equals
-``mean(X, axis=0) @ (W - W_dq).T`` — so the only per-source statistic
-needed downstream is the per-input-channel mean ``x_mean[src]``, a tiny
-vector. Caching ``(hessians, x_means)`` therefore lets the cache HIT
-path skip activation capture entirely, including the per-source FP32
-forward batch.
+(``X^T X / N``) per (layer, source). The Hessian phase is a dense
+``[d_in, d_in]`` float64 matmul per source. On the Tier-1 65K-token corpus
+this matmul dominates ``apply_w4_awq_gptq`` runtime after AWQ + activation
+capture — and is repeated every fresh process even though the result
+depends only on (fixture, calibration text, AWQ params, source-code-that
+-affects-the-capture).
 
 This module mirrors ``_prep_cache.py`` for that artifact. When a non-None
 ``hg_cache_path`` is passed to ``apply_w4_awq_gptq``, we look up an
-``.npz`` keyed by the inputs that affect the matrices; on hit, the entire
-capture + Hessian phase is skipped and only the downstream GPTQ +
-AdaRound + bias-correction loop runs.
+``.npz`` keyed by the inputs that affect the matrices; on hit, the dense
+float64 matmul is skipped and downstream GPTQ + AdaRound runs on the
+loaded arrays. Activation capture itself still runs on cache hit because
+the bias-correction step depends on the live ``activations[src]`` matrix
+and its ``mean(X @ M.T, axis=0)`` reduction is numerically order-sensitive
+— we deliberately do NOT cache a per-channel mean shortcut, to preserve
+byte-identity with the pre-cache W4A16 PPL baseline.
 
 Cache key inputs
 ----------------
 * **Fixture by path + mtime + size**: same cheap fingerprint as
-  ``_prep_cache``. Editing the fixture file (touch alone is enough to
-  affect mtime+size if size differs; size guards against false matches)
+  ``_prep_cache``. Editing the fixture file (mtime+size changes)
   invalidates.
 * **Calibration text by path + mtime + size**: similarly cheap. The
   actual token list is a deterministic function of (text, tokenizer,
   ``n_seqs``, ``seq_len``); see ``calibration/scales.py``.
 * **Capture + AWQ params**: ``n_seqs``, ``seq_len``, ``alpha``,
   ``awq_targets`` tuple. ``bitwidth`` is NOT included (bitwidth only
-  affects GPTQ / AdaRound downstream, not the Hessian or activation mean).
+  affects GPTQ / AdaRound downstream, not the Hessian value).
 * **Source-code SHA256** of files whose content affects the captured
   activations / Hessian value:
   - ``runtime/w4_quant.py`` — the capture loop and Hessian arithmetic
@@ -58,13 +53,10 @@ common iteration pattern (downstream-of-Hessian param sweeps lives in
 
 Storage format
 --------------
-A single uncompressed ``.npz`` per cache key, with two array families:
-
-  * ``H_<source_name>`` arrays, dtype float64, shape ``(d_in, d_in)``
-  * ``X_<source_name>`` arrays, dtype float32, shape ``(d_in,)``
-
-Schema versioning lives in the cache key (via ``_hg_cache.py``'s own
-content hash in _SOURCE_FILES) — bump _hg_cache.py to invalidate.
+A single uncompressed ``.npz`` per cache key, containing ``H_<source_name>``
+arrays at dtype float64 and shape ``(d_in, d_in)``. Schema versioning lives
+in the cache key (via ``_hg_cache.py``'s own content hash in _SOURCE_FILES)
+— bump _hg_cache.py to invalidate.
 
 Gram matrices are NOT stored; gram = hessian / 2.0 cast to float32 by
 construction (``hessian = X^T X * 2/N``, ``gram = X^T X / N``). The
@@ -76,7 +68,7 @@ Uncompressed because Hessian matrices are dense float64 matmul outputs
 that don't compress well — gzip typically halves at best, not worth the
 CPU cost on a load-path that wants to mmap.
 
-Atomicity: write to ``.tmp``, then ``os.replace``. A concurrent reader
+Atomicity: write to ``.tmp.npz``, then ``os.replace``. A concurrent reader
 sees either the old file (if any) or the new one, never a partial.
 
 Limitations
@@ -146,7 +138,7 @@ def compute_cache_key(
     awq_targets: Sequence[str],
     repo_root: Optional[Path] = None,
 ) -> str:
-    """Content-addressed cache key for the Hessian + activation-mean inputs."""
+    """Content-addressed cache key for the Hessian inputs."""
     rr = Path(repo_root) if repo_root is not None else _repo_root()
     h = hashlib.sha256()
     h.update(b"hg|v1|")  # cache schema version — bump on layout changes.
@@ -168,13 +160,10 @@ def cache_path_for(cache_dir: Path, key: str) -> Path:
 
 def try_load(
     cache_path: Path,
-) -> Optional[Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray]]]:
-    """Load ``(hessians, grams, x_means)`` from disk, or None on miss/unreadable.
+) -> Optional[Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]]:
+    """Load ``(hessians, grams)`` from disk, or None on miss / unreadable.
 
     Grams are derived on the fly: ``gram = hessian * 0.5`` cast to float32.
-
-    The result is None unless at least one ``H_*`` and the matching ``X_*``
-    arrays are present (a schema partial-write is a miss, not a half-success).
     """
     cache_path = Path(cache_path)
     if not cache_path.exists():
@@ -183,40 +172,27 @@ def try_load(
         with np.load(cache_path, allow_pickle=False) as npz:
             keys = list(npz.files)
             hessians: Dict[str, np.ndarray] = {}
-            x_means: Dict[str, np.ndarray] = {}
             for name in keys:
-                if name.startswith("H_"):
-                    hessians[name[len("H_"):]] = np.asarray(
-                        npz[name], dtype=np.float64
-                    )
-                elif name.startswith("X_"):
-                    x_means[name[len("X_"):]] = np.asarray(
-                        npz[name], dtype=np.float32
-                    )
+                if not name.startswith("H_"):
+                    continue
+                hessians[name[len("H_"):]] = np.asarray(
+                    npz[name], dtype=np.float64
+                )
             if not hessians:
-                return None
-            if set(hessians.keys()) != set(x_means.keys()):
-                # Partial / schema-mismatch — recompute.
                 return None
         grams: Dict[str, np.ndarray] = {
             n: (H * 0.5).astype(np.float32) for n, H in hessians.items()
         }
-        return hessians, grams, x_means
+        return hessians, grams
     except (OSError, ValueError, EOFError, KeyError):
         return None
 
 
 def save(
     hessians: Dict[str, np.ndarray],
-    x_means: Dict[str, np.ndarray],
     cache_path: Path,
 ) -> None:
-    """Atomically save ``(hessians, x_means)`` as a single ``.npz``."""
-    if set(hessians.keys()) != set(x_means.keys()):
-        raise ValueError(
-            "hessians and x_means must have the same source-name keys; "
-            f"got {sorted(hessians.keys())} vs {sorted(x_means.keys())}"
-        )
+    """Atomically save ``hessians`` as a single ``.npz``."""
     cache_path = Path(cache_path)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     # `np.savez` auto-appends ".npz" if the path doesn't already end in it,
@@ -225,8 +201,6 @@ def save(
     payload: Dict[str, np.ndarray] = {}
     for name, H in hessians.items():
         payload[f"H_{name}"] = np.ascontiguousarray(H, dtype=np.float64)
-    for name, x in x_means.items():
-        payload[f"X_{name}"] = np.ascontiguousarray(x, dtype=np.float32)
     try:
         np.savez(tmp, **payload)
         os.replace(tmp, cache_path)

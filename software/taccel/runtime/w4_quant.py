@@ -210,58 +210,58 @@ def apply_w4_awq_gptq(
     )
 
     # ---------------------------------------------------------------------
-    # Steps 2+3 — Capture per-matmul-input FP32 activations on the post-AWQ
-    # payload, then precompute one Hessian (`H = X^T X * 2/N`) and one gram
+    # Step 2 — Capture per-matmul-input FP32 activations on the post-AWQ
+    # payload. These feed GPTQ's Hessian H = X^T X, AdaRound's per-channel
+    # MSE search, and the bias-correction mean shift.
+    # ---------------------------------------------------------------------
+    t_capture = time.time()
+    seqs = build_calibration_seqs_from_token_ids(
+        token_ids, n_seqs=n_seqs, seq_len=seq_len,
+    )
+    n_calib_seqs_recorded = len(seqs)
+    needed = {
+        f"block{L}_{x}"
+        for L in range(n_layer)
+        for x in ("ln1", "concat", "ln2", "gelu")
+    }
+    captured: Dict[str, List[np.ndarray]] = defaultdict(list)
+    for tids in seqs:
+        out = _fp32_forward(sd, model_args, tids)
+        for name in needed:
+            arr = out.get(name)
+            if arr is not None:
+                captured[name].append(np.asarray(arr, dtype=np.float32))
+    activations: Dict[str, np.ndarray] = {
+        k: np.concatenate(v, axis=0) for k, v in captured.items()
+    }
+    t_capture = time.time() - t_capture
+
+    # ---------------------------------------------------------------------
+    # Step 3 — Precompute one Hessian (`H = X^T X * 2/N`) and one gram
     # (`X^T X / N`) PER (layer, source) so the 432 per-head Q/K/V + 36
     # block-matmul GPTQ + AdaRound calls don't redundantly recompute
-    # ~5-second matmuls on the 65K-token corpus.
-    #
-    # Bias correction (step 5) also wants the captured activations, but only
-    # through ``mean(X @ (W - W_dq).T, axis=0)``. By linearity that equals
-    # ``mean(X, axis=0) @ (W - W_dq).T`` — so we only need the per-source
-    # mean vector ``x_means[name]`` downstream, never the full activation
-    # matrix.
+    # ~5-second float64 matmuls on the 65K-token corpus.
     #
     # When ``hg_cache_path`` is set and the file exists with matching
-    # content, we skip the capture + Hessian compute entirely and load
-    # ``(hessians, grams, x_means)`` from the cache.
+    # content, the dense float64 matmul ``X64.T @ X64`` is loaded from
+    # disk instead of recomputed (the dominant Hessian cost). Bias
+    # correction (step 5) still uses the live `activations[src]` matrix
+    # captured above — its `mean(X @ (W - W_dq).T, axis=0)` reduction is
+    # numerically sensitive to ordering, so we deliberately do NOT cache
+    # a per-channel mean shortcut to preserve byte-identity with the
+    # pre-cache W4A16 baseline.
     # ---------------------------------------------------------------------
     cache_hit = False
     hessians: Dict[str, np.ndarray] = {}
     grams: Dict[str, np.ndarray] = {}
-    x_means: Dict[str, np.ndarray] = {}
-    n_calib_seqs_recorded = 0
     if hg_cache_path is not None:
         from . import _hg_cache as _hg
         loaded = _hg.try_load(Path(hg_cache_path))
         if loaded is not None:
-            hessians, grams, x_means = loaded
+            hessians, grams = loaded
             cache_hit = True
-    t_capture = 0.0
     t_hessian = 0.0
     if not cache_hit:
-        t0 = time.time()
-        seqs = build_calibration_seqs_from_token_ids(
-            token_ids, n_seqs=n_seqs, seq_len=seq_len,
-        )
-        n_calib_seqs_recorded = len(seqs)
-        needed = {
-            f"block{L}_{x}"
-            for L in range(n_layer)
-            for x in ("ln1", "concat", "ln2", "gelu")
-        }
-        captured: Dict[str, List[np.ndarray]] = defaultdict(list)
-        for tids in seqs:
-            out = _fp32_forward(sd, model_args, tids)
-            for name in needed:
-                arr = out.get(name)
-                if arr is not None:
-                    captured[name].append(np.asarray(arr, dtype=np.float32))
-        activations: Dict[str, np.ndarray] = {
-            k: np.concatenate(v, axis=0) for k, v in captured.items()
-        }
-        t_capture = time.time() - t0
-
         t0 = time.time()
         for name, X in activations.items():
             X64 = X.astype(np.float64)
@@ -269,22 +269,11 @@ def apply_w4_awq_gptq(
             XtX = X64.T @ X64
             hessians[name] = XtX * (2.0 / n)  # GPTQ's convention
             grams[name] = (XtX / n).astype(np.float32)  # AdaRound's convention
-            x_means[name] = X.mean(axis=0).astype(np.float32)
         t_hessian = time.time() - t0
 
         if hg_cache_path is not None:
             from . import _hg_cache as _hg
-            _hg.save(hessians, x_means, Path(hg_cache_path))
-    else:
-        # Cache hit: the corpus shape (n_calib_seqs, n_calib_tokens) is a
-        # function of (token_ids, n_seqs, seq_len). Recompute the lightweight
-        # sequence count for the diagnostics — `build_calibration_seqs_from_token_ids`
-        # is cheap (a slide-window over token_ids) and the result is
-        # deterministic given the inputs.
-        seqs = build_calibration_seqs_from_token_ids(
-            token_ids, n_seqs=n_seqs, seq_len=seq_len,
-        )
-        n_calib_seqs_recorded = len(seqs)
+            _hg.save(hessians, Path(hg_cache_path))
 
     # ---------------------------------------------------------------------
     # Step 4 — GPTQ + AdaRound per block weight; collect overrides
@@ -389,11 +378,10 @@ def apply_w4_awq_gptq(
                 # Dequantize the post-GPTQ-+-AdaRound integer weight back to
                 # FP32 with the per-output-channel scale. Shape [out, in].
                 W_dq = q.astype(np.float32) * s_fp32.reshape(-1, 1)
-                # Per-channel mean shift. By linearity, mean(X @ M.T, axis=0)
-                # equals mean(X, axis=0) @ M.T — so we only need the per-input-
-                # channel activation mean (cached by `_hg_cache`), not the full
-                # [N, in] matrix.
-                err = (x_means[src] @ (W - W_dq).T).astype(np.float32)
+                # Activations as captured by FP32 forward (post-AWQ). Shape
+                # [N, in]. Per-channel mean shift over N samples.
+                X = activations[src]
+                err = np.mean(X @ (W - W_dq).T, axis=0).astype(np.float32)
                 # Add the shift into the matmul bias and store back in the
                 # original dtype (typically FP32 in nanoGPT checkpoints).
                 b_old = _to_f32(sd[bias_key])
