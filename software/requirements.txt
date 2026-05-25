@@ -5,3 +5,4 @@ requests
 numpy
 scipy
 datasets
+pytest-xdist>=3.0
