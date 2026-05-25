@@ -1,5 +1,12 @@
 # RTL First-Divergence Debug Plan
 
+> **Status (2026-05-25):** historical debug plan, kept as record of the
+> first-divergence harness design. The bugs this plan was written to track
+> have since been fixed; the freeze cosim gate
+> (`software/tests/test_compare_rtl_golden.py`) is now 6+1 byte-identical on
+> the tiny fixture. Current state-of-truth: [top-level README](../README.md)
+> + [`docs/accelerator_completion_review.md`](accelerator_completion_review.md).
+
 ## Current State
 
 - The end-to-end `baseline_default` compiler flow still fails RTL-vs-golden comparison.

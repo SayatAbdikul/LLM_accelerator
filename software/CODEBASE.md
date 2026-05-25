@@ -1,6 +1,17 @@
 # TACCEL — Transformer Accelerator Toolchain
 
-A complete Python toolchain for an INT8 transformer accelerator targeting **facebook/deit-tiny-patch16-224**. The project spans five layers: a custom ISA, a two-pass assembler/disassembler, a per-channel INT8 quantizer, a tile-level compiler, and a bit-accurate golden-model simulator.
+> **Status note (2026-05-25):** this document captures the ViT-era architecture
+> (DeiT-tiny INT8 target) the project started from. ISA mechanics, hardware
+> model, assembler/compiler/quantizer/golden-model internals are still
+> accurate; the GPT-2-era decoder ISA, W4 / QuaRot / AWQ + GPTQ runtime,
+> gen-2 freeze, and RTL state are covered in the top-level [`README.md`](../README.md)
+> and [`software/docs/isa_generation_freeze.md`](docs/isa_generation_freeze.md).
+
+A complete Python toolchain for an INT8 transformer accelerator originally
+targeting **facebook/deit-tiny-patch16-224**, since extended to a nanoGPT /
+GPT-2 124M decoder frontend. The project spans five layers: a custom ISA, a
+two-pass assembler/disassembler, a per-channel INT8 quantizer, a tile-level
+compiler, and a bit-accurate golden-model simulator.
 
 ---
 

@@ -1,5 +1,11 @@
 # Plan: Extend TACCEL ISA to Run nanoGPT (ISA v1.1)
 
+> **Status (2026-05-25):** historical planning document. The ISA spec it
+> describes (v1.1) has since been superseded by the gen-2 freeze — see
+> [`software/docs/isa_generation_freeze.md`](../software/docs/isa_generation_freeze.md)
+> for the current normative contract. Kept for context on how the decoder
+> ops grew on top of the ViT base.
+
 Status: refined implementation plan, incorporating Rev 0-2 critiques plus the
 Rev 3-6 correctness, runtime-contract, striping, and verification-gate reviews.
 

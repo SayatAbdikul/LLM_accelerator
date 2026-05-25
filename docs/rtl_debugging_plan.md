@@ -1,5 +1,12 @@
 # TACCEL RTL Debugging Plan
 
+> **Status (2026-05-25):** historical debugging plan. The ISA has since grown
+> to gen-2 (19 emitted opcodes) and frozen 2026-05-19; the bottom-up debug
+> workflow this plan describes was the scaffold that ultimately closed the
+> freeze cosim gate (6+1 byte-identical). Current state-of-truth:
+> [top-level README](../README.md) and
+> [`software/docs/isa_generation_freeze.md`](../software/docs/isa_generation_freeze.md).
+
 ## Context
 
 The TACCEL RTL implements a 20-instruction ISA for an INT8 transformer accelerator targeting DeiT-tiny. The RTL has grown through Phases A-E (fetch/decode/control, DMA, helpers, SFU, experimental ops) and now needs systematic debugging to achieve functional parity with the Python golden model. The git status shows uncommitted changes across the RTL core (`control_unit.sv`, `taccel_pkg.sv`, `taccel_top.sv`), test infrastructure, and golden model — indicating active development that needs verification.
