@@ -124,11 +124,32 @@ def prepare(
     weight_overrides = None
     if getattr(preset, "apply_awq_gptq", False):
         from .w4_quant import apply_w4_awq_gptq
+        # Derive the Hessian / activation-mean cache path from the same
+        # `cache_dir` that the outer `Prepared` cache uses. The hg cache
+        # outlives `_prep_cache` invalidations that don't touch the
+        # capture / Hessian phase (e.g. edits to `quantize.py` AdaRound
+        # internals), turning a fresh-process W4 run from minutes into
+        # ~seconds for the capture+Hessian part.
+        _awq_alpha = float(getattr(preset, "awq_alpha", 0.40))
+        _awq_targets = ("c_attn", "c_fc", "lm_head")  # matches apply_w4_awq_gptq default
+        _hg_cache_path: Optional[Path] = None
+        if cache_dir is not None:
+            from . import _hg_cache as _hg
+            _hg_cache_path = _hg.cache_path_for(
+                Path(cache_dir) / "hg",
+                _hg.compute_cache_key(
+                    fixture, calibration_text,
+                    n_seqs=calibration_n_seqs, seq_len=calibration_seq_len,
+                    alpha=_awq_alpha, awq_targets=_awq_targets,
+                ),
+            )
         weight_overrides, _w4_info = apply_w4_awq_gptq(
             payload, calib_ids,
-            alpha=float(getattr(preset, "awq_alpha", 0.40)),
+            alpha=_awq_alpha,
             bitwidth=int(getattr(preset, "weight_bitwidth", 4)),
             n_seqs=calibration_n_seqs, seq_len=calibration_seq_len,
+            awq_targets=_awq_targets,
+            hg_cache_path=_hg_cache_path,
         )
     scales = None
     if getattr(preset, "weight_only_int8_calibrate", False):

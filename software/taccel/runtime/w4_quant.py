@@ -74,7 +74,8 @@ End-to-end gate (GPT-2 124M, 257-tok WikiText):
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Dict, List, Sequence, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -118,6 +119,7 @@ def apply_w4_awq_gptq(
     act_order: bool = True,
     apply_adaround: bool = True,
     apply_bias_correction: bool = True,
+    hg_cache_path: Optional[Path] = None,
 ) -> Tuple[WeightOverrides, dict]:
     """Apply the W4 production stack to ``payload``: AWQ in place, then
     GPTQ + AdaRound + bias correction to produce per-weight overrides.
@@ -165,6 +167,15 @@ def apply_w4_awq_gptq(
             channel mean shift between FP32 and quantized-weight matmul
             outputs into each block matmul's bias. Default True; set False
             to isolate weight-only effects.
+        hg_cache_path: Optional ``.npz`` path used by ``runtime._hg_cache``
+            to cache the per-source ``(hessian, x_mean)`` tensors. When
+            provided and the file exists with matching content, the
+            activation-capture + Hessian-compute phase is skipped
+            entirely (minutes saved on the W4 stack). When provided and
+            missing, the phase runs and the result is saved on the way
+            out. The caller computes the path via
+            ``_hg_cache.compute_cache_key`` + ``_hg_cache.cache_path_for``
+            from the upstream (fixture, calibration_text, AWQ params).
 
     Returns:
         ``(overrides, diagnostics)``:
@@ -199,48 +210,81 @@ def apply_w4_awq_gptq(
     )
 
     # ---------------------------------------------------------------------
-    # Step 2 — Capture per-matmul-input FP32 activations on the post-AWQ
-    # payload. These feed GPTQ's Hessian H = X^T X, AdaRound's per-channel
-    # MSE search, and the bias-correction mean shift.
-    # ---------------------------------------------------------------------
-    t_capture = time.time()
-    seqs = build_calibration_seqs_from_token_ids(
-        token_ids, n_seqs=n_seqs, seq_len=seq_len,
-    )
-    needed = {
-        f"block{L}_{x}"
-        for L in range(n_layer)
-        for x in ("ln1", "concat", "ln2", "gelu")
-    }
-    captured: Dict[str, List[np.ndarray]] = defaultdict(list)
-    for tids in seqs:
-        out = _fp32_forward(sd, model_args, tids)
-        for name in needed:
-            arr = out.get(name)
-            if arr is not None:
-                captured[name].append(np.asarray(arr, dtype=np.float32))
-    activations: Dict[str, np.ndarray] = {
-        k: np.concatenate(v, axis=0) for k, v in captured.items()
-    }
-    t_capture = time.time() - t_capture
-
-    # ---------------------------------------------------------------------
-    # Step 3 — Precompute one Hessian (`H = X^T X * 2/N`) and one gram
+    # Steps 2+3 — Capture per-matmul-input FP32 activations on the post-AWQ
+    # payload, then precompute one Hessian (`H = X^T X * 2/N`) and one gram
     # (`X^T X / N`) PER (layer, source) so the 432 per-head Q/K/V + 36
     # block-matmul GPTQ + AdaRound calls don't redundantly recompute
-    # ~5-second matmuls on the 65K-token corpus. Without this the
-    # bumped corpus would dominate runtime.
+    # ~5-second matmuls on the 65K-token corpus.
+    #
+    # Bias correction (step 5) also wants the captured activations, but only
+    # through ``mean(X @ (W - W_dq).T, axis=0)``. By linearity that equals
+    # ``mean(X, axis=0) @ (W - W_dq).T`` — so we only need the per-source
+    # mean vector ``x_means[name]`` downstream, never the full activation
+    # matrix.
+    #
+    # When ``hg_cache_path`` is set and the file exists with matching
+    # content, we skip the capture + Hessian compute entirely and load
+    # ``(hessians, grams, x_means)`` from the cache.
     # ---------------------------------------------------------------------
-    t_hessian = time.time()
+    cache_hit = False
     hessians: Dict[str, np.ndarray] = {}
     grams: Dict[str, np.ndarray] = {}
-    for name, X in activations.items():
-        X64 = X.astype(np.float64)
-        n = float(X64.shape[0])
-        XtX = X64.T @ X64
-        hessians[name] = XtX * (2.0 / n)  # GPTQ's convention
-        grams[name] = (XtX / n).astype(np.float32)  # AdaRound's convention
-    t_hessian = time.time() - t_hessian
+    x_means: Dict[str, np.ndarray] = {}
+    n_calib_seqs_recorded = 0
+    if hg_cache_path is not None:
+        from . import _hg_cache as _hg
+        loaded = _hg.try_load(Path(hg_cache_path))
+        if loaded is not None:
+            hessians, grams, x_means = loaded
+            cache_hit = True
+    t_capture = 0.0
+    t_hessian = 0.0
+    if not cache_hit:
+        t0 = time.time()
+        seqs = build_calibration_seqs_from_token_ids(
+            token_ids, n_seqs=n_seqs, seq_len=seq_len,
+        )
+        n_calib_seqs_recorded = len(seqs)
+        needed = {
+            f"block{L}_{x}"
+            for L in range(n_layer)
+            for x in ("ln1", "concat", "ln2", "gelu")
+        }
+        captured: Dict[str, List[np.ndarray]] = defaultdict(list)
+        for tids in seqs:
+            out = _fp32_forward(sd, model_args, tids)
+            for name in needed:
+                arr = out.get(name)
+                if arr is not None:
+                    captured[name].append(np.asarray(arr, dtype=np.float32))
+        activations: Dict[str, np.ndarray] = {
+            k: np.concatenate(v, axis=0) for k, v in captured.items()
+        }
+        t_capture = time.time() - t0
+
+        t0 = time.time()
+        for name, X in activations.items():
+            X64 = X.astype(np.float64)
+            n = float(X64.shape[0])
+            XtX = X64.T @ X64
+            hessians[name] = XtX * (2.0 / n)  # GPTQ's convention
+            grams[name] = (XtX / n).astype(np.float32)  # AdaRound's convention
+            x_means[name] = X.mean(axis=0).astype(np.float32)
+        t_hessian = time.time() - t0
+
+        if hg_cache_path is not None:
+            from . import _hg_cache as _hg
+            _hg.save(hessians, x_means, Path(hg_cache_path))
+    else:
+        # Cache hit: the corpus shape (n_calib_seqs, n_calib_tokens) is a
+        # function of (token_ids, n_seqs, seq_len). Recompute the lightweight
+        # sequence count for the diagnostics — `build_calibration_seqs_from_token_ids`
+        # is cheap (a slide-window over token_ids) and the result is
+        # deterministic given the inputs.
+        seqs = build_calibration_seqs_from_token_ids(
+            token_ids, n_seqs=n_seqs, seq_len=seq_len,
+        )
+        n_calib_seqs_recorded = len(seqs)
 
     # ---------------------------------------------------------------------
     # Step 4 — GPTQ + AdaRound per block weight; collect overrides
@@ -345,10 +389,11 @@ def apply_w4_awq_gptq(
                 # Dequantize the post-GPTQ-+-AdaRound integer weight back to
                 # FP32 with the per-output-channel scale. Shape [out, in].
                 W_dq = q.astype(np.float32) * s_fp32.reshape(-1, 1)
-                # Activations as captured by FP32 forward (post-AWQ). Shape
-                # [N, in]. Per-channel mean shift over N samples:
-                X = activations[src]
-                err = np.mean(X @ (W - W_dq).T, axis=0).astype(np.float32)
+                # Per-channel mean shift. By linearity, mean(X @ M.T, axis=0)
+                # equals mean(X, axis=0) @ M.T — so we only need the per-input-
+                # channel activation mean (cached by `_hg_cache`), not the full
+                # [N, in] matrix.
+                err = (x_means[src] @ (W - W_dq).T).astype(np.float32)
                 # Add the shift into the matmul bias and store back in the
                 # original dtype (typically FP32 in nanoGPT checkpoints).
                 b_old = _to_f32(sd[bias_key])
@@ -363,9 +408,10 @@ def apply_w4_awq_gptq(
 
     diagnostics = {
         "weights_quantized": weights_quantized,
-        "n_calib_seqs": len(seqs),
-        "n_calib_tokens": int(len(seqs) * seq_len),
+        "n_calib_seqs": n_calib_seqs_recorded,
+        "n_calib_tokens": int(n_calib_seqs_recorded * seq_len),
         "awq_keys_mutated": len(awq_mutated),
+        "hg_cache_hit": bool(cache_hit),
         "capture_s": round(t_capture, 1),
         "hessian_s": round(t_hessian, 1),
         "gptq_s": round(t_gptq, 1),
