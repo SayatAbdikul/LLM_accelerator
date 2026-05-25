@@ -94,6 +94,18 @@ def _run(max_tokens: int):
 
 
 def test_turboquant_kv_33_token():
+    # The L4 |Δnll| metrics (norm_slope, half_ratio) are underpowered at a
+    # 33-token window — the per-position perturbation array is too short for
+    # a slope estimate to be stable. Asserting compound-error bounds on this
+    # window has historically produced false positives (see e.g. the
+    # overturned "≥2.5b / ~5–6×" KV claim that lived only in 33-tok signals).
+    # Run only under PYTEST_SLOW=1 for symmetry with the 257-tok counterpart,
+    # which IS the real gate.
+    if os.environ.get("PYTEST_SLOW") != "1":
+        pytest.skip(
+            "set PYTEST_SLOW=1 to run the 33-tok TurboQuant-KV smoke "
+            "(L4 metrics are underpowered at this window; 257-tok is the gate)"
+        )
     _skip_if_no_fixtures()
     _run(33)
 
