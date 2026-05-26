@@ -25,23 +25,12 @@ MODULE ?= $(COCOTB_TEST_MODULES)
 SRC_DIR       := ../common/src
 INCLUDE_DIR   := $(SRC_DIR)/include
 
-# All SV source files for Phase 2 (order matters for Icarus)
-VERILOG_SOURCES := \
-  $(INCLUDE_DIR)/taccel_pkg.sv \
-  $(SRC_DIR)/decode_unit.sv \
-  $(SRC_DIR)/fetch_unit.sv \
-  $(SRC_DIR)/control_unit.sv \
-  $(SRC_DIR)/blocking_helper_engine.sv \
-  $(SRC_DIR)/sfu_engine.sv \
-  $(SRC_DIR)/memory/sram_dp_inferred.sv \
-  $(SRC_DIR)/memory/sram_dp.sv \
-  $(SRC_DIR)/memory/register_file.sv \
-  $(SRC_DIR)/memory/sram_subsystem.sv \
-  $(SRC_DIR)/systolic/systolic_pe.sv \
-  $(SRC_DIR)/systolic/systolic_array.sv \
-  $(SRC_DIR)/systolic/systolic_controller.sv \
-  $(SRC_DIR)/dma_engine.sv \
-  $(SRC_DIR)/taccel_top.sv
+# Step C (2026-05-26 RTL restructure): VERILOG_SOURCES derived from the
+# shared filelist at rtl/common/filelists/core.f (same source of truth as
+# the Verilator Makefile). Order in the filelist matters for Icarus.
+CORE_F        := ../common/filelists/core.f
+read_filelist  = $(shell grep -E -v '^[[:space:]]*(\#|$$)' $(1))
+VERILOG_SOURCES := $(addprefix $(SRC_DIR)/, $(call read_filelist,$(CORE_F)))
 
 # Include paths
 COMPILE_ARGS += -I$(INCLUDE_DIR)

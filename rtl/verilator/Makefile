@@ -38,34 +38,19 @@ VFLAGS += -I$(SRC_DIR)
 # Source file lists
 PKG           := $(INCLUDE_DIR)/taccel_pkg.sv
 DECODE_SV     := $(PKG) $(SRC_DIR)/decode_unit.sv $(TB_DIR)/tb_decode_unit.sv
-# Phase-2 synth primitives (used by sfu_engine.sv SFU_SYNTH_MODE=1 path;
-# always elaborated, dead-folded by synth in mode=0).
-FP32_PRIMS    := $(SRC_DIR)/fp32/fp32_add.sv \
-                 $(SRC_DIR)/fp32/fp32_mul.sv \
-                 $(SRC_DIR)/fp32/fp32_div.sv \
-                 $(SRC_DIR)/fp32/fp32_sqrt.sv \
-                 $(SRC_DIR)/fp32/fp32_to_fp16.sv \
-                 $(SRC_DIR)/fp32/fp16_to_fp32.sv \
-                 $(SRC_DIR)/fp32/i32_to_fp32.sv \
-                 $(SRC_DIR)/fp32/fp32_quantize_i8.sv \
-                 $(SRC_DIR)/fp32/fp32_exp.sv \
-                 $(SRC_DIR)/fp32/fp32_gelu_new.sv
-CONTROL_SV    := $(PKG) \
-                 $(FP32_PRIMS) \
-                 $(SRC_DIR)/decode_unit.sv \
-                 $(SRC_DIR)/fetch_unit.sv \
-                 $(SRC_DIR)/control_unit.sv \
-                 $(SRC_DIR)/blocking_helper_engine.sv \
-                 $(SRC_DIR)/sfu_engine.sv \
-                 $(SRC_DIR)/memory/register_file.sv \
-                 $(SRC_DIR)/memory/sram_dp_inferred.sv \
-                 $(SRC_DIR)/memory/sram_dp.sv \
-                 $(SRC_DIR)/memory/sram_subsystem.sv \
-				 $(SRC_DIR)/systolic/systolic_pe.sv \
-				 $(SRC_DIR)/systolic/systolic_array.sv \
-				 $(SRC_DIR)/systolic/systolic_controller.sv \
-                 $(SRC_DIR)/dma_engine.sv \
-                 $(SRC_DIR)/taccel_top.sv
+
+# Step C (2026-05-26 RTL restructure): single source of truth for the
+# design source list lives at rtl/common/filelists/core.f (full design)
+# and rtl/common/filelists/core_ctrl.f (control-plane subset, used by
+# synth-check-ctrl). Each entry is a path relative to rtl/common/src/;
+# the read_filelist function strips comments + blanks and the addprefix
+# call prepends $(SRC_DIR) to produce a CWD-correct Make list.
+CORE_F        := ../common/filelists/core.f
+CORE_CTRL_F   := ../common/filelists/core_ctrl.f
+read_filelist  = $(shell grep -E -v '^[[:space:]]*(\#|$$)' $(1))
+
+CONTROL_SV    := $(addprefix $(SRC_DIR)/, $(call read_filelist,$(CORE_F)))
+CTRL_SV       := $(addprefix $(SRC_DIR)/, $(call read_filelist,$(CORE_CTRL_F)))
 
 .PHONY: all run_program test_decode test_control test_dma test_helpers test_sfu \
         test_systolic test_systolic_array_chained test_systolic_chained \
@@ -477,19 +462,8 @@ synth-check: $(SV2V_OUT)
 # (proc/flatten/opt-fast/check/stat) — skips ABC tech-mapping for speed.
 # -----------------------------------------------------------------------
 SV2V_CTRL := $(SYNTH_BUILD)/design_ctrl.v
-CTRL_SV   := $(PKG) \
-             $(SRC_DIR)/decode_unit.sv \
-             $(SRC_DIR)/fetch_unit.sv \
-             $(SRC_DIR)/control_unit.sv \
-             $(SRC_DIR)/memory/register_file.sv \
-             $(SRC_DIR)/memory/sram_dp_inferred.sv \
-             $(SRC_DIR)/memory/sram_dp.sv \
-             $(SRC_DIR)/memory/sram_subsystem.sv \
-             $(SRC_DIR)/systolic/systolic_pe.sv \
-             $(SRC_DIR)/systolic/systolic_array.sv \
-             $(SRC_DIR)/systolic/systolic_controller.sv \
-             $(SRC_DIR)/dma_engine.sv \
-             $(SRC_DIR)/taccel_top.sv
+# CTRL_SV is defined alongside CONTROL_SV at the top of this Makefile, both
+# derived from rtl/common/filelists/ via read_filelist (Step C, 2026-05-26).
 
 $(SV2V_CTRL): $(CTRL_SV)
 	mkdir -p $(SYNTH_BUILD)
