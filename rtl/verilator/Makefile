@@ -58,6 +58,7 @@ CONTROL_SV    := $(PKG) \
                  $(SRC_DIR)/blocking_helper_engine.sv \
                  $(SRC_DIR)/sfu_engine.sv \
                  $(SRC_DIR)/memory/register_file.sv \
+                 $(SRC_DIR)/memory/sram_dp_inferred.sv \
                  $(SRC_DIR)/memory/sram_dp.sv \
                  $(SRC_DIR)/memory/sram_subsystem.sv \
 				 $(SRC_DIR)/systolic/systolic_pe.sv \
@@ -481,6 +482,7 @@ CTRL_SV   := $(PKG) \
              $(SRC_DIR)/fetch_unit.sv \
              $(SRC_DIR)/control_unit.sv \
              $(SRC_DIR)/memory/register_file.sv \
+             $(SRC_DIR)/memory/sram_dp_inferred.sv \
              $(SRC_DIR)/memory/sram_dp.sv \
              $(SRC_DIR)/memory/sram_subsystem.sv \
              $(SRC_DIR)/systolic/systolic_pe.sv \

@@ -1,15 +1,26 @@
-// Parameterized synchronous dual-port SRAM.
+// Target-dispatch wrapper for the dual-port SRAM macro family.
 //
 // Port A: read/write (DMA, BUF_COPY, REQUANT write-back)
 // Port B: read-only  (Systolic array, SFU read)
 //
-// Both ports are synchronous on the rising edge of clk.
-// Write-first semantics on port A: if A writes and reads the same address
-// in the same cycle, the new (written) data appears on a_rdata next cycle.
+// Both ports are synchronous on the rising edge of clk. Write-first
+// semantics on port A: if A writes and reads the same address in the
+// same cycle, the new (written) data appears on a_rdata next cycle.
 // Port B is always read-only — no write path.
 //
 // Data width: 128 bits (16 bytes) per row, matching the 16-byte DMA unit.
-// FPGA synthesis: infer block RAM with (* ram_style = "block" *).
+//
+// Target dispatch:
+//   - TARGET_ASIC : binds to `sram_dp_macro` (PDK SRAM macro wrapper),
+//                   defined in rtl/asic/src/sram_dp_<pdk>.sv.
+//   - default     : binds to `sram_dp_inferred` (inferred BRAM body with
+//                   `ram_style = "block"` attribute). Used by Verilator
+//                   simulation, the Yosys generic synth-check gate, and
+//                   FPGA build targets.
+//
+// The module name `sram_dp` and its port set are preserved across this
+// wrapper so sram_subsystem.sv (and any other instantiator) continues to
+// work unchanged.
 
 `ifndef SRAM_DP_SV
 `define SRAM_DP_SV
@@ -33,25 +44,11 @@ module sram_dp #(
   output logic [DATA_W-1:0]             b_rdata
 );
 
-  // Shared storage array. The wrapper modules above this one decide which
-  // architectural buffer is being addressed and suppress OOB accesses.
-  (* ram_style = "block" *)
-  logic [DATA_W-1:0] mem [0:DEPTH-1];
-
-  // Port A: synchronous read/write
-  always_ff @(posedge clk) begin
-    if (a_en) begin
-      if (a_we)
-        mem[a_addr] <= a_wdata;
-      a_rdata <= a_we ? a_wdata : mem[a_addr];
-    end
-  end
-
-  // Port B: synchronous read only
-  always_ff @(posedge clk) begin
-    if (b_en)
-      b_rdata <= mem[b_addr];
-  end
+`ifdef TARGET_ASIC
+  sram_dp_macro    #(.DATA_W(DATA_W), .DEPTH(DEPTH)) u_impl (.*);
+`else  // TARGET_FPGA or TARGET_SIM (default for Verilator + synth-check)
+  sram_dp_inferred #(.DATA_W(DATA_W), .DEPTH(DEPTH)) u_impl (.*);
+`endif
 
 endmodule
 

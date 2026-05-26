@@ -712,9 +712,12 @@ struct SimHarness {
 inline VlWide<4>* sram_row_ptr(Vtaccel_top* dut, int buf_id, int row) {
     auto* r = dut->rootp;
     switch (buf_id) {
-        case BUF_ABUF_ID:  return &r->taccel_top__DOT__u_sram__DOT__u_abuf__DOT__mem[row];
-        case BUF_WBUF_ID:  return &r->taccel_top__DOT__u_sram__DOT__u_wbuf__DOT__mem[row];
-        case BUF_ACCUM_ID: return &r->taccel_top__DOT__u_sram__DOT__u_accum__DOT__mem[row];
+        // Step B (2026-05-26 RTL restructure): sram_dp.sv became a target-
+        // dispatch wrapper around `sram_dp_inferred` (instance name u_impl),
+        // so the flat path to the inferred BRAM `mem` array gained one level.
+        case BUF_ABUF_ID:  return &r->taccel_top__DOT__u_sram__DOT__u_abuf__DOT__u_impl__DOT__mem[row];
+        case BUF_WBUF_ID:  return &r->taccel_top__DOT__u_sram__DOT__u_wbuf__DOT__u_impl__DOT__mem[row];
+        case BUF_ACCUM_ID: return &r->taccel_top__DOT__u_sram__DOT__u_accum__DOT__u_impl__DOT__mem[row];
         default: std::abort();
     }
 }
