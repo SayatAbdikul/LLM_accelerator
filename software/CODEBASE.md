@@ -1,11 +1,17 @@
 # TACCEL — Transformer Accelerator Toolchain
 
-> **Status note (2026-05-25):** this document captures the ViT-era architecture
+> **Status note (2026-05-26):** this document captures the ViT-era architecture
 > (DeiT-tiny INT8 target) the project started from. ISA mechanics, hardware
 > model, assembler/compiler/quantizer/golden-model internals are still
 > accurate; the GPT-2-era decoder ISA, W4 / QuaRot / AWQ + GPTQ runtime,
 > gen-2 freeze, and RTL state are covered in the top-level [`README.md`](../README.md)
 > and [`software/docs/isa_generation_freeze.md`](docs/isa_generation_freeze.md).
+>
+> **RTL layout note (2026-05-26):** the SystemVerilog tree was restructured into
+> `rtl/common/` (verified core + shared filelist), `rtl/fpga/` (FPGA wrappers
+> + smoke gate), and `rtl/asic/` (ASIC wrappers + SKY130 stub + deferred
+> OpenLane). The Python toolchain in `software/` is target-neutral and
+> unchanged by that restructure.
 
 A complete Python toolchain for an INT8 transformer accelerator originally
 targeting **facebook/deit-tiny-patch16-224**, since extended to a nanoGPT /

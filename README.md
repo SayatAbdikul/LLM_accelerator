@@ -19,7 +19,8 @@ ISA + GPT-2 frontend on top. Both lineages remain in the tree.
 | **Golden model** | Content-pinned (`taccel/golden_model/simulator.py`); SHA enforced by `test_frozen_golden_sha_pin`. |
 | **RTL behavioral** | All 19 emitted opcodes implemented across fetch / decode / control / DMA / 16×16 systolic / SFU / helper. ~9 k LOC SV. |
 | **Freeze cosim** | `test_compare_rtl_golden.py` — **6+1 byte-identical** vs golden on the tiny fixture (P6b + P6m). Closes freeze §5 definition-of-done. |
-| **RTL synthesizability** | Whole-design `make synth-check` GREEN (yosys + sv2v, `-DSFU_SYNTH_NO_DPI`). Phase-3 close-out 2026-05-21: `real`/DPI removed from the SFU/helper datapaths; first synth fp32 primitive (`rtl/src/fp32/fp32_add.sv`) bit-exact vs DPI golden. **No FPGA part chosen yet — no fmax / area / tokens-per-sec number exists.** |
+| **RTL synthesizability** | Whole-design `make synth-check` GREEN (yosys + sv2v, `-DSFU_SYNTH_NO_DPI`). Phase-3 close-out 2026-05-21: `real`/DPI removed from the SFU/helper datapaths; first synth fp32 primitive (`rtl/common/src/fp32/fp32_add.sv`) bit-exact vs DPI golden. **No FPGA part chosen yet — no fmax / area / tokens-per-sec number exists.** |
+| **RTL structure** | Three-way split (Step F, 2026-05-26): `rtl/common/` holds the verified compute core + shared filelist; `rtl/fpga/` and `rtl/asic/` hold per-target wrappers + build flows. Smoke gates `make -C rtl/fpga yosys-fpga` and `make -C rtl/asic yosys-asic` elaborate. Vendor-tool integration (Vivado / OpenLane) deferred. |
 | **W8A16+QuaRot** | GPT-2 124M 257-tok = **56.23 PPL** (FP32 ceiling 53.42). Productized preset `weight_only_int8_quarot`. |
 | **W4A16+AWQ+GPTQ** | GPT-2 124M 257-tok = **63.04 PPL**. Productized preset `weight_only_int4_awq_gptq` (W4 blocks + W8 lm_head; AWQ α=0.40 + GPTQ act-order). |
 | **TurboQuant KV** | Reference-only Tier-1 KV quantization characterized at 257-tok. Quality-neutral at ~4 bits on the QuaRot base (~3.76× KV compression). |
@@ -49,10 +50,21 @@ LLM_accelerator/
 │   │                               # accurate for ISA mechanics + assembler/compiler)
 │   └── requirements.txt
 │
-├── rtl/                            # SystemVerilog RTL + testbenches
-│   ├── src/                        # taccel_top, fetch/decode/control/DMA, systolic,
-│   │                               # sfu_engine, blocking_helper_engine, fp32/, memory/
-│   ├── verilator/                  # Native C++ benches + run_program harness
+├── rtl/                            # SystemVerilog RTL — three-way split
+│   ├── common/
+│   │   ├── src/                    # Verified core: taccel_top, fetch/decode/control/DMA,
+│   │   │                           # systolic, sfu_engine, blocking_helper_engine,
+│   │   │                           # fp32/, memory/ (sram_dp dispatch wrapper +
+│   │   │                           # sram_dp_inferred body)
+│   │   └── filelists/              # core.f / core_ctrl.f — single source of truth
+│   │                               # consumed by every per-target Makefile
+│   ├── fpga/                       # FPGA wrappers + PLL/IOBUF/DDR stubs; `make yosys-fpga`
+│   │                               # smoke gate. Vendor IP (Vivado/Quartus) deferred.
+│   ├── asic/                       # ASIC wrappers + pad ring + sram_dp_macro stub
+│   │                               # (SKY130 default). `make yosys-asic` smoke gate;
+│   │                               # `make openlane` stub (PDK install deferred).
+│   ├── verilator/                  # Native C++ benches + run_program harness; the freeze
+│   │                               # cosim moneyshot lives here as Vtaccel_top
 │   ├── cocotb/                     # Python-driven ISA-visible benches
 │   ├── synth/                      # yosys synth-check + Phase-3 baseline notes
 │   └── TESTBENCHES.md

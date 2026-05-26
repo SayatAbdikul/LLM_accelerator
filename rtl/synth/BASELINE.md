@@ -6,12 +6,46 @@ part). The gate now **PASSES on the FULL design** (script:
 `synth-check`; tooling: yosys 0.65 + sv2v 0.0.13 via Homebrew). It was
 RED through Phases 0–2; this revision documents the GREEN landing.
 
+## Current pinned hashes (post-Step-B, 2026-05-26)
+
+After the RTL restructure (`rtl/src/` → `rtl/common/src/`, `sram_dp` →
+target-dispatch wrapper around `sram_dp_inferred`, single-source-of-truth
+filelist at `rtl/common/filelists/core.f`):
+
+| Gate | Cells | Logfile hash | Pinned |
+|---|---|---|---|
+| `synth-check` (whole design) | **38,031** | **2650883be9** | 2026-05-26 |
+| `synth-check-ctrl` (ctrl plane) | **5,120** | **cd84afa9a9** | 2026-05-26 |
+
+Hash history (whole-design):
+
+| Date | Hash | Trigger |
+|---|---|---|
+| 2026-05-21 | `97873ef4a2` | Phase-3 closeout GREEN landing |
+| 2026-05-23 | `4006339cfc` | ISA Reduction Phase B+C (gen-1 SFU opcodes stripped; commit `e7b3314`) |
+| 2026-05-26 | **`2650883be9`** | RTL restructure Step B (sram_dp wrapper adds `u_impl` hierarchy level) |
+
+The Step B hash shift is purely AST-trace lines (yosys emits one extra
+`Generating RTLIL representation for module ...` per parametrized
+instantiation of `sram_dp_inferred`). Cell count is **unchanged**:
+yosys flattens the wrapper, the dispatch is preprocessor-level
+(`\`ifdef TARGET_ASIC`), and behaviorally `sram_dp` → `sram_dp_inferred`
+is identity. Freeze cosim moneyshot 5/5 byte-identical confirms zero
+logical drift.
+
 ## How the gate runs
 
 ```sh
-sv2v -DSFU_SYNTH_NO_DPI -I rtl/src/include -I rtl/src/systolic <CONTROL_SV> -w build/synth/design_full.v
+sv2v -DSFU_SYNTH_NO_DPI \
+     -I rtl/common/src/include -I rtl/common/src/systolic -I rtl/common/src \
+     <CORE_SV> -w build/synth/design_full.v
 yosys -p "read_verilog build/synth/design_full.v" rtl/synth/synth_check.ys
 ```
+
+`<CORE_SV>` is now derived from `rtl/common/filelists/core.f` via the
+shared `read_filelist`+`addprefix` Make pattern used by every per-target
+Makefile (Verilator, cocotb, FPGA, ASIC). Adding a new core source means
+one line in `core.f`; all four build paths pick it up.
 
 `sv2v` adapts SystemVerilog (packages, enums, `logic`, `always_ff/comb`,
 generate, `import pkg::*`) to Verilog-2005 that yosys's built-in frontend
@@ -81,7 +115,8 @@ gaps from the original RED list:
 | `fetch_unit.sv` | ✅ synth-clean | |
 | `control_unit.sv` | ✅ synth-clean | |
 | `register_file.sv` | ✅ synth-clean | yosys "Replacing memory \\addr_regs/\\scale_regs with list of registers" — expected per-buffer inference |
-| `sram_dp.sv` | ✅ synth-clean | `(* ram_style = "block" *)` BRAM-inferable |
+| `sram_dp.sv` | ✅ synth-clean | Step B (2026-05-26): target-dispatch wrapper. Default branch (`TARGET_SIM`/`TARGET_FPGA`) binds to `sram_dp_inferred` (`(* ram_style = "block" *)` BRAM-inferable); `TARGET_ASIC` binds to `sram_dp_macro` (defined in `rtl/asic/src/sram_dp_<pdk>.sv`) |
+| `sram_dp_inferred.sv` | ✅ synth-clean | Step B (2026-05-26): the inferred BRAM body, factored out of `sram_dp.sv`. Used by Verilator + synth-check + FPGA targets |
 | `sram_subsystem.sv` | ✅ synth-clean | |
 | `systolic_pe.sv` | ✅ synth-clean | |
 | `systolic_array.sv` | ✅ synth-clean | packed 2D array (Phase-3 refactor) |
