@@ -22,7 +22,7 @@ TOPLEVEL      := taccel_top
 COCOTB_TEST_MODULES := test_fetch_decode,test_dma,test_helpers,test_sfu,test_systolic
 MODULE ?= $(COCOTB_TEST_MODULES)
 
-SRC_DIR       := ../src
+SRC_DIR       := ../common/src
 INCLUDE_DIR   := $(SRC_DIR)/include
 
 # All SV source files for Phase 2 (order matters for Icarus)

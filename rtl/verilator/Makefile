@@ -22,7 +22,7 @@ VFLAGS        := --cc --exe --build --timing \
 SYSTOLIC_ARCH_MODE ?= 1
 DRAM_SIZE ?= 16777216
 
-SRC_DIR       := ../src
+SRC_DIR       := ../common/src
 INCLUDE_DIR   := $(SRC_DIR)/include
 SYSTOLIC_DIR  := $(SRC_DIR)/systolic
 TB_DIR        := $(SRC_DIR)/tb

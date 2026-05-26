@@ -396,7 +396,7 @@ def compare(golden_tensors, rtl_entries, rtl_data, instr_image,
     by_key = {(int(e["pc"]), int(e["event_index"])): e for e in rtl_entries}
     for pc in sorted(trace_manifest):
         # NOTE: codegen records trace events at the SYNC BARRIER
-        # (OP_SYNC == 5'h02, verified in rtl/src/include/taccel_pkg.sv:24)
+        # (OP_SYNC == 5'h02, verified in rtl/common/src/include/taccel_pkg.sv:24)
         # that serializes the async gen-2 SFU after the producing op, NOT at
         # the producer instruction. Confirmed empirically: 71/71 trace PCs
         # are 0x02 while the image holds thousands of 0x17-0x1F. (Capture is
