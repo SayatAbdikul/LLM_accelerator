@@ -172,7 +172,12 @@ module sfu_engine
     //   (row - mean) -> /denom -> *gamma -> +beta -> f2h -> out_h_q
     // ran in one cycle (~190 ns). NORM latches ln_norm_q = (row-mean)/denom
     // for the current iter; the OUT cycle takes (norm*gamma + beta) -> f2h.
-    F_G2_LN_OUT_NORM  = 6'd43
+    F_G2_LN_OUT_NORM  = 6'd43,
+    // Phase-5 (2026-05-28): further split — ln_diff_q latches (row - mean) in
+    // F_G2_LN_OUT_DIFF so u_ln_norm's input is registered, removing the
+    // serial fp32_add + fp32_div chain from the SFU critical path. The path
+    // ln_mean_q -> ln_norm_q was the post-PNR worst path at 184 ns.
+    F_G2_LN_OUT_DIFF  = 6'd44
   } sfu_state_t;
 
   sfu_state_t state;
@@ -213,6 +218,10 @@ module sfu_engine
   // Phase-4: pipeline cut inside F_G2_LN_OUT — ln_norm_q latches (row-mean)/denom
   // in F_G2_LN_OUT_NORM, consumed by u_ln_norm_g in F_G2_LN_OUT.
   logic [31:0]  ln_norm_q;
+  // Phase-5: latches (row - mean) in F_G2_LN_OUT_DIFF so fp32_div sees a
+  // registered operand. Removes the fp32_add+fp32_div serial chain that was
+  // the post-PNR critical path (184 ns).
+  logic [31:0]  ln_diff_q;
   // Phase-2 synth-mode SOFTMAX (0x1D) reduction state.
   logic [31:0]  sm_row_max_q;       // running fp32 row_max
   logic [31:0]  sm_exp_sum_q;       // running fp32 exp_sum
@@ -656,6 +665,7 @@ module sfu_engine
       ln_denom_q     <= 32'h0;
       ln_var_eps_q   <= 32'h0;
       ln_norm_q      <= 32'h0;
+      ln_diff_q      <= 32'h0;
       sm_row_max_q   <= 32'h0;
       sm_exp_sum_q   <= 32'h0;
       sm_have_vis_q  <= 1'b0;

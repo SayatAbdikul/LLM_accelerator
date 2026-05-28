@@ -293,23 +293,30 @@
 
         F_G2_LN_DENOM: begin
           ln_denom_q <= ln_denom_w;
-          state      <= F_G2_LN_OUT_NORM;
+          state      <= F_G2_LN_OUT_DIFF;
         end
 
-        // Phase-4 pipeline cut: F_G2_LN_OUT was a 5-op fp32 chain
+        // Phase-4/5 pipeline cuts: F_G2_LN_OUT was a 5-op fp32 chain
         //   (row - mean) -> /denom -> *gamma -> +beta -> f2h -> out_h_q
-        // (~187 ns combinationally on sky130). Now split: NORM latches the
-        // (row - mean) / denom result into ln_norm_q for the current iter;
-        // OUT next cycle does (norm * gamma + beta) -> f2h -> out_h_q[iter]
-        // and advances iter. Each element costs 2 cycles instead of 1.
-        F_G2_LN_OUT_NORM: begin
+        // (~187 ns combinationally on sky130). Now split across 3 cycles:
+        //   DIFF: ln_diff_q  <- row - mean                 (fp32_add only)
+        //   NORM: ln_norm_q  <- ln_diff_q / denom          (fp32_div only)
+        //   OUT : out_h_q[i] <- f2h(norm*gamma + beta);    iter++
+        // The DIFF cut removed the worst-case 184 ns ln_mean_q -> ln_norm_q
+        // path. Each element now costs 3 cycles instead of 2.
+        F_G2_LN_OUT_DIFF: begin
           if ({5'h0, iter_idx_q} < n_elems_q) begin
-            ln_norm_q <= ln_norm_w;
-            state     <= F_G2_LN_OUT;
+            ln_diff_q <= ln_diff_w;
+            state     <= F_G2_LN_OUT_NORM;
           end else begin
             iter_idx_q <= 11'h0;
             state      <= F_G2_PACK;
           end
+        end
+
+        F_G2_LN_OUT_NORM: begin
+          ln_norm_q <= ln_norm_w;
+          state     <= F_G2_LN_OUT;
         end
 
         F_G2_LN_OUT: begin
@@ -318,7 +325,7 @@
           // gen-2 0x1A LAYERNORM_FP32 reaches here, writing FP16.
           out_h_q[iter_idx_q[9:0]] <= ln_out_h_w;
           iter_idx_q               <= iter_idx_q + 11'd1;
-          state                    <= F_G2_LN_OUT_NORM;
+          state                    <= F_G2_LN_OUT_DIFF;
         end
 
         // 0x1D MASKED_SOFTMAX_FP32 synth sub-FSM (Phase-2; BANDED):

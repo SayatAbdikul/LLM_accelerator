@@ -241,7 +241,9 @@
   // Phase-4 pipeline cut: sqrt reads the registered ln_var_eps_q (latched in
   // F_G2_LN_DENOM_PRE one cycle earlier), not the combinational ln_var_eps_w.
   fp32_sqrt u_ln_sqrt    (.a(ln_var_eps_q),                    .y(ln_denom_w));
-  fp32_div  u_ln_norm    (.a(ln_diff_w),    .b(ln_denom_q),   .y(ln_norm_w));
+  // Phase-5 pipeline cut: divider consumes the registered ln_diff_q (latched
+  // in F_G2_LN_OUT_DIFF one cycle earlier), not the combinational ln_diff_w.
+  fp32_div  u_ln_norm    (.a(ln_diff_q),    .b(ln_denom_q),   .y(ln_norm_w));
   // Phase-4 pipeline cut: ln_norm_g multiplier reads the registered ln_norm_q
   // (latched in F_G2_LN_OUT_NORM), not the combinational ln_norm_w.
   fp32_mul  u_ln_norm_g  (.a(ln_norm_q),    .b(synth_gamma_bits), .y(ln_norm_g_w));
