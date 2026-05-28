@@ -273,7 +273,10 @@
   fp32_exp     u_sm_exp    (.a(sm_diff_w),                        .y(sm_exp_w));
   fp32_add     u_sm_sum_add(.a(sm_exp_sum_q), .b(sm_exp_w),       .y(sm_sum_add_w));
   fp32_div     u_sm_div    (.a(sm_exp_w),     .b(sm_exp_sum_q),   .y(sm_norm_w));
-  fp32_to_fp16 u_sm_out_h  (.a(sm_norm_w),                        .y(sm_out_h_w));
+  // Phase-6 pipeline cut: f2h consumes the registered sm_norm_q (latched in
+  // F_G2_SM_OUT_NORM), not the combinational sm_norm_w. Isolates fp32_div
+  // from fp32_to_fp16 (was 149 ns combined post-PNR worst path).
+  fp32_to_fp16 u_sm_out_h  (.a(sm_norm_q),                        .y(sm_out_h_w));
   // SOFTMAX max-update predicate: `diff` MSB (=sign): 1 -> row < max
   // (no update); 0 -> row >= max (update only if strictly > or first-vis).
   // Strictly > requires diff != 0; equal (diff == 0) is no-op either way.

@@ -177,7 +177,13 @@ module sfu_engine
     // F_G2_LN_OUT_DIFF so u_ln_norm's input is registered, removing the
     // serial fp32_add + fp32_div chain from the SFU critical path. The path
     // ln_mean_q -> ln_norm_q was the post-PNR worst path at 184 ns.
-    F_G2_LN_OUT_DIFF  = 6'd44
+    F_G2_LN_OUT_DIFF  = 6'd44,
+    // Phase-6 (2026-05-29): split F_G2_SM_OUT — sm_norm_q latches the
+    // fp32_div(exp, exp_sum) result so the subsequent fp32_to_fp16 sits in
+    // its own cycle. Post Phase-5 the worst path was sm_exp_sum_q ->
+    // fp32_div -> fp32_to_fp16 -> out_h_q at 149 ns; this cut isolates
+    // fp32_div from f2h.
+    F_G2_SM_OUT_NORM  = 6'd45
   } sfu_state_t;
 
   sfu_state_t state;
@@ -222,6 +228,10 @@ module sfu_engine
   // registered operand. Removes the fp32_add+fp32_div serial chain that was
   // the post-PNR critical path (184 ns).
   logic [31:0]  ln_diff_q;
+  // Phase-6: latches fp32_div(exp(row-max), exp_sum) in F_G2_SM_OUT_NORM so
+  // the fp32_to_fp16 in F_G2_SM_OUT runs in its own cycle. Was the post-PNR
+  // critical path (149 ns) after Phase-5.
+  logic [31:0]  sm_norm_q;
   // Phase-2 synth-mode SOFTMAX (0x1D) reduction state.
   logic [31:0]  sm_row_max_q;       // running fp32 row_max
   logic [31:0]  sm_exp_sum_q;       // running fp32 exp_sum
@@ -666,6 +676,7 @@ module sfu_engine
       ln_var_eps_q   <= 32'h0;
       ln_norm_q      <= 32'h0;
       ln_diff_q      <= 32'h0;
+      sm_norm_q      <= 32'h0;
       sm_row_max_q   <= 32'h0;
       sm_exp_sum_q   <= 32'h0;
       sm_have_vis_q  <= 1'b0;

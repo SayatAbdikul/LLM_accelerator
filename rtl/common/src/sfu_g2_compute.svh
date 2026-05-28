@@ -362,26 +362,35 @@
             iter_idx_q <= 11'h0;
             // Gen-1 SOFTMAX/MASKED_SOFTMAX/{ATTNV,MASKED_ATTNV} all illegal at
             // decode_unit (0x0E/0x15/0x12/0x16). Only gen-2 OP_MASKED_SOFTMAX_FP32
-            // reaches here and proceeds to F_G2_SM_OUT.
-            state <= F_G2_SM_OUT;
+            // reaches here and proceeds to F_G2_SM_OUT_NORM.
+            state <= F_G2_SM_OUT_NORM;
+          end
+        end
+
+        // Phase-6 pipeline cut: F_G2_SM_OUT was a chain
+        //   exp(row-max) -> /exp_sum -> f2h -> out_h_q
+        // at 149 ns post-PNR. NORM latches sm_norm_q = fp32_div(sm_exp_w,
+        // sm_exp_sum_q) so OUT just does f2h. Each element costs 2 cycles.
+        F_G2_SM_OUT_NORM: begin
+          if ({5'h0, iter_idx_q} < sm_iter_bound_w) begin
+            sm_norm_q <= sm_norm_w;
+            state     <= F_G2_SM_OUT;
+          end else begin
+            iter_idx_q <= 11'h0;
+            state      <= F_G2_PACK;
           end
         end
 
         F_G2_SM_OUT: begin
-          if ({5'h0, iter_idx_q} < sm_iter_bound_w) begin
-            // Gen-1 OP_SOFTMAX (0x0E), OP_MASKED_SOFTMAX (0x15),
-            // OP_SOFTMAX_ATTNV (0x12), OP_MASKED_SOFTMAX_ATTNV (0x16) are all
-            // illegal at decode_unit (decode_unit.sv L45). The INT8 quantize
-            // writeback path through sm_g1_quant_w is unreachable; only gen-2
-            // OP_MASKED_SOFTMAX_FP32 (0x1D) reaches here, writing FP16.
-            if (sm_have_vis_q && sm_visible_w && (sm_exp_sum_q != 32'h0))
-              out_h_q[iter_idx_q[9:0]] <= sm_out_h_w;
-            else
-              out_h_q[iter_idx_q[9:0]] <= 16'h0;
-            iter_idx_q <= iter_idx_q + 11'd1;
-          end else begin
-            iter_idx_q <= 11'h0;
-            // Gen-1 F_ROW_PACK exit is dead (see above). Only gen-2 reaches.
-            state <= F_G2_PACK;
-          end
+          // Gen-1 OP_SOFTMAX (0x0E), OP_MASKED_SOFTMAX (0x15),
+          // OP_SOFTMAX_ATTNV (0x12), OP_MASKED_SOFTMAX_ATTNV (0x16) are all
+          // illegal at decode_unit (decode_unit.sv L45). The INT8 quantize
+          // writeback path through sm_g1_quant_w is unreachable; only gen-2
+          // OP_MASKED_SOFTMAX_FP32 (0x1D) reaches here, writing FP16.
+          if (sm_have_vis_q && sm_visible_w && (sm_exp_sum_q != 32'h0))
+            out_h_q[iter_idx_q[9:0]] <= sm_out_h_w;
+          else
+            out_h_q[iter_idx_q[9:0]] <= 16'h0;
+          iter_idx_q <= iter_idx_q + 11'd1;
+          state      <= F_G2_SM_OUT_NORM;
         end
