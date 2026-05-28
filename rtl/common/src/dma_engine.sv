@@ -82,16 +82,25 @@ module dma_engine
   // LOAD walks bursts as AR -> R.
   // STORE walks bursts as AW -> SRAM pre-read -> W -> B because port A is a
   // synchronous single read/write port.
+  //
+  // Pipelining (2026-05-27): the dispatch-time 57-bit add + OOB compare was the
+  // critical path (7.49 ns on sky130_fd_sc_hd TT). It is now split across
+  // D_IDLE (just the add latched into curr_dram_addr_q) and D_DISPATCH_CHECK
+  // (the end+compare on the latched value). +1 cycle of dispatch latency.
+  // The burst-boundary 56-bit add is similarly precomputed every cycle into
+  // next_*_q registers, so the burst-done transition is flop->mux->flop with
+  // no in-path adder.
   // -------------------------------------------------------------------------
-  typedef enum logic [2:0] {
-    D_IDLE           = 3'd0,
-    D_LOAD_AR        = 3'd1,
-    D_LOAD_R         = 3'd2,
-    D_STORE_AW       = 3'd3,
-    D_STORE_SRAM_PRE = 3'd4,
-    D_STORE_W        = 3'd5,
-    D_STORE_B        = 3'd6,
-    D_FAULT          = 3'd7
+  typedef enum logic [3:0] {
+    D_IDLE           = 4'd0,
+    D_DISPATCH_CHECK = 4'd1,
+    D_LOAD_AR        = 4'd2,
+    D_LOAD_R         = 4'd3,
+    D_STORE_AW       = 4'd4,
+    D_STORE_SRAM_PRE = 4'd5,
+    D_STORE_W        = 4'd6,
+    D_STORE_B        = 4'd7,
+    D_FAULT          = 4'd8
   } dma_state_t;
 
   dma_state_t  state;
@@ -107,6 +116,14 @@ module dma_engine
   logic [55:0] curr_dram_addr_q;
   logic [3:0]  fault_code_r;
 
+  // Precomputed next-burst params, registered one cycle ahead of the
+  // burst-done transition. Removes the curr_dram_addr_q + burst_bytes_w
+  // adder + control-mux tail from the burst-boundary critical path.
+  logic [55:0] next_dram_addr_q;
+  logic [15:0] next_sram_row_q;
+  logic [15:0] next_beats_remaining_q;
+  logic [15:0] next_burst_beats_q;
+
   logic [55:0] burst_bytes_w;
   logic [15:0] remaining_after_burst_w;
   logic [15:0] next_burst_beats_w;
@@ -117,12 +134,16 @@ module dma_engine
   logic        load_beat_fault_w;
   logic        load_beat_accept_w;
 
+  // Dispatch-cycle: only the start-address add is left here. The end-of-
+  // transfer compare moved to D_DISPATCH_CHECK and operates on latched regs.
   logic [56:0] dispatch_dram_byte_addr_w;
-  logic [56:0] dispatch_dram_end_w;
-  logic [15:0] dispatch_buf_rows_w;
-  logic [16:0] dispatch_sram_end_w;
-  logic        dispatch_dram_oob_w;
-  logic        dispatch_sram_oob_w;
+
+  // D_DISPATCH_CHECK-cycle: OOB checks on the latched dispatch params.
+  logic [56:0] latched_dram_end_w;
+  logic        latched_dram_oob_w;
+  logic [15:0] latched_buf_rows_w;
+  logic [16:0] latched_sram_end_w;
+  logic        latched_sram_oob_w;
 
   function automatic logic [15:0] buf_rows(input logic [1:0] bid);
     begin
@@ -165,15 +186,23 @@ module dma_engine
       (dma_r_resp == 2'b00) &
       (dma_r_last == burst_last_beat_w);
 
+  // D_IDLE-cycle start address. Cut here: the result is registered into
+  // curr_dram_addr_q, and the end-compare is done in D_DISPATCH_CHECK using
+  // that registered value (see latched_* below).
   assign dispatch_dram_byte_addr_w = {1'b0, base_addr} + {37'h0, dram_off, 4'b0};
-  assign dispatch_dram_end_w       = dispatch_dram_byte_addr_w + {37'h0, xfer_len, 4'b0};
-  assign dispatch_buf_rows_w       = buf_rows(buf_id);
-  assign dispatch_sram_end_w       = {1'b0, sram_off} + {1'b0, xfer_len};
-  assign dispatch_dram_oob_w       = (dispatch_dram_end_w > 57'(DRAM_SIZE));
-  assign dispatch_sram_oob_w =
-      (dispatch_buf_rows_w == 16'h0) |
-      ((xfer_len == 16'h0) ? (sram_off >= dispatch_buf_rows_w)
-                           : (dispatch_sram_end_w > {1'b0, dispatch_buf_rows_w}));
+
+  // D_DISPATCH_CHECK-cycle OOB on the post-latch state. Equivalent to the
+  // previous combinational chain but the inputs are registered so the path
+  // is short.
+  assign latched_dram_end_w  = {1'b0, curr_dram_addr_q}
+                             + {37'h0, beats_remaining_q, 4'b0};
+  assign latched_dram_oob_w  = (latched_dram_end_w > 57'(DRAM_SIZE));
+  assign latched_buf_rows_w  = buf_rows(buf_id_q);
+  assign latched_sram_end_w  = {1'b0, curr_sram_row_q} + {1'b0, beats_remaining_q};
+  assign latched_sram_oob_w  =
+      (latched_buf_rows_w == 16'h0) |
+      ((beats_remaining_q == 16'h0) ? (curr_sram_row_q >= latched_buf_rows_w)
+                                    : (latched_sram_end_w > {1'b0, latched_buf_rows_w}));
 
   // -------------------------------------------------------------------------
   // Sequential FSM.
@@ -182,16 +211,28 @@ module dma_engine
   // -------------------------------------------------------------------------
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      state             <= D_IDLE;
-      is_store_q        <= 1'b0;
-      buf_id_q          <= 2'b00;
-      curr_sram_row_q   <= 16'h0;
-      beats_remaining_q <= 16'h0;
-      burst_beats_q     <= 16'h0;
-      burst_beat_idx_q  <= 16'h0;
-      curr_dram_addr_q  <= 56'h0;
-      fault_code_r      <= 4'h0;
+      state                  <= D_IDLE;
+      is_store_q             <= 1'b0;
+      buf_id_q               <= 2'b00;
+      curr_sram_row_q        <= 16'h0;
+      beats_remaining_q      <= 16'h0;
+      burst_beats_q          <= 16'h0;
+      burst_beat_idx_q       <= 16'h0;
+      curr_dram_addr_q       <= 56'h0;
+      fault_code_r           <= 4'h0;
+      next_dram_addr_q       <= 56'h0;
+      next_sram_row_q        <= 16'h0;
+      next_beats_remaining_q <= 16'h0;
+      next_burst_beats_q     <= 16'h0;
     end else begin
+      // Burst-boundary precompute: registers the (current burst +1) values
+      // every cycle so the burst-done transition only needs a flop->mux->flop
+      // path, no in-path adder.
+      next_dram_addr_q       <= dram_addr_after_burst_w;
+      next_sram_row_q        <= sram_row_after_burst_w;
+      next_beats_remaining_q <= remaining_after_burst_w;
+      next_burst_beats_q     <= next_burst_beats_w;
+
       case (state)
         D_IDLE: begin
           if (dispatch) begin
@@ -202,16 +243,24 @@ module dma_engine
             burst_beats_q     <= burst_beats(xfer_len);
             burst_beat_idx_q  <= 16'h0;
             curr_dram_addr_q  <= dispatch_dram_byte_addr_w[55:0];
+            // OOB check moved to D_DISPATCH_CHECK so this cycle's critical
+            // path is only the 57-bit add (no compare/select tail).
+            state             <= D_DISPATCH_CHECK;
+          end
+        end
 
-            if (dispatch_dram_oob_w) begin
-              fault_code_r <= 4'(FAULT_DRAM_OOB);
-              state        <= D_FAULT;
-            end else if (dispatch_sram_oob_w) begin
-              fault_code_r <= 4'(FAULT_SRAM_OOB);
-              state        <= D_FAULT;
-            end else if (xfer_len != 16'h0) begin
-              state <= is_store ? D_STORE_AW : D_LOAD_AR;
-            end
+        D_DISPATCH_CHECK: begin
+          if (latched_dram_oob_w) begin
+            fault_code_r <= 4'(FAULT_DRAM_OOB);
+            state        <= D_FAULT;
+          end else if (latched_sram_oob_w) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);
+            state        <= D_FAULT;
+          end else if (beats_remaining_q == 16'h0) begin
+            // Legal no-op dispatch (xfer_len=0, in-range sram_off).
+            state <= D_IDLE;
+          end else begin
+            state <= is_store_q ? D_STORE_AW : D_LOAD_AR;
           end
         end
 
@@ -235,10 +284,12 @@ module dma_engine
               if (transfer_last_burst_w) begin
                 state <= D_IDLE;
               end else begin
-                curr_dram_addr_q  <= dram_addr_after_burst_w;
-                curr_sram_row_q   <= sram_row_after_burst_w;
-                beats_remaining_q <= remaining_after_burst_w;
-                burst_beats_q     <= next_burst_beats_w;
+                // Use precomputed next-burst regs (one cycle stale, which is
+                // exactly the burst transition cadence — correct by construction).
+                curr_dram_addr_q  <= next_dram_addr_q;
+                curr_sram_row_q   <= next_sram_row_q;
+                beats_remaining_q <= next_beats_remaining_q;
+                burst_beats_q     <= next_burst_beats_q;
                 burst_beat_idx_q  <= 16'h0;
                 state             <= D_LOAD_AR;
               end
@@ -283,10 +334,10 @@ module dma_engine
             end else if (transfer_last_burst_w) begin
               state <= D_IDLE;
             end else begin
-              curr_dram_addr_q  <= dram_addr_after_burst_w;
-              curr_sram_row_q   <= sram_row_after_burst_w;
-              beats_remaining_q <= remaining_after_burst_w;
-              burst_beats_q     <= next_burst_beats_w;
+              curr_dram_addr_q  <= next_dram_addr_q;
+              curr_sram_row_q   <= next_sram_row_q;
+              beats_remaining_q <= next_beats_remaining_q;
+              burst_beats_q     <= next_burst_beats_q;
               burst_beat_idx_q  <= 16'h0;
               state             <= D_STORE_AW;
             end
