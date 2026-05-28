@@ -293,20 +293,32 @@
 
         F_G2_LN_DENOM: begin
           ln_denom_q <= ln_denom_w;
-          state      <= F_G2_LN_OUT;
+          state      <= F_G2_LN_OUT_NORM;
         end
 
-        F_G2_LN_OUT: begin
+        // Phase-4 pipeline cut: F_G2_LN_OUT was a 5-op fp32 chain
+        //   (row - mean) -> /denom -> *gamma -> +beta -> f2h -> out_h_q
+        // (~187 ns combinationally on sky130). Now split: NORM latches the
+        // (row - mean) / denom result into ln_norm_q for the current iter;
+        // OUT next cycle does (norm * gamma + beta) -> f2h -> out_h_q[iter]
+        // and advances iter. Each element costs 2 cycles instead of 1.
+        F_G2_LN_OUT_NORM: begin
           if ({5'h0, iter_idx_q} < n_elems_q) begin
-            // Gen-1 OP_LAYERNORM (0x0F) is illegal at decode_unit (see
-            // decode_unit.sv L45). The gen-1 INT8 write path is dead — only
-            // gen-2 0x1A LAYERNORM_FP32 reaches here, writing FP16.
-            out_h_q[iter_idx_q[9:0]]     <= ln_out_h_w;
-            iter_idx_q                   <= iter_idx_q + 11'd1;
+            ln_norm_q <= ln_norm_w;
+            state     <= F_G2_LN_OUT;
           end else begin
             iter_idx_q <= 11'h0;
             state      <= F_G2_PACK;
           end
+        end
+
+        F_G2_LN_OUT: begin
+          // Gen-1 OP_LAYERNORM (0x0F) is illegal at decode_unit (see
+          // decode_unit.sv L45). The gen-1 INT8 write path is dead — only
+          // gen-2 0x1A LAYERNORM_FP32 reaches here, writing FP16.
+          out_h_q[iter_idx_q[9:0]] <= ln_out_h_w;
+          iter_idx_q               <= iter_idx_q + 11'd1;
+          state                    <= F_G2_LN_OUT_NORM;
         end
 
         // 0x1D MASKED_SOFTMAX_FP32 synth sub-FSM (Phase-2; BANDED):

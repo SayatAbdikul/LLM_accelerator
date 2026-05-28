@@ -242,7 +242,9 @@
   // F_G2_LN_DENOM_PRE one cycle earlier), not the combinational ln_var_eps_w.
   fp32_sqrt u_ln_sqrt    (.a(ln_var_eps_q),                    .y(ln_denom_w));
   fp32_div  u_ln_norm    (.a(ln_diff_w),    .b(ln_denom_q),   .y(ln_norm_w));
-  fp32_mul  u_ln_norm_g  (.a(ln_norm_w),    .b(synth_gamma_bits), .y(ln_norm_g_w));
+  // Phase-4 pipeline cut: ln_norm_g multiplier reads the registered ln_norm_q
+  // (latched in F_G2_LN_OUT_NORM), not the combinational ln_norm_w.
+  fp32_mul  u_ln_norm_g  (.a(ln_norm_q),    .b(synth_gamma_bits), .y(ln_norm_g_w));
   fp32_add  u_ln_norm_gb (.a(ln_norm_g_w),  .b(synth_beta_bits),  .y(ln_norm_gb_w));
   fp32_to_fp16 u_ln_out_h(.a(ln_norm_gb_w),                        .y(ln_out_h_w));
   fp32_div  u_ln_g1_scale(.a(ln_norm_gb_w), .b(synth_scale1_bits), .y(ln_g1_scaled_w));

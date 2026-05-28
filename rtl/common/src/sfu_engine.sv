@@ -167,7 +167,12 @@ module sfu_engine
     // Phase-4 (2026-05-28): split F_G2_LN_DENOM into two cycles so the
     // (var_acc/n + eps) and sqrt() ops live on separate clock periods.
     // The pre-stage latches ln_var_eps_q; F_G2_LN_DENOM reads it via u_ln_sqrt.
-    F_G2_LN_DENOM_PRE = 6'd42
+    F_G2_LN_DENOM_PRE = 6'd42,
+    // Phase-4: split F_G2_LN_OUT — the 5-op fp32 chain
+    //   (row - mean) -> /denom -> *gamma -> +beta -> f2h -> out_h_q
+    // ran in one cycle (~190 ns). NORM latches ln_norm_q = (row-mean)/denom
+    // for the current iter; the OUT cycle takes (norm*gamma + beta) -> f2h.
+    F_G2_LN_OUT_NORM  = 6'd43
   } sfu_state_t;
 
   sfu_state_t state;
@@ -205,6 +210,9 @@ module sfu_engine
   // Phase-4 (2026-05-28): pipeline cut between (var_acc/n + eps) and sqrt.
   // ln_var_eps_q is latched in F_G2_LN_DENOM_PRE, consumed by u_ln_sqrt next cycle.
   logic [31:0]  ln_var_eps_q;
+  // Phase-4: pipeline cut inside F_G2_LN_OUT — ln_norm_q latches (row-mean)/denom
+  // in F_G2_LN_OUT_NORM, consumed by u_ln_norm_g in F_G2_LN_OUT.
+  logic [31:0]  ln_norm_q;
   // Phase-2 synth-mode SOFTMAX (0x1D) reduction state.
   logic [31:0]  sm_row_max_q;       // running fp32 row_max
   logic [31:0]  sm_exp_sum_q;       // running fp32 exp_sum
@@ -647,6 +655,7 @@ module sfu_engine
       ln_mean_q      <= 32'h0;
       ln_denom_q     <= 32'h0;
       ln_var_eps_q   <= 32'h0;
+      ln_norm_q      <= 32'h0;
       sm_row_max_q   <= 32'h0;
       sm_exp_sum_q   <= 32'h0;
       sm_have_vis_q  <= 1'b0;
