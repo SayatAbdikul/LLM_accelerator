@@ -163,7 +163,11 @@ module sfu_engine
     // quantization at out_bytes_q absorbs the tanh-vs-erf difference for
     // typical fixture inputs).
     F_GELU_SYNTH_I8_ITER  = 6'd40,
-    F_GELU_SYNTH_I32_ITER = 6'd41
+    F_GELU_SYNTH_I32_ITER = 6'd41,
+    // Phase-4 (2026-05-28): split F_G2_LN_DENOM into two cycles so the
+    // (var_acc/n + eps) and sqrt() ops live on separate clock periods.
+    // The pre-stage latches ln_var_eps_q; F_G2_LN_DENOM reads it via u_ln_sqrt.
+    F_G2_LN_DENOM_PRE = 6'd42
   } sfu_state_t;
 
   sfu_state_t state;
@@ -198,6 +202,9 @@ module sfu_engine
   logic [31:0]  ln_var_acc_q;
   logic [31:0]  ln_mean_q;
   logic [31:0]  ln_denom_q;
+  // Phase-4 (2026-05-28): pipeline cut between (var_acc/n + eps) and sqrt.
+  // ln_var_eps_q is latched in F_G2_LN_DENOM_PRE, consumed by u_ln_sqrt next cycle.
+  logic [31:0]  ln_var_eps_q;
   // Phase-2 synth-mode SOFTMAX (0x1D) reduction state.
   logic [31:0]  sm_row_max_q;       // running fp32 row_max
   logic [31:0]  sm_exp_sum_q;       // running fp32 exp_sum
@@ -639,6 +646,7 @@ module sfu_engine
       ln_var_acc_q   <= 32'h0;
       ln_mean_q      <= 32'h0;
       ln_denom_q     <= 32'h0;
+      ln_var_eps_q   <= 32'h0;
       sm_row_max_q   <= 32'h0;
       sm_exp_sum_q   <= 32'h0;
       sm_have_vis_q  <= 1'b0;

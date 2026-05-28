@@ -227,8 +227,9 @@
   assign ln_neg_mean = ln_mean_q ^ 32'h8000_0000;
   // n_elems_q (16-bit unsigned) → fp32 via i32_to_fp32 primitive (synth-safe).
   i32_to_fp32 u_ln_n_cvt (.a({16'h0, n_elems_q}), .y(ln_n_fp32));
-  // Epsilon mux: gen-1 LAYERNORM uses 1e-6, gen-2 LAYERNORM_FP32 uses 1e-5.
-  assign ln_eps_sel_w = (opcode_q == OP_LAYERNORM) ? C_LN_EPS_G1 : C_LN_FP32_EPS;
+  // Gen-1 OP_LAYERNORM is illegal at decode_unit; only gen-2 LAYERNORM_FP32
+  // reaches here. Drop the mux and pin to C_LN_FP32_EPS (1e-5).
+  assign ln_eps_sel_w = C_LN_FP32_EPS;
 
   fp32_add  u_ln_sum_add (.a(ln_sum_acc_q), .b(synth_a_bits), .y(ln_sum_add_w));
   fp32_div  u_ln_mean    (.a(ln_sum_acc_q), .b(ln_n_fp32),    .y(ln_mean_div_w));
@@ -237,7 +238,9 @@
   fp32_add  u_ln_var_add (.a(ln_var_acc_q), .b(ln_diff_sq_w), .y(ln_var_add_w));
   fp32_div  u_ln_var_norm(.a(ln_var_acc_q), .b(ln_n_fp32),    .y(ln_var_norm_w));
   fp32_add  u_ln_var_eps (.a(ln_var_norm_w),.b(ln_eps_sel_w), .y(ln_var_eps_w));
-  fp32_sqrt u_ln_sqrt    (.a(ln_var_eps_w),                    .y(ln_denom_w));
+  // Phase-4 pipeline cut: sqrt reads the registered ln_var_eps_q (latched in
+  // F_G2_LN_DENOM_PRE one cycle earlier), not the combinational ln_var_eps_w.
+  fp32_sqrt u_ln_sqrt    (.a(ln_var_eps_q),                    .y(ln_denom_w));
   fp32_div  u_ln_norm    (.a(ln_diff_w),    .b(ln_denom_q),   .y(ln_norm_w));
   fp32_mul  u_ln_norm_g  (.a(ln_norm_w),    .b(synth_gamma_bits), .y(ln_norm_g_w));
   fp32_add  u_ln_norm_gb (.a(ln_norm_g_w),  .b(synth_beta_bits),  .y(ln_norm_gb_w));

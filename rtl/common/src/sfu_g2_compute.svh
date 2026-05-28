@@ -277,8 +277,18 @@
             iter_idx_q   <= iter_idx_q + 11'd1;
           end else begin
             iter_idx_q   <= 11'h0;
-            state        <= F_G2_LN_DENOM;
+            state        <= F_G2_LN_DENOM_PRE;
           end
+        end
+
+        // Phase-4 pipeline cut: F_G2_LN_DENOM was a 4-op fp32 chain
+        //   var_acc/n -> +eps -> sqrt -> ln_denom_q
+        // ~250 ns combinationally on sky130. Now split: PRE latches the
+        // (var_acc/n + eps) sum into ln_var_eps_q; the next cycle takes
+        // sqrt of that registered value. Same bit-exact output, +1 cycle.
+        F_G2_LN_DENOM_PRE: begin
+          ln_var_eps_q <= ln_var_eps_w;
+          state        <= F_G2_LN_DENOM;
         end
 
         F_G2_LN_DENOM: begin
@@ -288,17 +298,14 @@
 
         F_G2_LN_OUT: begin
           if ({5'h0, iter_idx_q} < n_elems_q) begin
-            // Writeback branches on opcode (sub-FSM shared gen-1/gen-2):
-            //   gen-1 0x15 LAYERNORM:      out_bytes_q[i] = qi8(y / scale1_q)
-            //   gen-2 0x1A LAYERNORM_FP32: out_h_q[i]     = fp16(y)
-            if (opcode_q == OP_LAYERNORM)
-              out_bytes_q[iter_idx_q[9:0]] <= ln_g1_quant_w;
-            else
-              out_h_q[iter_idx_q[9:0]]     <= ln_out_h_w;
-            iter_idx_q                     <= iter_idx_q + 11'd1;
+            // Gen-1 OP_LAYERNORM (0x0F) is illegal at decode_unit (see
+            // decode_unit.sv L45). The gen-1 INT8 write path is dead — only
+            // gen-2 0x1A LAYERNORM_FP32 reaches here, writing FP16.
+            out_h_q[iter_idx_q[9:0]]     <= ln_out_h_w;
+            iter_idx_q                   <= iter_idx_q + 11'd1;
           end else begin
             iter_idx_q <= 11'h0;
-            state      <= (opcode_q == OP_LAYERNORM) ? F_ROW_PACK : F_G2_PACK;
+            state      <= F_G2_PACK;
           end
         end
 
@@ -321,18 +328,9 @@
             iter_idx_q <= iter_idx_q + 11'd1;
           end else begin
             iter_idx_q   <= 11'h0;
-            // Gen-1 SOFTMAX + ATTN semantics: if no element was visible (e.g.
-            // an empty mask), raise FAULT_NO_CONFIG — matches DPI gen-1 PREP
-            // path (sfu_engine.sv old lines 1336, 1727). Gen-2 just writes zeros.
-            if (((opcode_q == OP_SOFTMAX) || (opcode_q == OP_MASKED_SOFTMAX)
-                || (opcode_q == OP_SOFTMAX_ATTNV)
-                || (opcode_q == OP_MASKED_SOFTMAX_ATTNV))
-                && !sm_have_vis_q) begin
-              fault_code_r <= 4'(FAULT_NO_CONFIG);
-              state        <= F_FAULT;
-            end else begin
-              state        <= F_G2_SM_EXPSUM;
-            end
+            // Gen-1 SOFTMAX/ATTNV all illegal at decode; their no-visible
+            // FAULT path is unreachable. Gen-2 just falls through to EXPSUM.
+            state <= F_G2_SM_EXPSUM;
           end
         end
 
@@ -343,60 +341,28 @@
             iter_idx_q <= iter_idx_q + 11'd1;
           end else begin
             iter_idx_q <= 11'h0;
-            // Gen-1 SOFTMAX + ATTN semantics: exp_sum == 0 -> FAULT_NO_CONFIG.
-            if (((opcode_q == OP_SOFTMAX) || (opcode_q == OP_MASKED_SOFTMAX)
-                || (opcode_q == OP_SOFTMAX_ATTNV)
-                || (opcode_q == OP_MASKED_SOFTMAX_ATTNV))
-                && (sm_exp_sum_q == 32'h0)) begin
-              fault_code_r <= 4'(FAULT_NO_CONFIG);
-              state        <= F_FAULT;
-            end else if ((opcode_q == OP_SOFTMAX_ATTNV)
-                      || (opcode_q == OP_MASKED_SOFTMAX_ATTNV)) begin
-              // Phase-3.B gen-1 ATTN PREP: sync sm_* (fp32 bits) → attn_*
-              // (real, used by V_LATCH DPI path) and zero attn_accum_q for
-              // the upcoming weighted-V accumulation. F_ATTN_V_REQ next.
-              attn_row_max_q <= sm_row_max_q;
-              attn_exp_sum_q <= sm_exp_sum_q;
-              for (int zi = 0; zi < SFU_MAX_ROW_ELEMS; zi++) begin
-                if (zi < integer'(n_elems_q))
-                  attn_accum_q[zi] <= 0.0;
-              end
-              attn_k_idx_q   <= 16'h0;
-              read_idx_q     <= 13'h0;
-              write_chunk_q  <= 11'h0;
-              state          <= F_ATTN_V_REQ;
-            end else begin
-              state        <= F_G2_SM_OUT;
-            end
+            // Gen-1 SOFTMAX/MASKED_SOFTMAX/{ATTNV,MASKED_ATTNV} all illegal at
+            // decode_unit (0x0E/0x15/0x12/0x16). Only gen-2 OP_MASKED_SOFTMAX_FP32
+            // reaches here and proceeds to F_G2_SM_OUT.
+            state <= F_G2_SM_OUT;
           end
         end
 
         F_G2_SM_OUT: begin
           if ({5'h0, iter_idx_q} < sm_iter_bound_w) begin
-            // Writeback branches on opcode:
-            //   gen-1: out_bytes_q[i] = quantize_i8(norm * scale1_q) if
-            //          visible & exp_sum != 0; else 0.
-            //   gen-2: out_h_q[i]     = fp16(norm) if visible & exp_sum != 0;
-            //          else 0.
-            if ((opcode_q == OP_SOFTMAX) || (opcode_q == OP_MASKED_SOFTMAX)) begin
-              if (sm_have_vis_q && sm_visible_w && (sm_exp_sum_q != 32'h0))
-                out_bytes_q[iter_idx_q[9:0]] <= sm_g1_quant_w;
-              else
-                out_bytes_q[iter_idx_q[9:0]] <= 8'h00;
-            end else begin
-              if (sm_have_vis_q && sm_visible_w && (sm_exp_sum_q != 32'h0))
-                out_h_q[iter_idx_q[9:0]] <= sm_out_h_w;
-              else
-                out_h_q[iter_idx_q[9:0]] <= 16'h0;
-            end
+            // Gen-1 OP_SOFTMAX (0x0E), OP_MASKED_SOFTMAX (0x15),
+            // OP_SOFTMAX_ATTNV (0x12), OP_MASKED_SOFTMAX_ATTNV (0x16) are all
+            // illegal at decode_unit (decode_unit.sv L45). The INT8 quantize
+            // writeback path through sm_g1_quant_w is unreachable; only gen-2
+            // OP_MASKED_SOFTMAX_FP32 (0x1D) reaches here, writing FP16.
+            if (sm_have_vis_q && sm_visible_w && (sm_exp_sum_q != 32'h0))
+              out_h_q[iter_idx_q[9:0]] <= sm_out_h_w;
+            else
+              out_h_q[iter_idx_q[9:0]] <= 16'h0;
             iter_idx_q <= iter_idx_q + 11'd1;
           end else begin
             iter_idx_q <= 11'h0;
-            // Exit dispatch: gen-1 -> F_ROW_PACK (int8 pack), gen-2 -> F_G2_PACK
-            // (fp16 pack). Each pack stage handles its own write_chunk_q seq.
-            if ((opcode_q == OP_SOFTMAX) || (opcode_q == OP_MASKED_SOFTMAX))
-              state <= F_ROW_PACK;
-            else
-              state <= F_G2_PACK;
+            // Gen-1 F_ROW_PACK exit is dead (see above). Only gen-2 reaches.
+            state <= F_G2_PACK;
           end
         end
