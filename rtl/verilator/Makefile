@@ -58,7 +58,7 @@ CTRL_SV       := $(addprefix $(SRC_DIR)/, $(call read_filelist,$(CORE_CTRL_F)))
         test_systolic_qkt_basic test_systolic_qkt_replay \
         test_systolic_qkt_padded test_systolic_qkt_history \
         test_addr_raw_hazard \
-        test_accum_snapshot_readback test_fp32_add \
+        test_accum_snapshot_readback test_fp32_add test_fp32_div \
         test_sfu_synth test_helpers_synth \
         test_sfu_helper_synth synth-check synth-check-ctrl clean
 # R7 (2026-05-23): test_fp32_*_pipe targets removed. The 12 fp32_*_pipe.sv
@@ -350,6 +350,26 @@ $(BUILD_DIR)/test_fp32_add/Vfp32_add: $(FP32_DIR)/fp32_add.sv test_fp32_add.cpp
 test_fp32_add: $(BUILD_DIR)/test_fp32_add/Vfp32_add
 	@echo "--- Running synthesizable fp32_add bit-exact gate ---"
 	$(BUILD_DIR)/test_fp32_add/Vfp32_add
+
+# -----------------------------------------------------------------------
+# test_fp32_div: 2-stage pipelined fp32_div_p2, bit-exact gate.
+# Standalone — links ONLY fp32_div_p2 (no taccel_top). Proves the
+# path-cutting divider is byte-identical to the host-float golden before
+# any sfu_engine.sv integration.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_fp32_div/Vfp32_div_p2: $(FP32_DIR)/fp32_div_p2.sv test_fp32_div.cpp
+	mkdir -p $(BUILD_DIR)/test_fp32_div
+	$(VERILATOR) $(VFLAGS) \
+	  --top-module fp32_div_p2 \
+	  --Mdir $(BUILD_DIR)/test_fp32_div \
+	  $(FP32_DIR)/fp32_div_p2.sv \
+	  test_fp32_div.cpp \
+	  -CFLAGS "$(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_fp32_div -f Vfp32_div_p2.mk
+
+test_fp32_div: $(BUILD_DIR)/test_fp32_div/Vfp32_div_p2
+	@echo "--- Running pipelined fp32_div_p2 bit-exact gate ---"
+	$(BUILD_DIR)/test_fp32_div/Vfp32_div_p2
 
 # -----------------------------------------------------------------------
 # test_systolic_query: focused chained query-projection regression
