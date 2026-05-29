@@ -259,14 +259,17 @@
           end
         end
 
+        // mean = sum_acc / n_elems_fp32 via the pipelined fp32_div_p2 u_ln_mean
+        // (LATENCY=2). ln_sum_acc_q is registered & stable on entry; sample its
+        // quotient 2 cycles later. Once-per-row so the +2 cycles are negligible.
         F_G2_LN_MEAN: begin
-          // mean = sum_acc / n_elems_fp32   (combinational chain reuses
-          // u_ln_var_norm with operands sum_acc / n -- but that unit's a
-          // is tied to ln_var_acc_q.  Add a dedicated div instead.)
-          // Instead, compute mean via the same fp32_div module: re-instance
-          // not feasible inline, so do the divide here using
-          // u_ln_var_norm's port -- impractical. Use the dedicated below.
-          ln_mean_q    <= ln_mean_div_w;
+          state <= F_G2_LN_MEAN_W;
+        end
+        F_G2_LN_MEAN_W: begin
+          state <= F_G2_LN_MEAN_S;
+        end
+        F_G2_LN_MEAN_S: begin
+          ln_mean_q    <= ln_mean_div_w;   // divider y now valid
           ln_var_acc_q <= 32'h0;
           state        <= F_G2_LN_VAR;
         end
@@ -286,8 +289,17 @@
         // ~250 ns combinationally on sky130. Now split: PRE latches the
         // (var_acc/n + eps) sum into ln_var_eps_q; the next cycle takes
         // sqrt of that registered value. Same bit-exact output, +1 cycle.
+        // var_norm = var_acc / n via pipelined u_ln_var_norm (LATENCY=2), then
+        // +eps. ln_var_acc_q is registered & stable on entry; the +eps add sits
+        // after the divider output register. Once-per-row.
         F_G2_LN_DENOM_PRE: begin
-          ln_var_eps_q <= ln_var_eps_w;
+          state <= F_G2_LN_DENOM_PRE_W;
+        end
+        F_G2_LN_DENOM_PRE_W: begin
+          state <= F_G2_LN_DENOM_PRE_S;
+        end
+        F_G2_LN_DENOM_PRE_S: begin
+          ln_var_eps_q <= ln_var_eps_w;   // add(divider y, eps); y now valid
           state        <= F_G2_LN_DENOM;
         end
 
@@ -314,9 +326,16 @@
           end
         end
 
+        // (row-mean)/denom via pipelined u_ln_norm (LATENCY=2, the 180 ns STA
+        // worst path). ln_diff_q was registered in F_G2_LN_OUT_DIFF; the divider
+        // y (ln_norm_w) is valid in F_G2_LN_OUT, where the gamma multiply reads
+        // it directly (no intermediate ln_norm_q latch). NORM just presents;
+        // _W is the divider's 2nd pipeline stage. Net +1 cycle/element.
         F_G2_LN_OUT_NORM: begin
-          ln_norm_q <= ln_norm_w;
-          state     <= F_G2_LN_OUT;
+          state <= F_G2_LN_OUT_W;
+        end
+        F_G2_LN_OUT_W: begin
+          state <= F_G2_LN_OUT;
         end
 
         F_G2_LN_OUT: begin
@@ -371,14 +390,26 @@
         //   exp(row-max) -> /exp_sum -> f2h -> out_h_q
         // at 149 ns post-PNR. NORM latches sm_norm_q = fp32_div(sm_exp_w,
         // sm_exp_sum_q) so OUT just does f2h. Each element costs 2 cycles.
+        // exp(row-max)/exp_sum via pipelined u_sm_div (LATENCY=2, STA #2 path
+        // at 157 ns). NORM registers the combinational exp into sm_exp_q so the
+        // divider sees a registered dividend (isolating fp32_exp from div
+        // stage-1); DIV/_W are the divider's two pipeline stages; SM_OUT reads
+        // the y (sm_norm_w) directly. iter_idx_q is held across DIV/_W so the
+        // SM_OUT visibility check and write target stay on the same element.
         F_G2_SM_OUT_NORM: begin
           if ({5'h0, iter_idx_q} < sm_iter_bound_w) begin
-            sm_norm_q <= sm_norm_w;
-            state     <= F_G2_SM_OUT;
+            sm_exp_q <= sm_exp_w;        // exp(row[iter]-max); divider sees it next cycle
+            state    <= F_G2_SM_OUT_DIV;
           end else begin
             iter_idx_q <= 11'h0;
             state      <= F_G2_PACK;
           end
+        end
+        F_G2_SM_OUT_DIV: begin
+          state <= F_G2_SM_OUT_W;
+        end
+        F_G2_SM_OUT_W: begin
+          state <= F_G2_SM_OUT;
         end
 
         F_G2_SM_OUT: begin

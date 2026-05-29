@@ -183,7 +183,20 @@ module sfu_engine
     // its own cycle. Post Phase-5 the worst path was sm_exp_sum_q ->
     // fp32_div -> fp32_to_fp16 -> out_h_q at 149 ns; this cut isolates
     // fp32_div from f2h.
-    F_G2_SM_OUT_NORM  = 6'd45
+    F_G2_SM_OUT_NORM  = 6'd45,
+    // 2026-05-29 (new session): fp32_div_p2 pipelined divider (LATENCY=2)
+    // replaces the combinational fp32_div in the 4 STA-binding sites
+    // (ln_norm 180 ns, sm_div 157 ns, ln_var_norm 134 ns, ln_mean 122 ns).
+    // Each div site gains wait state(s) so the FSM samples y 2 cycles after
+    // the registered operands are presented. Moves the SFU fmax floor from
+    // the divider down to fp32_sqrt (ln_denom, ~113 ns). See [[dma_floor]].
+    F_G2_LN_MEAN_W      = 6'd46,  // ln_mean div stage2
+    F_G2_LN_MEAN_S      = 6'd47,  // ln_mean div y valid -> sample ln_mean_q
+    F_G2_LN_DENOM_PRE_W = 6'd48,  // ln_var_norm div stage2
+    F_G2_LN_DENOM_PRE_S = 6'd49,  // div y valid -> +eps -> sample ln_var_eps_q
+    F_G2_LN_OUT_W       = 6'd50,  // ln_norm div stage2 (NORM presented, OUT uses y)
+    F_G2_SM_OUT_DIV     = 6'd51,  // sm div stage1 (exp registered in OUT_NORM)
+    F_G2_SM_OUT_W       = 6'd52   // sm div stage2 (OUT uses y)
   } sfu_state_t;
 
   sfu_state_t state;
@@ -221,17 +234,15 @@ module sfu_engine
   // Phase-4 (2026-05-28): pipeline cut between (var_acc/n + eps) and sqrt.
   // ln_var_eps_q is latched in F_G2_LN_DENOM_PRE, consumed by u_ln_sqrt next cycle.
   logic [31:0]  ln_var_eps_q;
-  // Phase-4: pipeline cut inside F_G2_LN_OUT — ln_norm_q latches (row-mean)/denom
-  // in F_G2_LN_OUT_NORM, consumed by u_ln_norm_g in F_G2_LN_OUT.
-  logic [31:0]  ln_norm_q;
-  // Phase-5: latches (row - mean) in F_G2_LN_OUT_DIFF so fp32_div sees a
-  // registered operand. Removes the fp32_add+fp32_div serial chain that was
-  // the post-PNR critical path (184 ns).
+  // Phase-5: latches (row - mean) in F_G2_LN_OUT_DIFF so the divider sees a
+  // registered operand. (The Phase-4 ln_norm_q intermediate latch was removed
+  // 2026-05-29: u_ln_norm is now fp32_div_p2, whose output register replaces it
+  // — F_G2_LN_OUT reads ln_norm_w directly.)
   logic [31:0]  ln_diff_q;
-  // Phase-6: latches fp32_div(exp(row-max), exp_sum) in F_G2_SM_OUT_NORM so
-  // the fp32_to_fp16 in F_G2_SM_OUT runs in its own cycle. Was the post-PNR
-  // critical path (149 ns) after Phase-5.
-  logic [31:0]  sm_norm_q;
+  // 2026-05-29: registers exp(row-max) in F_G2_SM_OUT_NORM so the pipelined
+  // fp32_div_p2 sees a registered dividend (isolates fp32_exp from the
+  // divider's stage-1; otherwise exp+div_stage1 would chain ~138 ns).
+  logic [31:0]  sm_exp_q;
   // Phase-2 synth-mode SOFTMAX (0x1D) reduction state.
   logic [31:0]  sm_row_max_q;       // running fp32 row_max
   logic [31:0]  sm_exp_sum_q;       // running fp32 exp_sum
@@ -674,9 +685,8 @@ module sfu_engine
       ln_mean_q      <= 32'h0;
       ln_denom_q     <= 32'h0;
       ln_var_eps_q   <= 32'h0;
-      ln_norm_q      <= 32'h0;
       ln_diff_q      <= 32'h0;
-      sm_norm_q      <= 32'h0;
+      sm_exp_q       <= 32'h0;
       sm_row_max_q   <= 32'h0;
       sm_exp_sum_q   <= 32'h0;
       sm_have_vis_q  <= 1'b0;

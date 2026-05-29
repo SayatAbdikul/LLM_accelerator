@@ -25,6 +25,7 @@ include/taccel_pkg.sv
 fp32/fp32_add.sv
 fp32/fp32_mul.sv
 fp32/fp32_div.sv
+fp32/fp32_div_p2.sv
 fp32/fp32_sqrt.sv
 fp32/fp32_to_fp16.sv
 fp32/fp16_to_fp32.sv
