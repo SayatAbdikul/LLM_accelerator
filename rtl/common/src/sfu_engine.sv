@@ -202,7 +202,16 @@ module sfu_engine
     // floor after the dividers were pipelined. F_G2_LN_DENOM presents the
     // registered ln_var_eps_q; sample ln_denom_q 2 cycles later. See [[dma_floor]].
     F_G2_LN_DENOM_W     = 6'd53,  // ln_denom sqrt stage2
-    F_G2_LN_DENOM_S     = 6'd54   // sqrt y valid -> sample ln_denom_q
+    F_G2_LN_DENOM_S     = 6'd54,  // sqrt y valid -> sample ln_denom_q
+    // 2026-05-29: fp32_div_p3 (3-stage, LATENCY=3) replaces fp32_div_p2 at the
+    // 4 binding divider sites — the divider stage-1 was the ~88 ns synth floor
+    // after the sqrt was pipelined. Each site gets ONE extra wait state vs the
+    // LATENCY=2 integration so the FSM samples y 3 cycles after the registered
+    // operands are presented. See [[dma_floor]].
+    F_G2_LN_MEAN_W2     = 6'd55,  // ln_mean div 3rd stage
+    F_G2_LN_DENOM_PRE_W2= 6'd56,  // ln_var_norm div 3rd stage
+    F_G2_LN_OUT_W2      = 6'd57,  // ln_norm div 3rd stage
+    F_G2_SM_OUT_W2      = 6'd58   // sm_div 3rd stage
   } sfu_state_t;
 
   sfu_state_t state;
