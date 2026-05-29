@@ -71,7 +71,10 @@ module systolic_controller
     // #116: per-drain ACCUM read for the flags=1 (K-split accumulate)
     // read-modify-write. Only entered when flags_accumulate_q; the flags=0
     // path stays the single-cycle overwrite (byte-identical to pre-#116).
-    ST_DRAIN_RD   = 4'd10
+    ST_DRAIN_RD   = 4'd10,
+    // Double-buffer boundary: latch the final prefetched A row and swap the
+    // scratch buffer between K-tiles (1-cycle mesh-frozen pause).
+    ST_PF_FINISH  = 4'd11
   } state_t;
 
   state_t state;
@@ -91,7 +94,11 @@ module systolic_controller
   // Phase-3: packed 2D so yosys's built-in SV frontend can elaborate. All
   // accesses are [i][j] element-style (no row-slice ops) so the conversion
   // is value-semantic-equivalent. Originally `[0:15][0:15]` unpacked.
-  logic [SYS_DIM-1:0][SYS_DIM-1:0][7:0] a_tile_scratch;
+  // Double-buffered: [buf][row][col]. Streaming reads a_buf_sel_q; the next
+  // K-tile's A-tile is prefetched into ~a_buf_sel_q during streaming (port B
+  // is idle then) so the inter-K-tile A-load no longer stalls the mesh.
+  logic [1:0][SYS_DIM-1:0][SYS_DIM-1:0][7:0] a_tile_scratch;
+  logic a_buf_sel_q;
 
   // Row-major drain address tracking.
   // tile_drain_base_q = dst_off + mtile * n_tiles * 64 (advances by n_tiles*64 per M-tile).
@@ -159,6 +166,8 @@ module systolic_controller
   // NEXT scratch row (a_load_row_q + 1) while the current row is being
   // latched. ST_A_LOAD_REQ is a one-shot prime reading row 0 itself.
   logic [4:0]  ld_row_w;
+  // Prefetch (double-buffer) address: next K-tile's A row, row index = lane_q.
+  logic [31:0] src1_pf_logical_row, src1_pf_row_addr;
   always_comb begin
     src1_row_units = {21'h0, k_tiles_q};
     src2_row_units = {21'h0, n_tiles_q};
@@ -176,6 +185,10 @@ module systolic_controller
 
     src1_load_row_addr = {16'h0, src1_off_q} + (src1_logical_row * src1_row_units) + {21'h0, ktile_q};
     src2_stream_row_addr = {16'h0, src2_off_q} + (src2_logical_row * src2_row_units) + {21'h0, ntile_q};
+
+    src1_pf_logical_row = ({21'h0, mtile_q} << 4) + {26'h0, lane_q};
+    src1_pf_row_addr = {16'h0, src1_off_q} + (src1_pf_logical_row * src1_row_units)
+                     + {21'h0, (ktile_q + 11'd1)};
   end
 
   // Tile-walking FSM. One MATMUL dispatch can cover many logical 16x16 tiles
@@ -204,9 +217,11 @@ module systolic_controller
       dst_clear_total_rows_q <= 32'd0;
       tile_drain_base_q <= 16'h0;
       drain_row_addr_q <= 16'h0;
-      for (int row_idx = 0; row_idx < SYS_DIM; row_idx = row_idx + 1)
-        for (int col_idx = 0; col_idx < SYS_DIM; col_idx = col_idx + 1)
-          a_tile_scratch[row_idx][col_idx] <= 8'h0;
+      a_buf_sel_q <= 1'b0;
+      for (int buf_idx = 0; buf_idx < 2; buf_idx = buf_idx + 1)
+        for (int row_idx = 0; row_idx < SYS_DIM; row_idx = row_idx + 1)
+          for (int col_idx = 0; col_idx < SYS_DIM; col_idx = col_idx + 1)
+            a_tile_scratch[buf_idx][row_idx][col_idx] <= 8'h0;
     end else begin
       case (state)
         ST_IDLE: begin
@@ -257,6 +272,7 @@ module systolic_controller
         ST_INIT_TILE: begin
           lane_q <= 6'd0;
           a_load_row_q <= 5'd0;
+          a_buf_sel_q <= 1'b0;   // initial blocking A-load fills buffer 0
           state <= ST_A_LOAD_REQ;
         end
 
@@ -267,9 +283,11 @@ module systolic_controller
         ST_A_LOAD_LATCH: begin
           // Latch the row read in the previous cycle, and (via the read-ahead
           // issued this same cycle, ld_row_w = a_load_row_q+1) loop in place so
-          // each row costs 1 cycle instead of the old REQ/LATCH pair.
+          // each row costs 1 cycle instead of the old REQ/LATCH pair. This is
+          // the INITIAL (blocking) load for K-tile 0 into buffer a_buf_sel_q
+          // (=0); subsequent K-tiles are prefetched into the other buffer.
           for (int col_idx = 0; col_idx < SYS_DIM; col_idx = col_idx + 1)
-            a_tile_scratch[a_load_row_q[3:0]][col_idx] <= sram_b_rdata[(col_idx * 8) +: 8];
+            a_tile_scratch[a_buf_sel_q][a_load_row_q[3:0]][col_idx] <= sram_b_rdata[(col_idx * 8) +: 8];
 
           if (a_load_row_q == 5'd15) begin
             lane_q <= 6'd0;
@@ -285,21 +303,33 @@ module systolic_controller
         end
 
         ST_READ_USE: begin
+          // Double-buffer prefetch latch: the port-B read issued last cycle
+          // (for next K-tile row lane_q-1) returns now; stash it in the
+          // OTHER buffer. Only while prefetching (non-final K-tile) and once
+          // a read has been issued (lane_q >= 1; row 15 is latched in
+          // ST_PF_FINISH).
+          if ((ktile_q + 11'd1 < k_tiles_q) && (lane_q != 6'd0)) begin
+            for (int col_idx = 0; col_idx < SYS_DIM; col_idx = col_idx + 1)
+              a_tile_scratch[~a_buf_sel_q][lane_q[3:0] - 4'd1][col_idx]
+                <= sram_b_rdata[(col_idx * 8) +: 8];
+          end
+
           if (ktile_q + 11'd1 < k_tiles_q) begin
-            // Not the last K-tile: stream ONLY the 16 data lanes, then reload
-            // A for the next K-tile WITHOUT the 30 chained skew-flush lanes.
-            // The mesh freezes during A-load (step_en=0) with this tile's
+            // Not the last K-tile: stream ONLY the 16 data lanes, WITHOUT the
+            // 30 chained skew-flush lanes and WITHOUT stalling for an A-load
+            // (the next tile's A is prefetched into the other buffer during
+            // these 16 cycles). At lane 15 hop through ST_PF_FINISH to latch
+            // the final prefetched row and swap buffers (1-cycle pause). The
+            // mesh freezes (step_en=0) for that one cycle with this tile's
             // operands still in flight in the skew pipeline; the next tile's
             // lanes resume right behind them so each PE keeps accumulating its
             // aligned k. INT32 accumulation is order-independent under 2's-
-            // complement wrap, so deferring the single drain to the final
-            // K-tile is byte-identical. This removes 2*(SYS_DIM-1)=30 bubble
-            // cycles per K-tile (chained mode).
+            // complement wrap, so deferring the single skew-drain to the final
+            // K-tile is byte-identical.
             if (int'(lane_q) == (SYS_DIM - 1)) begin
               lane_q       <= 6'd0;
               ktile_q      <= ktile_q + 11'd1;
-              a_load_row_q <= 5'd0;
-              state        <= ST_A_LOAD_REQ;
+              state        <= ST_PF_FINISH;
             end else begin
               lane_q <= lane_q + 6'd1;
               state  <= ST_READ_USE;
@@ -317,6 +347,17 @@ module systolic_controller
               state  <= ST_READ_USE;
             end
           end
+        end
+
+        ST_PF_FINISH: begin
+          // Latch the final prefetched A row (row 15, issued in ST_READ_USE
+          // at lane 15) into the prefetch buffer, then swap so streaming reads
+          // it next cycle. The matching src2 (port A) prime read for the next
+          // K-tile's lane 0 is issued combinationally this cycle.
+          for (int col_idx = 0; col_idx < SYS_DIM; col_idx = col_idx + 1)
+            a_tile_scratch[~a_buf_sel_q][4'd15][col_idx] <= sram_b_rdata[(col_idx * 8) +: 8];
+          a_buf_sel_q <= ~a_buf_sel_q;
+          state       <= ST_READ_USE;
         end
 
         ST_DRAIN_PREP: begin
@@ -381,7 +422,7 @@ module systolic_controller
     a_row_data_q = 128'h0;
     for (int row_idx = 0; row_idx < SYS_DIM; row_idx = row_idx + 1) begin
       if (!inject_zero_data && (lane_q < 6'd16))
-        a_row_data_q[(row_idx * 8) +: 8] = a_tile_scratch[row_idx][lane_q[3:0]];
+        a_row_data_q[(row_idx * 8) +: 8] = a_tile_scratch[a_buf_sel_q][row_idx][lane_q[3:0]];
     end
     b_row_data_q = inject_zero_data ? 128'h0 : sram_a_rdata;
 
@@ -444,6 +485,27 @@ module systolic_controller
         // 1 cycle/lane. Bit-exact: the array sees the identical per-lane
         // (a_row_data, b_row_data, step_en) sequence.
         step_en = 1'b1;
+        if (int'(rd_lane_w) < SYS_DIM) begin
+          sram_a_en = 1'b1;
+          sram_a_we = 1'b0;
+          sram_a_buf = src2_buf_q;
+          sram_a_row = src2_stream_row_addr[15:0];
+        end
+        // Concurrent double-buffer prefetch on the idle port B: read the next
+        // K-tile's A row (row index = lane_q) into ~a_buf_sel_q. Its data is
+        // latched next cycle (ST_READ_USE lane+1, or ST_PF_FINISH for row 15).
+        if (ktile_q + 11'd1 < k_tiles_q) begin
+          sram_b_en  = 1'b1;
+          sram_b_buf = src1_buf_q;
+          sram_b_row = src1_pf_row_addr[15:0];
+        end
+      end
+
+      ST_PF_FINISH: begin
+        // Prime the src2 (port A) read for the next K-tile's lane 0 so its data
+        // is ready when ST_READ_USE resumes (rd_lane_w == lane_q == 0, ktile_q
+        // already incremented). Port B is idle here — the final prefetch row
+        // issued at lane 15 is latched into scratch this cycle.
         if (int'(rd_lane_w) < SYS_DIM) begin
           sram_a_en = 1'b1;
           sram_a_we = 1'b0;
