@@ -155,6 +155,10 @@ module systolic_controller
   // src2_logical_row is built from rd_lane_w so both the prime and the
   // in-loop read-ahead address the correct B row.
   logic [5:0]  rd_lane_w;
+  // A-load read-ahead: in ST_A_LOAD_LATCH the port-B read issued is for the
+  // NEXT scratch row (a_load_row_q + 1) while the current row is being
+  // latched. ST_A_LOAD_REQ is a one-shot prime reading row 0 itself.
+  logic [4:0]  ld_row_w;
   always_comb begin
     src1_row_units = {21'h0, k_tiles_q};
     src2_row_units = {21'h0, n_tiles_q};
@@ -165,8 +169,9 @@ module systolic_controller
     needs_dst_preclear_w = !flags_accumulate && (dst_buf == BUF_ACCUM);
 
     rd_lane_w = (state == ST_READ_USE) ? (lane_q + 6'd1) : lane_q;
+    ld_row_w  = (state == ST_A_LOAD_LATCH) ? (a_load_row_q + 5'd1) : a_load_row_q;
 
-    src1_logical_row = ({21'h0, mtile_q} << 4) + {27'h0, a_load_row_q};
+    src1_logical_row = ({21'h0, mtile_q} << 4) + {27'h0, ld_row_w};
     src2_logical_row = ({21'h0, ktile_q} << 4) + {26'h0, rd_lane_w};
 
     src1_load_row_addr = {16'h0, src1_off_q} + (src1_logical_row * src1_row_units) + {21'h0, ktile_q};
@@ -260,6 +265,9 @@ module systolic_controller
         end
 
         ST_A_LOAD_LATCH: begin
+          // Latch the row read in the previous cycle, and (via the read-ahead
+          // issued this same cycle, ld_row_w = a_load_row_q+1) loop in place so
+          // each row costs 1 cycle instead of the old REQ/LATCH pair.
           for (int col_idx = 0; col_idx < SYS_DIM; col_idx = col_idx + 1)
             a_tile_scratch[a_load_row_q[3:0]][col_idx] <= sram_b_rdata[(col_idx * 8) +: 8];
 
@@ -268,7 +276,7 @@ module systolic_controller
             state <= ST_READ_REQ;
           end else begin
             a_load_row_q <= a_load_row_q + 5'd1;
-            state <= ST_A_LOAD_REQ;
+            state <= ST_A_LOAD_LATCH;
           end
         end
 
@@ -385,9 +393,21 @@ module systolic_controller
 
     case (state)
       ST_A_LOAD_REQ: begin
+        // One-shot prime: read scratch row 0 (ld_row_w == a_load_row_q == 0).
         sram_b_en = 1'b1;
         sram_b_buf = src1_buf_q;
         sram_b_row = src1_load_row_addr[15:0];
+      end
+
+      ST_A_LOAD_LATCH: begin
+        // Read-ahead for the next scratch row (ld_row_w == a_load_row_q + 1)
+        // while latching the current one. Skip once the last row (15) is being
+        // latched — there is no row 16 to fetch.
+        if (ld_row_w <= 5'd15) begin
+          sram_b_en = 1'b1;
+          sram_b_buf = src1_buf_q;
+          sram_b_row = src1_load_row_addr[15:0];
+        end
       end
 
       ST_READ_REQ: begin
