@@ -51,7 +51,15 @@ module systolic_controller
   output logic                 sram_b_en,
   output logic [1:0]           sram_b_buf,
   output logic [15:0]          sram_b_row,
-  input  logic [127:0]         sram_b_rdata
+  input  logic [127:0]         sram_b_rdata,
+
+  // SRAM port W (read-only, WBUF-dedicated): src2 weight read when src2==WBUF.
+  // Frees the shared Port A so the DMA engine can prefetch the next weight tile
+  // into WBUF.PortA concurrently with this matmul. Attention matmuls (src2 in
+  // ABUF) keep using the shared Port A path below.
+  output logic                 sram_w_en,
+  output logic [15:0]          sram_w_row,
+  input  logic [127:0]         sram_w_rdata
 );
 
   // READ_REQ issues synchronous SRAM reads, READ_USE consumes the returned rows
@@ -116,6 +124,7 @@ module systolic_controller
   // it away. Pure Verilator pragma — no RTL/synthesis semantic change.
   logic clear_acc /* verilator public_flat_rd */;
   logic       inject_zero_data;
+  logic       src2_is_wbuf;
   logic [15:0] lane_row_idx;
   logic [127:0] a_row_data_q, b_row_data_q;
   logic [SYS_DIM*SYS_DIM*32-1:0] acc_flat;
@@ -424,13 +433,22 @@ module systolic_controller
       if (!inject_zero_data && (lane_q < 6'd16))
         a_row_data_q[(row_idx * 8) +: 8] = a_tile_scratch[a_buf_sel_q][row_idx][lane_q[3:0]];
     end
-    b_row_data_q = inject_zero_data ? 128'h0 : sram_a_rdata;
+    // Weight (src2) reads route to the dedicated W port when src2 is in WBUF
+    // (the streamed FC/projection matmuls); attention matmuls (src2 in ABUF)
+    // stay on the shared Port A. The array's b-operand row therefore comes from
+    // sram_w_rdata for WBUF matmuls, sram_a_rdata otherwise.
+    src2_is_wbuf = (src2_buf_q == BUF_WBUF);
+    b_row_data_q = inject_zero_data ? 128'h0
+                 : (src2_is_wbuf ? sram_w_rdata : sram_a_rdata);
 
     sram_a_en = 1'b0;
     sram_a_we = 1'b0;
     sram_a_buf = src2_buf_q;
     sram_a_row = 16'h0;
     sram_a_wdata = 128'h0;
+
+    sram_w_en  = 1'b0;
+    sram_w_row = 16'h0;
 
     sram_b_en = 1'b0;
     sram_b_buf = src1_buf_q;
@@ -470,10 +488,15 @@ module systolic_controller
         // Its row appears next cycle in ST_READ_USE. Only the real-data lanes
         // (rd_lane_w < SYS_DIM) read SRAM; chained flush lanes inject zeros.
         if (int'(rd_lane_w) < SYS_DIM) begin
-          sram_a_en = 1'b1;
-          sram_a_we = 1'b0;
-          sram_a_buf = src2_buf_q;
-          sram_a_row = src2_stream_row_addr[15:0];
+          if (src2_is_wbuf) begin
+            sram_w_en  = 1'b1;
+            sram_w_row = src2_stream_row_addr[15:0];
+          end else begin
+            sram_a_en = 1'b1;
+            sram_a_we = 1'b0;
+            sram_a_buf = src2_buf_q;
+            sram_a_row = src2_stream_row_addr[15:0];
+          end
         end
       end
 
@@ -486,10 +509,15 @@ module systolic_controller
         // (a_row_data, b_row_data, step_en) sequence.
         step_en = 1'b1;
         if (int'(rd_lane_w) < SYS_DIM) begin
-          sram_a_en = 1'b1;
-          sram_a_we = 1'b0;
-          sram_a_buf = src2_buf_q;
-          sram_a_row = src2_stream_row_addr[15:0];
+          if (src2_is_wbuf) begin
+            sram_w_en  = 1'b1;
+            sram_w_row = src2_stream_row_addr[15:0];
+          end else begin
+            sram_a_en = 1'b1;
+            sram_a_we = 1'b0;
+            sram_a_buf = src2_buf_q;
+            sram_a_row = src2_stream_row_addr[15:0];
+          end
         end
         // Concurrent double-buffer prefetch on the idle port B: read the next
         // K-tile's A row (row index = lane_q) into ~a_buf_sel_q. Its data is
@@ -507,10 +535,15 @@ module systolic_controller
         // already incremented). Port B is idle here — the final prefetch row
         // issued at lane 15 is latched into scratch this cycle.
         if (int'(rd_lane_w) < SYS_DIM) begin
-          sram_a_en = 1'b1;
-          sram_a_we = 1'b0;
-          sram_a_buf = src2_buf_q;
-          sram_a_row = src2_stream_row_addr[15:0];
+          if (src2_is_wbuf) begin
+            sram_w_en  = 1'b1;
+            sram_w_row = src2_stream_row_addr[15:0];
+          end else begin
+            sram_a_en = 1'b1;
+            sram_a_we = 1'b0;
+            sram_a_buf = src2_buf_q;
+            sram_a_row = src2_stream_row_addr[15:0];
+          end
         end
       end
 

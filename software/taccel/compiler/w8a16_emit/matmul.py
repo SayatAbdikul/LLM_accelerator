@@ -456,6 +456,131 @@ def emit_matmul_w8a16_large_weight_tiled(
             n_tile_groups.append(((n_start, n_len), []))
         n_tile_groups[-1][1].append((k_start, k_len))
 
+    # ----- Phase-2 DMA‖Systolic overlap: software-pipeline weight loads -----
+    # When every N-tile group is a single full-K weight tile (the GPT-2 124M
+    # FC/projection layers: out_proj, fc1, qkv, lm_head — no K-split, no INT8
+    # restage), prefetch the NEXT group's weight tile into the alternate WBUF
+    # region (double-buffered via the halved tile budget in
+    # _large_weight_tile_plan) while the systolic array streams the CURRENT
+    # tile through its dedicated WBUF read port. The weight DMA of group g+1
+    # thus overlaps the MATMUL of group g (DMA‖Systolic is permitted by the
+    # forbidden-overlap invariant; Phase-1 RTL gave systolic a dedicated WBUF
+    # read port so it no longer contends with DMA on shared Port A). The
+    # per-group SFU dequant still drains DMA (its pc/bias SYNC(0b001) also
+    # retires the prefetch), so SFU never overlaps DMA. Integer matmul is
+    # independent of WHEN weights load (only that they precede the consuming
+    # MATMUL), so the result is byte-identical. See [[dma_compute_overlap]].
+    pipeline_full_k = (
+        len(n_tile_groups) >= 2
+        and all(len(kl) == 1 and kl[0][0] == 0 and kl[0][1] == K_pad
+                for _grp, kl in n_tile_groups)
+    )
+
+    def _emit_pc_dequant(n_start, n_len, n_tile_units, out_tile_alloc):
+        # FP16 PC scale + folded bias slice load, then DEQUANT into out_tile.
+        # The pc/bias SYNC(0b001) also retires any in-flight DMA (the weight
+        # prefetch AND the PREVIOUS group's deferred output store), so the
+        # following DEQUANT (SFU) never overlaps DMA.
+        slice_bytes = 2 * n_len * 2
+        pc_scale_slice_alloc = cg.mem.wbuf.alloc(
+            f"_w8a16_pc_bias_{node.name}_n{n_start}", slice_bytes
+        )
+        cg._emit_dma_load(
+            BUF_WBUF, pc_scale_slice_alloc.offset_units, n_len * 2, 0,
+            pc_scale_dram_full + n_start * 2,
+        )
+        bias_slice_wbuf_off = pc_scale_slice_alloc.offset_units + (n_len * 2) // UNIT
+        cg._emit_dma_load(
+            BUF_WBUF, bias_slice_wbuf_off, n_len * 2, 0,
+            pc_scale_dram_full + bias_offset_in_blob + n_start * 2,
+        )
+        cg._emit(SyncInsn(resource_mask=0b001))
+        cg._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tile_units - 1, K=0))
+        cg._emit(DequantAccumFp32ScaledInsn(
+            src1_buf=BUF_ACCUM, src1_off=0,
+            src2_buf=BUF_WBUF, src2_off=pc_scale_slice_alloc.offset_units,
+            dst_buf=BUF_ABUF, dst_off=out_tile_alloc.offset_units,
+            sreg=sreg + 1,
+            flags=cg.fp_precision_flag,
+        ))
+        cg._emit(SyncInsn(resource_mask=0b100))
+        cg.mem.wbuf.free(pc_scale_slice_alloc.name)
+
+    def _emit_output_store(n_start, n_len, out_tile_alloc):
+        # DMA-store the N-tile output to DRAM-temp. NO draining SYNC here —
+        # the store is left in flight to overlap the NEXT group's MATMUL
+        # (DMA‖Systolic). It is drained by the next group's _emit_pc_dequant
+        # SYNC(0b001) before that group's out_tile is freed.
+        out_row_bytes = n_len * cg.elem_bytes
+        out_row_units = out_row_bytes // UNIT
+        full_row_bytes_in_dram = N_pad * cg.elem_bytes
+        for r in range(M_pad):
+            cg._emit_dma_store(
+                BUF_ABUF,
+                out_tile_alloc.offset_units + r * out_row_units,
+                out_row_bytes, 2,
+                dram_temp_off + r * full_row_bytes_in_dram + n_start * cg.elem_bytes,
+            )
+
+    def _load_group_weight(gidx):
+        (gn_start, gn_len), gkl = n_tile_groups[gidx]
+        gk_start, gk_len = gkl[0]
+        wt_name = cg._large_weight_tile_symbol(weight_name, gk_start, gk_len, gn_start, gn_len)
+        wt_dram = cg._dram_offset_required(
+            wt_name, f"loading W8A32 weight tile for '{weight_name}'")
+        wa = cg.mem.wbuf.alloc(f"_w_{node.name}_g{gidx}", gk_len * gn_len)
+        cg._emit_dma_load(BUF_WBUF, wa.offset_units, gk_len * gn_len, 0, wt_dram)
+        return wa
+
+    if pipeline_full_k:
+        # Software pipeline: prefetch group g+1's weights (DMA → alternate WBUF
+        # region) during group g's MATMUL, so the weight load rides DMA‖Systolic
+        # while the array streams the current tile via its dedicated WBUF read
+        # port. W[g] is already resident (drained by group g-1's pc/dequant
+        # SYNC(0b001)), so only the prologue needs a weight SYNC. Each pc/dequant
+        # SYNC(0b001) drains the prefetch before the SFU dequant, so SFU never
+        # overlaps DMA. (Output-store overlap was also tried — Phase 2.5 — but
+        # measured 0 gain: with weights prefetched, the DMA engine's total work
+        # plus the non-overlappable SFU is the floor, not store scheduling. So
+        # the store is drained per-group here for simplicity.)
+        cur_w = _load_group_weight(0)          # prologue: begin loading group 0
+        cg._emit(SyncInsn(resource_mask=0b001))   # ensure group 0 weights landed
+        for g, ((n_start, n_len), _kl) in enumerate(n_tile_groups):
+            n_tile_units = n_len // TILE
+            out_tile_alloc = cg.mem.abuf.alloc(
+                f"{node.name}_out_tile_n{n_start}", M_pad * n_len * cg.elem_bytes
+            )
+            # Prefetch group g+1 weights — DMA overlaps this MATMUL (the win).
+            nxt_w = _load_group_weight(g + 1) if g + 1 < len(n_tile_groups) else None
+            cg._emit(ConfigTileInsn(
+                M=m_tiles - 1, N=n_tile_units - 1, K=(K_pad // TILE) - 1,
+                weight_int4=(cg.weight_dtypes.get(weight_name) == "int4"),
+            ))
+            cg._emit(MatmulInsn(
+                src1_buf=BUF_ABUF, src1_off=int8_scratch.offset_units,
+                src2_buf=BUF_WBUF, src2_off=cur_w.offset_units,
+                dst_buf=BUF_ACCUM, dst_off=0,
+                flags=0,
+            ))
+            cg._emit(SyncInsn(resource_mask=0b010))   # wait systolic
+            cg.mem.wbuf.free(cur_w.name)
+            # pc load + DEQUANT (its SYNC(0b001) also drains the nxt_w prefetch),
+            # then the output store, drained immediately.
+            _emit_pc_dequant(n_start, n_len, n_tile_units, out_tile_alloc)
+            _emit_output_store(n_start, n_len, out_tile_alloc)
+            cg._emit(SyncInsn(resource_mask=0b010))
+            cg.mem.abuf.free(out_tile_alloc.name)
+            cur_w = nxt_w
+        # Register output + finalize below (shared epilogue after the loop).
+        cg.mem.abuf.free(int8_scratch.name)
+        cg.dram_temp_outputs[node.name] = dram_temp_off
+        cg.dram_temp_fp32_outputs[node.name] = output_bytes
+        out_scale = cg.calibration_scales.get(node.name, 1.0 / 127.0)
+        cg._record_trace_event(
+            node.name, BUF_ABUF, 0, M_pad, N_pad, M, N, "fp32", out_scale,
+        )
+        return
+
     for (n_start, n_len), k_tile_list in n_tile_groups:
         n_tile_units = n_len // TILE
 

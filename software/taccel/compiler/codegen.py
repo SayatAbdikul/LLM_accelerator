@@ -748,8 +748,18 @@ class CodeGenerator:
         # small k_tile, so we fall back to the K-split plan there. The plan
         # must stay a pure function of (K_pad, N_pad) for staging<->emit
         # symbol consistency, so the gate is purely K_pad-based.
+        # Double-buffer budget: size weight tiles to at most HALF of WBUF so
+        # TWO consecutive weight tiles fit simultaneously. This lets the
+        # large-weight-tiled matmul emitter prefetch the next tile's DMA load
+        # into the alternate WBUF region while the systolic array streams the
+        # current tile through the dedicated WBUF read port (DMA‖Systolic
+        # overlap; see [[dma_compute_overlap]]). pc_scale is never resident
+        # alongside two weight tiles (it loads after the consumed tile frees),
+        # so HALF is sufficient. Must stay a pure fn of (K_pad,N_pad) so the
+        # DRAM staging (_layout_weights) and emit agree on tile symbols.
+        wbuf_budget = WBUF_SIZE // 2
         full_k_fits_abuf = STAGE4_M_TILE * K_pad * 4 <= ABUF_SIZE
-        max_n_full_k = (WBUF_SIZE // K_pad) // TILE * TILE
+        max_n_full_k = (wbuf_budget // K_pad) // TILE * TILE
         if full_k_fits_abuf and max_n_full_k >= TILE:
             n_tile = max(TILE, (min(n_cap, max_n_full_k) // TILE) * TILE)
             k_tile = K_pad
@@ -762,14 +772,14 @@ class CodeGenerator:
             # (flags=0) path, so flags=1 is never reached.
             n_tile = n_cap
             while n_tile >= TILE:
-                k_tile = (WBUF_SIZE // n_tile) // TILE * TILE
+                k_tile = (wbuf_budget // n_tile) // TILE * TILE
                 if k_tile >= TILE:
                     break
                 n_tile //= 2
                 n_tile = (n_tile // TILE) * TILE
             if n_tile < TILE:
                 raise MemoryError("Unable to choose a Stage 4 N tile that fits WBUF")
-            k_tile = max(TILE, (WBUF_SIZE // n_tile) // TILE * TILE)
+            k_tile = max(TILE, (wbuf_budget // n_tile) // TILE * TILE)
             k_tile = min(K_pad, k_tile)
             k_tile = max(TILE, (k_tile // TILE) * TILE)
 

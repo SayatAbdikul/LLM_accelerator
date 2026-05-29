@@ -344,6 +344,13 @@ module taccel_top
   logic [15:0]  sys_sram_b_row;
   logic [127:0] sys_sram_b_rdata;
 
+  // SRAM Port W request from Systolic (WBUF-dedicated weight read). Wired
+  // directly to the subsystem's W port — no arbitration: the W port reads
+  // WBUF.PortB, which is otherwise unused, so the systolic array owns it.
+  logic         sys_sram_w_en;
+  logic [15:0]  sys_sram_w_row;
+  logic [127:0] sys_sram_w_rdata;
+
   // Arbitrated SRAM wires
   logic         sram_a_en, sram_a_we;
   logic [1:0]   sram_a_buf;
@@ -355,6 +362,7 @@ module taccel_top
   logic [15:0]  sram_b_row;
   logic [127:0] sram_b_rdata;
   logic         sram_b_fault;
+  logic         sram_w_fault;
 
   // Helper gets first access, then SFU, then DMA, then systolic. Stage D keeps
   // enough serialization at control level that fixed priority is sufficient.
@@ -397,7 +405,8 @@ module taccel_top
   assign sys_sram_b_rdata    = sram_b_rdata;
   assign dma_sram_fault_w = dma_sram_en & sram_a_fault;
   assign sys_sram_fault_now = (sys_sram_b_en & ~helper_sram_b_en & sram_b_fault) |
-                              (sys_sram_a_en & ~helper_sram_a_en & ~sfu_sram_a_en & ~dma_sram_en & sram_a_fault);
+                              (sys_sram_a_en & ~helper_sram_a_en & ~sfu_sram_a_en & ~dma_sram_en & sram_a_fault) |
+                              (sys_sram_w_en & sram_w_fault);
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n)
@@ -910,7 +919,10 @@ module taccel_top
     .sram_b_en       (sys_sram_b_en),
     .sram_b_buf      (sys_sram_b_buf),
     .sram_b_row      (sys_sram_b_row),
-    .sram_b_rdata    (sys_sram_b_rdata)
+    .sram_b_rdata    (sys_sram_b_rdata),
+    .sram_w_en       (sys_sram_w_en),
+    .sram_w_row      (sys_sram_w_row),
+    .sram_w_rdata    (sys_sram_w_rdata)
   );
 
   sram_subsystem u_sram (
@@ -929,7 +941,12 @@ module taccel_top
     .b_buf   (sram_b_buf),
     .b_row   (sram_b_row),
     .b_rdata (sram_b_rdata),
-    .b_fault (sram_b_fault)
+    .b_fault (sram_b_fault),
+    // Port W: systolic weight (src2==WBUF) reads, dedicated to WBUF.PortB
+    .w_en    (sys_sram_w_en),
+    .w_row   (sys_sram_w_row),
+    .w_rdata (sys_sram_w_rdata),
+    .w_fault (sram_w_fault)
   );
 
 endmodule
