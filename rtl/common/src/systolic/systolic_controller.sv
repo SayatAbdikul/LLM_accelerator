@@ -149,6 +149,12 @@ module systolic_controller
   logic [31:0] src1_load_row_addr, src2_stream_row_addr;
   logic [31:0] dispatch_m_tiles_w, dispatch_n_tiles_w, dispatch_clear_rows_w;
   logic        needs_dst_preclear_w;
+  // Pipelined streaming: the SRAM read issued this cycle is for the NEXT
+  // compute lane (read-ahead) while the array steps the CURRENT lane. In the
+  // one-shot prime (ST_READ_REQ) the read is for lane_q itself (lane 0).
+  // src2_logical_row is built from rd_lane_w so both the prime and the
+  // in-loop read-ahead address the correct B row.
+  logic [5:0]  rd_lane_w;
   always_comb begin
     src1_row_units = {21'h0, k_tiles_q};
     src2_row_units = {21'h0, n_tiles_q};
@@ -158,8 +164,10 @@ module systolic_controller
     dispatch_clear_rows_w = (dispatch_m_tiles_w * dispatch_n_tiles_w) << 6;
     needs_dst_preclear_w = !flags_accumulate && (dst_buf == BUF_ACCUM);
 
+    rd_lane_w = (state == ST_READ_USE) ? (lane_q + 6'd1) : lane_q;
+
     src1_logical_row = ({21'h0, mtile_q} << 4) + {27'h0, a_load_row_q};
-    src2_logical_row = ({21'h0, ktile_q} << 4) + {26'h0, lane_q};
+    src2_logical_row = ({21'h0, ktile_q} << 4) + {26'h0, rd_lane_w};
 
     src1_load_row_addr = {16'h0, src1_off_q} + (src1_logical_row * src1_row_units) + {21'h0, ktile_q};
     src2_stream_row_addr = {16'h0, src2_off_q} + (src2_logical_row * src2_row_units) + {21'h0, ntile_q};
@@ -281,8 +289,11 @@ module systolic_controller
               state <= ST_DRAIN_PREP;
             end
           end else begin
+            // Pipelined: stay in ST_READ_USE and step every cycle. The
+            // read for this next lane was already issued (read-ahead) in the
+            // current ST_READ_USE cycle, so its data is ready next cycle.
             lane_q <= lane_q + 6'd1;
-            state <= ST_READ_REQ;
+            state <= ST_READ_USE;
           end
         end
 
@@ -380,12 +391,10 @@ module systolic_controller
       end
 
       ST_READ_REQ: begin
-        // Issue both source reads together. Their rows appear one cycle later
-        // in ST_READ_USE, which then advances the systolic mesh by one step.
-        if (inject_zero_data) begin
-          sram_b_en = 1'b0;
-          sram_a_en = 1'b0;
-        end else begin
+        // One-shot prime: issue the read for lane 0 (rd_lane_w == lane_q == 0).
+        // Its row appears next cycle in ST_READ_USE. Only the real-data lanes
+        // (rd_lane_w < SYS_DIM) read SRAM; chained flush lanes inject zeros.
+        if (int'(rd_lane_w) < SYS_DIM) begin
           sram_a_en = 1'b1;
           sram_a_we = 1'b0;
           sram_a_buf = src2_buf_q;
@@ -394,7 +403,19 @@ module systolic_controller
       end
 
       ST_READ_USE: begin
+        // Step the array with the CURRENT lane (lane_q) data — b_row_data_q is
+        // sram_a_rdata, read in the previous cycle for this lane — AND issue
+        // the read-ahead for the NEXT lane (rd_lane_w == lane_q + 1) so its
+        // data is ready next cycle. Collapses the old 2-cycle REQ/USE pair to
+        // 1 cycle/lane. Bit-exact: the array sees the identical per-lane
+        // (a_row_data, b_row_data, step_en) sequence.
         step_en = 1'b1;
+        if (int'(rd_lane_w) < SYS_DIM) begin
+          sram_a_en = 1'b1;
+          sram_a_we = 1'b0;
+          sram_a_buf = src2_buf_q;
+          sram_a_row = src2_stream_row_addr[15:0];
+        end
       end
 
       ST_DRAIN_RD: begin
