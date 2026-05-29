@@ -252,11 +252,13 @@
                             .a(ln_var_acc_q), .b(ln_n_fp32),
                             .valid_out(ln_var_norm_vo), .y(ln_var_norm_w));
   fp32_add  u_ln_var_eps (.a(ln_var_norm_w),.b(ln_eps_sel_w), .y(ln_var_eps_w));
-  // 2026-05-29: pipelined sqrt (the new ~97 ns fmax floor after the dividers).
-  // Reads the registered ln_var_eps_q (latched in F_G2_LN_DENOM_PRE_S); ln_denom_w
-  // (= sqrt y) is valid in F_G2_LN_DENOM_S, 2 cycles after F_G2_LN_DENOM presents
+  // 2026-05-29: 3-stage pipelined sqrt. fp32_sqrt_p2's stage-2 (iters 7..0 +
+  // RNE/pack) was the ~57.8 ns post-PNR fmax floor; fp32_sqrt_p3 splits that
+  // tail across two stages (balanced ~40 ns/stage at synth). Reads the
+  // registered ln_var_eps_q (latched in F_G2_LN_DENOM_PRE_S); ln_denom_w
+  // (= sqrt y) is valid in F_G2_LN_DENOM_S, 3 cycles after F_G2_LN_DENOM presents
   // it. valid_in tied high (fixed-latency use); valid_out unused.
-  fp32_sqrt_p2 u_ln_sqrt (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
+  fp32_sqrt_p3 u_ln_sqrt (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
                           .a(ln_var_eps_q),
                           .valid_out(ln_sqrt_vo), .y(ln_denom_w));
   // 2026-05-29: pipelined divider (the STA worst path, 180 ns). Consumes the
