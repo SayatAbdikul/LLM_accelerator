@@ -285,23 +285,37 @@ module systolic_controller
         end
 
         ST_READ_USE: begin
-          if (int'(lane_q) == ((SYSTOLIC_ARCH_MODE == SYS_MODE_CHAINED) ? (CHAIN_TOTAL_STEPS - 1) : (SYS_DIM - 1))) begin
-            lane_q <= 6'd0;
-            if (ktile_q + 11'd1 < k_tiles_q) begin
-              ktile_q <= ktile_q + 11'd1;
+          if (ktile_q + 11'd1 < k_tiles_q) begin
+            // Not the last K-tile: stream ONLY the 16 data lanes, then reload
+            // A for the next K-tile WITHOUT the 30 chained skew-flush lanes.
+            // The mesh freezes during A-load (step_en=0) with this tile's
+            // operands still in flight in the skew pipeline; the next tile's
+            // lanes resume right behind them so each PE keeps accumulating its
+            // aligned k. INT32 accumulation is order-independent under 2's-
+            // complement wrap, so deferring the single drain to the final
+            // K-tile is byte-identical. This removes 2*(SYS_DIM-1)=30 bubble
+            // cycles per K-tile (chained mode).
+            if (int'(lane_q) == (SYS_DIM - 1)) begin
+              lane_q       <= 6'd0;
+              ktile_q      <= ktile_q + 11'd1;
               a_load_row_q <= 5'd0;
-              state <= ST_A_LOAD_REQ;
+              state        <= ST_A_LOAD_REQ;
             end else begin
-              drain_row_q <= 5'd0;
-              drain_grp_q <= 2'd0;
-              state <= ST_DRAIN_PREP;
+              lane_q <= lane_q + 6'd1;
+              state  <= ST_READ_USE;
             end
           end else begin
-            // Pipelined: stay in ST_READ_USE and step every cycle. The
-            // read for this next lane was already issued (read-ahead) in the
-            // current ST_READ_USE cycle, so its data is ready next cycle.
-            lane_q <= lane_q + 6'd1;
-            state <= ST_READ_USE;
+            // Last K-tile: stream the 16 data lanes followed by the full skew
+            // flush (chained: 30 zero-injection lanes), then drain the tile.
+            if (int'(lane_q) == ((SYSTOLIC_ARCH_MODE == SYS_MODE_CHAINED) ? (CHAIN_TOTAL_STEPS - 1) : (SYS_DIM - 1))) begin
+              lane_q      <= 6'd0;
+              drain_row_q <= 5'd0;
+              drain_grp_q <= 2'd0;
+              state       <= ST_DRAIN_PREP;
+            end else begin
+              lane_q <= lane_q + 6'd1;
+              state  <= ST_READ_USE;
+            end
           end
         end
 

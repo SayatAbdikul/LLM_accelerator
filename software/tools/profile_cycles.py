@@ -5,6 +5,7 @@ Verilator run_program binary, then prints the busy_cycles / sync_wait / dma
 counters so we can see the REAL per-engine cycle split (vs the
 architecture-derived estimates).
 """
+import argparse
 import json
 import subprocess
 import sys
@@ -15,17 +16,36 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # software/
 
 from tools.rtl_cosim import serialize_prefill_bundle, RTL_BINARY  # noqa: E402
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+GPT2_124M_FIXTURE = (REPO_ROOT / "software" / "tests" / "fixtures" / "generated"
+                     / "gpt2_converted_nanogpt.pt")
+
 
 def main():
-    sp = serialize_prefill_bundle(token_id=0)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--gpt2-124m", action="store_true",
+                    help="profile the real GPT-2 124M prefill (needs binary "
+                         "built with DRAM_SIZE>=1<<30; ~5 min)")
+    ap.add_argument("--max-cycles", type=int, default=5_000_000)
+    ap.add_argument("--timeout", type=int, default=1800)
+    args = ap.parse_args()
+
+    if args.gpt2_124m:
+        import torch
+        payload = torch.load(GPT2_124M_FIXTURE, map_location="cpu")
+        sp = serialize_prefill_bundle(token_id=464, payload=payload)
+    else:
+        sp = serialize_prefill_bundle(token_id=0)
+
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         (td / "p.bin").write_bytes(sp.program_bytes)
         argv = [str(RTL_BINARY),
                 "--program", str(td / "p.bin"),
                 "--json-out", str(td / "sum.json"),
-                "--max-cycles", "5000000"]
-        cp = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
+                "--max-cycles", str(args.max_cycles)]
+        cp = subprocess.run(argv, capture_output=True, text=True,
+                            timeout=args.timeout)
         if cp.returncode != 0:
             print("STDERR:", cp.stderr[-2000:])
             raise SystemExit(f"run_program exited {cp.returncode}")
