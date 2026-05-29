@@ -268,7 +268,10 @@
         F_G2_LN_MEAN_W: begin
           state <= F_G2_LN_MEAN_W2;
         end
-        F_G2_LN_MEAN_W2: begin    // div_p3 3rd stage (LATENCY=3)
+        F_G2_LN_MEAN_W2: begin    // div_p4 3rd stage
+          state <= F_G2_LN_MEAN_W3;
+        end
+        F_G2_LN_MEAN_W3: begin    // div_p4 4th stage (LATENCY=4)
           state <= F_G2_LN_MEAN_S;
         end
         F_G2_LN_MEAN_S: begin
@@ -301,7 +304,10 @@
         F_G2_LN_DENOM_PRE_W: begin
           state <= F_G2_LN_DENOM_PRE_W2;
         end
-        F_G2_LN_DENOM_PRE_W2: begin   // div_p3 3rd stage (LATENCY=3)
+        F_G2_LN_DENOM_PRE_W2: begin   // div_p4 3rd stage
+          state <= F_G2_LN_DENOM_PRE_W3;
+        end
+        F_G2_LN_DENOM_PRE_W3: begin   // div_p4 4th stage (LATENCY=4)
           state <= F_G2_LN_DENOM_PRE_S;
         end
         F_G2_LN_DENOM_PRE_S: begin
@@ -357,7 +363,10 @@
         F_G2_LN_OUT_W: begin
           state <= F_G2_LN_OUT_W2;
         end
-        F_G2_LN_OUT_W2: begin     // div_p3 3rd stage (LATENCY=3)
+        F_G2_LN_OUT_W2: begin     // div_p4 3rd stage
+          state <= F_G2_LN_OUT_W3;
+        end
+        F_G2_LN_OUT_W3: begin     // div_p4 4th stage (LATENCY=4)
           state <= F_G2_LN_OUT;
         end
 
@@ -434,7 +443,10 @@
         F_G2_SM_OUT_W: begin
           state <= F_G2_SM_OUT_W2;
         end
-        F_G2_SM_OUT_W2: begin     // div_p3 3rd stage (LATENCY=3)
+        F_G2_SM_OUT_W2: begin     // div_p4 3rd stage
+          state <= F_G2_SM_OUT_W3;
+        end
+        F_G2_SM_OUT_W3: begin     // div_p4 4th stage (LATENCY=4)
           state <= F_G2_SM_OUT;
         end
 

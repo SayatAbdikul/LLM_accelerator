@@ -216,7 +216,15 @@ module sfu_engine
     // ln_denom site — the sqrt stage-2 (iters 7..0 + pack) was the ~57.8 ns
     // post-PNR fmax floor. One extra wait state vs the LATENCY=2 integration so
     // the FSM samples ln_denom_w 3 cycles after F_G2_LN_DENOM presents it.
-    F_G2_LN_DENOM_W2    = 6'd59   // ln_denom sqrt 3rd stage
+    F_G2_LN_DENOM_W2    = 6'd59,  // ln_denom sqrt 3rd stage
+    // 2026-05-30: fp32_div_p4 (4-stage, LATENCY=4) replaces fp32_div_p3 at the 4
+    // divider sites — the div_p3 stage-2 (12-iter middle) was the ~53.8 ns
+    // post-PNR floor (binding at u_ln_var_norm + u_sm_div). One MORE wait state
+    // each (W3) so the FSM samples y 4 cycles after the operands are presented.
+    F_G2_LN_MEAN_W3     = 6'd60,  // ln_mean div 4th stage
+    F_G2_LN_DENOM_PRE_W3= 6'd61,  // ln_var_norm div 4th stage
+    F_G2_LN_OUT_W3      = 6'd62,  // ln_norm div 4th stage
+    F_G2_SM_OUT_W3      = 6'd63   // sm_div 4th stage
   } sfu_state_t;
 
   sfu_state_t state;

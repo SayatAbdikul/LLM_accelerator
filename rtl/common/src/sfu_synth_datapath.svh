@@ -236,19 +236,19 @@
   // dummy sinks keep PINCONNECTEMPTY / sv2v / yosys quiet.
   logic ln_mean_vo, ln_var_norm_vo, ln_norm_vo, sm_div_vo, ln_sqrt_vo;
   fp32_add  u_ln_sum_add (.a(ln_sum_acc_q), .b(synth_a_bits), .y(ln_sum_add_w));
-  // 2026-05-29: pipelined divider (LATENCY=2). FSM presents the registered
-  // ln_sum_acc_q and samples ln_mean_div_w 2 cycles later (F_G2_LN_MEAN ->
-  // _W -> _S). valid_in tied high (fixed-latency use); valid_out unused.
-  fp32_div_p3 u_ln_mean  (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
+  // 2026-05-30: 4-stage pipelined divider (LATENCY=4). FSM presents the
+  // registered ln_sum_acc_q and samples ln_mean_div_w 4 cycles later
+  // (F_G2_LN_MEAN -> _W -> _W2 -> _W3 -> _S). valid_in tied high; valid_out unused.
+  fp32_div_p4 u_ln_mean  (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
                           .a(ln_sum_acc_q), .b(ln_n_fp32),
                           .valid_out(ln_mean_vo), .y(ln_mean_div_w));
   fp32_add  u_ln_diff    (.a(synth_a_bits), .b(ln_neg_mean),  .y(ln_diff_w));
   fp32_mul  u_ln_diff_sq (.a(ln_diff_w),    .b(ln_diff_w),    .y(ln_diff_sq_w));
   fp32_add  u_ln_var_add (.a(ln_var_acc_q), .b(ln_diff_sq_w), .y(ln_var_add_w));
-  // 2026-05-29: pipelined divider. var_acc/n sampled 2 cycles after the
-  // registered ln_var_acc_q is presented (F_G2_LN_DENOM_PRE -> _W -> _S);
-  // the +eps add then sits after the divider output register.
-  fp32_div_p3 u_ln_var_norm(.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
+  // 2026-05-30: 4-stage pipelined divider. var_acc/n sampled 4 cycles after the
+  // registered ln_var_acc_q is presented (F_G2_LN_DENOM_PRE -> _W -> _W2 -> _W3
+  // -> _S); the +eps add then sits after the divider output register.
+  fp32_div_p4 u_ln_var_norm(.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
                             .a(ln_var_acc_q), .b(ln_n_fp32),
                             .valid_out(ln_var_norm_vo), .y(ln_var_norm_w));
   fp32_add  u_ln_var_eps (.a(ln_var_norm_w),.b(ln_eps_sel_w), .y(ln_var_eps_w));
@@ -261,12 +261,12 @@
   fp32_sqrt_p3 u_ln_sqrt (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
                           .a(ln_var_eps_q),
                           .valid_out(ln_sqrt_vo), .y(ln_denom_w));
-  // 2026-05-29: pipelined divider (the STA worst path, 180 ns). Consumes the
-  // registered ln_diff_q; ln_norm_w (= div y) is valid in F_G2_LN_OUT, 2
-  // cycles after F_G2_LN_OUT_NORM presents it. The downstream gamma multiply
-  // now reads ln_norm_w directly (the divider output register replaces the
-  // old ln_norm_q latch), so no extra cycle is spent re-registering.
-  fp32_div_p3 u_ln_norm  (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
+  // 2026-05-30: 4-stage pipelined divider. Consumes the registered ln_diff_q;
+  // ln_norm_w (= div y) is valid in F_G2_LN_OUT, 4 cycles after F_G2_LN_OUT_NORM
+  // presents it (_W -> _W2 -> _W3 -> _OUT). The downstream gamma multiply reads
+  // ln_norm_w directly (the divider output register replaces the old ln_norm_q
+  // latch), so no extra cycle is spent re-registering.
+  fp32_div_p4 u_ln_norm  (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
                           .a(ln_diff_q),    .b(ln_denom_q),
                           .valid_out(ln_norm_vo), .y(ln_norm_w));
   fp32_mul  u_ln_norm_g  (.a(ln_norm_w),    .b(synth_gamma_bits), .y(ln_norm_g_w));
@@ -295,11 +295,12 @@
   fp32_add     u_sm_diff   (.a(synth_a_bits), .b(sm_neg_max),    .y(sm_diff_w));
   fp32_exp     u_sm_exp    (.a(sm_diff_w),                        .y(sm_exp_w));
   fp32_add     u_sm_sum_add(.a(sm_exp_sum_q), .b(sm_exp_w),       .y(sm_sum_add_w));
-  // 2026-05-29: pipelined divider (STA #2 path, 157 ns). Dividend is the
+  // 2026-05-30: 4-stage pipelined divider (LATENCY=4). Dividend is the
   // REGISTERED sm_exp_q (latched in F_G2_SM_OUT_NORM) so fp32_exp is isolated
   // from the divider stage-1. sm_norm_w (= div y) is valid in F_G2_SM_OUT,
-  // 2 cycles after F_G2_SM_OUT_DIV presents it; f2h reads it directly.
-  fp32_div_p3  u_sm_div    (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
+  // 4 cycles after F_G2_SM_OUT_DIV presents it (_W -> _W2 -> _W3 -> _OUT);
+  // f2h reads it directly.
+  fp32_div_p4  u_sm_div    (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
                             .a(sm_exp_q),     .b(sm_exp_sum_q),
                             .valid_out(sm_div_vo), .y(sm_norm_w));
   fp32_to_fp16 u_sm_out_h  (.a(sm_norm_w),                        .y(sm_out_h_w));

@@ -27,6 +27,7 @@ fp32/fp32_mul.sv
 fp32/fp32_div.sv
 fp32/fp32_div_p2.sv
 fp32/fp32_div_p3.sv
+fp32/fp32_div_p4.sv
 fp32/fp32_sqrt.sv
 fp32/fp32_sqrt_p2.sv
 fp32/fp32_sqrt_p3.sv
