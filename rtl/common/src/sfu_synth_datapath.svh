@@ -234,7 +234,7 @@
   // valid_out of the pipelined dividers is unused (fixed-LATENCY=2 use; the
   // FSM samples y a fixed number of cycles after presenting operands). Named
   // dummy sinks keep PINCONNECTEMPTY / sv2v / yosys quiet.
-  logic ln_mean_vo, ln_var_norm_vo, ln_norm_vo, sm_div_vo;
+  logic ln_mean_vo, ln_var_norm_vo, ln_norm_vo, sm_div_vo, ln_sqrt_vo;
   fp32_add  u_ln_sum_add (.a(ln_sum_acc_q), .b(synth_a_bits), .y(ln_sum_add_w));
   // 2026-05-29: pipelined divider (LATENCY=2). FSM presents the registered
   // ln_sum_acc_q and samples ln_mean_div_w 2 cycles later (F_G2_LN_MEAN ->
@@ -252,9 +252,13 @@
                             .a(ln_var_acc_q), .b(ln_n_fp32),
                             .valid_out(ln_var_norm_vo), .y(ln_var_norm_w));
   fp32_add  u_ln_var_eps (.a(ln_var_norm_w),.b(ln_eps_sel_w), .y(ln_var_eps_w));
-  // Phase-4 pipeline cut: sqrt reads the registered ln_var_eps_q (latched in
-  // F_G2_LN_DENOM_PRE one cycle earlier), not the combinational ln_var_eps_w.
-  fp32_sqrt u_ln_sqrt    (.a(ln_var_eps_q),                    .y(ln_denom_w));
+  // 2026-05-29: pipelined sqrt (the new ~97 ns fmax floor after the dividers).
+  // Reads the registered ln_var_eps_q (latched in F_G2_LN_DENOM_PRE_S); ln_denom_w
+  // (= sqrt y) is valid in F_G2_LN_DENOM_S, 2 cycles after F_G2_LN_DENOM presents
+  // it. valid_in tied high (fixed-latency use); valid_out unused.
+  fp32_sqrt_p2 u_ln_sqrt (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
+                          .a(ln_var_eps_q),
+                          .valid_out(ln_sqrt_vo), .y(ln_denom_w));
   // 2026-05-29: pipelined divider (the STA worst path, 180 ns). Consumes the
   // registered ln_diff_q; ln_norm_w (= div y) is valid in F_G2_LN_OUT, 2
   // cycles after F_G2_LN_OUT_NORM presents it. The downstream gamma multiply

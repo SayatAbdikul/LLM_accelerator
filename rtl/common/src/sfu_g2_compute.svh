@@ -303,8 +303,19 @@
           state        <= F_G2_LN_DENOM;
         end
 
+        // denom = sqrt(ln_var_eps_q) via the pipelined fp32_sqrt_p2 u_ln_sqrt
+        // (LATENCY=2). ln_var_eps_q was latched in F_G2_LN_DENOM_PRE_S and is
+        // stable on entry; F_G2_LN_DENOM presents it, _W is the sqrt's 2nd
+        // pipeline stage, _S samples the now-valid ln_denom_w. Once-per-row so
+        // the +2 cycles are negligible.
         F_G2_LN_DENOM: begin
-          ln_denom_q <= ln_denom_w;
+          state <= F_G2_LN_DENOM_W;
+        end
+        F_G2_LN_DENOM_W: begin
+          state <= F_G2_LN_DENOM_S;
+        end
+        F_G2_LN_DENOM_S: begin
+          ln_denom_q <= ln_denom_w;        // sqrt y now valid
           state      <= F_G2_LN_OUT_DIFF;
         end
 

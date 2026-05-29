@@ -196,7 +196,13 @@ module sfu_engine
     F_G2_LN_DENOM_PRE_S = 6'd49,  // div y valid -> +eps -> sample ln_var_eps_q
     F_G2_LN_OUT_W       = 6'd50,  // ln_norm div stage2 (NORM presented, OUT uses y)
     F_G2_SM_OUT_DIV     = 6'd51,  // sm div stage1 (exp registered in OUT_NORM)
-    F_G2_SM_OUT_W       = 6'd52   // sm div stage2 (OUT uses y)
+    F_G2_SM_OUT_W       = 6'd52,  // sm div stage2 (OUT uses y)
+    // 2026-05-29: fp32_sqrt_p2 pipelined sqrt (LATENCY=2) replaces the
+    // combinational fp32_sqrt at the LN denom site — the new ~97 ns fmax
+    // floor after the dividers were pipelined. F_G2_LN_DENOM presents the
+    // registered ln_var_eps_q; sample ln_denom_q 2 cycles later. See [[dma_floor]].
+    F_G2_LN_DENOM_W     = 6'd53,  // ln_denom sqrt stage2
+    F_G2_LN_DENOM_S     = 6'd54   // sqrt y valid -> sample ln_denom_q
   } sfu_state_t;
 
   sfu_state_t state;
