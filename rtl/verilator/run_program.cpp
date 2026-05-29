@@ -60,6 +60,7 @@ struct CliOptions {
     int num_classes = 1000;
     int max_cycles = 500000;
     int latency = 2;
+    bool fast_beats = false;   // --fast-beats: 1-beat/cycle ideal AXI (measurement only)
     int systolic_window_start_pc = -1;
     int systolic_window_end_pc = -1;
     int accum_write_start_pc = -1;
@@ -803,6 +804,8 @@ CliOptions parse_args(int argc, char** argv) {
             opts.max_cycles = std::stoi(need_value("--max-cycles"));
         } else if (arg == "--latency") {
             opts.latency = std::stoi(need_value("--latency"));
+        } else if (arg == "--fast-beats") {
+            opts.fast_beats = true;
         } else if (arg == "--inject-next-rresp") {
             opts.inject_next_rresp = std::stoi(need_value("--inject-next-rresp"));
         } else if (arg == "--inject-next-rlast") {
@@ -973,6 +976,7 @@ int main(int argc, char** argv) {
         }
 
         sim.start_once(opts.latency);
+        sim.dram.set_fast_beats(opts.fast_beats);
         auto* root = sim.dut->rootp;
         window_trace_enabled = !opts.systolic_window_json_out_path.empty();
         if (window_trace_enabled) {

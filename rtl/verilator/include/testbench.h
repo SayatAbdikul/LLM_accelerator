@@ -441,6 +441,13 @@ public:
         return read_beat_count_;
     }
 
+    // Measurement knob (default OFF — committed behavior unchanged). When set,
+    // the R channel streams burst beats back-to-back at 1 beat/cycle (R_VALID
+    // stays high across accepts), modelling an ideal full-bandwidth AXI slave
+    // instead of the default ~2.66 cyc/beat pacing. Used to establish the
+    // honest-memory-BW cycle count; NOT a chip change.
+    void set_fast_beats(bool v) { fast_beats_ = v; }
+
     // Drive AXI slave outputs given DUT's master outputs (call every cycle).
     // Handles AR/R (reads, single-beat model) and AW/W/B (writes, multi-beat).
     void tick(Vtaccel_top* dut, int latency = 2) {
@@ -462,65 +469,80 @@ public:
         // ----------------------------------------------------------------
         // R channel: serve one beat per call when timer fires
         // ----------------------------------------------------------------
+        // Build + drive the response for the current pending_beat_. Advances
+        // pending_beat_/read_emit_count_ and clears pending_valid_ on the last
+        // beat. Factored out so the back-to-back streaming path (fast_beats_)
+        // can re-emit in the same tick a beat is accepted.
+        auto emit_beat = [&]() {
+            uint64_t beat_addr = pending_addr_ + (uint64_t)pending_beat_ * 16;
+            uint64_t lo = 0, hi = 0;
+            for (int b = 0; b < 8 && beat_addr+b < mem_.size(); b++)
+                lo |= (uint64_t)mem_[beat_addr+b] << (b*8);
+            for (int b = 0; b < 8 && beat_addr+8+b < mem_.size(); b++)
+                hi |= (uint64_t)mem_[beat_addr+8+b] << (b*8);
+
+            uint32_t* rdata = dut->m_axi_r_data.data();
+            rdata[0] = lo & 0xFFFFFFFF;
+            rdata[1] = (lo >> 32) & 0xFFFFFFFF;
+            rdata[2] = hi & 0xFFFFFFFF;
+            rdata[3] = (hi >> 32) & 0xFFFFFFFF;
+
+            bool is_last = (pending_beat_ >= (int)pending_ar_len_);
+            int resp = next_r_resp_;
+            int force_last = next_r_last_override_;
+            for (auto it = scheduled_read_addr_injections_.begin();
+                 it != scheduled_read_addr_injections_.end(); ++it) {
+                if (it->addr == beat_addr) {
+                    resp = it->resp;
+                    force_last = it->force_last;
+                    scheduled_read_addr_injections_.erase(it);
+                    break;
+                }
+            }
+            if (!scheduled_read_injections_.empty() &&
+                scheduled_read_injections_.front().beat_idx == read_emit_count_) {
+                resp = scheduled_read_injections_.front().resp;
+                force_last = scheduled_read_injections_.front().force_last;
+                scheduled_read_injections_.erase(scheduled_read_injections_.begin());
+            }
+            if (force_last >= 0)
+                is_last = (force_last != 0);
+            dut->m_axi_r_valid = 1;
+            dut->m_axi_r_last  = is_last ? 1 : 0;
+            dut->m_axi_r_resp  = resp;
+            r_valid_           = true;
+            pending_beat_++;
+            read_emit_count_++;
+            next_r_resp_ = 0;
+            next_r_last_override_ = -1;
+            if (is_last)
+                pending_valid_ = false;
+        };
+
         if (r_valid_) {
             if (dut->m_axi_r_ready) {
                 read_beat_count_++;
-                r_valid_           = false;
-                dut->m_axi_r_valid = 0;
-                dut->m_axi_r_last  = 0;
-                // If more beats remain in this burst, queue next beat
-                if (pending_beat_ <= (int)pending_ar_len_) {
-                    pending_timer_ = 1;  // next beat next cycle
+                bool more = (pending_beat_ <= (int)pending_ar_len_);
+                // fast_beats_: a realistic 1-beat/cycle AXI slave keeps R_VALID
+                // asserted and streams the next beat the very cycle the current
+                // one is accepted (no inter-beat bubble). Default model re-arms
+                // pending_timer_ (~2-3 cyc/beat) — see set_fast_beats().
+                if (fast_beats_ && more && pending_valid_) {
+                    emit_beat();
+                } else {
+                    r_valid_           = false;
+                    dut->m_axi_r_valid = 0;
+                    dut->m_axi_r_last  = 0;
+                    if (more) {
+                        pending_timer_ = 1;  // next beat next cycle
+                    }
                 }
             }
         } else if (pending_valid_) {
             if (pending_timer_ > 0) {
                 pending_timer_--;
             } else {
-                // Build 16-byte response for current beat
-                uint64_t beat_addr = pending_addr_ + (uint64_t)pending_beat_ * 16;
-                uint64_t lo = 0, hi = 0;
-                for (int b = 0; b < 8 && beat_addr+b < mem_.size(); b++)
-                    lo |= (uint64_t)mem_[beat_addr+b] << (b*8);
-                for (int b = 0; b < 8 && beat_addr+8+b < mem_.size(); b++)
-                    hi |= (uint64_t)mem_[beat_addr+8+b] << (b*8);
-
-                uint32_t* rdata = dut->m_axi_r_data.data();
-                rdata[0] = lo & 0xFFFFFFFF;
-                rdata[1] = (lo >> 32) & 0xFFFFFFFF;
-                rdata[2] = hi & 0xFFFFFFFF;
-                rdata[3] = (hi >> 32) & 0xFFFFFFFF;
-
-                bool is_last = (pending_beat_ >= (int)pending_ar_len_);
-                int resp = next_r_resp_;
-                int force_last = next_r_last_override_;
-                for (auto it = scheduled_read_addr_injections_.begin();
-                     it != scheduled_read_addr_injections_.end(); ++it) {
-                    if (it->addr == beat_addr) {
-                        resp = it->resp;
-                        force_last = it->force_last;
-                        scheduled_read_addr_injections_.erase(it);
-                        break;
-                    }
-                }
-                if (!scheduled_read_injections_.empty() &&
-                    scheduled_read_injections_.front().beat_idx == read_emit_count_) {
-                    resp = scheduled_read_injections_.front().resp;
-                    force_last = scheduled_read_injections_.front().force_last;
-                    scheduled_read_injections_.erase(scheduled_read_injections_.begin());
-                }
-                if (force_last >= 0)
-                    is_last = (force_last != 0);
-                dut->m_axi_r_valid = 1;
-                dut->m_axi_r_last  = is_last ? 1 : 0;
-                dut->m_axi_r_resp  = resp;
-                r_valid_           = true;
-                pending_beat_++;
-                read_emit_count_++;
-                next_r_resp_ = 0;
-                next_r_last_override_ = -1;
-                if (is_last)
-                    pending_valid_ = false;
+                emit_beat();
             }
         }
 
@@ -593,6 +615,7 @@ private:
     int      pending_beat_;
     int      pending_timer_;
     bool     r_valid_;
+    bool     fast_beats_ = false;   // 1-beat/cycle streaming (measurement knob)
     // Write state
     bool     aw_pending_;
     uint64_t aw_addr_;
