@@ -165,6 +165,87 @@
   fp32_add u_synth_scaled_add  (
     .a(synth_scaled_mul2), .b(synth_beta_bits),   .y(synth_scaled_add));
 
+  // ===================================================================
+  // 8-wide SIMD widening of the F_G2_SYNTH_ITER elementwise loop.
+  // ===================================================================
+  // Lanes 1..7 replicate the lane-0 compute (add / mul / quant / gelu /
+  // scaled-chain / f2h) at element index (iter_idx_q + lane). Lane 0 is
+  // kept as the existing synth_out_bits / synth_quant_out above (also
+  // reused by the LN/SM datapath via synth_a_bits), so only lanes 1..7
+  // are added here. Each lane's compute is identical & independent, so
+  // the 8-wide writeback in F_G2_SYNTH_ITER is bit-exact vs. the old
+  // 1/cycle sequential loop. Per-lane writes are gated by the FSM on
+  // (iter_idx_q + lane) < n_elems_q, so out-of-range lanes never write.
+  //
+  // synth_out_bits_lane[0] / synth_quant_out_lane[0] alias the existing
+  // lane-0 outputs so the FSM can index lanes 0..7 uniformly.
+  logic [15:0]       synth_out_bits_lane  [0:7];
+  logic signed [7:0] synth_quant_out_lane [0:7];
+  assign synth_out_bits_lane[0]  = synth_out_bits;
+  assign synth_quant_out_lane[0] = synth_quant_out;
+
+  genvar gv_simd;
+  generate
+    for (gv_simd = 1; gv_simd < 8; gv_simd = gv_simd + 1) begin : g_simd_lane
+      // Element index for this lane (wraps in 11-bit; the FSM guard keeps
+      // only valid lanes, and iter_idx_q+lane <= 1024+7 fits 11 bits).
+      logic [10:0] lane_idx;
+      assign lane_idx = iter_idx_q + 11'(gv_simd);
+
+      // Per-lane operands (same coercion as lane 0).
+      logic [31:0] a_bits;
+      logic [31:0] b_bits;
+      logic [31:0] b_bits_eff;
+      logic [31:0] gamma_bits;
+      logic [31:0] beta_bits;
+      assign a_bits     = row_data_q[lane_idx[9:0]];
+      assign b_bits     = attn_accum_q[lane_idx[9:0]];
+      assign gamma_bits = gamma_q[lane_idx[9:0]];
+      assign beta_bits  = beta_q[lane_idx[9:0]];
+      always_comb begin
+        case (opcode_q)
+          OP_QUANT_FP32_INT8: b_bits_eff = scale0_q;
+          default:            b_bits_eff = b_bits;
+        endcase
+      end
+
+      // Arithmetic primitives (replicas of u_synth_add / u_synth_mul).
+      logic [31:0] add_out;
+      logic [31:0] mul_out;
+      fp32_add u_add (.a(a_bits), .b(b_bits),     .y(add_out));
+      fp32_mul u_mul (.a(a_bits), .b(b_bits_eff), .y(mul_out));
+
+      // DEQUANT_ACCUM_FP32_SCALED chain (replica of the scaled chain).
+      logic [31:0] scaled_mul1;
+      logic [31:0] scaled_mul2;
+      logic [31:0] scaled_add;
+      fp32_mul u_scaled_mul1 (.a(a_bits),      .b(gamma_bits),  .y(scaled_mul1));
+      fp32_mul u_scaled_mul2 (.a(scaled_mul1), .b(scale0_q),    .y(scaled_mul2));
+      fp32_add u_scaled_add  (.a(scaled_mul2), .b(beta_bits),   .y(scaled_add));
+
+      // GELU is NOT replicated across lanes 1..7: fp32_gelu_new (exp+div) is
+      // the area hog (~45% -> ~+18% SFU area when omitted) and GELU is a minor
+      // share of SFU throughput. GELU runs LANE-0 ONLY — the FSM strides by 1
+      // for OP_GELU_FP32 and writes only lane 0, so synth_out_bits_lane[1..7]
+      // are don't-care for GELU and need no gelu instance here.
+
+      // Compute-output op-mux -> shared f2h (replica of synth_compute_out).
+      logic [31:0] compute_out;
+      always_comb begin
+        case (opcode_q)
+          OP_VADD_FP32:                 compute_out = add_out;
+          OP_DEQUANT_ACCUM_FP32:        compute_out = mul_out;
+          OP_DEQUANT_ACCUM_FP32_SCALED: compute_out = scaled_add;
+          default:                      compute_out = 32'd0;  // incl. GELU (lane-0-only)
+        endcase
+      end
+      fp32_to_fp16 u_f2h (.a(compute_out), .y(synth_out_bits_lane[gv_simd]));
+
+      // QUANT_FP32_INT8 path (replica of u_synth_quant).
+      fp32_quantize_i8 u_quant (.a(mul_out), .y(synth_quant_out_lane[gv_simd]));
+    end
+  endgenerate
+
   // For 0x1F MAX_ABS_REDUCE F_G2_SCALE_WR phase: replace the DPI fp64 path
   // (127.0/eps and eps/127.0 in fp64, then fp16 cast) with fp32 div + cvt.
   // Phase-3.E (2026-05-21): g2_clamp_eps performed via bit-level magnitude

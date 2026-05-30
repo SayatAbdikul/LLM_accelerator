@@ -230,12 +230,29 @@
         //   0x17 DEQUANT_AC -> synth_mul_out -> f2h -> out_h_q   -> F_G2_PACK
         //   0x18 QUANT      -> synth_mul_out -> qi8 -> out_bytes -> F_ROW_PACK
         F_G2_SYNTH_ITER: begin
+          // 8-wide SIMD: process up to 8 elements / cycle. Lanes 0..7 read
+          // element (iter_idx_q + lane) via the replicated datapath
+          // (synth_out_bits_lane / synth_quant_out_lane in
+          // sfu_synth_datapath.svh; lane 0 == the original synth_out_bits /
+          // synth_quant_out). Each lane is gated by (iter_idx_q + lane) <
+          // n_elems_q so partial final groups never write beyond the row.
+          // Bit-exact vs. the old 1/cycle loop (independent per-element ops).
           if ({5'h0, iter_idx_q} < n_elems_q) begin
-            if (opcode_q == OP_QUANT_FP32_INT8)
-              out_bytes_q[iter_idx_q[9:0]] <= synth_quant_out;
-            else
-              out_h_q[iter_idx_q[9:0]]     <= synth_out_bits;
-            iter_idx_q                     <= iter_idx_q + 11'd1;
+            // GELU is lane-0-only (fp32_gelu_new not replicated across lanes
+            // 1..7 — see sfu_synth_datapath.svh), so it strides by 1 and writes
+            // only lane 0; all other elementwise ops process 8 lanes/cycle.
+            for (int lane = 0; lane < 8; lane++) begin
+              automatic logic [10:0] wr_idx = iter_idx_q + 11'(lane);
+              if (((lane == 0) || (opcode_q != OP_GELU_FP32)) &&
+                  (({5'h0, iter_idx_q} + 16'(lane)) < n_elems_q)) begin
+                if (opcode_q == OP_QUANT_FP32_INT8)
+                  out_bytes_q[wr_idx[9:0]] <= synth_quant_out_lane[lane];
+                else
+                  out_h_q[wr_idx[9:0]]     <= synth_out_bits_lane[lane];
+              end
+            end
+            iter_idx_q <= iter_idx_q +
+                          ((opcode_q == OP_GELU_FP32) ? 11'd1 : 11'd8);
           end else begin
             iter_idx_q <= 11'h0;
             state      <= (opcode_q == OP_QUANT_FP32_INT8) ? F_ROW_PACK
