@@ -283,6 +283,13 @@ module sfu_engine
   // while the pack mux registers the next chunk — 2 cyc/chunk -> 1, with the
   // row_write_q register boundary (hence SFU fmax) preserved.
   logic [10:0]  g2_wr_addr_q;
+  // Streamed-load lagging capture pointer: the chunk index whose SRAM read
+  // data is on the bus this cycle (read_idx_q is the leading issue pointer,
+  // running one chunk ahead). Lets the F_G2_S1/S2 load loops issue one SRAM
+  // read per cycle and capture the prior cycle's data — 2 cyc/chunk -> 1.
+  // Used only by the streamed (plain-capture) loads; the MAX_ABS_REDUCE
+  // reduction load keeps its read_idx_q-aligned 2-cycle REQ/LATCH ping-pong.
+  logic [12:0]  ld_cap_q;
   logic [1:0]   gelu_part_q;
   logic [15:0]  attn_k_idx_q;
 
@@ -727,6 +734,7 @@ module sfu_engine
       sm_keep_through_q <= 16'sh0;
       write_chunk_q  <= 11'h0;
       g2_wr_addr_q   <= 11'h0;
+      ld_cap_q       <= 13'h0;
       gelu_part_q    <= 2'h0;
       attn_k_idx_q   <= 16'h0;
       g2_rows_q      <= 13'h0;
@@ -895,11 +903,20 @@ module sfu_engine
         // ABUF FP16 tile; src2 is an ABUF FP16 tile (VADD) or 2N FP16
         // gamma||beta in WBUF (LN); GELU has no src2. Output FP16 to ABUF.
         // ----------------------------------------------------------------
+        // Streamed src1 load. MAX_ABS_REDUCE keeps the 2-cycle REQ/LATCH
+        // ping-pong (its reduction mask mar_base_idx is read_idx_q-aligned).
+        // Every other src1 load streams: F_G2_S1_REQ primes (the comb block
+        // issues chunk read_idx_q==0), then F_G2_S1_LATCH captures the prior
+        // chunk (ld_cap_q) while the comb block issues the next (read_idx_q).
         F_G2_S1_REQ: begin
           if (sram_b_fault) begin
             fault_code_r <= 4'(FAULT_SRAM_OOB);
             state        <= F_FAULT;
           end else begin
+            if (opcode_q != OP_MAX_ABS_REDUCE_FP32) begin
+              ld_cap_q   <= read_idx_q;          // chunk on the bus next cycle (==0)
+              read_idx_q <= read_idx_q + 13'd1;  // issue pointer -> chunk 1
+            end
             state <= F_G2_S1_LATCH;
           end
         end
@@ -909,8 +926,9 @@ module sfu_engine
           if (opcode_q == OP_DEQUANT_ACCUM_FP32 ||
               opcode_q == OP_DEQUANT_ACCUM_FP32_SCALED) begin
             // 0x17 / 0x1E: src1 = ACCUM INT32, 4 int32 / 16-byte row, raw
-            // -> real (scales/bias applied later in F_G2_COMPUTE).
-            base_idx = integer'(read_idx_q) * 4;
+            // -> real (scales/bias applied later in F_G2_COMPUTE). Streamed:
+            // capture chunk ld_cap_q; the comb block already issued read_idx_q.
+            base_idx = integer'(ld_cap_q) * 4;
 `ifndef SFU_SYNTH_NO_DPI
             for (int lane = 0; lane < 4; lane++) begin
               if ((base_idx + lane) < integer'(n_elems_q))
@@ -918,9 +936,10 @@ module sfu_engine
                     real_to_fp32_bits(real'(get_i32(sram_b_rdata, lane)));
             end
 `endif
-            if (read_idx_q + 13'd1 < n_chunks_i32_q) begin
+            if (read_idx_q < n_chunks_i32_q) begin
+              ld_cap_q   <= read_idx_q;          // chunk issued this cycle
               read_idx_q <= read_idx_q + 13'd1;
-              state      <= F_G2_S1_REQ;
+              state      <= F_G2_S1_LATCH;
             end else begin
               read_idx_q    <= 13'h0;
               write_chunk_q <= 11'h0;
@@ -963,8 +982,9 @@ module sfu_engine
               state <= F_G2_SCALE_WR;          // all elements seen
             end
           end else begin
-            // FP16 src1 tile, 8 elems / 16-byte row.
-            base_idx = integer'(read_idx_q) * 8;
+            // FP16 src1 tile, 8 elems / 16-byte row. Streamed: capture chunk
+            // ld_cap_q; the comb block already issued read_idx_q.
+            base_idx = integer'(ld_cap_q) * 8;
             for (int lane = 0; lane < 8; lane++) begin
               if ((base_idx + lane) < integer'(n_elems_q)) begin
                 if (SFU_SYNTH_MODE == 1)
@@ -977,9 +997,10 @@ module sfu_engine
 `endif
               end
             end
-            if (read_idx_q + 13'd1 < {2'h0, g2_rows_q[10:0]}) begin
+            if (read_idx_q < {2'h0, g2_rows_q[10:0]}) begin
+              ld_cap_q   <= read_idx_q;
               read_idx_q <= read_idx_q + 13'd1;
-              state      <= F_G2_S1_REQ;
+              state      <= F_G2_S1_LATCH;
             end else begin
               read_idx_q    <= 13'h0;
               write_chunk_q <= 11'h0;
@@ -994,12 +1015,17 @@ module sfu_engine
           end
         end
 
+        // Streamed src2 load (LN/0x1E gamma||beta, or VADD 2nd operand). Same
+        // pipeline as src1: F_G2_S2_REQ primes chunk 0; F_G2_S2_LATCH captures
+        // chunk ld_cap_q while the comb block issues read_idx_q.
         F_G2_S2_REQ: begin
           if (sram_b_fault) begin
             fault_code_r <= 4'(FAULT_SRAM_OOB);
             state        <= F_FAULT;
           end else begin
-            state <= F_G2_S2_LATCH;
+            ld_cap_q   <= read_idx_q;          // chunk on the bus next cycle (==0)
+            read_idx_q <= read_idx_q + 13'd1;  // issue pointer -> chunk 1
+            state      <= F_G2_S2_LATCH;
           end
         end
 
@@ -1008,13 +1034,14 @@ module sfu_engine
           if (opcode_q == OP_LAYERNORM_FP32 ||
               opcode_q == OP_DEQUANT_ACCUM_FP32_SCALED) begin
             // LN: src2 = 2N FP16 (N gamma || N beta). 0x1E: identical
-            // layout, N wt-scales (-> gamma_q) || N bias (-> beta_q).
-            base_idx = (integer'(read_idx_q) < integer'(ln_gamma_rows_q)) ?
-                       (integer'(read_idx_q) * 8) :
-                       ((integer'(read_idx_q) - integer'(ln_gamma_rows_q)) * 8);
+            // layout, N wt-scales (-> gamma_q) || N bias (-> beta_q). The
+            // gamma/beta split is keyed on the captured chunk ld_cap_q.
+            base_idx = (integer'(ld_cap_q) < integer'(ln_gamma_rows_q)) ?
+                       (integer'(ld_cap_q) * 8) :
+                       ((integer'(ld_cap_q) - integer'(ln_gamma_rows_q)) * 8);
             for (int lane = 0; lane < 8; lane++) begin
               if ((base_idx + lane) < integer'(n_elems_q)) begin
-                if (integer'(read_idx_q) < integer'(ln_gamma_rows_q)) begin
+                if (integer'(ld_cap_q) < integer'(ln_gamma_rows_q)) begin
                   if (SFU_SYNTH_MODE == 1)
                     gamma_q[base_idx + lane] <=
                         synth_lat_h2f[lane];
@@ -1035,9 +1062,10 @@ module sfu_engine
                 end
               end
             end
-            if (read_idx_q + 13'd1 < {1'b0, ln_param_rows_q[11:0]}) begin
+            if (read_idx_q < {1'b0, ln_param_rows_q[11:0]}) begin
+              ld_cap_q   <= read_idx_q;
               read_idx_q <= read_idx_q + 13'd1;
-              state      <= F_G2_S2_REQ;
+              state      <= F_G2_S2_LATCH;
             end else begin
               read_idx_q    <= 13'h0;
               write_chunk_q <= 11'h0;
@@ -1045,7 +1073,7 @@ module sfu_engine
             end
           end else begin
             // VADD: src2 is an ABUF FP16 tile (2nd operand).
-            base_idx = integer'(read_idx_q) * 8;
+            base_idx = integer'(ld_cap_q) * 8;
             for (int lane = 0; lane < 8; lane++) begin
               if ((base_idx + lane) < integer'(n_elems_q)) begin
                 if (SFU_SYNTH_MODE == 1)
@@ -1058,9 +1086,10 @@ module sfu_engine
 `endif
               end
             end
-            if (read_idx_q + 13'd1 < {2'h0, g2_rows_q[10:0]}) begin
+            if (read_idx_q < {2'h0, g2_rows_q[10:0]}) begin
+              ld_cap_q   <= read_idx_q;
               read_idx_q <= read_idx_q + 13'd1;
-              state      <= F_G2_S2_REQ;
+              state      <= F_G2_S2_LATCH;
             end else begin
               read_idx_q    <= 13'h0;
               write_chunk_q <= 11'h0;
@@ -1165,6 +1194,22 @@ module sfu_engine
                      row_i32_addr_w[15:0] : g2_s1_addr_w[15:0];
       end
 
+      // Streamed src1: keep issuing the next chunk (read_idx_q) every cycle
+      // while F_G2_S1_LATCH captures the prior one. en drops once the issue
+      // pointer reaches the chunk count. MAX_ABS_REDUCE is excluded (it
+      // ping-pongs through REQ, so it issues only there).
+      F_G2_S1_LATCH: begin
+        sram_b_buf = src1_buf_q;
+        sram_b_row = ((opcode_q == OP_DEQUANT_ACCUM_FP32) ||
+                      (opcode_q == OP_DEQUANT_ACCUM_FP32_SCALED)) ?
+                     row_i32_addr_w[15:0] : g2_s1_addr_w[15:0];
+        sram_b_en  = (opcode_q != OP_MAX_ABS_REDUCE_FP32) &&
+                     (((opcode_q == OP_DEQUANT_ACCUM_FP32) ||
+                       (opcode_q == OP_DEQUANT_ACCUM_FP32_SCALED)) ?
+                        (read_idx_q < n_chunks_i32_q) :
+                        (read_idx_q < {2'h0, g2_rows_q[10:0]}));
+      end
+
       F_G2_S2_REQ: begin
         sram_b_en  = 1'b1;
         sram_b_buf = src2_buf_q;
@@ -1172,6 +1217,16 @@ module sfu_engine
         // (src2_off + read_idx); VADD's src2 is a full per-row tile.
         sram_b_row = (opcode_q == OP_VADD_FP32) ?
                      g2_s2_addr_w[15:0] : g2_lnp_addr_w[15:0];
+      end
+
+      // Streamed src2: same as src1 LATCH (no MAX_ABS here).
+      F_G2_S2_LATCH: begin
+        sram_b_buf = src2_buf_q;
+        sram_b_row = (opcode_q == OP_VADD_FP32) ?
+                     g2_s2_addr_w[15:0] : g2_lnp_addr_w[15:0];
+        sram_b_en  = (opcode_q == OP_VADD_FP32) ?
+                     (read_idx_q < {2'h0, g2_rows_q[10:0]}) :
+                     (read_idx_q < {1'b0, ln_param_rows_q[11:0]});
       end
 
       F_G2_WRITE: begin
