@@ -277,6 +277,12 @@ module sfu_engine
   logic         sm_have_vis_q;      // any visible element seen
   logic signed [15:0] sm_keep_through_q;
   logic [10:0]  write_chunk_q;
+  // Streamed-writeback lagging address pointer: the chunk index whose packed
+  // data is currently held in row_write_q (write_chunk_q is the leading pack
+  // pointer). Lets F_G2_WRITE / F_ROW_WRITE issue one SRAM write per cycle
+  // while the pack mux registers the next chunk — 2 cyc/chunk -> 1, with the
+  // row_write_q register boundary (hence SFU fmax) preserved.
+  logic [10:0]  g2_wr_addr_q;
   logic [1:0]   gelu_part_q;
   logic [15:0]  attn_k_idx_q;
 
@@ -599,7 +605,7 @@ module sfu_engine
                           {19'h0, read_idx_q};
   assign row_dst_addr_w = {16'h0, dst_off_q} +
                           ({17'h0, row_idx_q} * {21'h0, n_tiles_q}) +
-                          {21'h0, write_chunk_q};
+                          {21'h0, g2_wr_addr_q};
   assign ln_param_addr_w = {16'h0, src2_off_q} + {19'h0, read_idx_q};
   assign gelu_i8_addr_w = {16'h0, src1_off_q} +
                           ({17'h0, row_idx_q} * {21'h0, n_tiles_q}) +
@@ -632,7 +638,7 @@ module sfu_engine
   assign g2_lnp_addr_w = {16'h0, src2_off_q} + {19'h0, read_idx_q};
   assign g2_dst_addr_w = {16'h0, dst_off_q} +
                          ({17'h0, row_idx_q} * {19'h0, g2_rows_q}) +
-                         {21'h0, write_chunk_q};
+                         {21'h0, g2_wr_addr_q};
 
   always_comb begin
     row_write_data_w = 128'h0;
@@ -720,6 +726,7 @@ module sfu_engine
       sm_have_vis_q  <= 1'b0;
       sm_keep_through_q <= 16'sh0;
       write_chunk_q  <= 11'h0;
+      g2_wr_addr_q   <= 11'h0;
       gelu_part_q    <= 2'h0;
       attn_k_idx_q   <= 16'h0;
       g2_rows_q      <= 13'h0;
@@ -840,18 +847,28 @@ module sfu_engine
         // The `include "sfu_g1_compute.svh"` (gen-1 F_ROW_COMPUTE body) is
         // also removed. F_ROW_PACK / F_ROW_WRITE stay — gen-2 0x18
         // QUANT_FP32_INT8 uses them too (int8 pack format).
+        // Streamed writeback (INT8 output, 0x18 QUANT). Same pipeline as
+        // F_G2_PACK/WRITE: F_ROW_PACK primes chunk 0; F_ROW_WRITE issues one
+        // SRAM write per cycle (row_write_q @ row_dst_addr_w(g2_wr_addr_q))
+        // while row_write_data_w packs the next chunk. 1 cyc/chunk vs 2.
         F_ROW_PACK: begin
-          row_write_q <= row_write_data_w;
-          state <= F_ROW_WRITE;
+          row_write_q   <= row_write_data_w;       // packs write_chunk_q (==0)
+          g2_wr_addr_q  <= write_chunk_q;
+          write_chunk_q <= write_chunk_q + 11'd1;
+          state         <= F_ROW_WRITE;
         end
 
         F_ROW_WRITE: begin
+          // The comb block writes row_write_q every F_ROW_WRITE cycle, so the
+          // chunk g2_wr_addr_q is committed this cycle regardless of branch.
           if (sram_a_fault) begin
             fault_code_r <= 4'(FAULT_SRAM_OOB);
             state        <= F_FAULT;
-          end else if (write_chunk_q + 11'd1 < n_tiles_q) begin
+          end else if (write_chunk_q < n_tiles_q) begin
+            row_write_q   <= row_write_data_w;      // pack next chunk
+            g2_wr_addr_q  <= write_chunk_q;
             write_chunk_q <= write_chunk_q + 11'd1;
-            state         <= F_ROW_PACK;
+            state         <= F_ROW_WRITE;
           end else if (row_idx_q + 15'd1 < m_rows_q) begin
             row_idx_q     <= row_idx_q + 15'd1;
             read_idx_q    <= 13'h0;
@@ -1053,18 +1070,30 @@ module sfu_engine
         end
 
 `include "sfu_g2_compute.svh"
+        // Streamed writeback (FP16 output). F_G2_PACK primes the pipeline by
+        // registering chunk 0's packed data; F_G2_WRITE then issues one SRAM
+        // write per cycle (row_write_q @ g2_dst_addr_w(g2_wr_addr_q)) while the
+        // pack mux registers the next chunk. write_chunk_q leads (pack ptr);
+        // g2_wr_addr_q lags (the chunk now in row_write_q). 1 cyc/chunk vs 2,
+        // row_write_q register boundary preserved so SFU fmax is unchanged.
         F_G2_PACK: begin
-          row_write_q <= g2_write_data_w;
-          state       <= F_G2_WRITE;
+          row_write_q   <= g2_write_data_w;       // packs write_chunk_q (==0)
+          g2_wr_addr_q  <= write_chunk_q;          // row_write_q holds this chunk
+          write_chunk_q <= write_chunk_q + 11'd1;  // advance pack pointer
+          state         <= F_G2_WRITE;
         end
 
         F_G2_WRITE: begin
+          // The comb block writes row_write_q every F_G2_WRITE cycle, so the
+          // chunk g2_wr_addr_q is committed this cycle regardless of branch.
           if (sram_a_fault) begin
             fault_code_r <= 4'(FAULT_SRAM_OOB);
             state        <= F_FAULT;
-          end else if (write_chunk_q + 11'd1 < g2_rows_q[10:0]) begin
+          end else if (write_chunk_q < g2_rows_q[10:0]) begin
+            row_write_q   <= g2_write_data_w;       // pack next chunk
+            g2_wr_addr_q  <= write_chunk_q;
             write_chunk_q <= write_chunk_q + 11'd1;
-            state         <= F_G2_PACK;
+            state         <= F_G2_WRITE;
           end else if (row_idx_q + 15'd1 < m_rows_q) begin
             row_idx_q     <= row_idx_q + 15'd1;
             read_idx_q    <= 13'h0;
