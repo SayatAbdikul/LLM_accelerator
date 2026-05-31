@@ -279,6 +279,17 @@ module sfu_engine
   // paths already existed as the DIFF and OUT critical paths; they now just run
   // concurrently, and don't chain).
   logic [10:0]  ln_coll_q;
+  // 2026-05-31: LN_VAR accumulator pipelining (fmax lever). The variance pass
+  // computed (row-mean)^2 AND accumulated it in ONE cycle: synth_a_bits ->
+  // fp32_add(sub) -> fp32_mul(square) -> fp32_add(accumulate) -> ln_var_acc_q,
+  // a ~42 ns chain = the post-div_p4 SFU PNR floor (= whole-chip clock). diff
+  // and square are NOT loop-carried (only the final accumulate is), so register
+  // the square here and accumulate it the next cycle: the binding path splits
+  // into sub+mul (~28 ns, fed) and add (~14 ns, loop-carried). Software-
+  // pipelined like F_G2_LN_OUT_DIFF — feed element i's square while accumulating
+  // element i-1's — so throughput stays ~1 elem/cycle (+1 drain/row). Bit-exact
+  // (same sub/mul/add, same operands, same accumulation order).
+  logic [31:0]  ln_dsq_q;
   // 2026-05-29: registers exp(row-max) in F_G2_SM_OUT_NORM so the pipelined
   // fp32_div_p2 sees a registered dividend (isolates fp32_exp from the
   // divider's stage-1; otherwise exp+div_stage1 would chain ~138 ns).
@@ -740,6 +751,7 @@ module sfu_engine
       ln_var_eps_q   <= 32'h0;
       ln_diff_q      <= 32'h0;
       ln_coll_q      <= 11'h0;
+      ln_dsq_q       <= 32'h0;
       sm_exp_q       <= 32'h0;
       sm_row_max_q   <= 32'h0;
       sm_exp_sum_q   <= 32'h0;

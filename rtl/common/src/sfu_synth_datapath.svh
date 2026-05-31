@@ -325,7 +325,12 @@
                           .valid_out(ln_mean_vo), .y(ln_mean_div_w));
   fp32_add  u_ln_diff    (.a(synth_a_bits), .b(ln_neg_mean),  .y(ln_diff_w));
   fp32_mul  u_ln_diff_sq (.a(ln_diff_w),    .b(ln_diff_w),    .y(ln_diff_sq_w));
-  fp32_add  u_ln_var_add (.a(ln_var_acc_q), .b(ln_diff_sq_w), .y(ln_var_add_w));
+  // 2026-05-31: LN_VAR pipelined. The accumulate reads the REGISTERED square
+  // (ln_dsq_q, latched in F_G2_LN_VAR from ln_diff_sq_w) instead of the
+  // combinational ln_diff_sq_w, so sub+mul (-> ln_dsq_q) and the loop-carried
+  // accumulate (-> ln_var_acc_q) sit in separate pipeline stages. Breaks the
+  // ~42 ns sub->mul->add SFU floor into ~28 ns + ~14 ns. Bit-exact.
+  fp32_add  u_ln_var_add (.a(ln_var_acc_q), .b(ln_dsq_q),     .y(ln_var_add_w));
   // 2026-05-30: 4-stage pipelined divider. var_acc/n sampled 4 cycles after the
   // registered ln_var_acc_q is presented (F_G2_LN_DENOM_PRE -> _W -> _W2 -> _W3
   // -> _S); the +eps add then sits after the divider output register.

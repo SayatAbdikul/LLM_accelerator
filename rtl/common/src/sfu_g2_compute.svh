@@ -297,13 +297,25 @@
           state        <= F_G2_LN_VAR;
         end
 
+        // 2026-05-31: pipelined to break the ~42 ns sub->mul->add SFU floor.
+        // ln_dsq_q holds element (iter-1)'s (row-mean)^2 (registered last cycle);
+        // accumulate it (ln_var_add_w = ln_var_acc_q + ln_dsq_q, a lone add)
+        // while simultaneously computing element iter's square into ln_dsq_q
+        // (the sub+mul feed). Same accumulation order as the old 1-cycle loop
+        // (((0+dsq0)+dsq1)+...), so bit-exact; costs +1 drain cycle per row.
         F_G2_LN_VAR: begin
-          if ({5'h0, iter_idx_q} < n_elems_q) begin
+          // ACCUMULATE element (iter-1)'s square, once the pipe has filled.
+          if (iter_idx_q >= 11'd1)
             ln_var_acc_q <= ln_var_add_w;
-            iter_idx_q   <= iter_idx_q + 11'd1;
+          if ({5'h0, iter_idx_q} < n_elems_q) begin
+            // FEED: register element iter's (row[iter]-mean)^2.
+            ln_dsq_q   <= ln_diff_sq_w;
+            iter_idx_q <= iter_idx_q + 11'd1;
           end else begin
-            iter_idx_q   <= 11'h0;
-            state        <= F_G2_LN_DENOM_PRE;
+            // iter==n_elems: the final square (element n-1) was just accumulated
+            // by the branch above (iter>=1). Variance sum complete.
+            iter_idx_q <= 11'h0;
+            state       <= F_G2_LN_DENOM_PRE;
           end
         end
 
