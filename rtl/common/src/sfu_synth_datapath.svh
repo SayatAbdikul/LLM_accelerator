@@ -338,13 +338,15 @@
                             .a(ln_var_acc_q), .b(ln_n_fp32),
                             .valid_out(ln_var_norm_vo), .y(ln_var_norm_w));
   fp32_add  u_ln_var_eps (.a(ln_var_norm_w),.b(ln_eps_sel_w), .y(ln_var_eps_w));
-  // 2026-05-29: 3-stage pipelined sqrt. fp32_sqrt_p2's stage-2 (iters 7..0 +
-  // RNE/pack) was the ~57.8 ns post-PNR fmax floor; fp32_sqrt_p3 splits that
-  // tail across two stages (balanced ~40 ns/stage at synth). Reads the
-  // registered ln_var_eps_q (latched in F_G2_LN_DENOM_PRE_S); ln_denom_w
-  // (= sqrt y) is valid in F_G2_LN_DENOM_S, 3 cycles after F_G2_LN_DENOM presents
+  // 2026-05-31: 4-stage pipelined sqrt. After the div_p4 + sqrt_p3 + LN_VAR
+  // campaign, fp32_sqrt_p3's stage-2 (mid digit-recurrence iters 9..5) became
+  // the SOLE post-PNR fmax floor (u_ln_sqrt.rB_r cluster, 38.67 ns). fp32_sqrt_p4
+  // adds a 4th cut, splitting the recurrence tail across 3 stages instead of 2
+  // (balanced 32/33/36/26 ns standalone synth, floor 36.05 vs p3's ~41). Reads
+  // the registered ln_var_eps_q (latched in F_G2_LN_DENOM_PRE_S); ln_denom_w
+  // (= sqrt y) is valid in F_G2_LN_DENOM_S, 4 cycles after F_G2_LN_DENOM presents
   // it. valid_in tied high (fixed-latency use); valid_out unused.
-  fp32_sqrt_p3 u_ln_sqrt (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
+  fp32_sqrt_p4 u_ln_sqrt (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
                           .a(ln_var_eps_q),
                           .valid_out(ln_sqrt_vo), .y(ln_denom_w));
   // 2026-05-30: 4-stage pipelined divider. Consumes the registered ln_diff_q;

@@ -58,7 +58,7 @@ CTRL_SV       := $(addprefix $(SRC_DIR)/, $(call read_filelist,$(CORE_CTRL_F)))
         test_systolic_qkt_basic test_systolic_qkt_replay \
         test_systolic_qkt_padded test_systolic_qkt_history \
         test_addr_raw_hazard \
-        test_accum_snapshot_readback test_fp32_add test_fp32_div test_fp32_div_p3 test_fp32_div_p4 test_fp32_sqrt test_fp32_sqrt_p3 \
+        test_accum_snapshot_readback test_fp32_add test_fp32_div test_fp32_div_p3 test_fp32_div_p4 test_fp32_sqrt test_fp32_sqrt_p3 test_fp32_sqrt_p4 \
         test_sfu_synth test_helpers_synth \
         test_sfu_helper_synth synth-check synth-check-ctrl clean
 # R7 (2026-05-23): test_fp32_*_pipe targets removed. The 12 fp32_*_pipe.sv
@@ -450,6 +450,26 @@ $(BUILD_DIR)/test_fp32_sqrt_p3/Vfp32_sqrt_p3: $(FP32_DIR)/fp32_sqrt_p3.sv test_f
 test_fp32_sqrt_p3: $(BUILD_DIR)/test_fp32_sqrt_p3/Vfp32_sqrt_p3
 	@echo "--- Running pipelined fp32_sqrt_p3 bit-exact gate ---"
 	$(BUILD_DIR)/test_fp32_sqrt_p3/Vfp32_sqrt_p3
+
+# -----------------------------------------------------------------------
+# test_fp32_sqrt_p4: 4-stage pipelined fp32_sqrt_p4, bit-exact gate.
+# Standalone — links ONLY fp32_sqrt_p4 (no taccel_top). Proves the
+# 4-way path-cut sqrt is byte-identical to the host-float golden before
+# any sfu_engine.sv integration.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_fp32_sqrt_p4/Vfp32_sqrt_p4: $(FP32_DIR)/fp32_sqrt_p4.sv test_fp32_sqrt_p4.cpp
+	mkdir -p $(BUILD_DIR)/test_fp32_sqrt_p4
+	$(VERILATOR) $(VFLAGS) \
+	  --top-module fp32_sqrt_p4 \
+	  --Mdir $(BUILD_DIR)/test_fp32_sqrt_p4 \
+	  $(FP32_DIR)/fp32_sqrt_p4.sv \
+	  test_fp32_sqrt_p4.cpp \
+	  -CFLAGS "$(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_fp32_sqrt_p4 -f Vfp32_sqrt_p4.mk
+
+test_fp32_sqrt_p4: $(BUILD_DIR)/test_fp32_sqrt_p4/Vfp32_sqrt_p4
+	@echo "--- Running pipelined fp32_sqrt_p4 bit-exact gate ---"
+	$(BUILD_DIR)/test_fp32_sqrt_p4/Vfp32_sqrt_p4
 
 # -----------------------------------------------------------------------
 # test_systolic_query: focused chained query-projection regression

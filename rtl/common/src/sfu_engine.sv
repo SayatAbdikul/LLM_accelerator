@@ -95,47 +95,47 @@ module sfu_engine
 
   // 6-bit enum: Phase-2 LN sub-FSM (5'd32..) requires the extra state slot
   // beyond the original 5'd0..5'd31 range.
-  typedef enum logic [5:0] {
-    F_IDLE          = 6'd0,
-    F_LN_PARAM_REQ  = 6'd1,
-    F_LN_PARAM_LATCH= 6'd2,
-    F_ROW_I8_REQ    = 6'd3,
-    F_ROW_I8_LATCH  = 6'd4,
-    F_ROW_I32_REQ   = 6'd5,
-    F_ROW_I32_LATCH = 6'd6,
-    F_ROW_COMPUTE   = 6'd7,
-    F_ROW_PACK      = 6'd8,
-    F_ROW_WRITE     = 6'd9,
-    F_GELU_I8_REQ   = 6'd10,
-    F_GELU_I8_LATCH = 6'd11,
-    F_GELU_I8_WRITE = 6'd12,
-    F_GELU_I32_REQ  = 6'd13,
-    F_GELU_I32_LATCH= 6'd14,
-    F_GELU_I32_WRITE= 6'd15,
-    F_ATTN_QKT_REQ  = 6'd16,
-    F_ATTN_QKT_LATCH= 6'd17,
-    F_ATTN_PREP     = 6'd18,
-    F_ATTN_V_REQ    = 6'd19,
-    F_ATTN_V_LATCH  = 6'd20,
-    F_ATTN_WRITE    = 6'd21,
-    F_FAULT         = 6'd22,
+  typedef enum logic [6:0] {
+    F_IDLE          = 7'd0,
+    F_LN_PARAM_REQ  = 7'd1,
+    F_LN_PARAM_LATCH= 7'd2,
+    F_ROW_I8_REQ    = 7'd3,
+    F_ROW_I8_LATCH  = 7'd4,
+    F_ROW_I32_REQ   = 7'd5,
+    F_ROW_I32_LATCH = 7'd6,
+    F_ROW_COMPUTE   = 7'd7,
+    F_ROW_PACK      = 7'd8,
+    F_ROW_WRITE     = 7'd9,
+    F_GELU_I8_REQ   = 7'd10,
+    F_GELU_I8_LATCH = 7'd11,
+    F_GELU_I8_WRITE = 7'd12,
+    F_GELU_I32_REQ  = 7'd13,
+    F_GELU_I32_LATCH= 7'd14,
+    F_GELU_I32_WRITE= 7'd15,
+    F_ATTN_QKT_REQ  = 7'd16,
+    F_ATTN_QKT_LATCH= 7'd17,
+    F_ATTN_PREP     = 7'd18,
+    F_ATTN_V_REQ    = 7'd19,
+    F_ATTN_V_LATCH  = 7'd20,
+    F_ATTN_WRITE    = 7'd21,
+    F_FAULT         = 7'd22,
     // gen-2 FP32 shared datapath (0x19 VADD / 0x1A LN / 0x1B GELU).
     // FP16 storage (8 elems / 16-byte row), FP32 internal.
-    F_G2_S1_REQ     = 6'd23,
-    F_G2_S1_LATCH   = 6'd24,
-    F_G2_S2_REQ     = 6'd25,
-    F_G2_S2_LATCH   = 6'd26,
-    F_G2_COMPUTE    = 6'd27,
-    F_G2_PACK       = 6'd28,
-    F_G2_WRITE      = 6'd29,
-    F_G2_SCALE_WR   = 6'd30,  // 0x1F: 2-cycle scale-reg write-back
+    F_G2_S1_REQ     = 7'd23,
+    F_G2_S1_LATCH   = 7'd24,
+    F_G2_S2_REQ     = 7'd25,
+    F_G2_S2_LATCH   = 7'd26,
+    F_G2_COMPUTE    = 7'd27,
+    F_G2_PACK       = 7'd28,
+    F_G2_WRITE      = 7'd29,
+    F_G2_SCALE_WR   = 7'd30,  // 0x1F: 2-cycle scale-reg write-back
     // Phase-2 synth-mode iterator state (SFU_SYNTH_MODE=1): serializes the
     // 1024-parallel combinational compute loops into one element / cycle
     // through the shared synthesizable primitives. The op-code (opcode_q)
     // multiplexes which primitive's output is sampled.  Currently handles:
     //   0x19 OP_VADD_FP32, 0x17 OP_DEQUANT_ACCUM_FP32,
     //   0x18 OP_QUANT_FP32_INT8, 0x1E OP_DEQUANT_ACCUM_FP32_SCALED.
-    F_G2_SYNTH_ITER = 6'd31,
+    F_G2_SYNTH_ITER = 7'd31,
     // Phase-2 LAYERNORM_FP32 (0x1A) synth sub-FSM. 3 reduction passes over
     // the row (sum -> mean; var -> denom; output) plus 2 single-cycle math
     // steps. State sequence:
@@ -144,87 +144,88 @@ module sfu_engine
     //   F_G2_LN_VAR      : iter; var_acc_q += (row[iter] - mean)^2
     //   F_G2_LN_DENOM    : 1 cycle; denom_q = sqrt(var_acc/n + LN_FP32_EPS)
     //   F_G2_LN_OUT      : iter; out_h_q[iter] = f2h((row-mean)/denom*gamma + beta)
-    F_G2_LN_SUM     = 6'd32,
-    F_G2_LN_MEAN    = 6'd33,
-    F_G2_LN_VAR     = 6'd34,
-    F_G2_LN_DENOM   = 6'd35,
-    F_G2_LN_OUT     = 6'd36,
+    F_G2_LN_SUM     = 7'd32,
+    F_G2_LN_MEAN    = 7'd33,
+    F_G2_LN_VAR     = 7'd34,
+    F_G2_LN_DENOM   = 7'd35,
+    F_G2_LN_OUT     = 7'd36,
     // Phase-2 MASKED_SOFTMAX_FP32 (0x1D) synth sub-FSM. 3 passes:
     //   F_G2_SM_MAX     : iter; track row_max over visible elements
     //   F_G2_SM_EXPSUM  : iter; exp_sum += exp(row[i] - row_max) (visible only)
     //   F_G2_SM_OUT     : iter; out[i] = f2h(exp(row[i] - row_max) / exp_sum)
     //                     for visible elements (masked -> 16'h0).
     //   Banded — bounded by `fp32_exp` accuracy (Phase-3 minimax pending).
-    F_G2_SM_MAX     = 6'd37,
-    F_G2_SM_EXPSUM  = 6'd38,
-    F_G2_SM_OUT     = 6'd39,
+    F_G2_SM_MAX     = 7'd37,
+    F_G2_SM_EXPSUM  = 7'd38,
+    F_G2_SM_OUT     = 7'd39,
     // Phase-3.B gen-1 GELU synth-mode iterator (uses fp32_gelu_new tanh-poly
     // primitive as the synth approximation of gen-1 erf-GELU; the int8
     // quantization at out_bytes_q absorbs the tanh-vs-erf difference for
     // typical fixture inputs).
-    F_GELU_SYNTH_I8_ITER  = 6'd40,
-    F_GELU_SYNTH_I32_ITER = 6'd41,
+    F_GELU_SYNTH_I8_ITER  = 7'd40,
+    F_GELU_SYNTH_I32_ITER = 7'd41,
     // Phase-4 (2026-05-28): split F_G2_LN_DENOM into two cycles so the
     // (var_acc/n + eps) and sqrt() ops live on separate clock periods.
     // The pre-stage latches ln_var_eps_q; F_G2_LN_DENOM reads it via u_ln_sqrt.
-    F_G2_LN_DENOM_PRE = 6'd42,
+    F_G2_LN_DENOM_PRE = 7'd42,
     // Phase-4: split F_G2_LN_OUT — the 5-op fp32 chain
     //   (row - mean) -> /denom -> *gamma -> +beta -> f2h -> out_h_q
     // ran in one cycle (~190 ns). NORM latches ln_norm_q = (row-mean)/denom
     // for the current iter; the OUT cycle takes (norm*gamma + beta) -> f2h.
-    F_G2_LN_OUT_NORM  = 6'd43,
+    F_G2_LN_OUT_NORM  = 7'd43,
     // Phase-5 (2026-05-28): further split — ln_diff_q latches (row - mean) in
     // F_G2_LN_OUT_DIFF so u_ln_norm's input is registered, removing the
     // serial fp32_add + fp32_div chain from the SFU critical path. The path
     // ln_mean_q -> ln_norm_q was the post-PNR worst path at 184 ns.
-    F_G2_LN_OUT_DIFF  = 6'd44,
+    F_G2_LN_OUT_DIFF  = 7'd44,
     // Phase-6 (2026-05-29): split F_G2_SM_OUT — sm_norm_q latches the
     // fp32_div(exp, exp_sum) result so the subsequent fp32_to_fp16 sits in
     // its own cycle. Post Phase-5 the worst path was sm_exp_sum_q ->
     // fp32_div -> fp32_to_fp16 -> out_h_q at 149 ns; this cut isolates
     // fp32_div from f2h.
-    F_G2_SM_OUT_NORM  = 6'd45,
+    F_G2_SM_OUT_NORM  = 7'd45,
     // 2026-05-29 (new session): fp32_div_p2 pipelined divider (LATENCY=2)
     // replaces the combinational fp32_div in the 4 STA-binding sites
     // (ln_norm 180 ns, sm_div 157 ns, ln_var_norm 134 ns, ln_mean 122 ns).
     // Each div site gains wait state(s) so the FSM samples y 2 cycles after
     // the registered operands are presented. Moves the SFU fmax floor from
     // the divider down to fp32_sqrt (ln_denom, ~113 ns). See [[dma_floor]].
-    F_G2_LN_MEAN_W      = 6'd46,  // ln_mean div stage2
-    F_G2_LN_MEAN_S      = 6'd47,  // ln_mean div y valid -> sample ln_mean_q
-    F_G2_LN_DENOM_PRE_W = 6'd48,  // ln_var_norm div stage2
-    F_G2_LN_DENOM_PRE_S = 6'd49,  // div y valid -> +eps -> sample ln_var_eps_q
-    F_G2_LN_OUT_W       = 6'd50,  // ln_norm div stage2 (NORM presented, OUT uses y)
-    F_G2_SM_OUT_DIV     = 6'd51,  // sm div stage1 (exp registered in OUT_NORM)
-    F_G2_SM_OUT_W       = 6'd52,  // sm div stage2 (OUT uses y)
+    F_G2_LN_MEAN_W      = 7'd46,  // ln_mean div stage2
+    F_G2_LN_MEAN_S      = 7'd47,  // ln_mean div y valid -> sample ln_mean_q
+    F_G2_LN_DENOM_PRE_W = 7'd48,  // ln_var_norm div stage2
+    F_G2_LN_DENOM_PRE_S = 7'd49,  // div y valid -> +eps -> sample ln_var_eps_q
+    F_G2_LN_OUT_W       = 7'd50,  // ln_norm div stage2 (NORM presented, OUT uses y)
+    F_G2_SM_OUT_DIV     = 7'd51,  // sm div stage1 (exp registered in OUT_NORM)
+    F_G2_SM_OUT_W       = 7'd52,  // sm div stage2 (OUT uses y)
     // 2026-05-29: fp32_sqrt_p2 pipelined sqrt (LATENCY=2) replaces the
     // combinational fp32_sqrt at the LN denom site — the new ~97 ns fmax
     // floor after the dividers were pipelined. F_G2_LN_DENOM presents the
     // registered ln_var_eps_q; sample ln_denom_q 2 cycles later. See [[dma_floor]].
-    F_G2_LN_DENOM_W     = 6'd53,  // ln_denom sqrt stage2
-    F_G2_LN_DENOM_S     = 6'd54,  // sqrt y valid -> sample ln_denom_q
+    F_G2_LN_DENOM_W     = 7'd53,  // ln_denom sqrt stage2
+    F_G2_LN_DENOM_S     = 7'd54,  // sqrt y valid -> sample ln_denom_q
     // 2026-05-29: fp32_div_p3 (3-stage, LATENCY=3) replaces fp32_div_p2 at the
     // 4 binding divider sites — the divider stage-1 was the ~88 ns synth floor
     // after the sqrt was pipelined. Each site gets ONE extra wait state vs the
     // LATENCY=2 integration so the FSM samples y 3 cycles after the registered
     // operands are presented. See [[dma_floor]].
-    F_G2_LN_MEAN_W2     = 6'd55,  // ln_mean div 3rd stage
-    F_G2_LN_DENOM_PRE_W2= 6'd56,  // ln_var_norm div 3rd stage
-    F_G2_LN_OUT_W2      = 6'd57,  // ln_norm div 3rd stage
-    F_G2_SM_OUT_W2      = 6'd58,  // sm_div 3rd stage
+    F_G2_LN_MEAN_W2     = 7'd55,  // ln_mean div 3rd stage
+    F_G2_LN_DENOM_PRE_W2= 7'd56,  // ln_var_norm div 3rd stage
+    F_G2_LN_OUT_W2      = 7'd57,  // ln_norm div 3rd stage
+    F_G2_SM_OUT_W2      = 7'd58,  // sm_div 3rd stage
     // 2026-05-29: fp32_sqrt_p3 (3-stage, LATENCY=3) replaces fp32_sqrt_p2 at the
     // ln_denom site — the sqrt stage-2 (iters 7..0 + pack) was the ~57.8 ns
     // post-PNR fmax floor. One extra wait state vs the LATENCY=2 integration so
     // the FSM samples ln_denom_w 3 cycles after F_G2_LN_DENOM presents it.
-    F_G2_LN_DENOM_W2    = 6'd59,  // ln_denom sqrt 3rd stage
+    F_G2_LN_DENOM_W2    = 7'd59,  // ln_denom sqrt 3rd stage
     // 2026-05-30: fp32_div_p4 (4-stage, LATENCY=4) replaces fp32_div_p3 at the 4
     // divider sites — the div_p3 stage-2 (12-iter middle) was the ~53.8 ns
     // post-PNR floor (binding at u_ln_var_norm + u_sm_div). One MORE wait state
     // each (W3) so the FSM samples y 4 cycles after the operands are presented.
-    F_G2_LN_MEAN_W3     = 6'd60,  // ln_mean div 4th stage
-    F_G2_LN_DENOM_PRE_W3= 6'd61,  // ln_var_norm div 4th stage
-    F_G2_LN_OUT_W3      = 6'd62,  // ln_norm div 4th stage
-    F_G2_SM_OUT_W3      = 6'd63   // sm_div 4th stage
+    F_G2_LN_MEAN_W3     = 7'd60,  // ln_mean div 4th stage
+    F_G2_LN_DENOM_PRE_W3= 7'd61,  // ln_var_norm div 4th stage
+    F_G2_LN_OUT_W3      = 7'd62,  // ln_norm div 4th stage
+    F_G2_SM_OUT_W3      = 7'd63,  // sm_div 4th stage
+    F_G2_LN_DENOM_W3    = 7'd64   // ln_sqrt p4 4th stage (LATENCY=4)
   } sfu_state_t;
 
   sfu_state_t state;
