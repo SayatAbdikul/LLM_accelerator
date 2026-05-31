@@ -299,8 +299,8 @@ module sfu_engine
   // data is on the bus this cycle (read_idx_q is the leading issue pointer,
   // running one chunk ahead). Lets the F_G2_S1/S2 load loops issue one SRAM
   // read per cycle and capture the prior cycle's data — 2 cyc/chunk -> 1.
-  // Used only by the streamed (plain-capture) loads; the MAX_ABS_REDUCE
-  // reduction load keeps its read_idx_q-aligned 2-cycle REQ/LATCH ping-pong.
+  // Used by every streamed src1/src2 load, including (2026-05-31) the
+  // MAX_ABS_REDUCE running-max reduction (its mask mar_base_idx = ld_cap_q*8).
   logic [12:0]  ld_cap_q;
   logic [1:0]   gelu_part_q;
   logic [15:0]  attn_k_idx_q;
@@ -916,21 +916,20 @@ module sfu_engine
         // ABUF FP16 tile; src2 is an ABUF FP16 tile (VADD) or 2N FP16
         // gamma||beta in WBUF (LN); GELU has no src2. Output FP16 to ABUF.
         // ----------------------------------------------------------------
-        // Streamed src1 load. MAX_ABS_REDUCE keeps the 2-cycle REQ/LATCH
-        // ping-pong (its reduction mask mar_base_idx is read_idx_q-aligned).
-        // Every other src1 load streams: F_G2_S1_REQ primes (the comb block
-        // issues chunk read_idx_q==0), then F_G2_S1_LATCH captures the prior
-        // chunk (ld_cap_q) while the comb block issues the next (read_idx_q).
+        // Streamed src1 load. F_G2_S1_REQ primes (the comb block issues chunk
+        // read_idx_q==0), then F_G2_S1_LATCH captures the prior chunk (ld_cap_q)
+        // while the comb block issues the next (read_idx_q). 2026-05-31:
+        // MAX_ABS_REDUCE now streams too — its running-max reduction is a single
+        // -cycle R-M-W on g2_maxabs_q, so it keeps the divider-free 1-cyc/chunk
+        // pace; the reduction mask just follows the captured chunk ld_cap_q.
         F_G2_S1_REQ: begin
           if (sram_b_fault) begin
             fault_code_r <= 4'(FAULT_SRAM_OOB);
             state        <= F_FAULT;
           end else begin
-            if (opcode_q != OP_MAX_ABS_REDUCE_FP32) begin
-              ld_cap_q   <= read_idx_q;          // chunk on the bus next cycle (==0)
-              read_idx_q <= read_idx_q + 13'd1;  // issue pointer -> chunk 1
-            end
-            state <= F_G2_S1_LATCH;
+            ld_cap_q   <= read_idx_q;          // chunk on the bus next cycle (==0)
+            read_idx_q <= read_idx_q + 13'd1;  // issue pointer -> chunk 1
+            state      <= F_G2_S1_LATCH;
           end
         end
 
@@ -960,16 +959,20 @@ module sfu_engine
             end
           end else if (opcode_q == OP_MAX_ABS_REDUCE_FP32) begin
             // 0x1F: FP16 src1; accumulate the GLOBAL max|x| over the whole
-            // M*N tile (own row loop, no per-row output).
-            base_idx = integer'(read_idx_q) * 8;
+            // M*N tile (own row loop, no per-row output). Streamed: reduce the
+            // CAPTURED chunk ld_cap_q (on the bus now); the comb block already
+            // issued the next chunk read_idx_q.
+            base_idx = integer'(ld_cap_q) * 8;
             if (SFU_SYNTH_MODE == 1) begin
               // Synth: max-reduce the 8 fp32-bit-abs lanes against the
               // current g2_maxabs_q (computed combinationally at module
-              // scope as `mar_new_max`); store back via fp32_bits_to_real.
+              // scope as `mar_new_max`, masked by mar_base_idx = ld_cap_q*8);
+              // store back via fp32_bits_to_real.
               g2_maxabs_q <= mar_new_max;
             end else begin
 `ifndef SFU_SYNTH_NO_DPI
-              // DPI path (default; cosim-pinned).
+              // DPI path (default; cosim-pinned). max is order-independent, so
+              // streaming the chunk captures leaves the global result identical.
               real m;
               real v;
               real av;
@@ -984,10 +987,13 @@ module sfu_engine
               g2_maxabs_q <= real_to_fp32_bits(m);
 `endif
             end
-            if (read_idx_q + 13'd1 < {2'h0, g2_rows_q[10:0]}) begin
+            if (read_idx_q < {2'h0, g2_rows_q[10:0]}) begin
+              // more chunks issued for this row: capture next, keep streaming.
+              ld_cap_q   <= read_idx_q;
               read_idx_q <= read_idx_q + 13'd1;
-              state      <= F_G2_S1_REQ;
+              state      <= F_G2_S1_LATCH;
             end else if (row_idx_q + 15'd1 < m_rows_q) begin
+              // row complete (captured its last chunk); advance row + re-prime.
               row_idx_q  <= row_idx_q + 15'd1;
               read_idx_q <= 13'h0;
               state      <= F_G2_S1_REQ;
@@ -1209,18 +1215,17 @@ module sfu_engine
 
       // Streamed src1: keep issuing the next chunk (read_idx_q) every cycle
       // while F_G2_S1_LATCH captures the prior one. en drops once the issue
-      // pointer reaches the chunk count. MAX_ABS_REDUCE is excluded (it
-      // ping-pongs through REQ, so it issues only there).
+      // pointer reaches the chunk count. 2026-05-31: MAX_ABS_REDUCE streams too
+      // (FP16-tile addressing, g2_rows_q chunks/row); en follows the same bound.
       F_G2_S1_LATCH: begin
         sram_b_buf = src1_buf_q;
         sram_b_row = ((opcode_q == OP_DEQUANT_ACCUM_FP32) ||
                       (opcode_q == OP_DEQUANT_ACCUM_FP32_SCALED)) ?
                      row_i32_addr_w[15:0] : g2_s1_addr_w[15:0];
-        sram_b_en  = (opcode_q != OP_MAX_ABS_REDUCE_FP32) &&
-                     (((opcode_q == OP_DEQUANT_ACCUM_FP32) ||
-                       (opcode_q == OP_DEQUANT_ACCUM_FP32_SCALED)) ?
-                        (read_idx_q < n_chunks_i32_q) :
-                        (read_idx_q < {2'h0, g2_rows_q[10:0]}));
+        sram_b_en  = ((opcode_q == OP_DEQUANT_ACCUM_FP32) ||
+                      (opcode_q == OP_DEQUANT_ACCUM_FP32_SCALED)) ?
+                       (read_idx_q < n_chunks_i32_q) :
+                       (read_idx_q < {2'h0, g2_rows_q[10:0]});
       end
 
       F_G2_S2_REQ: begin

@@ -572,9 +572,12 @@
   logic [31:0] mar_curr_bits;
   logic [31:0] mar_cand     [0:7];
   logic [31:0] mar_new_max;
-  // base_idx in the F_G2_S1_LATCH 0x1F branch = read_idx_q * 8.
+  // 2026-05-31: streamed 0x1F load. The chunk being reduced this cycle is the
+  // CAPTURED one on the bus (ld_cap_q), not the issue pointer (read_idx_q, which
+  // now runs one chunk ahead). base_idx in the F_G2_S1_LATCH 0x1F branch =
+  // ld_cap_q * 8 to match.
   logic [15:0] mar_base_idx;
-  assign mar_base_idx = {3'h0, read_idx_q[12:0]} * 16'd8;
+  assign mar_base_idx = {3'h0, ld_cap_q[12:0]} * 16'd8;
   assign mar_curr_bits = g2_maxabs_q & 32'h7FFF_FFFF;
   generate
     for (g_lj = 0; g_lj < 8; g_lj = g_lj + 1) begin : g_mar
