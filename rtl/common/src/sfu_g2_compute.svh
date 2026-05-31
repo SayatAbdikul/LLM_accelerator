@@ -348,52 +348,55 @@
         end
         F_G2_LN_DENOM_S: begin
           ln_denom_q <= ln_denom_w;        // sqrt y now valid
-          state      <= F_G2_LN_OUT_DIFF;
+          ln_coll_q  <= 11'h0;             // collect pointer for the pipelined OUT
+          state      <= F_G2_LN_OUT_DIFF;  // iter_idx_q is already 0 (reset in VAR)
         end
 
-        // Phase-4/5 pipeline cuts: F_G2_LN_OUT was a 5-op fp32 chain
-        //   (row - mean) -> /denom -> *gamma -> +beta -> f2h -> out_h_q
-        // (~187 ns combinationally on sky130). Now split across 3 cycles:
-        //   DIFF: ln_diff_q  <- row - mean                 (fp32_add only)
-        //   NORM: ln_norm_q  <- ln_diff_q / denom          (fp32_div only)
-        //   OUT : out_h_q[i] <- f2h(norm*gamma + beta);    iter++
-        // The DIFF cut removed the worst-case 184 ns ln_mean_q -> ln_norm_q
-        // path. Each element now costs 3 cycles instead of 2.
+        // 2026-05-31: divider-drain SOFTWARE-PIPELINED LN output. The old
+        // DIFF/NORM/W/W2/W3/OUT chain processed ONE element per 6 cycles —
+        // it fed a single (row-mean) into the fully-pipelined fp32_div_p4
+        // u_ln_norm, then idled 4 cycles draining it. Since u_ln_norm accepts a
+        // new dividend EVERY cycle, this single state instead keeps the divider
+        // full: each cycle it feeds row[iter_idx_q]-mean into ln_diff_q (the
+        // FEED/master pointer) and, once the pipe has filled (iter>=5: 1 ln_diff_q
+        // reg + 4 divider stages), collects the quotient now emerging on
+        // ln_norm_w for element ln_coll_q (= iter_idx_q-5), applying that
+        // element's gamma/beta (ln_gamma/beta_coll_w, indexed by ln_coll_q in
+        // the datapath) and writing out_h_q[ln_coll_q]. The phase costs
+        // n_elems+5 cycles instead of 6*n_elems (~6x on the OUT pass).
+        //   Bit-exact: identical fp32 ops, same operands (gamma/beta now tracked
+        //   to the collect element), same RNE rounding, same in-order out_h_q[]
+        //   writes — only the per-element latency is overlapped. fmax-neutral:
+        //   the feed path (row-mean -> ln_diff_q) and the collect path (ln_norm_w
+        //   -> *gamma -> +beta -> f2h -> out_h_q) already existed as the DIFF and
+        //   OUT critical paths; they now run concurrently but do not chain.
+        //   Gen-1 OP_LAYERNORM (0x0F) is illegal at decode_unit (decode_unit.sv
+        //   L45); only gen-2 0x1A LAYERNORM_FP32 reaches here, writing FP16.
         F_G2_LN_OUT_DIFF: begin
-          if ({5'h0, iter_idx_q} < n_elems_q) begin
-            ln_diff_q <= ln_diff_w;
-            state     <= F_G2_LN_OUT_NORM;
-          end else begin
+          if ({5'h0, ln_coll_q} >= n_elems_q) begin
+            // every element collected (also the n_elems==0 degenerate case).
             iter_idx_q <= 11'h0;
+            ln_coll_q  <= 11'h0;
             state      <= F_G2_PACK;
+          end else begin
+            // FEED: present row[iter_idx_q]-mean to the divider input register.
+            if ({5'h0, iter_idx_q} < n_elems_q)
+              ln_diff_q <= ln_diff_w;
+            // COLLECT: after the 5-deep pipe fills, ln_norm_w holds element
+            // ln_coll_q's quotient; finalize and write it (in element order).
+            if (iter_idx_q >= 11'd5) begin
+              out_h_q[ln_coll_q[9:0]] <= ln_out_h_w;
+              ln_coll_q               <= ln_coll_q + 11'd1;
+            end
+            iter_idx_q <= iter_idx_q + 11'd1;
           end
         end
 
-        // (row-mean)/denom via pipelined u_ln_norm (LATENCY=2, the 180 ns STA
-        // worst path). ln_diff_q was registered in F_G2_LN_OUT_DIFF; the divider
-        // y (ln_norm_w) is valid in F_G2_LN_OUT, where the gamma multiply reads
-        // it directly (no intermediate ln_norm_q latch). NORM just presents;
-        // _W is the divider's 2nd pipeline stage. Net +1 cycle/element.
-        F_G2_LN_OUT_NORM: begin
-          state <= F_G2_LN_OUT_W;
-        end
-        F_G2_LN_OUT_W: begin
-          state <= F_G2_LN_OUT_W2;
-        end
-        F_G2_LN_OUT_W2: begin     // div_p4 3rd stage
-          state <= F_G2_LN_OUT_W3;
-        end
-        F_G2_LN_OUT_W3: begin     // div_p4 4th stage (LATENCY=4)
-          state <= F_G2_LN_OUT;
-        end
-
-        F_G2_LN_OUT: begin
-          // Gen-1 OP_LAYERNORM (0x0F) is illegal at decode_unit (see
-          // decode_unit.sv L45). The gen-1 INT8 write path is dead — only
-          // gen-2 0x1A LAYERNORM_FP32 reaches here, writing FP16.
-          out_h_q[iter_idx_q[9:0]] <= ln_out_h_w;
-          iter_idx_q               <= iter_idx_q + 11'd1;
-          state                    <= F_G2_LN_OUT_DIFF;
+        // Retired serial LN-OUT drain states — replaced by the pipelined
+        // F_G2_LN_OUT_DIFF above. Unreachable; kept as enum-valid no-ops.
+        F_G2_LN_OUT_NORM, F_G2_LN_OUT_W, F_G2_LN_OUT_W2,
+        F_G2_LN_OUT_W3, F_G2_LN_OUT: begin
+          state <= F_G2_LN_OUT_DIFF;
         end
 
         // 0x1D MASKED_SOFTMAX_FP32 synth sub-FSM (Phase-2; BANDED):

@@ -267,6 +267,18 @@ module sfu_engine
   // 2026-05-29: u_ln_norm is now fp32_div_p2, whose output register replaces it
   // — F_G2_LN_OUT reads ln_norm_w directly.)
   logic [31:0]  ln_diff_q;
+  // 2026-05-31: LN_OUT divider-drain software-pipelining. The fp32_div_p4
+  // u_ln_norm is fully pipelined (accepts a dividend every cycle), but the old
+  // DIFF/NORM/W/W2/W3/OUT loop fed one element then idled 4 cycles draining it
+  // (6 cyc/elem). The pipelined F_G2_LN_OUT_DIFF runs one state: iter_idx_q is
+  // the master/feed counter (presents row[iter]-mean to ln_diff_q each cycle);
+  // ln_coll_q is the lagging collect pointer (= iter_idx_q - 5: one ln_diff_q
+  // reg + 4 divider stages), indexing gamma/beta as the matching divider output
+  // (ln_norm_w) emerges. ~6x on the OUT pass; bit-exact (same ops/operands/order,
+  // same divider instance) and fmax-neutral (the feed and collect combinational
+  // paths already existed as the DIFF and OUT critical paths; they now just run
+  // concurrently, and don't chain).
+  logic [10:0]  ln_coll_q;
   // 2026-05-29: registers exp(row-max) in F_G2_SM_OUT_NORM so the pipelined
   // fp32_div_p2 sees a registered dividend (isolates fp32_exp from the
   // divider's stage-1; otherwise exp+div_stage1 would chain ~138 ns).
@@ -727,6 +739,7 @@ module sfu_engine
       ln_denom_q     <= 32'h0;
       ln_var_eps_q   <= 32'h0;
       ln_diff_q      <= 32'h0;
+      ln_coll_q      <= 11'h0;
       sm_exp_q       <= 32'h0;
       sm_row_max_q   <= 32'h0;
       sm_exp_sum_q   <= 32'h0;

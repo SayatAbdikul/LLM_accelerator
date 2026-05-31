@@ -350,8 +350,16 @@
   fp32_div_p4 u_ln_norm  (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
                           .a(ln_diff_q),    .b(ln_denom_q),
                           .valid_out(ln_norm_vo), .y(ln_norm_w));
-  fp32_mul  u_ln_norm_g  (.a(ln_norm_w),    .b(synth_gamma_bits), .y(ln_norm_g_w));
-  fp32_add  u_ln_norm_gb (.a(ln_norm_g_w),  .b(synth_beta_bits),  .y(ln_norm_gb_w));
+  // 2026-05-31: LN_OUT divider-drain pipelining. The gamma/beta applied to a
+  // given divider output (ln_norm_w) belong to the COLLECT element (iter-5),
+  // not the feed element (iter_idx_q). Index them by ln_coll_q so the multiply
+  // -add matches the element emerging from u_ln_norm this cycle. (synth_gamma/
+  // beta_bits stay iter_idx_q-indexed for the other ops that use them.)
+  logic [31:0] ln_gamma_coll_w, ln_beta_coll_w;
+  assign ln_gamma_coll_w = gamma_q[ln_coll_q[9:0]];
+  assign ln_beta_coll_w  = beta_q [ln_coll_q[9:0]];
+  fp32_mul  u_ln_norm_g  (.a(ln_norm_w),    .b(ln_gamma_coll_w), .y(ln_norm_g_w));
+  fp32_add  u_ln_norm_gb (.a(ln_norm_g_w),  .b(ln_beta_coll_w),  .y(ln_norm_gb_w));
   fp32_to_fp16 u_ln_out_h(.a(ln_norm_gb_w),                        .y(ln_out_h_w));
   fp32_div  u_ln_g1_scale(.a(ln_norm_gb_w), .b(synth_scale1_bits), .y(ln_g1_scaled_w));
   fp32_quantize_i8 u_ln_g1_quant (.a(ln_g1_scaled_w),               .y(ln_g1_quant_w));
