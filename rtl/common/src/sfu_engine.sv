@@ -230,7 +230,8 @@ module sfu_engine
     F_G2_LN_DENOM_PRE_W4= 7'd66,  // ln_var_norm div_p5 5th stage (LATENCY=5)
     F_G2_SM_OUT_W4      = 7'd67,  // sm_div div_p5 5th stage (LATENCY=5)
     F_G2_LN_DENOM_W4    = 7'd68,  // ln_sqrt p6 5th stage (LATENCY=6)
-    F_G2_LN_DENOM_W5    = 7'd69   // ln_sqrt p6 6th stage (LATENCY=6)
+    F_G2_LN_DENOM_W5    = 7'd69,  // ln_sqrt p6 6th stage (LATENCY=6)
+    F_G2_CW             = 7'd70   // fused compute+write (FP16 elementwise ops)
   } sfu_state_t;
 
   sfu_state_t state;
@@ -312,6 +313,11 @@ module sfu_engine
   // while the pack mux registers the next chunk — 2 cyc/chunk -> 1, with the
   // row_write_q register boundary (hence SFU fmax) preserved.
   logic [10:0]  g2_wr_addr_q;
+  // F_G2_CW (fused compute+write) "staged-chunk valid" flag: set the cycle
+  // after a chunk is packed into row_write_q, gating the comb SRAM-A write so
+  // the prime/drain cycles issue no spurious write. See F_G2_CW in
+  // sfu_g2_compute.svh.
+  logic         cw_have_q;
   // Streamed-load lagging capture pointer: the chunk index whose SRAM read
   // data is on the bus this cycle (read_idx_q is the leading issue pointer,
   // running one chunk ahead). Lets the F_G2_S1/S2 load loops issue one SRAM
@@ -765,6 +771,7 @@ module sfu_engine
       sm_keep_through_q <= 16'sh0;
       write_chunk_q  <= 11'h0;
       g2_wr_addr_q   <= 11'h0;
+      cw_have_q      <= 1'b0;
       ld_cap_q       <= 13'h0;
       gelu_part_q    <= 2'h0;
       attn_k_idx_q   <= 16'h0;
@@ -1271,6 +1278,19 @@ module sfu_engine
         sram_a_buf   = dst_buf_q;
         sram_a_row   = g2_dst_addr_w[15:0];
         sram_a_wdata = row_write_q;
+      end
+
+      // Fused compute+write: stream the staged chunk (row_write_q) to SRAM A
+      // while F_G2_CW's compute track fills out_h_q. Same port/addr/data as
+      // F_G2_WRITE; cw_have_q gates en/we so prime + drain cycles don't write.
+      F_G2_CW: begin
+        if (cw_have_q) begin
+          sram_a_en    = 1'b1;
+          sram_a_we    = 1'b1;
+          sram_a_buf   = dst_buf_q;
+          sram_a_row   = g2_dst_addr_w[15:0];
+          sram_a_wdata = row_write_q;
+        end
       end
 
       // 0x1F MAX_ABS_REDUCE_FP32 scale write-back. Golden:

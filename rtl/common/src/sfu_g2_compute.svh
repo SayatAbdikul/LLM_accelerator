@@ -16,9 +16,12 @@
         F_G2_COMPUTE: begin
           if (opcode_q == OP_VADD_FP32) begin
             if (SFU_SYNTH_MODE == 1) begin
-              // Synth path: serialize via F_G2_SYNTH_ITER (fp32_add + cvt).
-              iter_idx_q <= 11'h0;
-              state      <= F_G2_SYNTH_ITER;
+              // Synth path: 8-wide compute (fp32_add + cvt) fused with the
+              // writeback (F_G2_CW) — no separate F_G2_PACK/WRITE drain pass.
+              iter_idx_q    <= 11'h0;
+              write_chunk_q <= 11'h0;
+              cw_have_q     <= 1'b0;
+              state         <= F_G2_CW;
             end else begin
 `ifndef SFU_SYNTH_NO_DPI
               // DPI path (default; cosim-pinned).
@@ -52,9 +55,12 @@
           end else if (opcode_q == OP_DEQUANT_ACCUM_FP32) begin
             // 0x17: FP16 = fp32(INT32) * per-column FP16 scale.
             if (SFU_SYNTH_MODE == 1) begin
-              // Synth path: serialize via F_G2_SYNTH_ITER (fp32_mul + cvt).
-              iter_idx_q <= 11'h0;
-              state      <= F_G2_SYNTH_ITER;
+              // Synth path: 8-wide compute (fp32_mul + cvt) fused with the
+              // writeback (F_G2_CW) — no separate F_G2_PACK/WRITE drain pass.
+              iter_idx_q    <= 11'h0;
+              write_chunk_q <= 11'h0;
+              cw_have_q     <= 1'b0;
+              state         <= F_G2_CW;
             end else begin
 `ifndef SFU_SYNTH_NO_DPI
               // DPI path (default; cosim-pinned).
@@ -89,10 +95,13 @@
             // row_data_q=int32(real); gamma_q=wt-scales; beta_q=bias;
             // scale0_q = scale_regs[sreg] (the fwd act-scale from 0x1F).
             if (SFU_SYNTH_MODE == 1) begin
-              // Synth path: 3-stage combinational chain (mul, mul, add)
-              // through F_G2_SYNTH_ITER, then cvt fp16.
-              iter_idx_q <= 11'h0;
-              state      <= F_G2_SYNTH_ITER;
+              // Synth path: 3-stage combinational chain (mul, mul, add) + cvt
+              // fp16, 8-wide, fused with the writeback (F_G2_CW) — no separate
+              // F_G2_PACK/WRITE drain pass.
+              iter_idx_q    <= 11'h0;
+              write_chunk_q <= 11'h0;
+              cw_have_q     <= 1'b0;
+              state         <= F_G2_CW;
             end else begin
 `ifndef SFU_SYNTH_NO_DPI
               // DPI path (default; cosim-pinned).
@@ -257,6 +266,70 @@
             iter_idx_q <= 11'h0;
             state      <= (opcode_q == OP_QUANT_FP32_INT8) ? F_ROW_PACK
                                                            : F_G2_PACK;
+          end
+        end
+
+        // 2026-06-01: FUSED compute+write (mode-1) for the FP16-output stride-8
+        // elementwise ops (VADD / DEQUANT_ACCUM / DEQUANT_ACCUM_SCALED). Folds
+        // the separate F_G2_PACK/F_G2_WRITE drain pass INTO the 8-wide compute
+        // loop, so an op costs load + (compute || write) instead of
+        // load + compute + write — the whole ~g2_rows_q-cycle write pass is
+        // hidden behind compute. Two pointers run concurrently in this one state:
+        //   * iter_idx_q  — COMPUTE pointer (stride 8): each cycle computes one
+        //     8-element chunk into out_h_q, exactly as F_G2_SYNTH_ITER (same
+        //     datapath, so the row_data_q->compute->f2h->out_h_q register
+        //     boundary is unchanged -> SFU fmax is unaffected).
+        //   * write_chunk_q — lagging PACK pointer: once compute has produced a
+        //     chunk (write_chunk_q < iter_idx_q>>3, i.e. out_h_q[write_chunk_q]
+        //     is registered & visible), pack it via the shared g2_write_data_w
+        //     into row_write_q; the comb block streams row_write_q to SRAM port A
+        //     (idle during compute) the next cycle — identical to F_G2_WRITE.
+        // Bit-exact vs the unfused path: identical out_h_q values, identical
+        // g2_write_data_w packing (lanes >= n_elems_q zeroed), identical
+        // g2_dst_addr_w addresses, written in ascending chunk order — only the
+        // write is overlapped with compute. cw_have_q marks a staged-but-unwritten
+        // chunk (gates the comb write so prime/drain cycles stay quiet). Mode-0
+        // (DPI) never enters here (F_G2_COMPUTE routes it straight to F_G2_PACK),
+        // so the cosim byte-match is untouched. GELU (stride 1) and QUANT (INT8
+        // pack, F_ROW_*) keep the unfused F_G2_SYNTH_ITER path.
+        F_G2_CW: begin
+          if (cw_have_q && sram_a_fault) begin
+            // Fault on the chunk the comb block is writing this cycle.
+            fault_code_r <= 4'(FAULT_SRAM_OOB);
+            state        <= F_FAULT;
+          end else if (write_chunk_q >= g2_rows_q[10:0]) begin
+            // All chunks packed; the comb block commits the final staged chunk
+            // THIS cycle (when cw_have_q). Drain complete -> next row / idle.
+            cw_have_q     <= 1'b0;
+            iter_idx_q    <= 11'h0;
+            write_chunk_q <= 11'h0;
+            if (row_idx_q + 15'd1 < m_rows_q) begin
+              row_idx_q  <= row_idx_q + 15'd1;
+              read_idx_q <= 13'h0;
+              state      <= F_G2_S1_REQ;
+            end else begin
+              state <= F_IDLE;
+            end
+          end else begin
+            // WRITE track: pack the next chunk once compute has produced it.
+            if ({3'h0, iter_idx_q[10:3]} > write_chunk_q) begin
+              row_write_q   <= g2_write_data_w;   // packs out_h_q[write_chunk_q]
+              g2_wr_addr_q  <= write_chunk_q;      // its SRAM chunk address
+              write_chunk_q <= write_chunk_q + 11'd1;
+              cw_have_q     <= 1'b1;
+            end else begin
+              cw_have_q     <= 1'b0;               // prime cycle: nothing ready
+            end
+            // COMPUTE track: one 8-element chunk into out_h_q (datapath ==
+            // F_G2_SYNTH_ITER; these ops never take the GELU stride-1 branch).
+            if ({5'h0, iter_idx_q} < n_elems_q) begin
+              for (int lane = 0; lane < 8; lane++) begin
+                automatic logic [10:0] wr_idx = iter_idx_q + 11'(lane);
+                if (({5'h0, iter_idx_q} + 16'(lane)) < n_elems_q)
+                  out_h_q[wr_idx[9:0]] <= synth_out_bits_lane[lane];
+              end
+              iter_idx_q <= iter_idx_q + 11'd8;
+            end
           end
         end
 
