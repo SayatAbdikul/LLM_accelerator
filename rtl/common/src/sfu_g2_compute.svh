@@ -285,10 +285,13 @@
         F_G2_LN_MEAN_W: begin
           state <= F_G2_LN_MEAN_W2;
         end
-        F_G2_LN_MEAN_W2: begin    // div_p4 3rd stage
+        F_G2_LN_MEAN_W2: begin    // div_p5 3rd stage
           state <= F_G2_LN_MEAN_W3;
         end
-        F_G2_LN_MEAN_W3: begin    // div_p4 4th stage (LATENCY=4)
+        F_G2_LN_MEAN_W3: begin    // div_p5 4th stage
+          state <= F_G2_LN_MEAN_W4;
+        end
+        F_G2_LN_MEAN_W4: begin    // div_p5 5th stage (LATENCY=5)
           state <= F_G2_LN_MEAN_S;
         end
         F_G2_LN_MEAN_S: begin
@@ -333,10 +336,13 @@
         F_G2_LN_DENOM_PRE_W: begin
           state <= F_G2_LN_DENOM_PRE_W2;
         end
-        F_G2_LN_DENOM_PRE_W2: begin   // div_p4 3rd stage
+        F_G2_LN_DENOM_PRE_W2: begin   // div_p5 3rd stage
           state <= F_G2_LN_DENOM_PRE_W3;
         end
-        F_G2_LN_DENOM_PRE_W3: begin   // div_p4 4th stage (LATENCY=4)
+        F_G2_LN_DENOM_PRE_W3: begin   // div_p5 4th stage
+          state <= F_G2_LN_DENOM_PRE_W4;
+        end
+        F_G2_LN_DENOM_PRE_W4: begin   // div_p5 5th stage (LATENCY=5)
           state <= F_G2_LN_DENOM_PRE_S;
         end
         F_G2_LN_DENOM_PRE_S: begin
@@ -369,16 +375,16 @@
 
         // 2026-05-31: divider-drain SOFTWARE-PIPELINED LN output. The old
         // DIFF/NORM/W/W2/W3/OUT chain processed ONE element per 6 cycles —
-        // it fed a single (row-mean) into the fully-pipelined fp32_div_p4
-        // u_ln_norm, then idled 4 cycles draining it. Since u_ln_norm accepts a
+        // it fed a single (row-mean) into the fully-pipelined fp32_div_p5
+        // u_ln_norm, then idled draining it. Since u_ln_norm accepts a
         // new dividend EVERY cycle, this single state instead keeps the divider
         // full: each cycle it feeds row[iter_idx_q]-mean into ln_diff_q (the
-        // FEED/master pointer) and, once the pipe has filled (iter>=5: 1 ln_diff_q
-        // reg + 4 divider stages), collects the quotient now emerging on
-        // ln_norm_w for element ln_coll_q (= iter_idx_q-5), applying that
+        // FEED/master pointer) and, once the pipe has filled (iter>=6: 1 ln_diff_q
+        // reg + 5 divider stages), collects the quotient now emerging on
+        // ln_norm_w for element ln_coll_q (= iter_idx_q-6), applying that
         // element's gamma/beta (ln_gamma/beta_coll_w, indexed by ln_coll_q in
         // the datapath) and writing out_h_q[ln_coll_q]. The phase costs
-        // n_elems+5 cycles instead of 6*n_elems (~6x on the OUT pass).
+        // n_elems+6 cycles instead of 6*n_elems (~6x on the OUT pass).
         //   Bit-exact: identical fp32 ops, same operands (gamma/beta now tracked
         //   to the collect element), same RNE rounding, same in-order out_h_q[]
         //   writes — only the per-element latency is overlapped. fmax-neutral:
@@ -397,9 +403,10 @@
             // FEED: present row[iter_idx_q]-mean to the divider input register.
             if ({5'h0, iter_idx_q} < n_elems_q)
               ln_diff_q <= ln_diff_w;
-            // COLLECT: after the 5-deep pipe fills, ln_norm_w holds element
-            // ln_coll_q's quotient; finalize and write it (in element order).
-            if (iter_idx_q >= 11'd5) begin
+            // COLLECT: after the 6-deep pipe fills (1 ln_diff_q reg + 5 div_p5
+            // stages), ln_norm_w holds element ln_coll_q's quotient; finalize
+            // and write it (in element order).
+            if (iter_idx_q >= 11'd6) begin
               out_h_q[ln_coll_q[9:0]] <= ln_out_h_w;
               ln_coll_q               <= ln_coll_q + 11'd1;
             end
@@ -478,10 +485,13 @@
         F_G2_SM_OUT_W: begin
           state <= F_G2_SM_OUT_W2;
         end
-        F_G2_SM_OUT_W2: begin     // div_p4 3rd stage
+        F_G2_SM_OUT_W2: begin     // div_p5 3rd stage
           state <= F_G2_SM_OUT_W3;
         end
-        F_G2_SM_OUT_W3: begin     // div_p4 4th stage (LATENCY=4)
+        F_G2_SM_OUT_W3: begin     // div_p5 4th stage
+          state <= F_G2_SM_OUT_W4;
+        end
+        F_G2_SM_OUT_W4: begin     // div_p5 5th stage (LATENCY=5)
           state <= F_G2_SM_OUT;
         end
 
