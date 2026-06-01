@@ -231,7 +231,8 @@ module sfu_engine
     F_G2_SM_OUT_W4      = 7'd67,  // sm_div div_p5 5th stage (LATENCY=5)
     F_G2_LN_DENOM_W4    = 7'd68,  // ln_sqrt p6 5th stage (LATENCY=6)
     F_G2_LN_DENOM_W5    = 7'd69,  // ln_sqrt p6 6th stage (LATENCY=6)
-    F_G2_CW             = 7'd70   // fused compute+write (FP16 elementwise ops)
+    F_G2_CW             = 7'd70,  // fused compute+write (FP16 elementwise ops)
+    F_G2_QLC            = 7'd71   // QUANT fused load+compute (FP16 in / INT8 out)
   } sfu_state_t;
 
   sfu_state_t state;
@@ -318,6 +319,12 @@ module sfu_engine
   // the prime/drain cycles issue no spurious write. See F_G2_CW in
   // sfu_g2_compute.svh.
   logic         cw_have_q;
+  // F_G2_QLC (QUANT fused load+compute): qlc_load_q = a chunk is still being
+  // streamed in on port B; qlc_vis_q = count of FP16 chunks already captured &
+  // visible in row_data_q (the compute pointer iter_idx_q may quantize any chunk
+  // < qlc_vis_q). Lets the FP16 load and the 8-wide quant run concurrently.
+  logic         qlc_load_q;
+  logic [12:0]  qlc_vis_q;
   // Streamed-load lagging capture pointer: the chunk index whose SRAM read
   // data is on the bus this cycle (read_idx_q is the leading issue pointer,
   // running one chunk ahead). Lets the F_G2_S1/S2 load loops issue one SRAM
@@ -772,6 +779,8 @@ module sfu_engine
       write_chunk_q  <= 11'h0;
       g2_wr_addr_q   <= 11'h0;
       cw_have_q      <= 1'b0;
+      qlc_load_q     <= 1'b0;
+      qlc_vis_q      <= 13'h0;
       ld_cap_q       <= 13'h0;
       gelu_part_q    <= 2'h0;
       attn_k_idx_q   <= 16'h0;
@@ -954,7 +963,16 @@ module sfu_engine
           end else begin
             ld_cap_q   <= read_idx_q;          // chunk on the bus next cycle (==0)
             read_idx_q <= read_idx_q + 13'd1;  // issue pointer -> chunk 1
-            state      <= F_G2_S1_LATCH;
+            // QUANT (mode-1): fuse the FP16 load with the 8-wide quant compute
+            // (same 8-elem/cyc rate) via F_G2_QLC instead of the sequential
+            // F_G2_S1_LATCH -> F_G2_SYNTH_ITER. Mode-0/DPI keeps the old path.
+            if (SFU_SYNTH_MODE == 1 && opcode_q == OP_QUANT_FP32_INT8) begin
+              iter_idx_q <= 11'h0;
+              qlc_vis_q  <= 13'h0;
+              qlc_load_q <= 1'b1;
+              state      <= F_G2_QLC;
+            end else
+              state      <= F_G2_S1_LATCH;
           end
         end
 
@@ -1055,6 +1073,64 @@ module sfu_engine
                 state <= F_G2_COMPUTE;
               else
                 state <= F_G2_S2_REQ;
+            end
+          end
+        end
+
+        // 2026-06-01: QUANT (0x18) FUSED load+compute (mode-1). FP16 input and
+        // the 8-wide quantize are the SAME rate (8 elem/cyc), so the FP16 src1
+        // load (port B -> row_data_q) and the quant compute (synth_quant_out_lane
+        // -> out_bytes_q) run CONCURRENTLY here instead of as two sequential
+        // passes (F_G2_S1_LATCH then F_G2_SYNTH_ITER) -> the whole compute pass
+        // is hidden behind the load. The compute pointer iter_idx_q trails the
+        // captured-chunk count qlc_vis_q by >=1 chunk (out_bytes_q[iter] needs
+        // row_data_q[iter..] already registered & visible). F_ROW_PACK/F_ROW_WRITE
+        // then drains out_bytes_q to SRAM, unchanged. Bit-exact: identical
+        // row_data_q captures (synth_lat_h2f) + identical 8-wide quant
+        // (synth_quant_out_lane, keyed off iter_idx_q) written to out_bytes_q in
+        // element order; only overlapped with the load. fmax-neutral: the
+        // load->row_data_q and row_data_q->compute->out_bytes_q register
+        // boundaries are preserved (compute reads the *registered* prior chunk,
+        // never the chunk captured this cycle). Mode-0/DPI is untouched (QUANT
+        // there goes F_G2_S1_LATCH -> F_G2_COMPUTE; see F_G2_S1_REQ).
+        F_G2_QLC: begin
+          integer cap_base;
+          if (qlc_load_q && sram_b_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);
+            state        <= F_FAULT;
+          end else if ({5'h0, iter_idx_q} >= n_elems_q) begin
+            // Whole row quantized -> hand to the (unchanged) INT8 writeback.
+            iter_idx_q    <= 11'h0;
+            write_chunk_q <= 11'h0;
+            qlc_vis_q     <= 13'h0;
+            qlc_load_q    <= 1'b0;
+            state         <= F_ROW_PACK;
+          end else begin
+            // LOAD track: capture the FP16 chunk on the bus (ld_cap_q) into
+            // row_data_q, mark it visible, advance the issue pointer.
+            if (qlc_load_q) begin
+              cap_base = integer'(ld_cap_q) * 8;
+              for (int lane = 0; lane < 8; lane++)
+                if ((cap_base + lane) < integer'(n_elems_q))
+                  row_data_q[cap_base + lane] <= synth_lat_h2f[lane];
+              qlc_vis_q <= qlc_vis_q + 13'd1;          // chunk ld_cap_q visible next cycle
+              if (read_idx_q < {2'h0, g2_rows_q[10:0]}) begin
+                ld_cap_q   <= read_idx_q;
+                read_idx_q <= read_idx_q + 13'd1;
+              end else begin
+                qlc_load_q <= 1'b0;                    // last chunk captured
+              end
+            end
+            // COMPUTE track: quantize chunk iter_idx_q once captured & visible
+            // (iter_idx_q>>3 < qlc_vis_q) -> out_bytes_q, advance by 8.
+            if (({5'h0, iter_idx_q[10:3]} < qlc_vis_q) &&
+                ({5'h0, iter_idx_q} < n_elems_q)) begin
+              for (int lane = 0; lane < 8; lane++) begin
+                automatic logic [10:0] wr_idx = iter_idx_q + 11'(lane);
+                if (({5'h0, iter_idx_q} + 16'(lane)) < n_elems_q)
+                  out_bytes_q[wr_idx[9:0]] <= synth_quant_out_lane[lane];
+              end
+              iter_idx_q <= iter_idx_q + 11'd8;
             end
           end
         end
@@ -1251,6 +1327,14 @@ module sfu_engine
                       (opcode_q == OP_DEQUANT_ACCUM_FP32_SCALED)) ?
                        (read_idx_q < n_chunks_i32_q) :
                        (read_idx_q < {2'h0, g2_rows_q[10:0]});
+      end
+
+      // QUANT fused load+compute: same FP16 src1 read as the F_G2_S1_LATCH FP16
+      // arm (issue read_idx_q on port B until all g2_rows_q chunks are fetched).
+      F_G2_QLC: begin
+        sram_b_buf = src1_buf_q;
+        sram_b_row = g2_s1_addr_w[15:0];
+        sram_b_en  = (read_idx_q < {2'h0, g2_rows_q[10:0]});
       end
 
       F_G2_S2_REQ: begin
