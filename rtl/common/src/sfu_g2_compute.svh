@@ -350,11 +350,11 @@
           state        <= F_G2_LN_DENOM;
         end
 
-        // denom = sqrt(ln_var_eps_q) via the pipelined fp32_sqrt_p4 u_ln_sqrt
-        // (LATENCY=4). ln_var_eps_q was latched in F_G2_LN_DENOM_PRE_S and is
-        // stable on entry; F_G2_LN_DENOM presents it, _W / _W2 / _W3 are the
-        // sqrt's 2nd / 3rd / 4th pipeline stages, _S samples the now-valid
-        // ln_denom_w. Once-per-row so the +4 cycles are negligible.
+        // denom = sqrt(ln_var_eps_q) via the pipelined fp32_sqrt_p6 u_ln_sqrt
+        // (LATENCY=6). ln_var_eps_q was latched in F_G2_LN_DENOM_PRE_S and is
+        // stable on entry; F_G2_LN_DENOM presents it, _W.._W5 are the sqrt's
+        // 2nd..6th pipeline stages, _S samples the now-valid ln_denom_w.
+        // Once-per-row so the +6 cycles are negligible.
         F_G2_LN_DENOM: begin
           state <= F_G2_LN_DENOM_W;
         end
@@ -364,7 +364,13 @@
         F_G2_LN_DENOM_W2: begin
           state <= F_G2_LN_DENOM_W3;
         end
-        F_G2_LN_DENOM_W3: begin           // sqrt p4 4th stage (LATENCY=4)
+        F_G2_LN_DENOM_W3: begin
+          state <= F_G2_LN_DENOM_W4;
+        end
+        F_G2_LN_DENOM_W4: begin
+          state <= F_G2_LN_DENOM_W5;
+        end
+        F_G2_LN_DENOM_W5: begin           // sqrt p6 6th stage (LATENCY=6)
           state <= F_G2_LN_DENOM_S;
         end
         F_G2_LN_DENOM_S: begin

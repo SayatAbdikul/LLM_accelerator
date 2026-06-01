@@ -228,7 +228,9 @@ module sfu_engine
     F_G2_LN_DENOM_W3    = 7'd64,  // ln_sqrt p4 4th stage (LATENCY=4)
     F_G2_LN_MEAN_W4     = 7'd65,  // ln_mean div_p5 5th stage (LATENCY=5)
     F_G2_LN_DENOM_PRE_W4= 7'd66,  // ln_var_norm div_p5 5th stage (LATENCY=5)
-    F_G2_SM_OUT_W4      = 7'd67   // sm_div div_p5 5th stage (LATENCY=5)
+    F_G2_SM_OUT_W4      = 7'd67,  // sm_div div_p5 5th stage (LATENCY=5)
+    F_G2_LN_DENOM_W4    = 7'd68,  // ln_sqrt p6 5th stage (LATENCY=6)
+    F_G2_LN_DENOM_W5    = 7'd69   // ln_sqrt p6 6th stage (LATENCY=6)
   } sfu_state_t;
 
   sfu_state_t state;
