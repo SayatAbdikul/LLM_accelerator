@@ -309,6 +309,12 @@ module sfu_engine
   logic [31:0]  sm_exp_sum_q;       // running fp32 exp_sum
   logic         sm_have_vis_q;      // any visible element seen
   logic signed [15:0] sm_keep_through_q;
+  // Software-pipelined F_G2_SM_OUT_NORM lagging collect pointer: the element
+  // whose divider quotient (sm_norm_w) emerges this cycle (= iter_idx_q - 6:
+  // 1 sm_exp_q reg + 5 div_p5 stages). Feeds sm_visible_coll_w and the out_h_q
+  // write target so the masked write matches the draining element. Analogous to
+  // ln_coll_q in the LN output pipeline.
+  logic [10:0]  sm_coll_q;
   logic [10:0]  write_chunk_q;
   // Streamed-writeback lagging address pointer: the chunk index whose packed
   // data is currently held in row_write_q (write_chunk_q is the leading pack
@@ -801,6 +807,7 @@ module sfu_engine
       sm_exp_sum_q   <= 32'h0;
       sm_have_vis_q  <= 1'b0;
       sm_keep_through_q <= 16'sh0;
+      sm_coll_q      <= 11'h0;
       write_chunk_q  <= 11'h0;
       g2_wr_addr_q   <= 11'h0;
       cw_have_q      <= 1'b0;

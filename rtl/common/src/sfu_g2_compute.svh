@@ -532,6 +532,7 @@
             iter_idx_q <= iter_idx_q + 11'd1;
           end else begin
             iter_idx_q <= 11'h0;
+            sm_coll_q  <= 11'h0;   // collect pointer for the pipelined SM-OUT
             // Gen-1 SOFTMAX/MASKED_SOFTMAX/{ATTNV,MASKED_ATTNV} all illegal at
             // decode_unit (0x0E/0x15/0x12/0x16). Only gen-2 OP_MASKED_SOFTMAX_FP32
             // reaches here and proceeds to F_G2_SM_OUT_NORM.
@@ -539,51 +540,54 @@
           end
         end
 
-        // Phase-6 pipeline cut: F_G2_SM_OUT was a chain
-        //   exp(row-max) -> /exp_sum -> f2h -> out_h_q
-        // at 149 ns post-PNR. NORM latches sm_norm_q = fp32_div(sm_exp_w,
-        // sm_exp_sum_q) so OUT just does f2h. Each element costs 2 cycles.
-        // exp(row-max)/exp_sum via pipelined u_sm_div (LATENCY=2, STA #2 path
-        // at 157 ns). NORM registers the combinational exp into sm_exp_q so the
-        // divider sees a registered dividend (isolating fp32_exp from div
-        // stage-1); DIV/_W are the divider's two pipeline stages; SM_OUT reads
-        // the y (sm_norm_w) directly. iter_idx_q is held across DIV/_W so the
-        // SM_OUT visibility check and write target stay on the same element.
+        // 2026-06-01: divider-drain SOFTWARE-PIPELINED SM output (same transform
+        // as F_G2_LN_OUT_DIFF). The old NORM->DIV->W->W2->W3->W4->OUT chain
+        // processed ONE element per 7 cycles — it fed a single exp(row[iter]-max)
+        // into the fully-pipelined fp32_div_p5 u_sm_div, then idled 5 cycles
+        // draining it. Since u_sm_div accepts a new dividend EVERY cycle, this
+        // single state instead keeps the divider full: each cycle it feeds
+        // exp(row[iter_idx_q]-max) into sm_exp_q (the FEED pointer) and, once the
+        // pipe has filled (iter>=6: 1 sm_exp_q reg + 5 div_p5 stages), collects the
+        // quotient now emerging on sm_norm_w for element sm_coll_q (= iter-6),
+        // applying that element's visibility mask (sm_visible_coll_w, indexed by
+        // sm_coll_q) and writing out_h_q[sm_coll_q]. Phase costs n_elems+6 cycles
+        // instead of 7*n_elems (~7x on the OUT pass).
+        //   Bit-exact: identical fp32 exp/div/f2h, same operands (exp_sum and
+        //   row_max are row-constant; the visibility mask tracked to the collect
+        //   element), same in-order out_h_q[] writes — only per-element latency is
+        //   overlapped. fmax-neutral: the feed path (exp->sm_exp_q, which already
+        //   isolated fp32_exp from the divider stage-1) and the collect path
+        //   (sm_norm_w->f2h->out_h_q) already existed as the NORM and OUT critical
+        //   paths; they now run concurrently but do not chain. Only gen-2
+        //   OP_MASKED_SOFTMAX_FP32 (0x1D) reaches here (gen-1 softmax/ATTN illegal
+        //   at decode_unit), writing FP16.
         F_G2_SM_OUT_NORM: begin
-          if ({5'h0, iter_idx_q} < sm_iter_bound_w) begin
-            sm_exp_q <= sm_exp_w;        // exp(row[iter]-max); divider sees it next cycle
-            state    <= F_G2_SM_OUT_DIV;
-          end else begin
+          if ({5'h0, sm_coll_q} >= sm_iter_bound_w) begin
+            // every element collected (also the no-visible / bound==0 case).
             iter_idx_q <= 11'h0;
+            sm_coll_q  <= 11'h0;
             state      <= F_G2_PACK;
+          end else begin
+            // FEED: present exp(row[iter_idx_q]-max) to the divider input reg.
+            if ({5'h0, iter_idx_q} < sm_iter_bound_w)
+              sm_exp_q <= sm_exp_w;
+            // COLLECT: after the 6-deep pipe fills (1 sm_exp_q reg + 5 div_p5
+            // stages), sm_norm_w holds element sm_coll_q's quotient; finalize
+            // (f2h + visibility mask) and write it (in element order).
+            if (iter_idx_q >= 11'd6) begin
+              if (sm_have_vis_q && sm_visible_coll_w && (sm_exp_sum_q != 32'h0))
+                out_h_q[sm_coll_q[9:0]] <= sm_out_h_w;
+              else
+                out_h_q[sm_coll_q[9:0]] <= 16'h0;
+              sm_coll_q <= sm_coll_q + 11'd1;
+            end
+            iter_idx_q <= iter_idx_q + 11'd1;
           end
         end
-        F_G2_SM_OUT_DIV: begin
-          state <= F_G2_SM_OUT_W;
-        end
-        F_G2_SM_OUT_W: begin
-          state <= F_G2_SM_OUT_W2;
-        end
-        F_G2_SM_OUT_W2: begin     // div_p5 3rd stage
-          state <= F_G2_SM_OUT_W3;
-        end
-        F_G2_SM_OUT_W3: begin     // div_p5 4th stage
-          state <= F_G2_SM_OUT_W4;
-        end
-        F_G2_SM_OUT_W4: begin     // div_p5 5th stage (LATENCY=5)
-          state <= F_G2_SM_OUT;
-        end
 
-        F_G2_SM_OUT: begin
-          // Gen-1 OP_SOFTMAX (0x0E), OP_MASKED_SOFTMAX (0x15),
-          // OP_SOFTMAX_ATTNV (0x12), OP_MASKED_SOFTMAX_ATTNV (0x16) are all
-          // illegal at decode_unit (decode_unit.sv L45). The INT8 quantize
-          // writeback path through sm_g1_quant_w is unreachable; only gen-2
-          // OP_MASKED_SOFTMAX_FP32 (0x1D) reaches here, writing FP16.
-          if (sm_have_vis_q && sm_visible_w && (sm_exp_sum_q != 32'h0))
-            out_h_q[iter_idx_q[9:0]] <= sm_out_h_w;
-          else
-            out_h_q[iter_idx_q[9:0]] <= 16'h0;
-          iter_idx_q <= iter_idx_q + 11'd1;
-          state      <= F_G2_SM_OUT_NORM;
+        // Retired serial SM-OUT drain states — replaced by the pipelined
+        // F_G2_SM_OUT_NORM above. Unreachable; kept as enum-valid no-ops.
+        F_G2_SM_OUT_DIV, F_G2_SM_OUT_W, F_G2_SM_OUT_W2,
+        F_G2_SM_OUT_W3, F_G2_SM_OUT_W4, F_G2_SM_OUT: begin
+          state <= F_G2_SM_OUT_NORM;
         end

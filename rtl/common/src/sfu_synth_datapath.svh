@@ -489,6 +489,24 @@
       default:                   sm_visible_w = 1'b0;
     endcase
   end
+  // Collect-indexed visibility for the software-pipelined F_G2_SM_OUT_NORM: the
+  // element whose quotient emerges on sm_norm_w is sm_coll_q (= iter_idx_q-6),
+  // NOT the feed element iter_idx_q, so its output mask must be evaluated at
+  // sm_coll_q. Mirrors sm_visible_w exactly with sm_coll_q. Only gen-2
+  // OP_MASKED_SOFTMAX_FP32 reaches mode-1 here; the gen-1 arms are decode-illegal
+  // (dead) but kept for elaboration parity with sm_visible_w.
+  logic sm_visible_coll_w;
+  always_comb begin
+    case (opcode_q)
+      OP_SOFTMAX:                sm_visible_coll_w = 1'b1;
+      OP_MASKED_SOFTMAX:         sm_visible_coll_w = attn_visible(row_idx_q, integer'(sm_coll_q));
+      OP_MASKED_SOFTMAX_FP32:    sm_visible_coll_w =
+          ($signed({6'b0, sm_coll_q}) <= $signed({1'b0, sm_keep_through_q[15:0]}));
+      OP_SOFTMAX_ATTNV:          sm_visible_coll_w = 1'b1;
+      OP_MASKED_SOFTMAX_ATTNV:   sm_visible_coll_w = attn_visible(row_idx_q, integer'(sm_coll_q));
+      default:                   sm_visible_coll_w = 1'b0;
+    endcase
+  end
   // Phase-3.B ATTN: bound is k_elems_q (column count) instead of n_elems_q.
   // Bound mux keeps the F_G2_SM_* sub-FSM iteration logic single-source.
   logic [15:0] sm_iter_bound_w;
