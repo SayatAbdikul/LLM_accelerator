@@ -233,7 +233,8 @@ module sfu_engine
     F_G2_LN_DENOM_W5    = 7'd69,  // ln_sqrt p6 6th stage (LATENCY=6)
     F_G2_CW             = 7'd70,  // fused compute+write (FP16 elementwise ops)
     F_G2_QLC            = 7'd71,  // QUANT fused load+compute (FP16 in / INT8 out)
-    F_G2_DQL            = 7'd72   // DEQUANT fused int32-load+compute+write
+    F_G2_DQL            = 7'd72,  // DEQUANT fused int32-load+compute+write
+    F_G2_VLC            = 7'd73   // VADD fused src2-load+compute+write
   } sfu_state_t;
 
   sfu_state_t state;
@@ -338,6 +339,17 @@ module sfu_engine
   logic         dq_params_done_q;
   logic         dq_load_q;
   logic [12:0]  dq_vis_q;
+  // F_G2_VLC (VADD 0x19 fused src2-load+compute+write, mode-1): VADD adds two
+  // FP16 tiles (src1 -> row_data_q, src2 -> attn_accum_q). src1 loads in the
+  // normal F_G2_S1 pass; then F_G2_VLC streams src2 (port B, 8 elem/cyc, SAME
+  // rate as the 8-wide add) WHILE the add+writeback run concurrently -> the
+  // compute+write pass is hidden behind the src2 load (op cost ~2*g2_rows: the
+  // two irreducible port-B operand loads, since both operands share port B).
+  // vlc_load_q = src2 chunks still streaming; vlc_vis_q = count of src2 chunks
+  // captured & visible in attn_accum_q (compute chunk iter ready when
+  // iter>>3 < vlc_vis_q; row_data_q is already fully loaded).
+  logic         vlc_load_q;
+  logic [12:0]  vlc_vis_q;
   // Streamed-load lagging capture pointer: the chunk index whose SRAM read
   // data is on the bus this cycle (read_idx_q is the leading issue pointer,
   // running one chunk ahead). Lets the F_G2_S1/S2 load loops issue one SRAM
@@ -797,6 +809,8 @@ module sfu_engine
       dq_params_done_q <= 1'b0;
       dq_load_q      <= 1'b0;
       dq_vis_q       <= 13'h0;
+      vlc_load_q     <= 1'b0;
+      vlc_vis_q      <= 13'h0;
       ld_cap_q       <= 13'h0;
       gelu_part_q    <= 2'h0;
       attn_k_idx_q   <= 16'h0;
@@ -1308,6 +1322,96 @@ module sfu_engine
           end
         end
 
+        // 2026-06-01: VADD (0x19) FULLY-FUSED src2-load+compute+write (mode-1).
+        // VADD adds two FP16 tiles; src1 is already fully in row_data_q (loaded by
+        // the normal F_G2_S1 pass). F_G2_VLC streams src2 into attn_accum_q (port B,
+        // FP16 8 elem/cyc) WHILE the 8-wide add + FP16 writeback run as concurrent
+        // trailing tracks (vs the old src2-load -> compute -> F_G2_CW three passes),
+        // so the compute+write pass is hidden behind the src2 load. Op cost drops
+        // ~3*g2_rows -> ~2*g2_rows (the two irreducible port-B operand loads: both
+        // src1 and src2 are FP16 tiles on the single port B, so 2*g2_rows of reads
+        // is the floor once compute+write overlap). Three pointers:
+        //   * ld_cap_q / vlc_vis_q : src2 FP16 load capture -> attn_accum_q (8/cyc,
+        //                            SAME rate as compute, like F_G2_QLC).
+        //   * iter_idx_q           : 8-wide add -> out_h_q, trailing the load: chunk
+        //                            iter needs attn_accum_q[iter..iter+7] captured
+        //                            (iter>>3 < vlc_vis_q); row_data_q is pre-loaded.
+        //   * write_chunk_q        : FP16 write chunk (8 elem), trailing compute
+        //                            (== F_G2_CW / F_G2_DQL pack/addr/order).
+        // Load=portB, write=portA, compute=regs -> no clash. Bit-exact vs the unfused
+        // path: identical src2 capture (synth_lat_h2f -> attn_accum_q), identical
+        // 8-wide add (synth_out_bits_lane, the F_G2_CW datapath), identical FP16 pack
+        // (g2_write_data_w) + addresses in chunk order; only overlapped. fmax-neutral:
+        // load->attn_accum_q, ->compute->out_h_q, ->row_write_q boundaries preserved;
+        // tracks never chain. Mode-0/DPI never enters here (VADD there keeps
+        // S2_LATCH -> F_G2_COMPUTE -> F_G2_PACK; F_G2_VLC is gated in F_G2_S2_REQ).
+        F_G2_VLC: begin
+          integer cap_base;
+          if (cw_have_q && sram_a_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);       // FP16 write OOB
+            state        <= F_FAULT;
+          end else if (vlc_load_q && sram_b_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);       // src2 load OOB
+            state        <= F_FAULT;
+          end else if (write_chunk_q >= g2_rows_q[10:0]) begin
+            // Every FP16 chunk written (comb committed the last staged chunk this
+            // cycle when cw_have_q). Advance row / finish.
+            cw_have_q     <= 1'b0;
+            iter_idx_q    <= 11'h0;
+            write_chunk_q <= 11'h0;
+            vlc_vis_q     <= 13'h0;
+            vlc_load_q    <= 1'b0;
+            if (row_idx_q + 15'd1 < m_rows_q) begin
+              row_idx_q  <= row_idx_q + 15'd1;
+              read_idx_q <= 13'h0;
+              state      <= F_G2_S1_REQ;   // reload next row's src1 (then S2_REQ -> VLC)
+            end else begin
+              state <= F_IDLE;
+            end
+          end else begin
+            // LOAD track: capture the src2 FP16 chunk ld_cap_q -> attn_accum_q
+            // (synth_lat_h2f, the synthesizable FP16->fp32 of the port-B bus; ==
+            // F_G2_S2_LATCH VADD branch). Same-rate with compute (8 elem/cyc).
+            if (vlc_load_q) begin
+              cap_base = integer'(ld_cap_q) * 8;
+              for (int lane = 0; lane < 8; lane++)
+                if ((cap_base + lane) < integer'(n_elems_q))
+                  attn_accum_q[cap_base + lane] <= synth_lat_h2f[lane];
+              vlc_vis_q <= vlc_vis_q + 13'd1;          // chunk ld_cap_q visible next cycle
+              if (read_idx_q < {2'h0, g2_rows_q[10:0]}) begin
+                ld_cap_q   <= read_idx_q;
+                read_idx_q <= read_idx_q + 13'd1;
+              end else begin
+                vlc_load_q <= 1'b0;                    // last src2 chunk captured
+              end
+            end
+            // COMPUTE track: 8-wide add chunk iter_idx_q -> out_h_q once its src2
+            // chunk is captured & visible (iter>>3 < vlc_vis_q). Same datapath as
+            // F_G2_CW (op-mux selects synth_add_out for OP_VADD_FP32).
+            if (({5'h0, iter_idx_q[10:3]} < vlc_vis_q) &&
+                ({5'h0, iter_idx_q} < n_elems_q)) begin
+              for (int lane = 0; lane < 8; lane++) begin
+                automatic logic [10:0] wr_idx = iter_idx_q + 11'(lane);
+                if (({5'h0, iter_idx_q} + 16'(lane)) < n_elems_q)
+                  out_h_q[wr_idx[9:0]] <= synth_out_bits_lane[lane];
+              end
+              iter_idx_q <= iter_idx_q + 11'd8;
+            end
+            // WRITE track: stage FP16 chunk write_chunk_q once compute produced it
+            // ({iter>>3} > write_chunk_q) or compute finished (iter >= n_elems).
+            if ((write_chunk_q < g2_rows_q[10:0]) &&
+                (({3'h0, iter_idx_q[10:3]} > write_chunk_q) ||
+                 ({5'h0, iter_idx_q} >= n_elems_q))) begin
+              row_write_q   <= g2_write_data_w;       // packs out_h_q[8*write_chunk_q..]
+              g2_wr_addr_q  <= write_chunk_q;
+              write_chunk_q <= write_chunk_q + 11'd1;
+              cw_have_q     <= 1'b1;
+            end else begin
+              cw_have_q     <= 1'b0;
+            end
+          end
+        end
+
         // Streamed src2 load (LN/0x1E gamma||beta, or VADD 2nd operand). Same
         // pipeline as src1: F_G2_S2_REQ primes chunk 0; F_G2_S2_LATCH captures
         // chunk ld_cap_q while the comb block issues read_idx_q.
@@ -1318,7 +1422,20 @@ module sfu_engine
           end else begin
             ld_cap_q   <= read_idx_q;          // chunk on the bus next cycle (==0)
             read_idx_q <= read_idx_q + 13'd1;  // issue pointer -> chunk 1
-            state      <= F_G2_S2_LATCH;
+            // VADD (mode-1): src1 is now fully in row_data_q; fuse the src2 load
+            // with the 8-wide add+writeback via F_G2_VLC (same 8-elem/cyc rate)
+            // instead of the sequential F_G2_S2_LATCH -> F_G2_COMPUTE -> F_G2_CW.
+            // This S2_REQ cycle already primed src2 chunk 0 (comb issues
+            // g2_s2_addr_w for read_idx_q==0). Mode-0/DPI keeps the old path.
+            if (SFU_SYNTH_MODE == 1 && opcode_q == OP_VADD_FP32) begin
+              iter_idx_q    <= 11'h0;
+              vlc_vis_q     <= 13'h0;
+              vlc_load_q    <= 1'b1;
+              write_chunk_q <= 11'h0;
+              cw_have_q     <= 1'b0;
+              state         <= F_G2_VLC;
+            end else
+              state      <= F_G2_S2_LATCH;
           end
         end
 
@@ -1541,6 +1658,22 @@ module sfu_engine
         sram_b_buf = src1_buf_q;
         sram_b_row = row_i32_addr_w[15:0];
         sram_b_en  = (read_idx_q < n_chunks_i32_q);
+        if (cw_have_q) begin
+          sram_a_en    = 1'b1;
+          sram_a_we    = 1'b1;
+          sram_a_buf   = dst_buf_q;
+          sram_a_row   = g2_dst_addr_w[15:0];
+          sram_a_wdata = row_write_q;
+        end
+      end
+
+      // VADD fused src2-load+compute+write: stream FP16 src2 on port B
+      // (g2_s2_addr_w, == F_G2_S2 VADD arm) while the staged FP16 output chunk
+      // is written on port A (g2_dst_addr_w, == F_G2_CW / F_G2_WRITE) when cw_have_q.
+      F_G2_VLC: begin
+        sram_b_buf = src2_buf_q;
+        sram_b_row = g2_s2_addr_w[15:0];
+        sram_b_en  = (read_idx_q < {2'h0, g2_rows_q[10:0]});
         if (cw_have_q) begin
           sram_a_en    = 1'b1;
           sram_a_we    = 1'b1;
