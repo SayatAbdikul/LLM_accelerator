@@ -49,6 +49,45 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
+# The SFU caps one row at SFU_MAX_ROW_ELEMS elements; a CONFIG_TILE with
+# more columns faults FAULT_UNSUPPORTED_OP at SFU dispatch on RTL. (The
+# golden simulator has no such cap, which is how the d384 stage4 fixture —
+# fc2 K_pad=1536 — validated on golden but faulted on RTL, 2026-07-08.)
+SFU_MAX_ROW_ELEMS = 1024
+
+
+def _act_quant_tiles(M_pad: int, K_pad: int) -> tuple[int, int]:
+    """(m_tiles, k_tiles) for the act-quant MAX_ABS/QUANT CONFIG_TILE.
+
+    The M_pad x K_pad activation tile is dense in ABUF (K_pad is
+    16-aligned, so rows are contiguous). When K_pad exceeds the SFU row
+    cap, view the same elements as (M_pad*f) rows of (K_pad/f) columns:
+    MAX_ABS_REDUCE accumulates its global max across all rows of one op
+    and QUANT applies the single resulting scale row-by-row in element
+    order, so the emitted scale and the quantized bytes are BYTE-IDENTICAL
+    to the un-reshaped op — on the golden model and on RTL — while every
+    row now fits the hardware cap. f=1 (no change) whenever K_pad already
+    fits, so pre-existing bundles are byte-identical.
+    """
+    f = 1
+    k_units = K_pad // TILE
+    while K_pad // f > SFU_MAX_ROW_ELEMS or k_units % f != 0:
+        f += 1
+        if f > k_units:
+            raise ValueError(
+                f"act-quant reshape: no row split for K_pad={K_pad} "
+                f"(need K_pad/f <= {SFU_MAX_ROW_ELEMS} with 16-aligned rows)"
+            )
+    m_tiles = (M_pad // TILE) * f
+    k_tiles = k_units // f
+    if m_tiles > 1024:
+        raise ValueError(
+            f"act-quant reshape: m_tiles={m_tiles} exceeds the 10-bit "
+            f"CONFIG_TILE M field (M_pad={M_pad}, K_pad={K_pad})"
+        )
+    return m_tiles, k_tiles
+
+
 def emit_matmul_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     """W8A32 matmul lowering using the M2.5-A dynamic activation-scale primitives.
 
@@ -177,10 +216,13 @@ def emit_matmul_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     sreg = cg._alloc_sreg_pair()
 
     # ----- Stage 1: MAX_ABS_REDUCE_FP32 -----
-    # CONFIG_TILE for the activation tile: M_pad rows × K_pad cols.
+    # CONFIG_TILE for the activation tile: M_pad rows × K_pad cols,
+    # row-split via _act_quant_tiles when K_pad exceeds the SFU row cap
+    # (byte-identical reshape; f=1 for K_pad <= 1024).
     m_tiles = M_pad // TILE
     k_tiles = K_pad // TILE
-    cg._emit(ConfigTileInsn(M=m_tiles - 1, N=k_tiles - 1, K=0))
+    aq_m_tiles, aq_k_tiles = _act_quant_tiles(M_pad, K_pad)
+    cg._emit(ConfigTileInsn(M=aq_m_tiles - 1, N=aq_k_tiles - 1, K=0))
     cg._emit(
         MaxAbsReduceFp32Insn(
             src1_buf=BUF_ABUF, src1_off=in_alloc.offset_units,
@@ -396,7 +438,10 @@ def emit_matmul_w8a16_large_weight_tiled(
     sreg = cg._alloc_sreg_pair()
 
     # ----- Stage 1: MAX_ABS_REDUCE on the full activation -----
-    cg._emit(ConfigTileInsn(M=m_tiles - 1, N=k_tiles - 1, K=0))
+    # Row-split via _act_quant_tiles when K_pad exceeds the SFU row cap
+    # (byte-identical reshape; f=1 for K_pad <= 1024).
+    aq_m_tiles, aq_k_tiles = _act_quant_tiles(M_pad, K_pad)
+    cg._emit(ConfigTileInsn(M=aq_m_tiles - 1, N=aq_k_tiles - 1, K=0))
     cg._emit(MaxAbsReduceFp32Insn(
         src1_buf=BUF_ABUF, src1_off=in_alloc.offset_units,
         src2_buf=BUF_ABUF, src2_off=0,
@@ -826,10 +871,13 @@ def _emit_matmul_w8a16_large_input_streaming(
             # scale is inflated by upstream padding garbage.
             _zero_fill_fp32_padding_rows(cg, in_tile_alloc, M_logical, M_pad, k_len)
 
-            # Stage 2: MAX_ABS_REDUCE on this K-tile.
+            # Stage 2: MAX_ABS_REDUCE on this K-tile. Row-split via
+            # _act_quant_tiles when k_len exceeds the SFU row cap
+            # (byte-identical reshape; f=1 for k_len <= 1024).
             sreg = cg._alloc_sreg_pair()
             k_tiles_units = k_len // TILE
-            cg._emit(ConfigTileInsn(M=m_tiles - 1, N=k_tiles_units - 1, K=0))
+            aq_m_tiles, aq_k_tiles = _act_quant_tiles(M_pad, k_len)
+            cg._emit(ConfigTileInsn(M=aq_m_tiles - 1, N=aq_k_tiles - 1, K=0))
             cg._emit(MaxAbsReduceFp32Insn(
                 src1_buf=BUF_ABUF, src1_off=in_tile_alloc.offset_units,
                 src2_buf=BUF_ABUF, src2_off=0,
