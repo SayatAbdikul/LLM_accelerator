@@ -109,3 +109,11 @@ def emit_gather_rows(cg: "CodeGenerator", node: IRNode) -> None:
         pad_dim(rows), pad_dim(cols), rows, cols, "fp16",
         cg.calibration_scales.get(node.name, 1.0),
     )
+    # The gathered per-head attention output is held until concat_heads runs
+    # (after all heads). At production scale (d_head >= 64) that pins n_head
+    # tiles in ABUF and crowds the next head's 64 KB+ per-stream V / v_int8
+    # allocs. Spill it to DRAM-temp; concat_heads reloads spilled inputs on
+    # demand. Small models (tiny fixture, d_head=32) have no such pressure and
+    # keep the tile resident.
+    if cg.current_node_idx >= 0 and rows > 1 and pad_dim(cols) >= 64:
+        cg._spill_fp32_tile_to_dram(node.name, out_alloc, pad_dim(rows), pad_dim(cols))
