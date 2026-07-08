@@ -601,7 +601,7 @@ int32_t read_accum_wide(Vtaccel_top* dut, int dst_off, int row_idx, int col_idx,
   const int grp = col_idx / 4;
   const int lane = col_idx % 4;
   const int row = dst_off + row_idx * words_per_row + grp;
-  uint32_t word = root->taccel_top__DOT__u_sram__DOT__u_accum__DOT__mem[row][lane];
+  uint32_t word = root->taccel_top__DOT__u_sram__DOT__u_accum__DOT__u_impl__DOT__mem[row][lane];
   return static_cast<int32_t>(word);
 }
 

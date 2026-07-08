@@ -148,7 +148,7 @@ inline int32_t read_accum_ij(Vtaccel_top* dut, int dst_off, int i, int j) {
   int grp = j / 4;
   int lane = j % 4;
   int row = dst_off + i * 4 + grp;
-  uint32_t word = r->taccel_top__DOT__u_sram__DOT__u_accum__DOT__mem[row][lane];
+  uint32_t word = r->taccel_top__DOT__u_sram__DOT__u_accum__DOT__u_impl__DOT__mem[row][lane];
   return static_cast<int32_t>(word);
 }
 
@@ -157,7 +157,7 @@ inline int32_t read_accum_32x32(Vtaccel_top* dut, int off, int i, int j) {
   int lane = j % 4;
   int row = off + i * 8 + grp;
   auto* r = dut->rootp;
-  uint32_t word = r->taccel_top__DOT__u_sram__DOT__u_accum__DOT__mem[row][lane];
+  uint32_t word = r->taccel_top__DOT__u_sram__DOT__u_accum__DOT__u_impl__DOT__mem[row][lane];
   return static_cast<int32_t>(word);
 }
 

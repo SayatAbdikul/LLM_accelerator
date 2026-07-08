@@ -21,8 +21,13 @@ constexpr int ST_READ_REQ = 2;
 constexpr int ST_READ_USE = 3;
 constexpr int ST_DRAIN_WR = 5;
 constexpr int ST_A_LOAD_REQ = 6;
+constexpr int ST_A_LOAD_LATCH = 7;
 constexpr int ST_INIT_TILE = 1;
 constexpr int CHAIN_TOTAL_STEPS = 16 + (2 * (16 - 1));
+// Weight reads issue on the READ_USE read-ahead (rd_lane_w = lane+1 < 16),
+// so lanes 0..14 issue rows 1..15 and the chained-flush tail starting at
+// lane 15 issues nothing: the zero-read window is lanes 15..45.
+constexpr int CHAIN_ZERO_READ_START = 15;
 
 using Row = std::array<int8_t, 16>;
 
@@ -172,11 +177,11 @@ void assert_identity_schedule(const char* name, const ScheduleTrace& trace) {
     }
   }
 
-  if (trace.zero_read_lanes.size() != (CHAIN_TOTAL_STEPS - 16))
+  if (trace.zero_read_lanes.size() != (CHAIN_TOTAL_STEPS - CHAIN_ZERO_READ_START))
     TEST_FAIL(name, "unexpected zero-read window length");
 
   for (size_t i = 0; i < trace.zero_read_lanes.size(); ++i) {
-    int exp_lane = 16 + static_cast<int>(i);
+    int exp_lane = CHAIN_ZERO_READ_START + static_cast<int>(i);
     if (trace.zero_read_lanes[i] != exp_lane) {
       std::fprintf(stderr, "zero-read lane mismatch idx=%zu got=%d exp=%d\n",
                    i, trace.zero_read_lanes[i], exp_lane);
@@ -275,18 +280,26 @@ void test_matmul_identity_schedule() {
       ref.step(zero, zero, false, true);
     } else if (state == ST_READ_USE) {
       trace.read_use_lanes.push_back(lane);
+      // Weight read-ahead (rd_lane_w = lane+1) issues on the dedicated
+      // WBUF W port (163f0cb), one row/cycle while rd_lane_w < 16; the
+      // chained-flush tail issues nothing (zero window).
+      if (r->taccel_top__DOT__sys_sram_w_en)
+        trace.b_stream_rows.push_back(r->taccel_top__DOT__sys_sram_w_row);
+      else
+        trace.zero_read_lanes.push_back(lane);
       if (!check_identity_read_use_inputs(s.dut.get(), a, eye, lane))
         TEST_FAIL(name, "unexpected READ_USE inputs");
       ref.step(sample_vec16(s.dut.get(), true), sample_vec16(s.dut.get(), false), true, false);
-    } else if (state == ST_A_LOAD_REQ) {
+    } else if ((state == ST_A_LOAD_REQ) || (state == ST_A_LOAD_LATCH)) {
+      // A-tile load: ST_A_LOAD_REQ one-shot-primes row 0; ST_A_LOAD_LATCH
+      // issues the read-ahead rows 1..15 while latching (f4ebd17). Both on
+      // port B.
       if (r->taccel_top__DOT__sys_sram_b_en)
         trace.a_load_rows.push_back(r->taccel_top__DOT__sys_sram_b_row);
     } else if (state == ST_READ_REQ) {
-      if (r->taccel_top__DOT__sys_sram_a_en) {
-        trace.b_stream_rows.push_back(r->taccel_top__DOT__sys_sram_a_row);
-      } else {
-        trace.zero_read_lanes.push_back(lane);
-      }
+      // One-shot prime of weight lane 0 on the W port.
+      if (r->taccel_top__DOT__sys_sram_w_en)
+        trace.b_stream_rows.push_back(r->taccel_top__DOT__sys_sram_w_row);
     } else if ((state == ST_DRAIN_WR) && r->taccel_top__DOT__sys_sram_a_we) {
       if (trace.read_use_count_before_drain < 0)
         trace.read_use_count_before_drain = static_cast<int>(trace.read_use_lanes.size());
