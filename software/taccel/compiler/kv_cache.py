@@ -33,6 +33,9 @@ class KVCacheEntry:
     bank_offset: int
     dram_off_units: int
     span_bytes: int
+    # Phase 2 lockstep batched decode: which of the n_streams per-stream
+    # caches this entry addresses. Always 0 for the single-stream layout.
+    stream: int = 0
 
 
 @dataclass(frozen=True)
@@ -59,37 +62,23 @@ class KVCacheLayout:
     # `position * d_head * elem_bytes`) flows from this field.
     elem_bytes: int = 1
     # Phase 2 lockstep batched decode: number of independent KV streams
-    # sharing this cache. Each (layer, kind, head) entry's region holds
-    # `n_streams` back-to-back per-stream caches of `stream_span` bytes
-    # each; stream `s`'s data starts `s * stream_span` past the entry
-    # base. `n_streams=1` (default) is byte-identical to the single-stream
-    # layout (stream_span == the whole head span, offset 0).
+    # sharing this cache. Each (layer, kind, head, stream) gets its own
+    # bank-aware entry of `stream_span` bytes — laid out exactly like a
+    # single-stream head entry, so the 16-bit DMA reach (bank splitting)
+    # and the runtime kv_base position patch behave identically per stream.
+    # `n_streams=1` (default) is byte-identical to the single-stream layout.
     n_streams: int = 1
     stream_span: int = 0
 
-    def entry(self, layer: int, kind: str, head: int) -> KVCacheEntry:
-        key = (int(layer), normalize_kv_kind(kind), int(head))
+    def entry(self, layer: int, kind: str, head: int, stream: int = 0) -> KVCacheEntry:
+        key = (int(layer), normalize_kv_kind(kind), int(head), int(stream))
         for entry in self.entries:
-            if (entry.layer, entry.kind, entry.head) == key:
+            if (entry.layer, entry.kind, entry.head, entry.stream) == key:
                 return entry
-        raise KeyError(f"No KV cache entry for layer={layer}, kind={kind!r}, head={head}")
-
-    def stream_offset_units(self, stream: int) -> int:
-        """Compile-time DRAM-unit offset of stream `s` within a head entry.
-
-        Added to an entry's `dram_off_units` by the per-stream kv_store /
-        kv_load emitters. The runtime `kv_base` patch (position) is applied
-        on top of this static per-stream base.
-        """
-        s = int(stream)
-        if s < 0 or s >= self.n_streams:
-            raise ValueError(f"stream {s} out of range [0, {self.n_streams})")
-        if self.stream_span % 16 != 0:
-            raise ValueError(
-                f"stream_span={self.stream_span} must be 16-byte aligned for "
-                "DRAM-unit offsets"
-            )
-        return (s * self.stream_span) // 16
+        raise KeyError(
+            f"No KV cache entry for layer={layer}, kind={kind!r}, head={head}, "
+            f"stream={stream}"
+        )
 
     @property
     def bank_symbols(self) -> Dict[str, int]:
@@ -162,31 +151,38 @@ def build_kv_cache_layout(
         current_bank_base = base_offset
         current_bank_end = base_offset
 
+    # Stream is the innermost axis: (layer, kind, head)'s `n_streams`
+    # per-stream caches are contiguous, each an independent bank-aware entry
+    # of `stream_span` bytes. With n_streams=1 this reproduces the original
+    # per-head layout exactly (span == head_span, stream 0 only).
     for layer in range(config.n_layer):
         for kind_idx, kind in enumerate(KV_KINDS):
             for head in range(config.n_head):
-                absolute_offset = (
-                    ((layer * len(KV_KINDS) + kind_idx) * config.n_head + head) * head_span
-                )
-                if current_bank_id < 0:
-                    start_bank(absolute_offset)
-                bank_offset = absolute_offset - current_bank_base
-                if bank_offset > M_DRAM_OFF_REACH_BYTES:
-                    start_bank(absolute_offset)
-                    bank_offset = 0
-                dram_off_units = bank_offset // 16
-                entries.append(KVCacheEntry(
-                    bank_id=current_bank_id,
-                    base_symbol=f"kv_bank{current_bank_id}",
-                    layer=layer,
-                    kind=kind,
-                    head=head,
-                    byte_offset=absolute_offset,
-                    bank_offset=bank_offset,
-                    dram_off_units=dram_off_units,
-                    span_bytes=head_span,
-                ))
-                current_bank_end = max(current_bank_end, absolute_offset + head_span)
+                for stream in range(n_streams):
+                    absolute_offset = (
+                        (((layer * len(KV_KINDS) + kind_idx) * config.n_head + head)
+                         * n_streams + stream) * stream_span
+                    )
+                    if current_bank_id < 0:
+                        start_bank(absolute_offset)
+                    bank_offset = absolute_offset - current_bank_base
+                    if bank_offset > M_DRAM_OFF_REACH_BYTES:
+                        start_bank(absolute_offset)
+                        bank_offset = 0
+                    dram_off_units = bank_offset // 16
+                    entries.append(KVCacheEntry(
+                        bank_id=current_bank_id,
+                        base_symbol=f"kv_bank{current_bank_id}",
+                        layer=layer,
+                        kind=kind,
+                        head=head,
+                        byte_offset=absolute_offset,
+                        bank_offset=bank_offset,
+                        dram_off_units=dram_off_units,
+                        span_bytes=stream_span,
+                        stream=stream,
+                    ))
+                    current_bank_end = max(current_bank_end, absolute_offset + stream_span)
 
     if current_bank_id >= 0:
         banks.append(KVCacheBank(

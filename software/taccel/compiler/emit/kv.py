@@ -27,26 +27,17 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 def kv_entry_for_node(cg: "CodeGenerator", node: IRNode):
     if cg.kv_layout is None:
         raise ValueError("kv_layout is required for kv_load/kv_store nodes")
+    # Phase 2 lockstep batched decode: a ``stream`` attr selects one of the
+    # ``n_streams`` per-stream caches. Each (layer, kind, head, stream) is its
+    # own bank-aware entry, so its base_symbol/dram_off_units already encode
+    # the correct bank and in-bank offset (the 16-bit DMA reach holds). When
+    # ``stream`` is absent this is the single-stream entry (byte-identical).
     return cg.kv_layout.entry(
         int(node.attrs["layer"]),
         normalize_kv_kind(node.attrs["kind"]),
         int(node.attrs["head"]),
+        int(node.attrs.get("stream", 0)),
     )
-
-
-def kv_stream_base_units(cg: "CodeGenerator", node: IRNode, entry) -> int:
-    """DRAM-unit base for this node = entry base + static per-stream offset.
-
-    Phase 2 lockstep batched decode: a ``stream`` attr selects one of the
-    ``n_streams`` per-stream caches inside a head entry. The offset
-    ``s * stream_span`` is a compile-time constant; the runtime ``kv_base``
-    patch (token position) is applied on top of it by the DMA emitters.
-    When ``stream`` is absent the base is the entry base (single-stream,
-    byte-identical to before).
-    """
-    if "stream" not in node.attrs:
-        return entry.dram_off_units
-    return entry.dram_off_units + cg.kv_layout.stream_offset_units(int(node.attrs["stream"]))
 
 
 def kv_transfer_bytes(cg: "CodeGenerator", node: IRNode, *,
@@ -88,7 +79,7 @@ def kv_source_location(cg: "CodeGenerator", node: IRNode) -> Tuple[int, int]:
 
 def emit_kv_store(cg: "CodeGenerator", node: IRNode) -> None:
     entry = kv_entry_for_node(cg, node)
-    dram_off = kv_stream_base_units(cg, node, entry)
+    dram_off = entry.dram_off_units
     src_buf, src_off = kv_source_location(cg, node)
     decode_mode = bool(node.attrs.get("decode", cg.stream_name == "decode"))
     xfer_bytes = kv_transfer_bytes(cg, node, decode_default=decode_mode)
@@ -119,7 +110,7 @@ def emit_kv_store(cg: "CodeGenerator", node: IRNode) -> None:
 
 def emit_kv_load(cg: "CodeGenerator", node: IRNode) -> None:
     entry = kv_entry_for_node(cg, node)
-    dram_off = kv_stream_base_units(cg, node, entry)
+    dram_off = entry.dram_off_units
     decode_mode = bool(node.attrs.get("decode", cg.stream_name == "decode"))
     xfer_bytes = kv_transfer_bytes(cg, node, decode_default=decode_mode)
     addr_reg = int(node.attrs.get("addr_reg", 2))
