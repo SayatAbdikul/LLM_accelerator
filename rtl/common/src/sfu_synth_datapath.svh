@@ -223,16 +223,17 @@
       fp32_mul u_scaled_mul2 (.a(scaled_mul1), .b(scale0_q),    .y(scaled_mul2));
       fp32_add u_scaled_add  (.a(scaled_mul2), .b(beta_bits),   .y(scaled_add));
 
-      // GELU is NOT replicated across lanes 1..7 — but NOT for area: the
-      // original "area hog" guess was falsified by the 2026-05-30 trim
-      // measurement (removing 7 gelu replicas saved only 0.5% of SFU cells,
-      // 1,287,144 -> 1,280,022; the real area went to the scaled-chain
-      // replicas). GELU runs LANE-0 ONLY (FSM strides by 1 for OP_GELU_FP32,
-      // writes only lane 0, lanes 1..7 don't-care) purely as a leftover of
-      // that decision. Widening GELU to 8 lanes via this existing genvar
-      // block is the top remaining contained SFU cycle lever (~-560K mode-1
-      // cyc = +2.3% tok/s at the 2026-07-08 profile; see
-      // docs/perf_roadmap_2026-07-08.md #4).
+      // GELU replica (fp32_gelu_new tanh-poly core, identical to lane-0
+      // u_synth_gelu). 2026-07-08: widened to 8 lanes. The old "area hog"
+      // guess was falsified by the 2026-05-30 trim measurement (removing 7
+      // gelu replicas saved only 0.5% of SFU cells, 1,287,144 -> 1,280,022;
+      // the real area went to the scaled-chain replicas), so GELU now strides
+      // 8 like every other elementwise op (~-560K mode-1 cyc = +2.3% tok/s;
+      // see docs/perf_roadmap_2026-07-08.md #4). Each lane is an identical,
+      // independent combinational core -> bit-exact vs the old lane-0-only
+      // 1/cycle loop.
+      logic [31:0] gelu_out;
+      fp32_gelu_new u_gelu (.a(a_bits), .y(gelu_out));
 
       // Compute-output op-mux -> shared f2h (replica of synth_compute_out).
       logic [31:0] compute_out;
@@ -241,7 +242,8 @@
           OP_VADD_FP32:                 compute_out = add_out;
           OP_DEQUANT_ACCUM_FP32:        compute_out = mul_out;
           OP_DEQUANT_ACCUM_FP32_SCALED: compute_out = scaled_add;
-          default:                      compute_out = 32'd0;  // incl. GELU (lane-0-only)
+          OP_GELU_FP32:                 compute_out = gelu_out;
+          default:                      compute_out = 32'd0;
         endcase
       end
       fp32_to_fp16 u_f2h (.a(compute_out), .y(synth_out_bits_lane[gv_simd]));
