@@ -223,11 +223,16 @@
       fp32_mul u_scaled_mul2 (.a(scaled_mul1), .b(scale0_q),    .y(scaled_mul2));
       fp32_add u_scaled_add  (.a(scaled_mul2), .b(beta_bits),   .y(scaled_add));
 
-      // GELU is NOT replicated across lanes 1..7: fp32_gelu_new (exp+div) is
-      // the area hog (~45% -> ~+18% SFU area when omitted) and GELU is a minor
-      // share of SFU throughput. GELU runs LANE-0 ONLY — the FSM strides by 1
-      // for OP_GELU_FP32 and writes only lane 0, so synth_out_bits_lane[1..7]
-      // are don't-care for GELU and need no gelu instance here.
+      // GELU is NOT replicated across lanes 1..7 — but NOT for area: the
+      // original "area hog" guess was falsified by the 2026-05-30 trim
+      // measurement (removing 7 gelu replicas saved only 0.5% of SFU cells,
+      // 1,287,144 -> 1,280,022; the real area went to the scaled-chain
+      // replicas). GELU runs LANE-0 ONLY (FSM strides by 1 for OP_GELU_FP32,
+      // writes only lane 0, lanes 1..7 don't-care) purely as a leftover of
+      // that decision. Widening GELU to 8 lanes via this existing genvar
+      // block is the top remaining contained SFU cycle lever (~-560K mode-1
+      // cyc = +2.3% tok/s at the 2026-07-08 profile; see
+      // docs/perf_roadmap_2026-07-08.md #4).
 
       // Compute-output op-mux -> shared f2h (replica of synth_compute_out).
       logic [31:0] compute_out;

@@ -1,6 +1,6 @@
 {
-  "checkpoint_path": "/Users/sayat/Documents/GitHub/LLM_accelerator/software/tests/fixtures/generated/nanogpt_shakespeare_char_d384_l6.pt",
-  "checkpoint_sha256": "6800d6ff0a8112aed3a7ae72bfaf60ca30bf965429f1fa354c3e2ec233ccf144",
+  "checkpoint_path": "/home/user/LLM_accelerator/software/tests/fixtures/generated/nanogpt_shakespeare_char_d384_l6.pt",
+  "checkpoint_sha256": "accd8037ae104adaac54b1a257ab818198fec5e77054b1381aaa4b340b89dc96",
   "dataset": "embedded_shakespeare_char_excerpt",
   "hyperparameters": {
     "bias": true,

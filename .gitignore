@@ -1,1 +1,5 @@
 .venv
+# EDA / experiment artifacts (never commit)
+.gptq_runs/
+rtl/asic/build/synth_blocks/
+rtl/asic/openlane/
