@@ -12,7 +12,7 @@ from ..compiler.decoder_bundle import (
     inject_kv_cache_nodes,
     mark_runtime_embedding_lookups,
 )
-from ..compiler.frontend.nanogpt_adapter import load_nanogpt
+from ..compiler.frontend.nanogpt_adapter import load_nanogpt, load_nanogpt_batched_decode
 from ..compiler.model_config import ModelConfig
 from ..compiler.tiler import pad_dim
 from ..quantizer.quantize import quantize_tensor
@@ -465,18 +465,30 @@ def build_stage3_tiny_decoder_bundle(
     if batch == 1:
         decode_graph = inject_kv_cache_nodes(graph, config, decode=True, seq_len=decode_key_len)
     else:
-        # Phase 2 (2a): batched decode stream is a distinct 16-row frontend
-        # graph. It shares the prefill weights/scales (so the codegen data
-        # blobs match), only the activation row count differs.
-        frontend_b = load_nanogpt(
+        # Phase 2 (2b): the batched decode stream is a complete per-stream
+        # graph (its own KV nodes + attention context), so it is NOT run
+        # through inject_kv_cache_nodes. Each of the `batch` streams owns its
+        # own cache region (n_streams sizes the KV cache below).
+        frontend_b = load_nanogpt_batched_decode(
             config=payload["model_args"],
             state_dict=payload["state_dict"],
-            variant="forward_batch16",
+            key_len=decode_key_len,
+            n_streams=batch,
         )
         decode_src = mark_runtime_embedding_lookups(frontend_b.graph)
         if gelu_from_accum_blocks:
             _mark_gelu_from_accum_inline(decode_src, gelu_from_accum_blocks)
-        decode_graph = inject_kv_cache_nodes(decode_src, config, decode=True, seq_len=decode_key_len)
+        decode_graph = decode_src
+        # The batched decode graph carries 16x the per-stream attention scale
+        # vectors, so it cannot share one data blob with the single-token
+        # prefill graph. Use the batched graph for the prefill slot too (they
+        # then produce identical data). This makes the batched bundle's prefill
+        # stream a lockstep single-token-per-stream prime rather than a
+        # multi-token prefill — sufficient for decode-cycle measurement and the
+        # RTL==golden byte-match, which only exercise the decode stream. A
+        # proper multi-token batched prefill (and per-head scale dedup) is
+        # separable follow-on work.
+        prefill_graph = decode_src
     build = build_decoder_program_bundle(
         prefill_graph=prefill_graph,
         decode_graph=decode_graph,
@@ -492,6 +504,7 @@ def build_stage3_tiny_decoder_bundle(
         gelu_from_accum_blocks=gelu_from_accum_blocks or None,
         use_fp16_activations=True,
         biases=biases,
+        n_streams=batch,
     )
     return TinyFixtureBundle(build=build, config=config, logits_size=logits_size)
 

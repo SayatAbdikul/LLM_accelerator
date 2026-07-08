@@ -358,3 +358,120 @@ def load_nanogpt(*, model: Optional[Any] = None, state_dict: Optional[Mapping[st
     if has_lm_head_bias and not shape.has_lm_head_bias:
         shape = _dc_replace(shape, has_lm_head_bias=True)
     return FrontendResult(graph=_build_graph(shape, variant), config=_model_config(shape))
+
+
+def _emit_batched_attention_block(graph: IRGraph, prev: str, block_idx: int,
+                                  n_streams: int, key_len: int,
+                                  shape: NanoGPTShape) -> str:
+    """Per-stream block-diagonal attention for lockstep batched decode.
+
+    The Q/K/V projections stay batched (one matmul each over the `n_streams`
+    query rows). Attention then runs per stream: each stream extracts its own
+    query row, stores its new K/V into its own cache region, loads its own
+    cache, and runs the ordinary single-token (query_len=1) QK^T / softmax /
+    AV. The 16 per-stream outputs are gathered back into one (n_streams,
+    d_head) tile per head for concat_heads. Emits kv_store/kv_load nodes
+    directly (with the `stream`/`src_row` attrs) — this graph is complete and
+    must NOT be run through `inject_kv_cache_nodes`.
+    """
+    inv_sqrt = shape.d_head ** -0.5
+    ln1 = _add(
+        graph, "layernorm", f"block{block_idx}_ln1",
+        [prev, f"transformer.h.{block_idx}.ln_1.weight", f"transformer.h.{block_idx}.ln_1.bias"],
+        (n_streams, shape.d_model), block_idx=block_idx, epsilon=shape.norm_epsilon,
+    )
+    head_outputs = []
+    for head_idx in range(shape.n_head):
+        q_weight = f"transformer.h.{block_idx}.attn.c_attn.weight_h{head_idx}_query"
+        k_weight = f"transformer.h.{block_idx}.attn.c_attn.weight_h{head_idx}_key"
+        v_weight = f"transformer.h.{block_idx}.attn.c_attn.weight_h{head_idx}_value"
+        qb = _add(
+            graph, "matmul", f"block{block_idx}_head{head_idx}_query",
+            [ln1, q_weight], (n_streams, shape.d_head),
+            block_idx=block_idx, head_idx=head_idx, projection="query", weight_name=q_weight,
+            bias=f"transformer.h.{block_idx}.attn.c_attn.bias_h{head_idx}_query" if shape.split_qkv_bias else None,
+        )
+        kb = _add(
+            graph, "matmul", f"block{block_idx}_head{head_idx}_key",
+            [ln1, k_weight], (n_streams, shape.d_head),
+            block_idx=block_idx, head_idx=head_idx, projection="key", weight_name=k_weight,
+            bias=f"transformer.h.{block_idx}.attn.c_attn.bias_h{head_idx}_key" if shape.split_qkv_bias else None,
+        )
+        vb = _add(
+            graph, "matmul", f"block{block_idx}_head{head_idx}_value",
+            [ln1, v_weight], (n_streams, shape.d_head),
+            block_idx=block_idx, head_idx=head_idx, projection="value", weight_name=v_weight,
+            bias=f"transformer.h.{block_idx}.attn.c_attn.bias_h{head_idx}_value" if shape.split_qkv_bias else None,
+        )
+        stream_outs = []
+        for s in range(n_streams):
+            pfx = f"block{block_idx}_head{head_idx}_s{s}"
+            # Store stream s's new K/V (row s of the batched projection) into
+            # its own cache region at the runtime position.
+            _add(graph, "kv_store", f"{pfx}_kstore", [kb], (),
+                 layer=block_idx, kind="key", head=head_idx, tokens=1,
+                 stream=s, src_row=s, decode=True)
+            _add(graph, "kv_store", f"{pfx}_vstore", [vb], (),
+                 layer=block_idx, kind="value", head=head_idx, tokens=1,
+                 stream=s, src_row=s, decode=True)
+            # Extract stream s's single query row.
+            q_s = _add(graph, "row_copy", f"{pfx}_q", [qb], (1, shape.d_head), src_row=s)
+            # Load stream s's own K cache, then QK^T.
+            k_s = _add(graph, "kv_load", f"{pfx}_kload", [], (key_len, shape.d_head),
+                       layer=block_idx, kind="key", head=head_idx, tokens=key_len,
+                       stream=s, decode=True)
+            qkt = _add(graph, "matmul_qkt", f"{pfx}_qkt", [q_s, k_s], (1, key_len),
+                       block_idx=block_idx, head_idx=head_idx, query_len=1, key_len=key_len,
+                       masked=True, runtime_config_attn=True, scale=inv_sqrt)
+            scaled = _add(graph, "scale_mul", f"{pfx}_scale", [qkt], (1, key_len),
+                          query_len=1, key_len=key_len, scale=inv_sqrt)
+            sm = _add(graph, "softmax", f"{pfx}_softmax", [scaled], (1, key_len),
+                      query_len=1, key_len=key_len, masked=True, runtime_config_attn=True,
+                      causal_identity=True)
+            v_s = _add(graph, "kv_load", f"{pfx}_vload", [], (key_len, shape.d_head),
+                       layer=block_idx, kind="value", head=head_idx, tokens=key_len,
+                       stream=s, decode=True)
+            attn_v = _add(graph, "matmul_attn_v", f"{pfx}_attnv", [sm, v_s], (1, shape.d_head),
+                          block_idx=block_idx, head_idx=head_idx, query_len=1, key_len=key_len)
+            stream_outs.append(attn_v)
+        # Gather the 16 per-stream (1, d_head) outputs into one (n_streams, d_head) tile.
+        head_outputs.append(_add(
+            graph, "gather_rows", f"block{block_idx}_head{head_idx}_attn_out",
+            stream_outs, (n_streams, shape.d_head),
+        ))
+    concat = _add(graph, "concat_heads", f"block{block_idx}_concat", head_outputs,
+                  (n_streams, shape.d_model))
+    out_proj = _add(
+        graph, "matmul", f"block{block_idx}_out_proj",
+        [concat, f"transformer.h.{block_idx}.attn.c_proj.weight"], (n_streams, shape.d_model),
+        weight_name=f"transformer.h.{block_idx}.attn.c_proj.weight",
+        bias=f"transformer.h.{block_idx}.attn.c_proj.bias" if shape.bias else None,
+    )
+    return _add(graph, "vadd", f"block{block_idx}_residual1", [prev, out_proj],
+                (n_streams, shape.d_model))
+
+
+def build_batched_decode_graph(shape: NanoGPTShape, *, key_len: int, n_streams: int = 16) -> IRGraph:
+    """Full lockstep batched-decode IR graph (per-stream attention).
+
+    Complete decode graph — it already carries its KV nodes and attention
+    context, so it must NOT be passed through `inject_kv_cache_nodes`.
+    """
+    graph = IRGraph()
+    prev = _emit_embeddings(graph, n_streams, shape)
+    for block_idx in range(shape.n_layer):
+        prev = _emit_batched_attention_block(graph, prev, block_idx, n_streams, key_len, shape)
+        prev = _emit_mlp_block(graph, prev, block_idx, n_streams, shape, include_ln1=False)
+    _finish(graph, prev, n_streams, shape)
+    return graph
+
+
+def load_nanogpt_batched_decode(*, config: Any, state_dict: Optional[Mapping[str, Any]] = None,
+                                key_len: int, n_streams: int = 16) -> FrontendResult:
+    """Return the lockstep batched-decode graph + ModelConfig (Phase 2)."""
+    shape = _coerce_shape(config)
+    has_lm_head_bias = state_dict is not None and "lm_head.bias" in state_dict
+    if has_lm_head_bias and not shape.has_lm_head_bias:
+        shape = _dc_replace(shape, has_lm_head_bias=True)
+    graph = build_batched_decode_graph(shape, key_len=key_len, n_streams=n_streams)
+    return FrontendResult(graph=graph, config=_model_config(shape))

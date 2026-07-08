@@ -849,6 +849,10 @@ class CodeGenerator:
             pass  # No-op, handled by matmul_qkt
         elif op == "concat_heads":
             self._emit_concat_heads(node)
+        elif op == "row_copy":
+            self._emit_row_copy(node)
+        elif op == "gather_rows":
+            self._emit_gather_rows(node)
 
     def _emit_qkt(self, node: IRNode):
         from .emit.matmul import emit_qkt
@@ -861,6 +865,14 @@ class CodeGenerator:
     def _emit_concat_heads(self, node: IRNode):
         from .emit.matmul import emit_concat_heads
         emit_concat_heads(self, node)
+
+    def _emit_row_copy(self, node: IRNode):
+        from .emit.batch import emit_row_copy
+        emit_row_copy(self, node)
+
+    def _emit_gather_rows(self, node: IRNode):
+        from .emit.batch import emit_gather_rows
+        emit_gather_rows(self, node)
 
     def _emit_scale_mul(self, node: IRNode):
         from .emit.sfu import emit_scale_mul

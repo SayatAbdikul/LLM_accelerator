@@ -58,6 +58,28 @@ def test_build_stage3_rejects_bad_batch():
         build_stage3_tiny_decoder_bundle({}, batch=4)
 
 
+def test_batched_decode_graph_is_per_stream():
+    """The decode graph must expand attention block-diagonally per stream."""
+    from taccel.compiler.frontend.nanogpt_adapter import load_nanogpt_batched_decode
+    import collections
+
+    n_layer, n_head, n_streams = 2, 4, 16
+    fe = load_nanogpt_batched_decode(config=_tiny_nanogpt_config(), key_len=3, n_streams=n_streams)
+    c = collections.Counter(n.op for n in fe.graph.nodes)
+    per_stream = n_layer * n_head * n_streams
+    assert c["matmul_qkt"] == per_stream
+    assert c["matmul_attn_v"] == per_stream
+    assert c["softmax"] == per_stream
+    assert c["row_copy"] == per_stream            # per-stream query extract
+    assert c["kv_store"] == 2 * per_stream        # key + value per stream
+    assert c["kv_load"] == 2 * per_stream
+    assert c["gather_rows"] == n_layer * n_head   # one gather per head
+    # Every KV node carries a stream tag spanning all 16 streams.
+    kv = [n for n in fe.graph.nodes if n.op in ("kv_store", "kv_load")]
+    assert all("stream" in n.attrs for n in kv)
+    assert sorted({n.attrs["stream"] for n in kv}) == list(range(n_streams))
+
+
 def _build_payload(tmp_path):
     pytest.importorskip("torch")
     tool = _load_tool()
@@ -81,9 +103,13 @@ def test_batched_bundle_builds_and_has_16_embedding_sites(tmp_path):
     assert len(_decode_sites(tiny.build.bundle, "token_embed")) == 16
     assert len(_decode_sites(tiny.build.bundle, "pos_embed")) == 16
 
-    # The prefill stream stays single-token in both bundles.
-    assert len([s for s in tiny.build.bundle.runtime_patch_sites
+    # The single-token bundle's prefill has one embed site; the batched
+    # bundle reuses the batched graph for its prefill slot (16 sites) so the
+    # two streams share one weight/scale data blob.
+    assert len([s for s in base.build.bundle.runtime_patch_sites
                 if s.kind == "token_embed" and s.stream == "prefill"]) == 1
+    assert len([s for s in tiny.build.bundle.runtime_patch_sites
+                if s.kind == "token_embed" and s.stream == "prefill"]) == 16
 
 
 def test_batched_decode_runs_clean_in_golden(tmp_path):
@@ -91,8 +117,10 @@ def test_batched_decode_runs_clean_in_golden(tmp_path):
     tiny = build_stage3_tiny_decoder_bundle(payload, smoke_decode_steps=2, batch=16)
 
     runner = HostRunner(tiny.build.bundle, logits_dtype=np.int8)
-    runner.run_prefill([0])
-    tokens16 = [(1 + s) % _tiny_nanogpt_config()["vocab_size"] for s in range(16)]
+    # Batched bundle's prefill slot is the lockstep batched graph (16 rows).
+    vocab = _tiny_nanogpt_config()["vocab_size"]
+    runner.run_prefill([(3 + s) % vocab for s in range(16)])
+    tokens16 = [(1 + s) % vocab for s in range(16)]
     out = runner.run_decode_step_batch(tokens16, position=1)
 
     assert out.shape == (tiny.logits_size,)
