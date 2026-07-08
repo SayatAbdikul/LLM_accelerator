@@ -6,7 +6,9 @@ divider-drain"). All numbers: GPT-2 124M, 1-token prefill bundle
 (`/tmp/p124m.bin`), mode-1 (SFU_SYNTH_MODE=1 = real-chip RTL), honest-BW DMA
 model (`--fast-beats`, 1 beat/cycle), post-PNR fmax 34.41 MHz.
 
-**Current: 23,934,723 cycles/token → ~1.438 tok/s.**
+**Baseline (HEAD 0aeb597): 23,934,723 cycles/token → ~1.438 tok/s.**
+**After Phase 1 (HEAD b7c6cfd, 2026-07-08): 23,202,051 prefill cyc → ~1.483 tok/s
+(−3.06%); decode ~34.6M → ~32.69M avg → ~1.053 tok/s (−5.5%). See §5.**
 
 tok/s = fmax / cycles_per_token. The two axes multiply; every cycle lever
 below stacks with every fmax lever.
@@ -50,9 +52,10 @@ SFU decomposition (6.44M):
 | 1 | Batching B=16 | ~2.5–3.0× (ctx≈0) / ~2.1× @ ctx=1024 | multi-week, mostly compiler | medium |
 | 2 | SFU‖DMA overlap relax | 1.29× standalone (shrinks to ~+4% after batching) | 1–2 weeks | high (golden + cosim contract) |
 | 3 | fmax cluster: div_p6 + sqrt M_pad-restructure | +12–18%, multiplies everything | multi-day, EDA-heavy | medium — **blocked** (§3.1) |
-| 4 | GELU 8-wide | +2.3% | days | low |
+| 4 | GELU 8-wide + fuse (1a/1b) — **DONE** (§5) | +2.9% prefill | days | low |
+| 4b | Runtime-bound softmax (1c) — **DONE** (§5) | +5.9% decode-avg | days | low |
 | 5 | MAX_ABS producer-fusion | up to +3.6% | ~1 week | medium-high (ISA freeze) |
-| 6 | Dispatch-stall investigation | 0 to +3% | ~1 day | low |
+| 6 | Dispatch-stall investigation — **DONE, no-change** (§2.6) | ~0 | ~1 day | low |
 | 7 | Multi-clock domains | ~2.2× single-stream / ~3.4× with batching | multi-week | highest (CDC) |
 | 8 | LN 2-row software-pipeline | +1.5% | medium | medium |
 
@@ -122,14 +125,23 @@ for free; MAX_ABS collapses to a register read. Requires a new op/flag →
 touches the ISA freeze, golden model, compiler. Standalone MAX_ABS is already
 load-bound, so fusion is the only way to reclaim this.
 
-### 2.6 Dispatch-stall investigation (0 to +3%, 1 day)
+### 2.6 Dispatch-stall investigation — DONE, CLOSED NO-CHANGE (2026-07-08)
 
-SET_ADDR_HI retires at 31.2 cyc/op and CONFIG_TILE at 40.9 (baseline simple
-ops: 4.0) ≈ 844K total. Hypothesis: the *following* engine op can't dispatch
-while that engine is busy, and the wait lands in the preceding ctl op's
-retire gap — i.e., mostly the same serialization story, not fetch
-inefficiency. Worth one day to confirm; any part that's a genuine dispatch
-bubble is a cheap fix.
+Investigated (1d). The hypothesis is **confirmed: no control-unit dispatch
+bubble.** Method: from a `--trace-json-out` run, break each opcode's retire gap
+down by the NEXT retired opcode. SET_ADDR_HI's 31.2 avg = the *following* op's
+latency — →STORE 44.7, →LOAD 17.0; CONFIG_TILE's 40.9 = →MATMUL 96.7. Pure control→control gaps are a flat **4.0** (SET_ADDR_LO→
+SET_ADDR_HI: 86,904 = 4.0×21,726 exactly). The 4.0 floor is the **AXI
+instruction-fetch round-trip** (`fetch_unit` is an AXI read master: ar→r) +
+1 issue cycle — inherent memory latency, not a removable dead cycle; the
+control FSM is already a minimal 2-state FETCH→ISSUE loop. Reducing it needs
+instruction prefetch/caching (a fetch-pipeline redesign touching every
+instruction + every test) with a **~0.5% ceiling** (only helps the
+non-engine-overlapped control sequences; during engine ops the fetch overlaps
+with execution). Not worth the critical-path risk. **Related future lever
+(compiler/ISA, not control-unit):** 21,726 SET_ADDR_LO+HI *pairs* (~174K cyc)
+set 48-bit DMA addresses in two 4-cyc instructions; a combined single-
+instruction address-set would ~halve that (~+0.37%) but touches the ISA freeze.
 
 ### 2.7 Multi-clock domains (~2.2× single-stream)
 
@@ -234,6 +246,58 @@ compiled window (+6.2M)**, then QK^T/AV systolic (+1.4M) and KV DMA
   reclaims roughly half of the MAX/EXPSUM walk, ~2M cyc/token ≈ +6% decode
   tok/s. Makes decode cycles position-dependent (benchmark must then sweep
   positions). Low-risk, contained — slots between #4 and #5 in §2.
+
+## 5. Phase 1 implementation — RESULTS (2026-07-08)
+
+Contained SFU wins, all strictly bit-exact (test_sfu_synth 11/11 per commit;
+airtight SFU-only Δtotal == Δsfu_busy exactly, systolic/dma/retired invariant)
+and fmax-neutral (no fp32 primitive touched; boundaries preserved — PNR stamp
+box-blocked per §3.1, same basis as the 6 prior fusions). All three changes are
+SFU_SYNTH_MODE==1-only (mode-1 states/reroutes/datapath); the mode-0 DPI path is
+untouched, confirmed by the consolidated **cosim byte-match: 6 passed / 1
+skipped** (the skip is the opt-in 124M leg) on a fresh mode-0 `run_program`
+built from HEAD b7c6cfd. Prefill = p124m 1-token honest-BW @ 34.41 MHz.
+
+| step | commit | change | prefill cyc | Δ | tok/s |
+|---|---|---|---:|---:|---:|
+| base | 0aeb597 | (6-fusion baseline) | 23,934,723 | — | 1.438 |
+| 1a | 65841f1 | GELU 8-wide SIMD (F_G2_SYNTH_ITER stride 1→8) | 23,418,627 | −516,096 | 1.469 |
+| 1b | 552e08d | GELU fuse load+compute+write (F_G2_GLC) | 23,271,171 | −147,456 | 1.479 |
+| 1c | b7c6cfd | runtime-bound softmax MAX/EXPSUM (sm_eff_bound_w) | 23,202,051 | −69,120 | 1.483 |
+| | | **Phase 1 total** | | **−732,672 (−3.06%)** | **1.483** |
+
+- **1a GELU 8-wide**: replicated `fp32_gelu_new` across lanes 1..7 (the
+  falsified "area hog"); GELU compute 739K → ~180K. `g2_gelu_fp32` band
+  unchanged (max_ulp=3, byte-identical — only the lane assignment parallelizes).
+- **1b F_G2_GLC**: GELU is single-operand FP16-in/out; after 1a its compute is
+  8/cyc = load rate, so the 3 passes collapse (QLC load track + VLC compute/
+  write track, reroute at F_G2_S1_REQ). GELU now load-bound. F_G2_SYNTH_ITER is
+  now a dead mode-1 arm (QUANT already uses QLC).
+- **1c softmax bound**: MASKED_SOFTMAX_FP32 visible set is exactly [0,
+  keep_through]; MAX/EXPSUM accumulate only visible elements in order, so
+  bounding the walk to keep_through+1 is bit-exact (OUT still walks full width
+  for the zero-writes). Prefill (small kv) −69,120; the real win is decode.
+
+### 5.1 Decode-shape after Phase 1 (the deployment metric)
+
+Decode was position-INVARIANT at 34,605,975 (0.994 tok/s); 1a/1b remove a fixed
+GELU floor and 1c makes softmax position-dependent. Airtight at every position
+(Δtotal == Δsfu_busy; sys_busy 12,390,189 / dma_beats 11,143,408 invariant):
+
+| pos | ctx | cycles | Δ vs base | sfu_busy | tok/s |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 1 | 31,514,007 | −8.9% | 9,539,986 | 1.092 |
+| 63 | 64 | 31,804,311 | −8.1% | 9,830,290 | 1.082 |
+| 255 | 256 | 32,689,047 | −5.5% | 10,715,026 | 1.053 |
+| 511 | 512 | 33,868,695 | −2.1% | 11,894,674 | 1.016 |
+
+pos-255 ≈ the uniform generation-average → **decode ~0.994 → ~1.053 tok/s
+(+5.9%)**. Decomposition: pos-511 (softmax fully walked, 1c inactive) isolates
+the fixed 1a+1b GELU floor (−737,280); 1c's softmax slope adds 0 at pos-511 up
+to −2,354,688 at pos-0 (~−1.18M generation-average). Decode benchmark must now
+sweep positions (no longer a single number).
+
+### 5.2 1d dispatch-stall — closed no-change (see §2.6).
 
 ## Appendix: measurement recipe
 
