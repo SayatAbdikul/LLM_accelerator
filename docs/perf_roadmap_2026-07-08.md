@@ -176,32 +176,64 @@ not batched throughput — is the target metric.)
 
 ---
 
-## 3. Current caveats / problems
+## 3. Current caveats / problems — RESOLUTION STATUS (2026-07-08 evening)
 
-1. **EDA validation is hardware-blocked (top operational issue).** yosys
-   `synth -flatten`+abc on the SFU now OOMs this 15.76 GB box — 4/4 attempts
-   killed (yosys-abc at 7.2–8.6 GB RSS; last clean-idle run peaked at
-   15.4/15.76 GB system-wide). The 6 fusion states grew the netlist past what
-   the box can flatten. Blocks: the empirical fmax stamp for the committed
-   fusion stack, and all future fmax/area work (#3, #4 confirmation, #7).
-   Unblock: `sudo swapon` an ~8 GB swapfile, then `/tmp/pnr_final.sh`; or a
-   bigger machine. (Neutrality of the committed fusions is not in doubt — no
-   fp32 primitive was modified; they reuse registered boundaries and add no
-   arithmetic near 29 ns.)
-2. **4 commits unpushed**: `fbee703`, `123aece`, `ba6aa13`, `0aeb597`.
-3. **Benchmark shape**: 1-token prefill (ctx≈0). Real decode at ctx=1024 adds
-   ~+2.4M/token of non-amortizable attention+KV, shrinking every ratio above.
-   The legacy DMA model (2.66 cyc/beat testbench artifact) reports ~1.6×
-   lower tok/s across the board; all numbers here are honest-BW.
-4. **Pre-existing test debt** (predates this work; muddies CI signal):
-   `FROZEN_GOLDEN_BLOB_SHA` cosim pin fails since `2ae4535`; `test_systolic`
-   unit tests fail to build (`u_accum.mem` not public); the d384 fixture
-   faults on RTL `run_program` (fault_code=6; golden-sim-only fixture).
-5. **Stale comment suppressing a win**: `sfu_synth_datapath.svh` claims GELU
-   replication costs ~45% area; measurement says 0.5%. Fix alongside #4.
-6. **Standing dirty-tree excludes** (`rtl/asic/build/synth/design_asic.v`,
-   d384 fixture JSON, untracked `synth_blocks/` etc.) — intentional; keep
-   them out of commits.
+1. **EDA validation: CLOSED AS HARDWARE-BLOCKED — do not retry on this box.**
+   yosys `synth -flatten`+abc on the current SFU netlist was OOM-killed on
+   **5/5 attempts, including a swap-backed run** (8 GB swapfile active,
+   swap 8 GB free at kill time, no cgroup/ulimit caps): abc's working set is
+   hot (`anon-rss ≈ total-vm` at kill — nothing swapped out) and its
+   allocation burst outruns swap-out on the 92%-full NVMe. The empirical
+   fmax stamp for the 6-fusion stack needs a machine with **≥24 GB RAM**;
+   `/tmp/pnr_final.sh` is self-contained for that. Neutrality remains
+   architecturally solid (no fp32 primitive modified; fusions reuse
+   registered boundaries, no new arithmetic near the 29 ns cluster).
+2. **Unpushed commits**: RESOLVED — user pushed `fbee703..0aeb597`; the
+   caveat-fix commits (`81ad53f..`) await the next push.
+3. **Benchmark shape**: RESOLVED — `software/tools/bench_decode_cycles.py`
+   measures the true decode shape (see §4 below). Headline: decode compiled
+   for a ctx-512 budget costs **34,605,975 cyc/token = 0.994 tok/s** — the
+   1-token prefill number (1.438) overstates deployment decode by ~45%.
+4. **Pre-existing test debt**: RESOLVED — SHA pin re-pinned per freeze §6
+   (`81ad53f`; cosim file fully green, no deselection); systolic unit-test
+   family repaired (`ccd604b`; 5/5 targets, 7/7 chained); d384-on-RTL
+   root-caused and fixed (`6cab6ea`; act-quant row-split, byte-identical;
+   d384 now runs to halt on RTL).
+5. **Stale GELU comment**: RESOLVED (`9f233c5`).
+6. **Dirty tree**: RESOLVED (`9f233c5`) — artifact roots gitignored,
+   `design_asic.v` restored, fixture metadata refreshed; `git status` clean.
+
+## 4. Decode-shape benchmark (NEW standard measurement)
+
+`software/tools/bench_decode_cycles.py` builds the decoder ProgramBundle,
+patches the decode stream to a target position (the exact
+`HostRunner.run_decode_step` patch set), and measures one standalone step on
+the mode-1 RTL. Cycle counts are data-independent, so zero-filled KV is
+valid and no warm-up steps are needed.
+
+Measured at HEAD `0aeb597` + fixes (mode-1 honest-BW, 34.41 MHz), decode
+program compiled for a **ctx-512 budget** — cycles are **exactly
+position-invariant** (attention is statically shaped for the compiled
+window and runtime-masked):
+
+| shape | cycles/tok | sfu_busy | sys_busy | dma beats | tok/s |
+|---|---:|---:|---:|---:|---:|
+| 1-token prefill (ctx≈0) | 23,934,723 | 6.44M | 10.95M | 9.92M | 1.438 |
+| decode @ ctx-512 budget | 34,605,975 | 12.63M | 12.39M | 11.14M | **0.994** |
+
+The +10.7M delta is dominated by **SFU masked-softmax over the full
+compiled window (+6.2M)**, then QK^T/AV systolic (+1.4M) and KV DMA
+(+1.2M beats). Two roadmap consequences:
+- SFU share in the deployment shape is **36.5%** (vs 26.9% at ctx≈0) —
+  strengthens every SFU lever in §2.
+- **New decode-specific lever — runtime-bounded softmax reductions:** the
+  SM MAX/EXPSUM passes walk all n_elems with a visibility gate instead of
+  stopping at `keep_through` (invisible elements contribute nothing —
+  bounding the walk is bit-exact; the OUT pass must still write zeros).
+  Averaged over a 512-token generation (mean valid_kv_len ≈ 256) this
+  reclaims roughly half of the MAX/EXPSUM walk, ~2M cyc/token ≈ +6% decode
+  tok/s. Makes decode cycles position-dependent (benchmark must then sweep
+  positions). Low-risk, contained — slots between #4 and #5 in §2.
 
 ## Appendix: measurement recipe
 
