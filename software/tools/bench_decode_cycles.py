@@ -46,8 +46,13 @@ DEFAULT_RTL = (
 FREEZE_PTQ_PRESET = "weight_only_int8_quarot"
 
 
-def build_decode_bins(payload, positions, out_dir: Path):
-    """Build one standalone decode ProgramBinary per requested position."""
+def build_decode_bins(payload, positions, out_dir: Path, batch: int = 1):
+    """Build one standalone decode ProgramBinary per requested position.
+
+    With ``batch > 1`` the decode stream is the lockstep batched graph (all
+    streams at the same position); the reported cycles are for one batched
+    step, so per-token cost is ``cycles / batch``.
+    """
     from taccel.assembler.assembler import ProgramBinary
     from taccel.runtime.calibration import build_calibration_scales
     from taccel.runtime.host_runner import HostRunner
@@ -63,6 +68,7 @@ def build_decode_bins(payload, positions, out_dir: Path):
     tiny = build_stage3_tiny_decoder_bundle(
         payload, smoke_decode_steps=max(positions) + 1,
         calibration_scales=scales, ptq_preset=FREEZE_PTQ_PRESET,
+        batch=batch,
     )
     bundle = tiny.build.bundle
 
@@ -91,7 +97,7 @@ def build_decode_bins(payload, positions, out_dir: Path):
 
     bins = {}
     for pos in positions:
-        runner._patch_embeddings("decode", [0], [int(pos)])
+        runner._patch_embeddings("decode", [0] * batch, [int(pos)] * batch)
         runner._patch_kv_bases(int(pos))
         runner._patch_decode_attention_context(int(pos))
         image = bundle.materialize(reset_runtime=False)
@@ -138,6 +144,9 @@ def main() -> int:
     ap.add_argument("--positions", default="0,63,255,511",
                     help="comma-separated decode positions (ctx = pos+1)")
     ap.add_argument("--fmax-mhz", type=float, default=34.41)
+    ap.add_argument("--batch", type=int, default=1,
+                    help="lockstep batched decode width (1 or 16); "
+                         "per-token cost = cycles / batch")
     ap.add_argument("--max-cycles", type=int, default=200_000_000)
     ap.add_argument("--keep-bins", action="store_true",
                     help="keep the per-position .bin files next to --out-dir")
@@ -156,9 +165,9 @@ def main() -> int:
 
     out_dir = args.out_dir or Path(tempfile.mkdtemp(prefix="bench_decode_"))
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"building decode bins for positions {positions} -> {out_dir}",
-          flush=True)
-    bins = build_decode_bins(payload, positions, out_dir)
+    print(f"building decode bins (batch={args.batch}) for positions "
+          f"{positions} -> {out_dir}", flush=True)
+    bins = build_decode_bins(payload, positions, out_dir, batch=args.batch)
 
     rows = []
     for pos in positions:
@@ -168,28 +177,31 @@ def main() -> int:
             print(f"  FAULT: status={s.get('status')} "
                   f"fault_code={s.get('fault_code')} — row excluded", flush=True)
             continue
+        per_tok = s["cycles"] / args.batch
         rows.append({
             "position": pos,
             "ctx": pos + 1,
             "cycles": s["cycles"],
+            "per_tok_cycles": per_tok,
             "status": s["status"],
             "retired": s["retired_instructions"],
             "sfu_busy": s["busy_cycles"].get("sfu", 0),
             "sys_busy": s["busy_cycles"].get("systolic", 0),
             "dma_beats": s["dma"]["beat_count"],
-            "tok_s": args.fmax_mhz * 1e6 / s["cycles"],
+            "tok_s": args.fmax_mhz * 1e6 / per_tok,
         })
-        print(f"  cycles={rows[-1]['cycles']:,}  "
+        print(f"  step_cycles={rows[-1]['cycles']:,}  per_tok={per_tok:,.0f}  "
               f"tok/s@{args.fmax_mhz}MHz={rows[-1]['tok_s']:.3f}", flush=True)
         if not args.keep_bins:
             bins[pos].unlink()
 
     print("\n=== decode-shape benchmark (mode-1 honest-BW, "
-          f"fmax {args.fmax_mhz} MHz) ===")
-    print(f"{'pos':>5} {'ctx':>5} {'cycles':>13} {'sfu_busy':>12} "
-          f"{'sys_busy':>12} {'dma_beats':>12} {'tok/s':>8}")
+          f"fmax {args.fmax_mhz} MHz, batch={args.batch}) ===")
+    print(f"{'pos':>5} {'ctx':>5} {'step_cyc':>13} {'per_tok_cyc':>13} "
+          f"{'sfu_busy':>12} {'sys_busy':>12} {'dma_beats':>12} {'tok/s':>8}")
     for r in rows:
         print(f"{r['position']:>5} {r['ctx']:>5} {r['cycles']:>13,} "
+              f"{r['per_tok_cycles']:>13,.0f} "
               f"{r['sfu_busy']:>12,} {r['sys_busy']:>12,} "
               f"{r['dma_beats']:>12,} {r['tok_s']:>8.3f}")
     return 0

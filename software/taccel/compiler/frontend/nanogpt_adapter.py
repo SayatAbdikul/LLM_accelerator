@@ -403,17 +403,22 @@ def _emit_batched_attention_block(graph: IRGraph, prev: str, block_idx: int,
             block_idx=block_idx, head_idx=head_idx, projection="value", weight_name=v_weight,
             bias=f"transformer.h.{block_idx}.attn.c_attn.bias_h{head_idx}_value" if shape.split_qkv_bias else None,
         )
-        stream_outs = []
+        # Store every stream's new K/V (row s of the batched projection) into
+        # its own cache region FIRST, so the batched K/V projection tiles
+        # (kb/vb) free before the memory-heavy per-stream attention loop (at
+        # ctx-512 each stream's V + v_int8 is ~100 KB — every KB of headroom
+        # matters).
         for s in range(n_streams):
             pfx = f"block{block_idx}_head{head_idx}_s{s}"
-            # Store stream s's new K/V (row s of the batched projection) into
-            # its own cache region at the runtime position.
             _add(graph, "kv_store", f"{pfx}_kstore", [kb], (),
                  layer=block_idx, kind="key", head=head_idx, tokens=1,
                  stream=s, src_row=s, decode=True)
             _add(graph, "kv_store", f"{pfx}_vstore", [vb], (),
                  layer=block_idx, kind="value", head=head_idx, tokens=1,
                  stream=s, src_row=s, decode=True)
+        stream_outs = []
+        for s in range(n_streams):
+            pfx = f"block{block_idx}_head{head_idx}_s{s}"
             # Extract stream s's single query row.
             q_s = _add(graph, "row_copy", f"{pfx}_q", [qb], (1, shape.d_head), src_row=s)
             # Load stream s's own K cache, then QK^T.
