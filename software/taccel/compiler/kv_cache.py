@@ -58,6 +58,14 @@ class KVCacheLayout:
     # byte-stride math (head_span, kv_cache_size, per-token offset
     # `position * d_head * elem_bytes`) flows from this field.
     elem_bytes: int = 1
+    # Phase 2 lockstep batched decode: number of independent KV streams
+    # sharing this cache. Each (layer, kind, head) entry's region holds
+    # `n_streams` back-to-back per-stream caches of `stream_span` bytes
+    # each; stream `s`'s data starts `s * stream_span` past the entry
+    # base. `n_streams=1` (default) is byte-identical to the single-stream
+    # layout (stream_span == the whole head span, offset 0).
+    n_streams: int = 1
+    stream_span: int = 0
 
     def entry(self, layer: int, kind: str, head: int) -> KVCacheEntry:
         key = (int(layer), normalize_kv_kind(kind), int(head))
@@ -65,6 +73,23 @@ class KVCacheLayout:
             if (entry.layer, entry.kind, entry.head) == key:
                 return entry
         raise KeyError(f"No KV cache entry for layer={layer}, kind={kind!r}, head={head}")
+
+    def stream_offset_units(self, stream: int) -> int:
+        """Compile-time DRAM-unit offset of stream `s` within a head entry.
+
+        Added to an entry's `dram_off_units` by the per-stream kv_store /
+        kv_load emitters. The runtime `kv_base` patch (position) is applied
+        on top of this static per-stream base.
+        """
+        s = int(stream)
+        if s < 0 or s >= self.n_streams:
+            raise ValueError(f"stream {s} out of range [0, {self.n_streams})")
+        if self.stream_span % 16 != 0:
+            raise ValueError(
+                f"stream_span={self.stream_span} must be 16-byte aligned for "
+                "DRAM-unit offsets"
+            )
+        return (s * self.stream_span) // 16
 
     @property
     def bank_symbols(self) -> Dict[str, int]:
@@ -82,6 +107,7 @@ def build_kv_cache_layout(
     max_seq_len: int = None,
     *,
     elem_bytes: int = 1,
+    n_streams: int = 1,
 ) -> KVCacheLayout:
     """Build the Stage 3 deterministic per-head KV-cache layout.
 
@@ -107,8 +133,14 @@ def build_kv_cache_layout(
         raise ValueError("d_head must be 16-byte aligned for KV cache layout")
     if elem_bytes not in (1, 2, 4):
         raise ValueError(f"elem_bytes must be 1 (INT8), 2 (FP16), or 4 (FP32), got {elem_bytes}")
+    if n_streams < 1:
+        raise ValueError(f"n_streams must be >= 1, got {n_streams}")
 
-    head_span = seq_len * config.d_head * elem_bytes
+    # Each stream owns a `stream_span`-byte cache; a head entry holds
+    # `n_streams` of them back to back. `n_streams=1` collapses to the
+    # original single-stream `head_span` (byte-identical layout).
+    stream_span = seq_len * config.d_head * elem_bytes
+    head_span = n_streams * stream_span
     kv_cache_size = config.n_layer * len(KV_KINDS) * config.n_head * head_span
 
     banks: List[KVCacheBank] = []
@@ -173,4 +205,6 @@ def build_kv_cache_layout(
         banks=tuple(banks),
         entries=tuple(entries),
         elem_bytes=elem_bytes,
+        n_streams=n_streams,
+        stream_span=stream_span,
     )

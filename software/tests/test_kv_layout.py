@@ -69,3 +69,48 @@ def test_kv_layout_normalizes_kind_aliases():
 
     assert layout.entry(0, "k", 0) == layout.entry(0, "key", 0)
     assert layout.entry(0, "v", 1) == layout.entry(0, "value", 1)
+
+
+def test_kv_layout_single_stream_is_byte_identical():
+    """n_streams=1 (default) must not perturb the single-stream layout."""
+    config = _decoder_config(n_layer=2, n_head=2, d_head=16, max_seq_len=4)
+    for elem_bytes in (1, 2, 4):
+        base = build_kv_cache_layout(config, elem_bytes=elem_bytes)
+        one = build_kv_cache_layout(config, elem_bytes=elem_bytes, n_streams=1)
+        assert one.kv_cache_size == base.kv_cache_size
+        assert one.entries == base.entries
+        assert one.banks == base.banks
+        # A one-stream cache's stream_span is exactly the head span, and
+        # stream 0 sits at offset 0.
+        assert one.stream_span == 4 * 16 * elem_bytes
+        assert one.stream_offset_units(0) == 0
+
+
+def test_kv_layout_multi_stream_scales_and_offsets():
+    config = _decoder_config(n_layer=2, n_head=2, d_head=16, max_seq_len=4)
+    elem_bytes = 2
+    one = build_kv_cache_layout(config, elem_bytes=elem_bytes, n_streams=1)
+    sixteen = build_kv_cache_layout(config, elem_bytes=elem_bytes, n_streams=16)
+
+    stream_span = 4 * 16 * elem_bytes  # seq_len * d_head * elem_bytes
+    assert sixteen.stream_span == stream_span
+    assert sixteen.n_streams == 16
+    # Whole cache is 16x, and each head entry's base offset is 16x the
+    # single-stream base (each head region now holds 16 stream caches).
+    assert sixteen.kv_cache_size == 16 * one.kv_cache_size
+    for e1, e16 in zip(one.entries, sixteen.entries):
+        assert (e1.layer, e1.kind, e1.head) == (e16.layer, e16.kind, e16.head)
+        assert e16.byte_offset == 16 * e1.byte_offset
+        assert e16.span_bytes == 16 * stream_span
+
+    # Per-stream static offset is s * stream_span (in 16-byte DRAM units).
+    for s in range(16):
+        assert sixteen.stream_offset_units(s) == (s * stream_span) // 16
+    # Out-of-range streams raise.
+    for bad in (-1, 16):
+        try:
+            sixteen.stream_offset_units(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"stream {bad} should be rejected")

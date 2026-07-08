@@ -34,6 +34,21 @@ def kv_entry_for_node(cg: "CodeGenerator", node: IRNode):
     )
 
 
+def kv_stream_base_units(cg: "CodeGenerator", node: IRNode, entry) -> int:
+    """DRAM-unit base for this node = entry base + static per-stream offset.
+
+    Phase 2 lockstep batched decode: a ``stream`` attr selects one of the
+    ``n_streams`` per-stream caches inside a head entry. The offset
+    ``s * stream_span`` is a compile-time constant; the runtime ``kv_base``
+    patch (token position) is applied on top of it by the DMA emitters.
+    When ``stream`` is absent the base is the entry base (single-stream,
+    byte-identical to before).
+    """
+    if "stream" not in node.attrs:
+        return entry.dram_off_units
+    return entry.dram_off_units + cg.kv_layout.stream_offset_units(int(node.attrs["stream"]))
+
+
 def kv_transfer_bytes(cg: "CodeGenerator", node: IRNode, *,
                       decode_default: bool) -> int:
     if "xfer_bytes" in node.attrs:
@@ -53,17 +68,27 @@ def kv_transfer_bytes(cg: "CodeGenerator", node: IRNode, *,
 
 def kv_source_location(cg: "CodeGenerator", node: IRNode) -> Tuple[int, int]:
     if "src_buf" in node.attrs and "src_off_units" in node.attrs:
-        return int(node.attrs["src_buf"]), int(node.attrs["src_off_units"])
-    if not node.inputs:
+        buf, off = int(node.attrs["src_buf"]), int(node.attrs["src_off_units"])
+    elif not node.inputs:
         raise ValueError(f"{node.name} requires an input allocation or src_buf/src_off_units attrs")
-    alloc = cg.mem.abuf.get(node.inputs[0])
-    if alloc is None:
-        raise KeyError(f"Missing ABUF allocation '{node.inputs[0]}' for {node.name}")
-    return alloc.buf_id, alloc.offset_units
+    else:
+        alloc = cg.mem.abuf.get(node.inputs[0])
+        if alloc is None:
+            raise KeyError(f"Missing ABUF allocation '{node.inputs[0]}' for {node.name}")
+        buf, off = alloc.buf_id, alloc.offset_units
+    # Phase 2: a per-stream kv_store reads row `src_row` of the batched K/V
+    # projection tile (16 stream rows, one new token each). The row stride is
+    # the padded projection width in activation elements.
+    if "src_row" in node.attrs:
+        row = int(node.attrs["src_row"])
+        row_units = (pad_dim(cg.config.d_head) * cg.elem_bytes) // UNIT
+        off += row * row_units
+    return buf, off
 
 
 def emit_kv_store(cg: "CodeGenerator", node: IRNode) -> None:
     entry = kv_entry_for_node(cg, node)
+    dram_off = kv_stream_base_units(cg, node, entry)
     src_buf, src_off = kv_source_location(cg, node)
     decode_mode = bool(node.attrs.get("decode", cg.stream_name == "decode"))
     xfer_bytes = kv_transfer_bytes(cg, node, decode_default=decode_mode)
@@ -75,7 +100,7 @@ def emit_kv_store(cg: "CodeGenerator", node: IRNode) -> None:
             xfer_bytes,
             addr_reg,
             0,
-            dram_off_units=entry.dram_off_units,
+            dram_off_units=dram_off,
             runtime_patch_kind="kv_base",
             runtime_base_symbol=entry.base_symbol,
         )
@@ -86,7 +111,7 @@ def emit_kv_store(cg: "CodeGenerator", node: IRNode) -> None:
             xfer_bytes,
             addr_reg,
             0,
-            dram_off_units=entry.dram_off_units,
+            dram_off_units=dram_off,
             relocation_symbol=entry.base_symbol,
         )
     cg._emit(SyncInsn(resource_mask=0b001))
@@ -94,6 +119,7 @@ def emit_kv_store(cg: "CodeGenerator", node: IRNode) -> None:
 
 def emit_kv_load(cg: "CodeGenerator", node: IRNode) -> None:
     entry = kv_entry_for_node(cg, node)
+    dram_off = kv_stream_base_units(cg, node, entry)
     decode_mode = bool(node.attrs.get("decode", cg.stream_name == "decode"))
     xfer_bytes = kv_transfer_bytes(cg, node, decode_default=decode_mode)
     addr_reg = int(node.attrs.get("addr_reg", 2))
@@ -135,7 +161,7 @@ def emit_kv_load(cg: "CodeGenerator", node: IRNode) -> None:
             xfer_bytes,
             addr_reg,
             0,
-            dram_off_units=entry.dram_off_units,
+            dram_off_units=dram_off,
             relocation_symbol=entry.base_symbol,
         )
     elif decode_mode:
@@ -147,7 +173,7 @@ def emit_kv_load(cg: "CodeGenerator", node: IRNode) -> None:
             xfer_bytes,
             addr_reg,
             0,
-            dram_off_units=entry.dram_off_units,
+            dram_off_units=dram_off,
             runtime_patch_kind="kv_base",
             runtime_base_symbol=entry.base_symbol,
         )
@@ -158,7 +184,7 @@ def emit_kv_load(cg: "CodeGenerator", node: IRNode) -> None:
             xfer_bytes,
             addr_reg,
             0,
-            dram_off_units=entry.dram_off_units,
+            dram_off_units=dram_off,
             relocation_symbol=entry.base_symbol,
         )
     cg._emit(SyncInsn(resource_mask=0b001))

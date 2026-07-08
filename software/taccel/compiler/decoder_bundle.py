@@ -323,16 +323,22 @@ def build_decoder_program_bundle(
     gelu_from_accum_blocks: Optional[set[int]] = None,
     use_fp16_activations: bool = False,
     biases: Optional[Dict[str, np.ndarray]] = None,
+    n_streams: int = 1,
 ) -> DecoderBundleBuild:
     """Build a ProgramBundle from already-formed decoder IR graphs.
 
     All FP tiles are FP16 (2 bytes/element) — the INT8-activation (W8A8)
     path was retired with the DeiT/RTL tooling. `use_fp16_activations`
     is kept for signature compatibility but is always True.
+
+    `n_streams` (Phase 2 lockstep batched decode) sizes the KV cache to hold
+    that many independent per-stream caches per head entry. `n_streams=1`
+    (default) is byte-identical to the single-stream cache.
     """
     elem_bytes = 2
     kv_layout = build_kv_cache_layout(
         model_config, max_seq_len=max_seq_len, elem_bytes=elem_bytes,
+        n_streams=n_streams,
     )
     prefill_graph = _copy_graph_with_logits_store(prefill_graph, stream_name="prefill")
     decode_graph = _copy_graph_with_logits_store(decode_graph, stream_name="decode")
