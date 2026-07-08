@@ -305,8 +305,23 @@ def _build_graph(shape: NanoGPTShape, variant: str) -> IRGraph:
     elif variant == "non_attention_seq16":
         seq_len = 16
         include_attention = False
+    elif variant == "forward_batch16":
+        # Phase 2 lockstep batched decode (B=16). The 16 query rows share the
+        # non-attention path (embeddings/LN/FFN/quant/logits are all M-shaped
+        # and batch for free). Attention is emitted in the ordinary *dense*
+        # (16, key) form here so the decode graph references the same weights
+        # as the single-token prefill graph (they must share one data blob).
+        # Step 2b rewrites the KV/attention lowering to be per-stream
+        # block-diagonal — each of the 16 streams owns its own K/V cache and
+        # cannot share one dense QK^T tile; that transform lives in the KV
+        # injection + attention emitters, not the frontend shape.
+        seq_len = 16
+        include_attention = True
     else:
-        raise ValueError("variant must be 'forward_1token' or 'non_attention_seq16'")
+        raise ValueError(
+            "variant must be 'forward_1token', 'non_attention_seq16', "
+            "or 'forward_batch16'"
+        )
 
     graph = IRGraph()
     prev = _emit_embeddings(graph, seq_len, shape)

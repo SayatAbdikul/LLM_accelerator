@@ -94,6 +94,29 @@ class HostRunner:
         self.simulator.run_program(self.bundle, "decode", max_instructions=max_instructions)
         return self._read_logits(self.bundle.decode_logits_offset)
 
+    def run_decode_step_batch(self, token_ids: Sequence[int], position: int, *,
+                              max_instructions: int = 10_000_000) -> np.ndarray:
+        """Drive one lockstep batched decode step (Phase 2).
+
+        All ``len(token_ids)`` streams advance to the same ``position`` (single
+        ``valid_kv_len`` scalar — ragged batching is out of scope). The token
+        count must match the decode stream's embedding patch-site count (16 for
+        a ``batch=16`` bundle, 1 for a single-token bundle).
+
+        NOTE: until step 2c wires the ``store_rows=16`` logits store, this
+        returns only the row-0 logits window; the per-stream logits split
+        arrives with 2c. KV bases are patched with the shared decode base until
+        2b adds the per-stream stream axis.
+        """
+        if position < 0:
+            raise ValueError("position must be non-negative")
+        tokens = [int(tok) for tok in token_ids]
+        self._patch_embeddings("decode", tokens, [int(position)] * len(tokens))
+        self._patch_kv_bases(int(position))
+        self._patch_decode_attention_context(int(position))
+        self.simulator.run_program(self.bundle, "decode", max_instructions=max_instructions)
+        return self._read_logits(self.bundle.decode_logits_offset)
+
     @staticmethod
     def _greedy_token(logits: np.ndarray) -> int:
         if logits.size == 0:

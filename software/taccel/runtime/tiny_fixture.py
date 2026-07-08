@@ -414,8 +414,17 @@ def build_stage3_tiny_decoder_bundle(
     smoke_decode_steps: int = 2,
     calibration_scales: Optional[Dict[str, float]] = None,
     ptq_preset: str | Stage5PTQPreset | None = None,
+    batch: int = 1,
 ) -> TinyFixtureBundle:
-    """Build the full 1-token tiny decoder ProgramBundle used by Stage 3 tests."""
+    """Build the full 1-token tiny decoder ProgramBundle used by Stage 3 tests.
+
+    ``batch`` selects the decode-stream shape. ``batch=1`` (default) keeps the
+    single-token decoder byte-identical to before. ``batch=16`` builds the
+    Phase 2 lockstep batched decode stream (16 query rows through the shared
+    non-attention path); the prefill stream stays single-token regardless.
+    """
+    if batch not in (1, 16):
+        raise ValueError("build_stage3_tiny_decoder_bundle: batch must be 1 or 16")
     resolved_preset = resolve_stage5_ptq_preset(ptq_preset)
     activation_percentile_nodes = dict(resolved_preset.activation_percentile_nodes)
     if calibration_scales is None:
@@ -453,7 +462,21 @@ def build_stage3_tiny_decoder_bundle(
         _mark_gelu_from_accum_inline(graph, gelu_from_accum_blocks)
     decode_key_len = 1 + int(smoke_decode_steps)
     prefill_graph = inject_kv_cache_nodes(graph, config, decode=False, seq_len=1)
-    decode_graph = inject_kv_cache_nodes(graph, config, decode=True, seq_len=decode_key_len)
+    if batch == 1:
+        decode_graph = inject_kv_cache_nodes(graph, config, decode=True, seq_len=decode_key_len)
+    else:
+        # Phase 2 (2a): batched decode stream is a distinct 16-row frontend
+        # graph. It shares the prefill weights/scales (so the codegen data
+        # blobs match), only the activation row count differs.
+        frontend_b = load_nanogpt(
+            config=payload["model_args"],
+            state_dict=payload["state_dict"],
+            variant="forward_batch16",
+        )
+        decode_src = mark_runtime_embedding_lookups(frontend_b.graph)
+        if gelu_from_accum_blocks:
+            _mark_gelu_from_accum_inline(decode_src, gelu_from_accum_blocks)
+        decode_graph = inject_kv_cache_nodes(decode_src, config, decode=True, seq_len=decode_key_len)
     build = build_decoder_program_bundle(
         prefill_graph=prefill_graph,
         decode_graph=decode_graph,
