@@ -234,7 +234,8 @@ module sfu_engine
     F_G2_CW             = 7'd70,  // fused compute+write (FP16 elementwise ops)
     F_G2_QLC            = 7'd71,  // QUANT fused load+compute (FP16 in / INT8 out)
     F_G2_DQL            = 7'd72,  // DEQUANT fused int32-load+compute+write
-    F_G2_VLC            = 7'd73   // VADD fused src2-load+compute+write
+    F_G2_VLC            = 7'd73,  // VADD fused src2-load+compute+write
+    F_G2_GLC            = 7'd74   // GELU fused load+compute+write (FP16 in / FP16 out)
   } sfu_state_t;
 
   sfu_state_t state;
@@ -356,6 +357,17 @@ module sfu_engine
   // iter>>3 < vlc_vis_q; row_data_q is already fully loaded).
   logic         vlc_load_q;
   logic [12:0]  vlc_vis_q;
+  // F_G2_GLC (GELU 0x1B fused load+compute+write, mode-1): GELU is a single-
+  // operand FP16-in/FP16-out elementwise op (like QUANT but FP16-out). Its
+  // operand streams into row_data_q on port B (8 elem/cyc, SAME rate as the
+  // 8-wide gelu compute) WHILE the compute + FP16 writeback run as concurrent
+  // trailing tracks -> the compute+write pass is hidden behind the load (op
+  // cost ~g2_rows: the single irreducible port-B operand load). glc_load_q =
+  // FP16 chunks still streaming on port B; glc_vis_q = count of chunks captured
+  // & visible in row_data_q (compute chunk iter ready when iter>>3 < glc_vis_q).
+  // Load track == F_G2_QLC's; compute+write track == F_G2_VLC's (FP16 out).
+  logic         glc_load_q;
+  logic [12:0]  glc_vis_q;
   // Streamed-load lagging capture pointer: the chunk index whose SRAM read
   // data is on the bus this cycle (read_idx_q is the leading issue pointer,
   // running one chunk ahead). Lets the F_G2_S1/S2 load loops issue one SRAM
@@ -818,6 +830,8 @@ module sfu_engine
       dq_vis_q       <= 13'h0;
       vlc_load_q     <= 1'b0;
       vlc_vis_q      <= 13'h0;
+      glc_load_q     <= 1'b0;
+      glc_vis_q      <= 13'h0;
       ld_cap_q       <= 13'h0;
       gelu_part_q    <= 2'h0;
       attn_k_idx_q   <= 16'h0;
@@ -1010,6 +1024,20 @@ module sfu_engine
             write_chunk_q <= 11'h0;
             cw_have_q     <= 1'b0;
             state         <= F_G2_QLC;
+          // GELU (mode-1, 0x1B): single-operand FP16-in/FP16-out; fuse the FP16
+          // load with the 8-wide gelu compute + FP16 writeback (F_G2_GLC) instead
+          // of the sequential F_G2_S1_LATCH -> F_G2_SYNTH_ITER -> F_G2_PACK/WRITE.
+          // Same FP16 8-elem/cyc load as QUANT (F_G2_QLC), FP16 output like VADD.
+          // Mode-0/DPI keeps the old F_G2_COMPUTE path (this branch is mode-1-gated).
+          end else if (SFU_SYNTH_MODE == 1 && opcode_q == OP_GELU_FP32) begin
+            ld_cap_q      <= read_idx_q;          // chunk on the bus next cycle (==0)
+            read_idx_q    <= read_idx_q + 13'd1;  // issue pointer -> chunk 1
+            iter_idx_q    <= 11'h0;
+            glc_vis_q     <= 13'h0;
+            glc_load_q    <= 1'b1;
+            write_chunk_q <= 11'h0;
+            cw_have_q     <= 1'b0;
+            state         <= F_G2_GLC;
           // DEQUANT (mode-1, 0x17/0x1E): reorder src2 (per-col scales/bias) ahead
           // of the int32 src1 so the src1 load fuses with compute+write in
           // F_G2_DQL. dq_params_done_q sequences the two visits here: 0 -> bounce
@@ -1419,6 +1447,95 @@ module sfu_engine
           end
         end
 
+        // 2026-07-08: GELU (0x1B) FULLY-FUSED load+compute+write (mode-1). GELU
+        // is a single-operand FP16-in/FP16-out elementwise op; after the 8-wide
+        // widening (1a) its compute is 8 elem/cyc, the SAME rate as the FP16 load.
+        // F_G2_GLC streams the operand into row_data_q (port B, 8/cyc, == F_G2_QLC
+        // load) WHILE the 8-wide gelu + FP16 writeback run as concurrent trailing
+        // tracks (== F_G2_VLC compute/write), vs the old load -> F_G2_SYNTH_ITER
+        // compute -> F_G2_PACK/WRITE three passes. Op cost ~3*g2_rows -> ~g2_rows
+        // (the single irreducible port-B operand load; compute+write hide behind
+        // it). Three pointers:
+        //   * ld_cap_q / glc_vis_q : FP16 load capture -> row_data_q (8/cyc).
+        //   * iter_idx_q           : 8-wide gelu -> out_h_q, trailing the load
+        //                            (chunk iter ready when iter>>3 < glc_vis_q).
+        //   * write_chunk_q        : FP16 write chunk (== F_G2_CW/VLC pack/addr).
+        // Load=portB, write=portA, compute=regs -> no clash. Bit-exact vs the
+        // unfused path: identical FP16 capture (synth_lat_h2f -> row_data_q),
+        // identical 8-wide gelu (synth_out_bits_lane, the F_G2_SYNTH_ITER
+        // datapath: gelu_out -> f2h), identical FP16 pack (g2_write_data_w) +
+        // addresses in chunk order; only overlapped. fmax-neutral: the
+        // row_data_q->gelu->f2h->out_h_q compute path is the exact
+        // F_G2_SYNTH_ITER path (unchanged), and load->row_data_q / out_h_q->
+        // row_write_q boundaries are preserved; tracks never chain. Mode-0/DPI
+        // never enters here (GELU there: S1_LATCH -> F_G2_COMPUTE DPI whole-row).
+        F_G2_GLC: begin
+          integer cap_base;
+          if (cw_have_q && sram_a_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);       // FP16 write OOB
+            state        <= F_FAULT;
+          end else if (glc_load_q && sram_b_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);       // FP16 load OOB
+            state        <= F_FAULT;
+          end else if (write_chunk_q >= g2_rows_q[10:0]) begin
+            // Every FP16 chunk written (the comb committed the last staged chunk
+            // this cycle when cw_have_q). Advance row / finish.
+            cw_have_q     <= 1'b0;
+            iter_idx_q    <= 11'h0;
+            write_chunk_q <= 11'h0;
+            glc_vis_q     <= 13'h0;
+            glc_load_q    <= 1'b0;
+            if (row_idx_q + 15'd1 < m_rows_q) begin
+              row_idx_q  <= row_idx_q + 15'd1;
+              read_idx_q <= 13'h0;
+              state      <= F_G2_S1_REQ;
+            end else begin
+              state <= F_IDLE;
+            end
+          end else begin
+            // LOAD track: capture the FP16 chunk ld_cap_q -> row_data_q
+            // (synth_lat_h2f, the synthesizable FP16->fp32 of the port-B bus;
+            // == F_G2_QLC load / F_G2_S1_LATCH FP16 branch). Same rate as compute.
+            if (glc_load_q) begin
+              cap_base = integer'(ld_cap_q) * 8;
+              for (int lane = 0; lane < 8; lane++)
+                if ((cap_base + lane) < integer'(n_elems_q))
+                  row_data_q[cap_base + lane] <= synth_lat_h2f[lane];
+              glc_vis_q <= glc_vis_q + 13'd1;          // chunk ld_cap_q visible next cycle
+              if (read_idx_q < {2'h0, g2_rows_q[10:0]}) begin
+                ld_cap_q   <= read_idx_q;
+                read_idx_q <= read_idx_q + 13'd1;
+              end else begin
+                glc_load_q <= 1'b0;                    // last chunk captured
+              end
+            end
+            // COMPUTE track: 8-wide gelu chunk iter_idx_q -> out_h_q once its
+            // chunk is captured & visible (iter>>3 < glc_vis_q). Same datapath as
+            // F_G2_SYNTH_ITER (op-mux selects gelu_out for OP_GELU_FP32).
+            if (({5'h0, iter_idx_q[10:3]} < glc_vis_q) &&
+                ({5'h0, iter_idx_q} < n_elems_q)) begin
+              for (int lane = 0; lane < 8; lane++) begin
+                automatic logic [10:0] wr_idx = iter_idx_q + 11'(lane);
+                if (({5'h0, iter_idx_q} + 16'(lane)) < n_elems_q)
+                  out_h_q[wr_idx[9:0]] <= synth_out_bits_lane[lane];
+              end
+              iter_idx_q <= iter_idx_q + 11'd8;
+            end
+            // WRITE track: stage FP16 chunk write_chunk_q once compute produced it
+            // ({iter>>3} > write_chunk_q) or compute finished (iter >= n_elems).
+            if ((write_chunk_q < g2_rows_q[10:0]) &&
+                (({3'h0, iter_idx_q[10:3]} > write_chunk_q) ||
+                 ({5'h0, iter_idx_q} >= n_elems_q))) begin
+              row_write_q   <= g2_write_data_w;       // packs out_h_q[8*write_chunk_q..]
+              g2_wr_addr_q  <= write_chunk_q;
+              write_chunk_q <= write_chunk_q + 11'd1;
+              cw_have_q     <= 1'b1;
+            end else begin
+              cw_have_q     <= 1'b0;
+            end
+          end
+        end
+
         // Streamed src2 load (LN/0x1E gamma||beta, or VADD 2nd operand). Same
         // pipeline as src1: F_G2_S2_REQ primes chunk 0; F_G2_S2_LATCH captures
         // chunk ld_cap_q while the comb block issues read_idx_q.
@@ -1680,6 +1797,22 @@ module sfu_engine
       F_G2_VLC: begin
         sram_b_buf = src2_buf_q;
         sram_b_row = g2_s2_addr_w[15:0];
+        sram_b_en  = (read_idx_q < {2'h0, g2_rows_q[10:0]});
+        if (cw_have_q) begin
+          sram_a_en    = 1'b1;
+          sram_a_we    = 1'b1;
+          sram_a_buf   = dst_buf_q;
+          sram_a_row   = g2_dst_addr_w[15:0];
+          sram_a_wdata = row_write_q;
+        end
+      end
+
+      // GELU fused load+compute+write: FP16 src1 read on port B (g2_s1_addr_w,
+      // == F_G2_QLC / F_G2_S1_LATCH FP16 arm) while the staged FP16 output chunk
+      // is written on port A (g2_dst_addr_w, == F_G2_CW / F_G2_VLC) when cw_have_q.
+      F_G2_GLC: begin
+        sram_b_buf = src1_buf_q;
+        sram_b_row = g2_s1_addr_w[15:0];
         sram_b_en  = (read_idx_q < {2'h0, g2_rows_q[10:0]});
         if (cw_have_q) begin
           sram_a_en    = 1'b1;
