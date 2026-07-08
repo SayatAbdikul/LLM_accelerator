@@ -506,7 +506,7 @@
         //   F_G2_SM_OUT:  iterate; out[iter] = f2h(exp(row-max)/exp_sum) if
         //                 visible & have_vis & exp_sum!=0, else 0.
         F_G2_SM_MAX: begin
-          if ({5'h0, iter_idx_q} < sm_iter_bound_w) begin
+          if ({5'h0, iter_idx_q} < sm_eff_bound_w) begin
             // Opcode-aware visibility via sm_visible_w (gen-1, gen-2, and
             // ATTN share this sub-FSM). For kt<0 in gen-2, no iter passes
             // since iter is unsigned ≥ 0; gen-1 unmasked is always visible.
@@ -525,7 +525,7 @@
         end
 
         F_G2_SM_EXPSUM: begin
-          if ({5'h0, iter_idx_q} < sm_iter_bound_w) begin
+          if ({5'h0, iter_idx_q} < sm_eff_bound_w) begin
             if (sm_have_vis_q && sm_visible_w)
               sm_exp_sum_q <= sm_sum_add_w;  // exp_sum += exp(row - row_max)
             iter_idx_q <= iter_idx_q + 11'd1;

@@ -524,6 +524,33 @@
     endcase
   end
 
+  // Runtime-bounded MAX/EXPSUM walk for gen-2 causal masked softmax. For
+  // OP_MASKED_SOFTMAX_FP32 the visible set is EXACTLY the contiguous prefix
+  // iter in [0, sm_keep_through_q] (sm_visible_w = iter <= keep_through), so the
+  // MAX and EXPSUM reductions — which accumulate ONLY visible elements, in
+  // element order — reach their final value at iter == keep_through; the
+  // invisible tail (keep_through, sm_iter_bound_w) contributes nothing
+  // (excluded from the max; exp gated to 0 in expsum). Bounding those two walks
+  // to keep_through+1 is therefore bit-exact (identical values & accumulation
+  // order) and skips the masked tail — a position-dependent decode win, since
+  // decode's keep_through = position grows with the sequence while the compiled
+  // key width sm_iter_bound_w stays at the context budget. keep_through is
+  // treated as the same non-negative value sm_visible_w uses ({1'b0, kt}), so
+  // the bound matches the mask exactly. The OUT pass keeps the full
+  // sm_iter_bound_w walk (it must write 0 for every masked column, consumed by
+  // the AV matmul). All other softmax opcodes keep the full bound (their
+  // visible set is not this keep_through prefix), so they are unchanged.
+  logic [16:0] sm_kt_p1_w;
+  assign sm_kt_p1_w = {1'b0, sm_keep_through_q[15:0]} + 17'd1;  // keep_through + 1
+  logic [15:0] sm_eff_bound_w;
+  always_comb begin
+    if ((opcode_q == OP_MASKED_SOFTMAX_FP32) &&
+        (sm_kt_p1_w < {1'b0, sm_iter_bound_w}))
+      sm_eff_bound_w = sm_kt_p1_w[15:0];
+    else
+      sm_eff_bound_w = sm_iter_bound_w;
+  end
+
   // Phase-3.B ATTN V_LATCH parallel 16-lane synth datapath. Each cycle:
   //   weight   = exp(row_data_q[k_idx] - row_max) / exp_sum   (visible only)
   //   per lane: attn_accum_q[idx] += weight * sign_ext(v_lane) * scale1_q
