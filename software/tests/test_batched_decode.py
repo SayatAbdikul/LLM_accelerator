@@ -1,20 +1,30 @@
-"""Phase 2 (2a) tests: lockstep batched decode graph builds + runs in golden.
+"""Phase 2 tests: lockstep batched (B=16) decode — graph, golden, RTL byte-match.
 
 The batched decode stream carries 16 query rows through the shared
 non-attention path (embeddings/LN/FFN/quant/logits are all M-shaped and batch
-for free). Attention is emitted dense here so the decode graph references the
-same weights as the single-token prefill graph — they share one data blob.
-Per-stream block-diagonal attention + the byte-exact RTL leg arrive in 2b.
+for free); attention is per-stream block-diagonal (each stream runs the
+single-token query_len=1 QK^T/softmax/AV against its own KV cache). The final
+test is the bit-exact contract: the mode-1 synth RTL and the mode-0 golden
+model produce byte-identical logits for the batched decode program.
 """
 import importlib.util
+import json
+import subprocess
+import tempfile
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from taccel.assembler.assembler import ProgramBinary
 from taccel.compiler.frontend import load_frontend
 from taccel.runtime.host_runner import HostRunner
 from taccel.runtime.tiny_fixture import build_stage3_tiny_decoder_bundle
+
+RTL_SYNTH_BINARY = (
+    Path(__file__).resolve().parents[2]
+    / "rtl" / "verilator" / "build" / "run_program_synth" / "Vtaccel_top"
+)
 
 
 TOOL_PATH = Path(__file__).resolve().parents[1] / "tools" / "train_tiny_fixture.py"
@@ -125,6 +135,55 @@ def test_batched_decode_runs_clean_in_golden(tmp_path):
 
     assert out.shape == (tiny.logits_size,)
     assert np.any(out)
+
+
+def test_batched_decode_rtl_matches_golden_bytes(tmp_path):
+    """Bit-exact contract: mode-1 synth RTL == mode-0 golden on the batched
+    decode program (byte-identical logits)."""
+    if not RTL_SYNTH_BINARY.exists():
+        pytest.skip(f"synth RTL binary not built: {RTL_SYNTH_BINARY}")
+    payload = _build_payload(tmp_path)
+    tiny = build_stage3_tiny_decoder_bundle(payload, smoke_decode_steps=2, batch=16)
+    bundle = tiny.build.bundle
+    pos = 1
+    tokens16 = [(3 + s) % 64 for s in range(16)]
+
+    # Golden (mode-0 DPI).
+    runner = HostRunner(bundle, logits_dtype=np.int8)
+    runner.run_prefill([(5 + s) % 64 for s in range(16)])
+    golden = runner.run_decode_step_batch(tokens16, pos)
+
+    # Extract the standalone decode program and run it on the synth RTL,
+    # dumping the logits region for a byte compare.
+    patcher = HostRunner(bundle, simulator=None)
+    patcher._patch_embeddings("decode", tokens16, [pos] * 16)
+    patcher._patch_kv_bases(pos)
+    patcher._patch_decode_attention_context(pos)
+    image = bundle.materialize(reset_runtime=False)
+    data_base = int(bundle.data_base)
+    decode_only = bytes(image[int(bundle.decode_instrs_offset):data_base])
+    pb = ProgramBinary(
+        instructions=decode_only, data=bytes(image[data_base:]), entry_point=0,
+        insn_count=len(decode_only) // 8, data_base=data_base,
+        input_offset=0, pos_embed_patch_dram_offset=0, pos_embed_cls_dram_offset=0,
+        cls_token_dram_offset=0, trace_manifest={}, compiler_manifest={},
+    )
+    td = Path(tempfile.mkdtemp())
+    (td / "p.bin").write_bytes(pb.to_bytes())
+    logits_off, logits_size = int(bundle.decode_logits_offset), int(bundle.logits_size)
+    argv = [str(RTL_SYNTH_BINARY), "--program", str(td / "p.bin"),
+            "--json-out", str(td / "s.json"), "--fast-beats", "--max-cycles", "20000000",
+            "--dram-dump-offset", str(logits_off), "--dram-dump-size", str(logits_size),
+            "--dram-dump-out", str(td / "dram.bin")]
+    cp = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
+    assert (td / "s.json").exists(), f"RTL run failed: {cp.stderr[-800:]}"
+    summ = json.loads((td / "s.json").read_text())
+    assert summ.get("status") == "halted" and not summ.get("fault"), summ
+    rtl = np.frombuffer((td / "dram.bin").read_bytes(), dtype=np.int8)[:golden.shape[0]]
+
+    assert np.array_equal(golden, rtl), (
+        f"RTL != golden: {int(np.sum(golden != rtl))}/{golden.shape[0]} bytes differ"
+    )
 
 
 def test_batch1_decode_still_matches_single_token_path(tmp_path):
