@@ -52,15 +52,18 @@ from taccel.runtime.tiny_fixture import (
 # --------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GOLDEN_MODEL_PATH = REPO_ROOT / "software" / "taccel" / "golden_model" / "simulator.py"
-# git-blob SHA-1 of simulator.py. Freeze §6 REVISION 2026-05-17 (P6g /
-# Option B, task #110): the 0x18 QUANT_FP32_INT8 non-finite contract was
-# made explicit (NaN->0, +-inf->saturate); numerically identical to the
-# prior idiom on the pinned numpy (all gen-2 .raw fixtures byte-stable,
-# only the meta.json sha-stamp changed) but a source change, so the
-# content pin is re-pinned. Prior: 7746e65598961ac8430f8eeece45d7ec976584cd
+# git-blob SHA-1 of simulator.py. Freeze §6 REVISION 2026-07-08 (W4
+# tile_config extension): commit 2ae4535 added the weight_int4 flag to
+# the simulator tile_config + packed-INT4 read paths. Gen-2 W8 semantics
+# untouched (flag defaults off): all gen-2 .raw fixtures regenerated
+# byte-identical, only the meta.json sha-stamps changed — a source
+# change, so the content pin is re-pinned per freeze §6.
+# Prior: 131d3ef1a6009519976cf99baf9157a434e67f6f (§6 REVISION 2026-05-17,
+# P6g / Option B, task #110: explicit 0x18 non-finite contract, also
+# byte-stable). Earlier: 7746e65598961ac8430f8eeece45d7ec976584cd
 # (pre-P6g; freeze commit aa9a9c0). New commit SHA is set by the user on
 # external commit; this blob hash is the authoritative enforced pin.
-FROZEN_GOLDEN_BLOB_SHA = "131d3ef1a6009519976cf99baf9157a434e67f6f"
+FROZEN_GOLDEN_BLOB_SHA = "8fd46a159169696e306fb8f601a1857452bd1fcb"
 
 # freeze §4.5: the conformance bundle is the GPT-2 W8A16 weight_only_int8_quarot
 # generation. Its FP32 sub-layer ops are the gen-2 ISA this freeze covers.
