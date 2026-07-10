@@ -53,6 +53,9 @@ module sfu_engine
   input  logic [9:0]   tile_m,
   input  logic [9:0]   tile_n,
   input  logic [9:0]   tile_k,
+  // m_exact (freeze §6 rev 2026-07-10): exact row count for the SFU row
+  // loops; 0 = full tiles ((tile_m+1)*16, legacy behaviour).
+  input  logic [11:0]  m_exact,
   input  logic         attn_valid,
   input  logic [11:0]  attn_query_row_base,
   input  logic [11:0]  attn_valid_kv_len,
@@ -508,7 +511,12 @@ module sfu_engine
     end
   endfunction
 
-  assign dispatch_m_rows_w        = ({5'h0, tile_m} + 15'd1) << 4;
+  // m_exact != 0 overrides the tile-quantized row count. Dispatch-stage
+  // logic only (latched into m_rows_q at op dispatch) — no change to the
+  // per-row loop compare paths or any fp32 primitive.
+  assign dispatch_m_rows_w        = (m_exact != 12'd0)
+                                    ? {3'h0, m_exact}
+                                    : (({5'h0, tile_m} + 15'd1) << 4);
   assign dispatch_n_tiles_w       = {1'b0, tile_n} + 11'd1;
   assign dispatch_k_tiles_w       = {1'b0, tile_k} + 11'd1;
   assign dispatch_n_chunks_i32_w  = dispatch_n_tiles_w << 2;

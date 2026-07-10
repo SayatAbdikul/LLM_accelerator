@@ -249,6 +249,14 @@ C_K_SHIFT = 29
 # and does NOT widen the instruction word. Default 0 keeps every existing
 # W8 CONFIG_TILE bit-identical. See plan §3.1 + [[w4a16-phase1-quality]].
 C_WEIGHT_INT4_SHIFT = 28
+# m_exact (freeze §6 rev 2026-07-10). Bits [27:16] of CONFIG_TILE carry an
+# exact SFU row count: 0 = full tiles ((M+1)*16 rows, legacy — every
+# pre-existing bundle encodes 0), k>0 = the SFU row loops walk exactly k
+# rows. Consumed ONLY by the SFU engine (RTL: sfu_engine dispatch_m_rows_w
+# mux; golden: the SFU _exec_* row bounds). Systolic MATMUL and the helper
+# engine keep the tile-quantized (M+1)*16. Encoder-additive inside the free
+# C-type bits — default 0 keeps every existing CONFIG_TILE bit-identical.
+C_M_EXACT_SHIFT = 16
 
 # ATTN-type CONFIG_ATTN fields
 ATTN_QUERY_ROW_BASE_SHIFT = 47

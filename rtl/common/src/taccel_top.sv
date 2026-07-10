@@ -203,7 +203,9 @@ module taccel_top
   logic [27:0] addr_imm28;
   logic        tile_we;
   logic [9:0]  tile_m_in, tile_n_in, tile_k_in;
+  logic [11:0] m_exact_in;
   logic [9:0]  tile_m, tile_n, tile_k;
+  logic [11:0] m_exact;   // exact SFU row count (0 = full tiles); SFU-only
   logic        tile_valid;
   logic        attn_we;
   logic [11:0] attn_query_row_base_in;
@@ -681,6 +683,7 @@ module taccel_top
     .tile_m_in      (tile_m_in),
     .tile_n_in      (tile_n_in),
     .tile_k_in      (tile_k_in),
+    .m_exact_in     (m_exact_in),
     .attn_we        (attn_we),
     .attn_query_row_base_in(attn_query_row_base_in),
     .attn_valid_kv_len_in  (attn_valid_kv_len_in),
@@ -746,6 +749,7 @@ module taccel_top
     .tile_m_in    (tile_m_in),
     .tile_n_in    (tile_n_in),
     .tile_k_in    (tile_k_in),
+    .m_exact_in   (m_exact_in),
     .attn_we      (attn_we),
     .attn_query_row_base_in(attn_query_row_base_in),
     .attn_valid_kv_len_in  (attn_valid_kv_len_in),
@@ -753,6 +757,7 @@ module taccel_top
     .tile_m       (tile_m),
     .tile_n       (tile_n),
     .tile_k       (tile_k),
+    .m_exact      (m_exact),
     .tile_valid   (tile_valid),
     .attn_valid   (attn_valid),
     .attn_query_row_base(attn_query_row_base),
@@ -815,6 +820,7 @@ module taccel_top
     .tile_m         (tile_m),
     .tile_n         (tile_n),
     .tile_k         (tile_k),
+    .m_exact        (m_exact),
     .attn_valid     (attn_valid),
     .attn_query_row_base(attn_query_row_base),
     .attn_valid_kv_len  (attn_valid_kv_len),

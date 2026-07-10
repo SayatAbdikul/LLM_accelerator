@@ -158,6 +158,10 @@ module decode_unit
     insn.c_tile_m = insn_data[58:49];
     insn.c_tile_n = insn_data[48:39];
     insn.c_tile_k = insn_data[38:29];
+    // m_exact (freeze §6 rev 2026-07-10): exact SFU row count; 0 = full
+    // tiles (legacy). Pre-existing bundles carry zeros in [27:16] (the
+    // bits were ignored), so decode stays backward byte-compatible.
+    insn.c_m_exact = insn_data[27:16];
 
     // ATTN-type fields
     insn.attn_query_row_base = insn_data[58:47];

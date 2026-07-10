@@ -52,6 +52,7 @@ module control_unit
   output logic [9:0]    tile_m_in,
   output logic [9:0]    tile_n_in,
   output logic [9:0]    tile_k_in,
+  output logic [11:0]   m_exact_in,
 
   output logic          attn_we,
   output logic [11:0]   attn_query_row_base_in,
@@ -547,6 +548,7 @@ module control_unit
     tile_m_in    = insn.c_tile_m;
     tile_n_in    = insn.c_tile_n;
     tile_k_in    = insn.c_tile_k;
+    m_exact_in   = insn.c_m_exact;
 
     attn_we      = 1'b0;
     attn_query_row_base_in = insn.attn_query_row_base;

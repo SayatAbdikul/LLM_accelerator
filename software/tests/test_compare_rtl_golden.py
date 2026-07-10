@@ -63,7 +63,7 @@ GOLDEN_MODEL_PATH = REPO_ROOT / "software" / "taccel" / "golden_model" / "simula
 # byte-stable). Earlier: 7746e65598961ac8430f8eeece45d7ec976584cd
 # (pre-P6g; freeze commit aa9a9c0). New commit SHA is set by the user on
 # external commit; this blob hash is the authoritative enforced pin.
-FROZEN_GOLDEN_BLOB_SHA = "8fd46a159169696e306fb8f601a1857452bd1fcb"
+FROZEN_GOLDEN_BLOB_SHA = "029605f58c56002c06848fa5a18e42ec69513409"
 
 # freeze §4.5: the conformance bundle is the GPT-2 W8A16 weight_only_int8_quarot
 # generation. Its FP32 sub-layer ops are the gen-2 ISA this freeze covers.
@@ -128,7 +128,7 @@ def test_frozen_golden_sha_pin():
     actual = _git_blob_sha1(GOLDEN_MODEL_PATH)
     assert actual == FROZEN_GOLDEN_BLOB_SHA, (
         "FROZEN GOLDEN DRIFT — gen-2 conformance is undefined.\n"
-        f"  expected blob {FROZEN_GOLDEN_BLOB_SHA} (freeze §6 rev 2026-05-17, P6g/B)\n"
+        f"  expected blob {FROZEN_GOLDEN_BLOB_SHA} (freeze §6 rev 2026-07-10, m_exact)\n"
         f"  actual   blob {actual}\n"
         f"  file: {GOLDEN_MODEL_PATH}\n"
         "simulator.py changed since the freeze. Per freeze §6 this REQUIRES "

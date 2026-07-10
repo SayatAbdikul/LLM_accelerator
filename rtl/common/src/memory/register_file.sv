@@ -62,6 +62,7 @@ module register_file
   input  logic [9:0]  tile_m_in,
   input  logic [9:0]  tile_n_in,
   input  logic [9:0]  tile_k_in,
+  input  logic [11:0] m_exact_in,
 
   // --- Attention config write (CONFIG_ATTN) ---
   input  logic        attn_we,
@@ -73,6 +74,9 @@ module register_file
   output logic [9:0]  tile_m,
   output logic [9:0]  tile_n,
   output logic [9:0]  tile_k,
+  // m_exact (freeze §6 rev 2026-07-10): exact SFU row count latched with
+  // the tile config; 0 = full tiles (legacy). Consumed only by sfu_engine.
+  output logic [11:0] m_exact,
   output logic        tile_valid,     // 0 until first CONFIG_TILE
 
   // --- Attention config read ---
@@ -130,11 +134,13 @@ module register_file
       tile_m     <= 10'h0;
       tile_n     <= 10'h0;
       tile_k     <= 10'h0;
+      m_exact    <= 12'h0;
       tile_valid <= 1'b0;
     end else if (tile_we) begin
       tile_m     <= tile_m_in;
       tile_n     <= tile_n_in;
       tile_k     <= tile_k_in;
+      m_exact    <= m_exact_in;
       tile_valid <= 1'b1;
     end
   end

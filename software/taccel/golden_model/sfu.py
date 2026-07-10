@@ -159,6 +159,9 @@ def execute_layernorm(state, insn):
     m_tiles = state.tile_config[0] + 1
     n_tiles = state.tile_config[1] + 1
     M = m_tiles * 16
+    # m_exact (freeze §6 rev 2026-07-10): exact SFU row count when nonzero.
+    if len(state.tile_config) > 4 and state.tile_config[4]:
+        M = int(state.tile_config[4])
     N = n_tiles * 16
 
     in_scale, out_scale = _get_dual_scales(state, insn.sreg)
@@ -203,6 +206,9 @@ def execute_softmax(state, insn):
     m_tiles = state.tile_config[0] + 1
     n_tiles = state.tile_config[1] + 1
     M = m_tiles * 16
+    # m_exact (freeze §6 rev 2026-07-10): exact SFU row count when nonzero.
+    if len(state.tile_config) > 4 and state.tile_config[4]:
+        M = int(state.tile_config[4])
     N = n_tiles * 16
 
     in_scale, out_scale = _get_dual_scales(state, insn.sreg)
@@ -245,6 +251,9 @@ def execute_masked_softmax(state, insn):
     m_tiles = state.tile_config[0] + 1
     n_tiles = state.tile_config[1] + 1
     M = m_tiles * 16
+    # m_exact (freeze §6 rev 2026-07-10): exact SFU row count when nonzero.
+    if len(state.tile_config) > 4 and state.tile_config[4]:
+        M = int(state.tile_config[4])
     N = n_tiles * 16
 
     in_scale, out_scale = _get_dual_scales(state, insn.sreg)
@@ -285,6 +294,9 @@ def execute_gelu(state, insn):
     m_tiles = state.tile_config[0] + 1
     n_tiles = state.tile_config[1] + 1
     M = m_tiles * 16
+    # m_exact (freeze §6 rev 2026-07-10): exact SFU row count when nonzero.
+    if len(state.tile_config) > 4 and state.tile_config[4]:
+        M = int(state.tile_config[4])
     N = n_tiles * 16
 
     in_scale, out_scale = _get_dual_scales(state, insn.sreg)
@@ -343,6 +355,9 @@ def execute_softmax_attnv(state, insn):
     n_tiles = state.tile_config[1] + 1
     k_tiles = state.tile_config[2] + 1
     M = m_tiles * 16
+    # m_exact (freeze §6 rev 2026-07-10): exact SFU row count when nonzero.
+    if len(state.tile_config) > 4 and state.tile_config[4]:
+        M = int(state.tile_config[4])
     N = n_tiles * 16
     K = k_tiles * 16
 
@@ -405,6 +420,9 @@ def execute_masked_softmax_attnv(state, insn):
     n_tiles = state.tile_config[1] + 1
     k_tiles = state.tile_config[2] + 1
     M = m_tiles * 16
+    # m_exact (freeze §6 rev 2026-07-10): exact SFU row count when nonzero.
+    if len(state.tile_config) > 4 and state.tile_config[4]:
+        M = int(state.tile_config[4])
     N = n_tiles * 16
     K = k_tiles * 16
 

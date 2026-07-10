@@ -10,7 +10,7 @@ from .opcodes import (
     B_SRC_BUF_SHIFT, B_SRC_OFF_SHIFT, B_DST_BUF_SHIFT, B_DST_OFF_SHIFT,
     B_LENGTH_SHIFT, B_SRC_ROWS_SHIFT, B_TRANSPOSE_SHIFT,
     A_ADDR_REG_SHIFT, A_IMM28_SHIFT,
-    C_M_SHIFT, C_N_SHIFT, C_K_SHIFT, C_WEIGHT_INT4_SHIFT,
+    C_M_SHIFT, C_N_SHIFT, C_K_SHIFT, C_WEIGHT_INT4_SHIFT, C_M_EXACT_SHIFT,
     ATTN_QUERY_ROW_BASE_SHIFT, ATTN_VALID_KV_LEN_SHIFT, ATTN_MODE_SHIFT, ATTN_RESERVED_MASK,
     SS_SREG_SHIFT, SS_SRC_MODE_SHIFT, SS_IMM16_SHIFT,
     SYNC_RESOURCE_MASK_SHIFT,
@@ -111,6 +111,9 @@ def encode(insn: Instruction) -> bytes:
         # W4A16 plan Phase 2: bit [28] selects W4 weights for the next matmul.
         if getattr(insn, "weight_int4", False):
             word |= 1 << C_WEIGHT_INT4_SHIFT
+        # m_exact (freeze §6 rev 2026-07-10): bits [27:16]; 0 (default)
+        # keeps the word bit-identical to the pre-extension encoding.
+        word |= (getattr(insn, "m_exact", 0) & MASK_12BIT) << C_M_EXACT_SHIFT
 
     elif fmt == InsnFormat.ATTN_TYPE:
         word |= (insn.query_row_base & MASK_12BIT) << ATTN_QUERY_ROW_BASE_SHIFT
@@ -187,6 +190,7 @@ def decode(data: bytes) -> Instruction:
             N=(word >> C_N_SHIFT) & MASK_10BIT,
             K=(word >> C_K_SHIFT) & MASK_10BIT,
             weight_int4=bool((word >> C_WEIGHT_INT4_SHIFT) & 0x1),
+            m_exact=(word >> C_M_EXACT_SHIFT) & MASK_12BIT,
         )
 
     elif fmt == InsnFormat.ATTN_TYPE:

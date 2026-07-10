@@ -265,6 +265,19 @@ To make golden-vs-RTL cosim possible on the production path:
    within the same or a later commit, so the pin is enforced at the
    content level: the SHA-1 git-blob hash of
    `software/taccel/golden_model/simulator.py` is
+   `029605f58c56002c06848fa5a18e42ec69513409` (**freeze §6 REVISION
+   2026-07-10, m_exact CONFIG_TILE extension**: CONFIG_TILE bits [27:16]
+   now carry `m_exact`, an exact SFU row count (0 = full tiles, the
+   legacy behaviour every pre-extension bundle encodes — decode of old
+   words is bit-identical). The simulator `tile_config` grows to a
+   5-tuple with `m_exact` at [4]; the 14 SFU `_exec_*` row bounds in
+   `simulator.py` and the 6 legacy INT8-path ops in `golden_model/sfu.py`
+   honor it via partial read/write of the leading M rows. Systolic
+   `execute_matmul` and the helper engine keep the tile-quantized
+   `(M+1)*16` — the field is SFU-only, mirroring the RTL
+   (`sfu_engine.dispatch_m_rows_w` mux; `decode_unit`/`register_file`
+   plumbing added the same day). Gen-2 W8 semantics untouched: all gen-2
+   `.raw` fixtures regenerate byte-identical. Prior pin
    `8fd46a159169696e306fb8f601a1857452bd1fcb` (**freeze §6 REVISION
    2026-07-08, W4 tile_config extension**: commit `2ae4535` ("Add INT4
    weight packing and W4 support") extended the simulator `tile_config`

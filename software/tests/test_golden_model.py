@@ -37,8 +37,10 @@ class TestSIMDMatmul:
         # Execute CONFIG_TILE
         sim.step()  # CONFIG_TILE
 
-        # Manually check tile config is set
-        assert sim.state.tile_config == (0, 0, 0)  # encoded as 0-based
+        # Manually check tile config is set: (M, N, K, weight_int4, m_exact)
+        # — 0-based M/N/K; weight_int4 False (W4 ext 2026-05-24); m_exact 0
+        # = full tiles (freeze §6 rev 2026-07-10).
+        assert sim.state.tile_config == (0, 0, 0, False, 0)
 
         sim.step()  # HALT (but already halted by CONFIG_TILE)
 

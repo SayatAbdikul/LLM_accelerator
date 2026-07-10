@@ -496,8 +496,16 @@ class Simulator:
             # FROZEN_GOLDEN_BLOB_SHA pin in test_compare_rtl_golden.py — that
             # is the freeze §6 trigger reserved for Phase 4 (user-owned
             # commit per freeze policy).
+            # m_exact (freeze §6 rev 2026-07-10): extend tile_config to a
+            # 5-tuple carrying the exact SFU row count at [4]. 0 = full
+            # tiles (legacy; every pre-extension bundle encodes 0, so
+            # indices [0..3] readers and all W8/W4 outputs stay
+            # bit-identical). Consulted ONLY by the SFU _exec_* row
+            # bounds below and golden_model/sfu.py — systolic
+            # execute_matmul and the helper keep (M+1)*16.
             self.state.tile_config = (
                 insn.M, insn.N, insn.K, bool(getattr(insn, "weight_int4", False)),
+                int(getattr(insn, "m_exact", 0)),
             )
         elif op == Opcode.CONFIG_ATTN:
             self._exec_config_attn(insn)
@@ -658,6 +666,10 @@ class Simulator:
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
+        # m_exact (freeze §6 rev 2026-07-10): SFU ops walk exactly this
+        # many rows when nonzero (partial read/write of the leading rows).
+        if len(self.state.tile_config) > 4 and self.state.tile_config[4]:
+            M = int(self.state.tile_config[4])
         N = n_tiles * 16
 
         # FP16 scale register widened to FP32 — no extra precision introduced
@@ -690,6 +702,10 @@ class Simulator:
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
+        # m_exact (freeze §6 rev 2026-07-10): SFU ops walk exactly this
+        # many rows when nonzero (partial read/write of the leading rows).
+        if len(self.state.tile_config) > 4 and self.state.tile_config[4]:
+            M = int(self.state.tile_config[4])
         N = n_tiles * 16
 
         src = mem.read_int32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
@@ -715,6 +731,10 @@ class Simulator:
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
+        # m_exact (freeze §6 rev 2026-07-10): SFU ops walk exactly this
+        # many rows when nonzero (partial read/write of the leading rows).
+        if len(self.state.tile_config) > 4 and self.state.tile_config[4]:
+            M = int(self.state.tile_config[4])
         N = n_tiles * 16
 
         # FP16 scale register widened to FP32 — no extra precision introduced
@@ -747,6 +767,10 @@ class Simulator:
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
+        # m_exact (freeze §6 rev 2026-07-10): SFU ops walk exactly this
+        # many rows when nonzero (partial read/write of the leading rows).
+        if len(self.state.tile_config) > 4 and self.state.tile_config[4]:
+            M = int(self.state.tile_config[4])
         N = n_tiles * 16
 
         if insn.src1_buf == BUF_ABUF:
@@ -789,6 +813,10 @@ class Simulator:
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
+        # m_exact (freeze §6 rev 2026-07-10): SFU ops walk exactly this
+        # many rows when nonzero (partial read/write of the leading rows).
+        if len(self.state.tile_config) > 4 and self.state.tile_config[4]:
+            M = int(self.state.tile_config[4])
         N = n_tiles * 16
 
         accum_rescale = np.float32(self.state.scale_regs[insn.sreg])
@@ -836,6 +864,10 @@ class Simulator:
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
+        # m_exact (freeze §6 rev 2026-07-10): SFU ops walk exactly this
+        # many rows when nonzero (partial read/write of the leading rows).
+        if len(self.state.tile_config) > 4 and self.state.tile_config[4]:
+            M = int(self.state.tile_config[4])
         N = n_tiles * 16
 
         src = mem.read_int32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
@@ -862,6 +894,10 @@ class Simulator:
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
+        # m_exact (freeze §6 rev 2026-07-10): SFU ops walk exactly this
+        # many rows when nonzero (partial read/write of the leading rows).
+        if len(self.state.tile_config) > 4 and self.state.tile_config[4]:
+            M = int(self.state.tile_config[4])
         N = n_tiles * 16
 
         scale = np.float32(self.state.scale_regs[insn.sreg])
@@ -895,6 +931,10 @@ class Simulator:
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
+        # m_exact (freeze §6 rev 2026-07-10): SFU ops walk exactly this
+        # many rows when nonzero (partial read/write of the leading rows).
+        if len(self.state.tile_config) > 4 and self.state.tile_config[4]:
+            M = int(self.state.tile_config[4])
         N = n_tiles * 16
 
         src1 = mem.read_fp16_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
@@ -931,6 +971,10 @@ class Simulator:
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
+        # m_exact (freeze §6 rev 2026-07-10): SFU ops walk exactly this
+        # many rows when nonzero (partial read/write of the leading rows).
+        if len(self.state.tile_config) > 4 and self.state.tile_config[4]:
+            M = int(self.state.tile_config[4])
         N = n_tiles * 16
 
         src = mem.read_fp16_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
@@ -963,6 +1007,10 @@ class Simulator:
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
+        # m_exact (freeze §6 rev 2026-07-10): SFU ops walk exactly this
+        # many rows when nonzero (partial read/write of the leading rows).
+        if len(self.state.tile_config) > 4 and self.state.tile_config[4]:
+            M = int(self.state.tile_config[4])
         N = n_tiles * 16
 
         src = mem.read_fp16_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
@@ -991,6 +1039,10 @@ class Simulator:
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
+        # m_exact (freeze §6 rev 2026-07-10): SFU ops walk exactly this
+        # many rows when nonzero (partial read/write of the leading rows).
+        if len(self.state.tile_config) > 4 and self.state.tile_config[4]:
+            M = int(self.state.tile_config[4])
         N = n_tiles * 16
 
         src = mem.read_fp16_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
@@ -1020,6 +1072,10 @@ class Simulator:
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
+        # m_exact (freeze §6 rev 2026-07-10): SFU ops walk exactly this
+        # many rows when nonzero (partial read/write of the leading rows).
+        if len(self.state.tile_config) > 4 and self.state.tile_config[4]:
+            M = int(self.state.tile_config[4])
         N = n_tiles * 16
 
         ctx = self.state.attn_context
@@ -1085,6 +1141,10 @@ class Simulator:
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
+        # m_exact (freeze §6 rev 2026-07-10): SFU ops walk exactly this
+        # many rows when nonzero (partial read/write of the leading rows).
+        if len(self.state.tile_config) > 4 and self.state.tile_config[4]:
+            M = int(self.state.tile_config[4])
         N = n_tiles * 16
 
         src = mem.read_int32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
@@ -1131,6 +1191,10 @@ class Simulator:
         m_tiles = self.state.tile_config[0] + 1
         n_tiles = self.state.tile_config[1] + 1
         M = m_tiles * 16
+        # m_exact (freeze §6 rev 2026-07-10): SFU ops walk exactly this
+        # many rows when nonzero (partial read/write of the leading rows).
+        if len(self.state.tile_config) > 4 and self.state.tile_config[4]:
+            M = int(self.state.tile_config[4])
         N = n_tiles * 16
 
         src = mem.read_fp16_tile(self.state, insn.src1_buf, insn.src1_off, M, N)

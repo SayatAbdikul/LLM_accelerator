@@ -4,7 +4,7 @@
   "src1_off": 0,
   "src2_off": 512,
   "dst_off": 1024,
-  "frozen_golden_sha": "0aeb5972838dc3e925093b0156e483eb6414b4e9",
+  "frozen_golden_sha": "4d845892f3f3d4c490d90b6902e8f6029e0c39f0",
   "op": "max_abs_reduce_fp32",
   "opcode": 31,
   "sreg": 5,

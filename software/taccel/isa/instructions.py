@@ -299,11 +299,19 @@ class ConfigTileInsn(Instruction):
     # (Phase 3 RTL) / `golden_model/memory.read_int4_tile` (Phase 2 golden).
     # Encoded at bit [28] (see `C_WEIGHT_INT4_SHIFT` in opcodes.py).
     weight_int4: bool = False
+    # m_exact (freeze §6 rev 2026-07-10): exact SFU row count at bits
+    # [27:16] (see `C_M_EXACT_SHIFT`). 0 = full tiles ((M+1)*16 rows,
+    # legacy behaviour — default keeps every existing CONFIG_TILE
+    # bit-identical); k>0 = SFU row loops walk exactly k rows. Ignored
+    # by systolic MATMUL and the helper engine.
+    m_exact: int = 0
 
     def __post_init__(self):
         for name, val in [("M", self.M), ("N", self.N), ("K", self.K)]:
             if not (0 <= val <= 1023):
                 raise ValueError(f"{name} must be 0-1023 (encoded), got {val}")
+        if not (0 <= self.m_exact <= 0xFFF):
+            raise ValueError(f"m_exact must be 0-4095, got {self.m_exact}")
 
 
 # --- ATTN-type instruction ---

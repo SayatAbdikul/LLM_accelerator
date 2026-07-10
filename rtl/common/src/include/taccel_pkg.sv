@@ -180,9 +180,14 @@ package taccel_pkg;
 
     // ---- C-TYPE: CONFIG_TILE ----
     // Bits [58:49]=M, [48:39]=N, [38:29]=K  (0-based; actual = field + 1)
+    // Bits [27:16]=m_exact (freeze §6 rev 2026-07-10): exact SFU row count.
+    // 0 = full tiles ((M+1)*16 rows, legacy — every pre-existing bundle
+    // encodes 0 here); k>0 = SFU row loops walk exactly k rows. Consumed
+    // ONLY by sfu_engine; systolic/helper keep (M+1)*16.
     logic [9:0]  c_tile_m;
     logic [9:0]  c_tile_n;
     logic [9:0]  c_tile_k;
+    logic [11:0] c_m_exact;
 
     // ---- ATTN-TYPE: CONFIG_ATTN ----
     // Bits [58:47]=query_row_base, [46:35]=valid_kv_len,
