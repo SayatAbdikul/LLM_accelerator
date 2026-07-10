@@ -51,6 +51,40 @@ stages 33 KB in ABUF). Program sizes: b1 94,878→93,726 insns, b16
 
 ---
 
+## 0.1 UPDATE (same day) — lever C LANDED (`1bb5f51` C-2 ISA/RTL/golden, `6bc4dd7` C-3a attention core, `85e181e` C-3b shared ops)
+
+`m_exact` (12-bit exact SFU row count in CONFIG_TILE[27:16]; 0 = full-tile
+legacy): the SFU row loops walk the real rows instead of the 16-row-quantized
+tile count. C-2 wired ISA/RTL/golden in lockstep — SFU-only, systolic MATMUL +
+helper ignore the field, and m_exact=0 keeps every pre-existing bundle byte-
+identical. C-3a stamped the per-head attention core (QK^T / masked-softmax / AV
++ store-time `kv_quant`); C-3b the per-token dynamic-quant matmuls (MAX_ABS /
+QUANT / DEQUANT across all three lowering paths — simple, large-weight-tiled,
+large-input-streamed — including the fc2 act-quant f=3 reshape) plus LN / GELU /
+residual VADD. Bit-exact per commit: golden logits byte-diff 12/12 identical
+(tiny + 124M, b1 + b16), mode-1 RTL == mode-0 golden byte-match, full suite
+zero new failures vs the 16 pre-existing.
+
+**Measured after lever C (same protocol as the baseline table):**
+
+| shape | cyc/step | cyc/tok | tok/s | Δ vs A | Δ vs base | sfu | sys | dma beats |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| decode B=1, pos 511 | 21,075,507 | 21,075,507 | **1.633** | **+45.0%** | **+60.7%** | 0.63M | 12.39M | 10.53M |
+| decode B=16, pos 510 | 76,550,463 | 4,784,404 | **7.192** | **+89.5%** | **+157.6%** | 10.06M | 35.51M | 19.33M |
+
+Closure: sys_busy AND dma_beats are invariant to the cycle on BOTH shapes
+(systolic + DMA untouched — m_exact is SFU-only), so every delta is pure SFU
+row-walk. b1 sfu 10.13M → 0.63M (−93.7%: the attention core + every per-token
+dynamic-quant epilogue shed 15/16 of their walk). b16 sfu 78.55M → 10.06M
+(−87.2%, entirely C-3a — C-3b is a no-op at b16 because the 16 batched streams
+fill M_pad, so M==M_pad → m_exact=0 on every shared op). Program byte-count
+unchanged (m_exact rides existing CONFIG_TILE immediates): b1 93,726 insns,
+b16 221,634. SFU is now near-eliminated for b1; **sys_busy (systolic) is the
+new floor on both shapes** → the next cycle lever is B (packed attention) or
+the systolic/K^T-transpose path (D), not the SFU.
+
+---
+
 ## 1. Where the cycles go
 
 ### 1.1 Batch-1 decode step, measured per-opcode (fresh profile, HEAD)
@@ -156,7 +190,16 @@ stays (see D). New-row quant: the (16,64) K/V projection tiles are quantized
 once per (layer,head) — full 16-row utilization — then rows stored.
 Gate: byte-match cosim (outputs identical by construction) + kv-layout tests.
 
-### 2C. `m_exact` — exact SFU row count (small ISA extension, big cut)
+### 2C. `m_exact` — exact SFU row count (small ISA extension, big cut) — **DELIVERED, see §0.1**
+
+Landed as designed with two refinements: the field is **12-bit** (bits
+[27:16], not 5-bit — decode M can reach 1024 at prefill) and **MAX_ABS *was*
+adopted** after all. The reduction-safety worry below was resolved: pad rows
+are zero-filled before every MAX_ABS, so bounding to the real rows gives the
+identical max (|0| ≤ any real value). Result beat the estimate: **b16 7.192
+tok/s (est. ~7.1), b1 1.633 (est. ~1.16)** — b1 far exceeded because C-3b's
+shared-op adoption (matmuls + LN/GELU/VADD, not just attention) near-eliminated
+the batch-1 SFU (10.13M → 0.63M). Original plan text preserved below.
 
 CONFIG_TILE bits **[28:0] are free and already ignored by the RTL decoder**
 (`decode_unit.sv:158-160` extracts only [58:29]; the W4 bit [28] exists only
@@ -275,9 +318,12 @@ any of these also shrinks batch-1 decode.
    **G (W4)** if/when prefill or DRAM footprint matters.
 
 Waterfall (B=16, ctx-512, honest-BW, 34.41 MHz unless noted):
-2.79 → A 3.65 → +C 6.5 → +B ~9 → +D ~10.5-11 → +E ~12-13 → +F ~18+ tok/s.
-Single-stream decode rides along: 1.016 → ~1.09 (A) → ~1.16 (A+C) → ~1.3 (B,D).
-**A landed (§0): b1 1.126 (beat the ~1.09 estimate); b16 3.796 (beat the ~3.65 estimate) — the waterfall now starts from 3.80.**
+2.79 → A 3.80 → +C **7.19** → +B ~9 → +D ~10.5-11 → +E ~12-13 → +F ~18+ tok/s.
+Single-stream decode rides along: 1.016 → 1.126 (A) → **1.633 (A+C)** → ~1.8+ (B,D).
+**A landed (§0): b1 1.126, b16 3.796 — both beat estimate.**
+**C landed (§0.1): b16 3.796 → 7.192 (beat the ~6.5-7.1 estimate); b1 1.126 →
+1.633 (far beat the ~1.16 estimate — C-3b's shared-op adoption near-eliminated
+batch-1 SFU). sys_busy is now the floor on both shapes → B/D are next, not SFU.**
 
 ## 4. Floors (what "done" looks like at this fmax)
 
