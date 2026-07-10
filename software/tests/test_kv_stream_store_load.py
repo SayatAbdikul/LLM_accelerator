@@ -78,8 +78,10 @@ def test_per_stream_store_load_round_trips_without_contamination():
     sim = Simulator()
     sim.load_bundle(bundle)
 
-    # Row s of the batched projection is 32 bytes (16 FP16) all equal to s.
-    row_bytes = D_HEAD * 2
+    # Row s of the batched projection tile is 16 bytes (16 INT8 — the KV
+    # cache stores store-time-quantized int8 rows since lever A) all equal
+    # to s.
+    row_bytes = D_HEAD * 1
     src = np.zeros((N_STREAMS, row_bytes), dtype=np.uint8)
     for s in range(N_STREAMS):
         src[s, :] = s
@@ -102,5 +104,6 @@ def test_per_stream_store_load_round_trips_without_contamination():
 
 def test_kv_cache_is_sized_for_all_streams():
     build = _build()
-    # 1 layer * 2 kinds * 1 head * (16 streams * seq_len(4) * d_head(16) * 2B)
-    assert build.bundle.kv_cache_size == 1 * 2 * 1 * (N_STREAMS * 4 * D_HEAD * 2)
+    # 1 layer * 2 kinds * 1 head * (16 streams * seq_len(4) * d_head(16) * 1B)
+    # — INT8 KV cache (lever A), half the FP16 footprint.
+    assert build.bundle.kv_cache_size == 1 * 2 * 1 * (N_STREAMS * 4 * D_HEAD * 1)

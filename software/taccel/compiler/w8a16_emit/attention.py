@@ -103,39 +103,74 @@ def emit_matmul_qkt_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     n_tiles = N_pad // TILE
     k_tiles = K_pad // TILE
 
-    # FP32 Q and K input allocs from the upstream per-head Q/K matmuls.
+    # Lever A: the decode K input is the kv_load's INT8 tile (store-time
+    # quantized with the same static scale this emitter would apply) —
+    # no FP16 K copy exists, and Stage 2 + the pad-row zero-fill drop out.
+    k_int8_from_cache = bool(node.attrs.get("k_int8_from_cache"))
+    if k_int8_from_cache:
+        # Lazy import: emit.kv module-imports w8a16_emit._common, so a
+        # module-level import here would be entry-order-circular.
+        from ..emit.kv import kv_int8_full_rows
+
+    # FP32 Q (and, on the non-cache path, K) input allocs from the
+    # upstream per-head Q/K matmuls.
     q_fp32_alloc = cg.mem.abuf.get(node.inputs[0]) or _abuf_alloc_fp32(
         cg, node.inputs[0], M_pad, K_pad
     )
-    k_fp32_alloc = cg.mem.abuf.get(node.inputs[1]) or _abuf_alloc_fp32(
-        cg, node.inputs[1], N_pad, K_pad
-    )
+    if k_int8_from_cache:
+        k_cache_alloc = cg.mem.abuf.get(node.inputs[1])
+        if k_cache_alloc is None:
+            raise KeyError(
+                f"Missing ABUF allocation '{node.inputs[1]}' (int8 kv_load) "
+                f"for {node.name}"
+            )
+        # The kv_load pulled pad_dim(key_len) rows from the stream's own
+        # zero-initialized cache span; only when the layout window caps
+        # that (never at GPT-2 shapes) do the remaining pad rows need an
+        # explicit INT8 zero-fill.
+        loaded_rows = kv_int8_full_rows(cg, key_len)
+        if loaded_rows < N_pad:
+            zero_pad_dram = cg._dram_offset_required(
+                "__zero_pad__", f"zeroing int8 K padding rows for '{node.name}'"
+            )
+            cg._emit_dma_load(
+                BUF_ABUF,
+                k_cache_alloc.offset_units + (loaded_rows * K_pad) // UNIT,
+                (N_pad - loaded_rows) * K_pad,
+                3,
+                zero_pad_dram,
+            )
+            cg._emit(SyncInsn(resource_mask=0b001))
+    else:
+        k_fp32_alloc = cg.mem.abuf.get(node.inputs[1]) or _abuf_alloc_fp32(
+            cg, node.inputs[1], N_pad, K_pad
+        )
 
-    # ----- M3-C: zero K's FP32 pad rows before quantization -----
-    # If key_len < N_pad, K has padding rows (e.g. seq_len=14 → N_pad=16
-    # has 2 padding rows). LN(zero_row) = β (non-zero) propagates into
-    # K's padding rows during the per-head K projection, so the FP32 K
-    # tile holds β-derived junk there. The downstream masked-softmax-FP32
-    # will mask those columns to -∞, but the K-QUANT runs first and
-    # would consume that junk; the safer (and matching-INT8) approach is
-    # to zero the FP32 pad rows BEFORE quantization so K's INT8 also
-    # has zero pad rows. `__zero_pad__` is sized 4× in W8A32 mode (see
-    # codegen._layout_weights), so the FP32 byte size fits.
-    if N_pad > key_len:
-        pad_rows = N_pad - key_len
-        k_row_units_fp32 = (K_pad * cg.elem_bytes) // UNIT
-        k_pad_units = k_fp32_alloc.offset_units + key_len * k_row_units_fp32
-        zero_pad_dram = cg._dram_offset_required(
-            "__zero_pad__", f"zeroing K padding rows for '{node.name}'"
-        )
-        cg._emit_dma_load(
-            BUF_ABUF,
-            k_pad_units,
-            pad_rows * K_pad * cg.elem_bytes,
-            3,
-            zero_pad_dram,
-        )
-        cg._emit(SyncInsn(resource_mask=0b001))
+        # ----- M3-C: zero K's FP32 pad rows before quantization -----
+        # If key_len < N_pad, K has padding rows (e.g. seq_len=14 → N_pad=16
+        # has 2 padding rows). LN(zero_row) = β (non-zero) propagates into
+        # K's padding rows during the per-head K projection, so the FP32 K
+        # tile holds β-derived junk there. The downstream masked-softmax-FP32
+        # will mask those columns to -∞, but the K-QUANT runs first and
+        # would consume that junk; the safer (and matching-INT8) approach is
+        # to zero the FP32 pad rows BEFORE quantization so K's INT8 also
+        # has zero pad rows. `__zero_pad__` is sized 4× in W8A32 mode (see
+        # codegen._layout_weights), so the FP32 byte size fits.
+        if N_pad > key_len:
+            pad_rows = N_pad - key_len
+            k_row_units_fp32 = (K_pad * cg.elem_bytes) // UNIT
+            k_pad_units = k_fp32_alloc.offset_units + key_len * k_row_units_fp32
+            zero_pad_dram = cg._dram_offset_required(
+                "__zero_pad__", f"zeroing K padding rows for '{node.name}'"
+            )
+            cg._emit_dma_load(
+                BUF_ABUF,
+                k_pad_units,
+                pad_rows * K_pad * cg.elem_bytes,
+                3,
+                zero_pad_dram,
+            )
+            cg._emit(SyncInsn(resource_mask=0b001))
 
     # Static calibration scales for the QKT re-quant boundary.
     DEFAULT_ACT_SCALE = 6.0 / 127.0
@@ -164,25 +199,32 @@ def emit_matmul_qkt_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     cg._emit(SyncInsn(resource_mask=0b100))
 
     # ----- Stage 2: QUANT_FP32_INT8(K) into an ABUF scratch -----
-    cg._emit(ConfigTileInsn(M=n_tiles - 1, N=k_tiles - 1, K=0))
-    sreg_k = cg._alloc_sreg()
-    cg._emit(
-        SetScaleInsn(
-            sreg=sreg_k, src_mode=0,
-            imm16=_fp16_to_uint16(1.0 / max(k_scale, 1e-12)),
+    # Lever A: skipped for cache-int8 K — the kv_load tile IS the INT8 K
+    # (bit-identical: same FP16 source bits, same static scale, quantized
+    # once at store time).
+    if k_int8_from_cache:
+        k_int8_off = k_cache_alloc.offset_units
+    else:
+        cg._emit(ConfigTileInsn(M=n_tiles - 1, N=k_tiles - 1, K=0))
+        sreg_k = cg._alloc_sreg()
+        cg._emit(
+            SetScaleInsn(
+                sreg=sreg_k, src_mode=0,
+                imm16=_fp16_to_uint16(1.0 / max(k_scale, 1e-12)),
+            )
         )
-    )
-    k_int8_alloc = cg.mem.abuf.alloc(f"{node.name}__k_int8", N_pad * K_pad)
-    cg._emit(
-        QuantFp32Int8Insn(
-            src1_buf=BUF_ABUF, src1_off=k_fp32_alloc.offset_units,
-            src2_buf=BUF_ABUF, src2_off=0,
-            dst_buf=BUF_ABUF, dst_off=k_int8_alloc.offset_units,
-            sreg=sreg_k,
-            flags=cg.fp_precision_flag,
+        k_int8_alloc = cg.mem.abuf.alloc(f"{node.name}__k_int8", N_pad * K_pad)
+        cg._emit(
+            QuantFp32Int8Insn(
+                src1_buf=BUF_ABUF, src1_off=k_fp32_alloc.offset_units,
+                src2_buf=BUF_ABUF, src2_off=0,
+                dst_buf=BUF_ABUF, dst_off=k_int8_alloc.offset_units,
+                sreg=sreg_k,
+                flags=cg.fp_precision_flag,
+            )
         )
-    )
-    cg._emit(SyncInsn(resource_mask=0b100))
+        cg._emit(SyncInsn(resource_mask=0b100))
+        k_int8_off = k_int8_alloc.offset_units
 
     # ----- Stage 3: BUF_COPY transpose K_int8 (ABUF) → K^T (WBUF) -----
     # Same mechanism as the INT8 _emit_qkt path: 1-byte/elem transpose,
@@ -191,7 +233,7 @@ def emit_matmul_qkt_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     kt_wbuf = cg.mem.wbuf.alloc(f"kt_head{head_idx}_{node.name}", K_pad * N_pad)
     cg._emit(
         BufCopyInsn(
-            src_buf=BUF_ABUF, src_off=k_int8_alloc.offset_units,
+            src_buf=BUF_ABUF, src_off=k_int8_off,
             dst_buf=BUF_WBUF, dst_off=kt_wbuf.offset_units,
             length=length_units,
             src_rows=N_pad // TILE,
@@ -206,13 +248,15 @@ def emit_matmul_qkt_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     # this frees 64 KB (k_loaded) + 16 KB (k_int8) = 80 KB ABUF before
     # the qkt out_alloc, which would otherwise OOM at head 7+ when
     # accumulated attn_v outputs (28 KB+) crowd the buffer.
+    # (Cache-int8 path: the only ABUF copy is the kv_load tile itself.)
     #
     # Gated by k_loaded being big enough to matter (≥ 16 KB) so unit
     # tests with seq_len=16/d_head=64 (= 4 KB) keep their allocations
     # alive for post-emit inspection.
-    k_size_bytes = N_pad * K_pad * cg.elem_bytes
+    k_size_bytes = N_pad * K_pad * (1 if k_int8_from_cache else cg.elem_bytes)
     if k_size_bytes >= 16 * 1024:
-        cg.mem.abuf.free(f"{node.name}__k_int8")
+        if not k_int8_from_cache:
+            cg.mem.abuf.free(f"{node.name}__k_int8")
         k_in_name = node.inputs[1]
         if cg.last_uses.get(k_in_name, -1) <= cg.current_node_idx:
             if cg.mem.abuf.get(k_in_name) is not None:
@@ -362,38 +406,67 @@ def emit_matmul_attn_v_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     n_tiles = N_pad // TILE
     k_tiles = Kseq_pad // TILE
 
+    # Lever A: the decode V input is the kv_load's INT8 tile (store-time
+    # quantized with the same static scale this emitter would apply).
+    v_int8_from_cache = bool(node.attrs.get("v_int8_from_cache"))
+    if v_int8_from_cache:
+        from ..emit.kv import kv_int8_full_rows  # lazy: avoids import cycle
+
     sm_fp32_alloc = cg.mem.abuf.get(node.inputs[0]) or _abuf_alloc_fp32(
         cg, node.inputs[0], M_pad, Kseq_pad
     )
-    v_fp32_alloc = cg.mem.abuf.get(node.inputs[1]) or _abuf_alloc_fp32(
-        cg, node.inputs[1], Kseq_pad, N_pad
-    )
+    if v_int8_from_cache:
+        v_cache_alloc = cg.mem.abuf.get(node.inputs[1])
+        if v_cache_alloc is None:
+            raise KeyError(
+                f"Missing ABUF allocation '{node.inputs[1]}' (int8 kv_load) "
+                f"for {node.name}"
+            )
+        # kv_load pulled pad_dim(key_len) zero-tail rows; only a layout-
+        # window cap (never at GPT-2 shapes) leaves rows to zero-fill.
+        loaded_rows = kv_int8_full_rows(cg, key_len)
+        if loaded_rows < Kseq_pad:
+            zero_pad_dram = cg._dram_offset_required(
+                "__zero_pad__", f"zeroing int8 V padding rows for '{node.name}'"
+            )
+            cg._emit_dma_load(
+                BUF_ABUF,
+                v_cache_alloc.offset_units + (loaded_rows * N_pad) // UNIT,
+                (Kseq_pad - loaded_rows) * N_pad,
+                3,
+                zero_pad_dram,
+            )
+            cg._emit(SyncInsn(resource_mask=0b001))
+    else:
+        v_fp32_alloc = cg.mem.abuf.get(node.inputs[1]) or _abuf_alloc_fp32(
+            cg, node.inputs[1], Kseq_pad, N_pad
+        )
 
-    # ----- M3-C: zero V's FP32 pad rows before quantization -----
-    # Same reasoning as K's pad-row zero-fill in emit_matmul_qkt_w8a16:
-    # LN(zero_row) = β contaminates V's padding rows downstream of the V
-    # projection. Zeroing the FP32 pad rows before V-QUANT ensures the
-    # attention output (softmax × V) doesn't include padded-position
-    # contributions. (Softmax probabilities for padded columns are
-    # already 0 — the MASKED_SOFTMAX_FP32 op masks them to -∞ before the
-    # exp — so this V pad-row zero-fill is a defense-in-depth measure
-    # that matches the INT8 path's behavior (see codegen._emit_attn_v
-    # lines 2249-2258).
-    if Kseq_pad > key_len:
-        pad_rows = Kseq_pad - key_len
-        v_row_units_fp32 = (N_pad * cg.elem_bytes) // UNIT
-        v_pad_units = v_fp32_alloc.offset_units + key_len * v_row_units_fp32
-        zero_pad_dram = cg._dram_offset_required(
-            "__zero_pad__", f"zeroing V padding rows for '{node.name}'"
-        )
-        cg._emit_dma_load(
-            BUF_ABUF,
-            v_pad_units,
-            pad_rows * N_pad * cg.elem_bytes,
-            3,
-            zero_pad_dram,
-        )
-        cg._emit(SyncInsn(resource_mask=0b001))
+        # ----- M3-C: zero V's FP32 pad rows before quantization -----
+        # Same reasoning as K's pad-row zero-fill in emit_matmul_qkt_w8a16:
+        # LN(zero_row) = β contaminates V's padding rows downstream of the V
+        # projection. Zeroing the FP32 pad rows before V-QUANT ensures the
+        # attention output (softmax × V) doesn't include padded-position
+        # contributions. (Softmax probabilities for padded columns are
+        # already 0 — the MASKED_SOFTMAX_FP32 op masks them to -∞ before the
+        # exp — so this V pad-row zero-fill is a defense-in-depth measure
+        # that matches the INT8 path's behavior (see codegen._emit_attn_v
+        # lines 2249-2258).
+        if Kseq_pad > key_len:
+            pad_rows = Kseq_pad - key_len
+            v_row_units_fp32 = (N_pad * cg.elem_bytes) // UNIT
+            v_pad_units = v_fp32_alloc.offset_units + key_len * v_row_units_fp32
+            zero_pad_dram = cg._dram_offset_required(
+                "__zero_pad__", f"zeroing V padding rows for '{node.name}'"
+            )
+            cg._emit_dma_load(
+                BUF_ABUF,
+                v_pad_units,
+                pad_rows * N_pad * cg.elem_bytes,
+                3,
+                zero_pad_dram,
+            )
+            cg._emit(SyncInsn(resource_mask=0b001))
 
     # Static calibration scales for the attn_v re-quant boundary.
     DEFAULT_ACT_SCALE = 6.0 / 127.0
@@ -432,25 +505,30 @@ def emit_matmul_attn_v_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
                 cg.mem.abuf.free(sm_in_name)
 
     # ----- Stage 2: QUANT_FP32_INT8(V) into an ABUF scratch -----
-    cg._emit(ConfigTileInsn(M=k_tiles - 1, N=n_tiles - 1, K=0))
-    sreg_v = cg._alloc_sreg()
-    cg._emit(
-        SetScaleInsn(
-            sreg=sreg_v, src_mode=0,
-            imm16=_fp16_to_uint16(1.0 / max(v_scale, 1e-12)),
+    # Lever A: skipped for cache-int8 V — the kv_load tile IS the INT8 V.
+    if v_int8_from_cache:
+        v_int8_off = v_cache_alloc.offset_units
+    else:
+        cg._emit(ConfigTileInsn(M=k_tiles - 1, N=n_tiles - 1, K=0))
+        sreg_v = cg._alloc_sreg()
+        cg._emit(
+            SetScaleInsn(
+                sreg=sreg_v, src_mode=0,
+                imm16=_fp16_to_uint16(1.0 / max(v_scale, 1e-12)),
+            )
         )
-    )
-    v_int8_alloc = cg.mem.abuf.alloc(f"{node.name}__v_int8", Kseq_pad * N_pad)
-    cg._emit(
-        QuantFp32Int8Insn(
-            src1_buf=BUF_ABUF, src1_off=v_fp32_alloc.offset_units,
-            src2_buf=BUF_ABUF, src2_off=0,
-            dst_buf=BUF_ABUF, dst_off=v_int8_alloc.offset_units,
-            sreg=sreg_v,
-            flags=cg.fp_precision_flag,
+        v_int8_alloc = cg.mem.abuf.alloc(f"{node.name}__v_int8", Kseq_pad * N_pad)
+        cg._emit(
+            QuantFp32Int8Insn(
+                src1_buf=BUF_ABUF, src1_off=v_fp32_alloc.offset_units,
+                src2_buf=BUF_ABUF, src2_off=0,
+                dst_buf=BUF_ABUF, dst_off=v_int8_alloc.offset_units,
+                sreg=sreg_v,
+                flags=cg.fp_precision_flag,
+            )
         )
-    )
-    cg._emit(SyncInsn(resource_mask=0b100))
+        cg._emit(SyncInsn(resource_mask=0b100))
+        v_int8_off = v_int8_alloc.offset_units
 
     # ----- Stage 3: BUF_COPY V_int8 (ABUF) → V (WBUF), no transpose -----
     # V's natural layout is [K, N] = [seq_len, d_head], which is what
@@ -459,7 +537,7 @@ def emit_matmul_attn_v_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     v_wbuf = cg.mem.wbuf.alloc(f"v_head{head_idx}_{node.name}", Kseq_pad * N_pad)
     cg._emit(
         BufCopyInsn(
-            src_buf=BUF_ABUF, src_off=v_int8_alloc.offset_units,
+            src_buf=BUF_ABUF, src_off=v_int8_off,
             dst_buf=BUF_WBUF, dst_off=v_wbuf.offset_units,
             length=length_units,
             src_rows=0,
@@ -471,11 +549,13 @@ def emit_matmul_attn_v_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     # M4-debug: same as QKT — free FP32 V (v_loaded) and V_int8 ABUF
     # regions now since the MATMUL reads V from WBUF, not ABUF. At
     # GPT-2 decode 256-token scale this frees 64 KB + 16 KB = 80 KB.
+    # (Cache-int8 path: the only ABUF copy is the kv_load tile itself.)
     # Gated by v_size >= 16 KB to preserve unit-test allocation
     # inspection at d_head=64 / seq_len=16 (= 4 KB v_loaded).
-    v_size_bytes = Kseq_pad * N_pad * cg.elem_bytes
+    v_size_bytes = Kseq_pad * N_pad * (1 if v_int8_from_cache else cg.elem_bytes)
     if v_size_bytes >= 16 * 1024:
-        cg.mem.abuf.free(f"{node.name}__v_int8")
+        if not v_int8_from_cache:
+            cg.mem.abuf.free(f"{node.name}__v_int8")
         v_in_name = node.inputs[1]
         if cg.last_uses.get(v_in_name, -1) <= cg.current_node_idx:
             if cg.mem.abuf.get(v_in_name) is not None:

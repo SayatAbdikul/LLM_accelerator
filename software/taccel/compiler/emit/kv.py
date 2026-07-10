@@ -1,4 +1,4 @@
-"""KV-cache emit helpers (store, load) + logits-store.
+"""KV-cache emit helpers (store, load, store-time quant) + logits-store.
 
 Free-function migrations of the original `_kv_*` and `_emit_kv_*` and
 `_emit_logits_store` methods on `CodeGenerator`. Semantics are
@@ -8,17 +8,31 @@ module-scope changes.
 The KV-cache layout (`self.kv_layout`) is required for every kv_load /
 kv_store; logits_store uses ABUF as a staging area for DRAM-temp
 sources and chunk-streams when the row would not fit ABUF whole.
+
+Lever A (int8 KV cache): `emit_kv_quant` quantizes the FP16 K/V
+projection tile ONCE at store time with the same static calibration
+scale the decode-side QKT/AV emitters would have applied after loading
+— so the cached int8 bytes are bit-identical to what the old
+per-step re-quantization produced, and `emit_matmul_{qkt,attn_v}_w8a16`
+consume the loaded tile directly (`k_int8_from_cache` /
+`v_int8_from_cache` node attrs).
 """
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Tuple
 
-from ...isa.instructions import SyncInsn
+from ...isa.instructions import (
+    ConfigTileInsn,
+    QuantFp32Int8Insn,
+    SetScaleInsn,
+    SyncInsn,
+)
 from ...isa.opcodes import ABUF_SIZE, BUF_ABUF
 from ..ir import IRNode
 from ..kv_cache import normalize_kv_kind
-from ..tiler import pad_dim
+from ..tiler import TILE, pad_dim
 from ._common import UNIT
+from ..w8a16_emit._common import _fp16_to_uint16
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..codegen import CodeGenerator
@@ -69,12 +83,81 @@ def kv_source_location(cg: "CodeGenerator", node: IRNode) -> Tuple[int, int]:
         buf, off = alloc.buf_id, alloc.offset_units
     # Phase 2: a per-stream kv_store reads row `src_row` of the batched K/V
     # projection tile (16 stream rows, one new token each). The row stride is
-    # the padded projection width in activation elements.
+    # the padded projection width in KV-cache elements — the source tile is a
+    # `kv_quant` output whose element size matches the cache layout.
     if "src_row" in node.attrs:
         row = int(node.attrs["src_row"])
-        row_units = (pad_dim(cg.config.d_head) * cg.elem_bytes) // UNIT
+        elem_bytes = int(cg.kv_layout.elem_bytes) if cg.kv_layout is not None else cg.elem_bytes
+        row_units = (pad_dim(cg.config.d_head) * elem_bytes) // UNIT
         off += row * row_units
     return buf, off
+
+
+def kv_int8_full_rows(cg: "CodeGenerator", key_len: int) -> int:
+    """Rows an int8 full-context kv_load actually transfers.
+
+    Loading `pad_dim(key_len)` rows makes the attention pad rows come from
+    the zero-initialized tail of the stream's own cache span (rows beyond
+    any written position) — bit-identical to the old fp16 path's explicit
+    zero-fill + QUANT(0)=0. Capped at the layout's per-stream row capacity;
+    a shortfall (only possible when `pad_dim(key_len)` exceeds the layout
+    window) is zero-filled by the consumer.
+    """
+    cap = int(cg.kv_layout.max_seq_len) if cg.kv_layout is not None else pad_dim(int(key_len))
+    return min(pad_dim(int(key_len)), cap)
+
+
+def emit_kv_quant(cg: "CodeGenerator", node: IRNode) -> None:
+    """Quantize a K/V projection tile to INT8 at store time (lever A).
+
+    One QUANT_FP32_INT8 over the whole (M_pad, d_head_pad) FP16 projection
+    tile, using the SAME static calibration scale the decode-side
+    QKT/AV emitter resolves for the corresponding kv_load input — this
+    equality is what makes the cached int8 bytes identical to the old
+    load-then-quantize path. `scale_keys` carries every consumer lookup
+    key (16 per-stream names for the batched graph); they must all
+    resolve to one scale or a single store-time quant cannot match them.
+    """
+    if not node.inputs:
+        raise ValueError(f"{node.name} requires the K/V projection tile as input")
+    src_alloc = cg.mem.abuf.get(node.inputs[0])
+    if src_alloc is None:
+        raise KeyError(f"Missing ABUF allocation '{node.inputs[0]}' for {node.name}")
+
+    keys = [str(k) for k in node.attrs.get("scale_keys", [])]
+    if not keys:
+        raise ValueError(f"{node.name} requires scale_keys (consumer kv_load names)")
+    DEFAULT_ACT_SCALE = 6.0 / 127.0
+    resolved = {float(cg.calibration_scales.get(k, DEFAULT_ACT_SCALE)) for k in keys}
+    if len(resolved) != 1:
+        raise ValueError(
+            f"{node.name}: consumer scales disagree across streams ({resolved}); "
+            "store-time KV quantization requires one shared scale"
+        )
+    scale = resolved.pop()
+
+    rows = int(node.output_shape[0]) if node.output_shape else 1
+    M_pad = pad_dim(rows)
+    K_pad = pad_dim(cg.config.d_head)
+    cg._emit(ConfigTileInsn(M=M_pad // TILE - 1, N=K_pad // TILE - 1, K=0))
+    sreg = cg._alloc_sreg()
+    cg._emit(
+        SetScaleInsn(
+            sreg=sreg, src_mode=0,
+            imm16=_fp16_to_uint16(1.0 / max(scale, 1e-12)),
+        )
+    )
+    out_alloc = cg.mem.abuf.alloc(node.name, M_pad * K_pad)
+    cg._emit(
+        QuantFp32Int8Insn(
+            src1_buf=BUF_ABUF, src1_off=src_alloc.offset_units,
+            src2_buf=BUF_ABUF, src2_off=0,
+            dst_buf=BUF_ABUF, dst_off=out_alloc.offset_units,
+            sreg=sreg,
+            flags=cg.fp_precision_flag,
+        )
+    )
+    cg._emit(SyncInsn(resource_mask=0b100))
 
 
 def emit_kv_store(cg: "CodeGenerator", node: IRNode) -> None:
@@ -115,6 +198,19 @@ def emit_kv_load(cg: "CodeGenerator", node: IRNode) -> None:
     xfer_bytes = kv_transfer_bytes(cg, node, decode_default=decode_mode)
     addr_reg = int(node.attrs.get("addr_reg", 2))
     dst_buf = int(node.attrs.get("dst_buf", BUF_ABUF))
+    tokens = int(node.attrs.get("tokens", 1))
+    dtype_int8 = str(node.attrs.get("dtype", "")) == "int8"
+    if (dtype_int8 and decode_mode and tokens > 1
+            and "xfer_bytes" not in node.attrs and cg.kv_layout is not None):
+        # Lever A: pull `pad_dim(key_len)` rows so the attention pad rows
+        # come from the zero-initialized tail of this stream's cache span
+        # (bit-identical to the old explicit zero-fill + QUANT(0)=0, and
+        # it deletes that zero-fill DMA from the QKT/AV emitters).
+        xfer_bytes = (
+            kv_int8_full_rows(cg, tokens)
+            * cg.config.d_head
+            * int(cg.kv_layout.elem_bytes)
+        )
     if "dst_off_units" in node.attrs:
         dst_off = int(node.attrs["dst_off_units"])
     else:
@@ -130,7 +226,8 @@ def emit_kv_load(cg: "CodeGenerator", node: IRNode) -> None:
             # QUANT's INT8 destination, corrupting the FP16 K source at offsets
             # [192..256] and producing NaN-decoded INT8 byte pairs (e.g. 0x09
             # 0xfc -> FP16 NaN). See tools/debug_w8a16_nan.py for the trace.
-            tile_elem_bytes = cg.elem_bytes
+            # Lever A: `dtype=int8` kv_loads hold 1-byte elements.
+            tile_elem_bytes = 1 if dtype_int8 else cg.elem_bytes
             alloc_bytes = max(alloc_bytes, rows * cols * tile_elem_bytes)
         # M4-debug: large W8A32 kv_load tiles (256-token K/V FP32 cache
         # at GPT-2 scale = 64 KB) fragment under first-fit. Compact
@@ -139,7 +236,6 @@ def emit_kv_load(cg: "CodeGenerator", node: IRNode) -> None:
             cg._compact_abuf()
         alloc = cg.mem.abuf.alloc(node.name, alloc_bytes)
         dst_off = alloc.offset_units
-    tokens = int(node.attrs.get("tokens", 1))
     if decode_mode and tokens > 1:
         # Full-context kv_load (tokens = seq_len): must always read from
         # position 0 so the QKT sees K[0..seq_len-1].  kv_store uses

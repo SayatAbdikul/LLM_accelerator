@@ -218,6 +218,8 @@ def inject_kv_cache_nodes(graph: IRGraph, config: ModelConfig, *,
             replacement = key_loads.get((int(layer), int(head)))
             if replacement is not None and len(copied.inputs) >= 2:
                 copied.inputs[1] = replacement
+                # Lever A: the kv_load delivers store-time-quantized INT8 K.
+                copied.attrs["k_int8_from_cache"] = True
             copied.attrs["query_len"] = int(copied.output_shape[0])
             copied.attrs["key_len"] = int(seq_len)
             copied.attrs["runtime_config_attn"] = True
@@ -241,6 +243,8 @@ def inject_kv_cache_nodes(graph: IRGraph, config: ModelConfig, *,
             replacement = value_loads.get((int(layer), int(head)))
             if replacement is not None and len(copied.inputs) >= 2:
                 copied.inputs[1] = replacement
+                # Lever A: the kv_load delivers store-time-quantized INT8 V.
+                copied.attrs["v_int8_from_cache"] = True
             copied.attrs["query_len"] = int(copied.output_shape[0])
             copied.attrs["key_len"] = int(seq_len)
             # Emit kv_load(V) IMMEDIATELY before matmul_attn_v.
@@ -256,10 +260,29 @@ def inject_kv_cache_nodes(graph: IRGraph, config: ModelConfig, *,
             continue
 
         kind = normalize_kv_kind(str(projection))
+        # Lever A: quantize the K/V projection to INT8 once at store time.
+        # `scale_keys` names the decode-side kv_load whose consumer QKT/AV
+        # would have re-quantized the loaded FP16 tile — resolving the SAME
+        # calibration key keeps the cached int8 bytes bit-identical to the
+        # old per-step re-quantization (prefill stores use the decode-side
+        # key too: it is the decode stream that consumes them).
+        quant_name = f"{copied.name}_kv_quant"
+        out.add_node(IRNode(
+            op="kv_quant",
+            name=quant_name,
+            inputs=[copied.name],
+            output_shape=tuple(copied.output_shape),
+            attrs={
+                "layer": int(layer),
+                "kind": kind,
+                "head": int(head),
+                "scale_keys": [f"{copied.name}_kv_load"],
+            },
+        ))
         out.add_node(IRNode(
             op="kv_store",
             name=f"{copied.name}_kv_store",
-            inputs=[copied.name],
+            inputs=[quant_name],
             output_shape=(),
             attrs={
                 "layer": int(layer),
@@ -288,6 +311,7 @@ def inject_kv_cache_nodes(graph: IRGraph, config: ModelConfig, *,
                 "head": int(head),
                 "tokens": int(seq_len),
                 "decode": True,
+                "dtype": "int8",
             },
         )
         pending_kv_load[load_name] = kv_load_node
@@ -336,8 +360,14 @@ def build_decoder_program_bundle(
     (default) is byte-identical to the single-stream cache.
     """
     elem_bytes = 2
+    # Lever A (int8 KV cache): K/V rows are quantized to INT8 at store time
+    # (`kv_quant` nodes) with the decode-side static calibration scales, so
+    # the cache stores 1 byte/elem — half the KV DRAM + DMA of the FP16
+    # cache and no per-step re-quantization. `elem_bytes` (=2) still governs
+    # FP16 activations (embedding rows, logits).
+    kv_elem_bytes = 1
     kv_layout = build_kv_cache_layout(
-        model_config, max_seq_len=max_seq_len, elem_bytes=elem_bytes,
+        model_config, max_seq_len=max_seq_len, elem_bytes=kv_elem_bytes,
         n_streams=n_streams,
     )
     prefill_graph = _copy_graph_with_logits_store(prefill_graph, stream_name="prefill")
@@ -418,13 +448,14 @@ def build_decoder_program_bundle(
         temp_size=temp_size,
         logits_size=logits_size,
         kv_cache_size=kv_layout.kv_cache_size,
-        # M4-B: both byte strides scale by elem_bytes in W8A32 mode.
+        # M4-B: byte strides scale by their region's element size.
         # `embedding_row_bytes` is consumed by `HostRunner._patch_embeddings`
-        # to compute `token_id * row_bytes` for the runtime patch site.
-        # `kv_step_bytes` is consumed by `HostRunner._patch_kv_bases` to
-        # compute `position * step_bytes` for kv_base sites.
+        # to compute `token_id * row_bytes` for the runtime patch site
+        # (FP16 rows). `kv_step_bytes` is consumed by
+        # `HostRunner._patch_kv_bases` to compute `position * step_bytes`
+        # for kv_base sites (INT8 rows since lever A).
         embedding_row_bytes=model_config.d_model * elem_bytes,
-        kv_step_bytes=model_config.d_head * elem_bytes,
+        kv_step_bytes=model_config.d_head * kv_elem_bytes,
         symbol_offsets=symbol_offsets,
         symbol_regions=symbol_regions,
         relocation_sites=prefill_codegen.relocation_sites + decode_codegen.relocation_sites,

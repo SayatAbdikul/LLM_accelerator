@@ -403,17 +403,33 @@ def _emit_batched_attention_block(graph: IRGraph, prev: str, block_idx: int,
             block_idx=block_idx, head_idx=head_idx, projection="value", weight_name=v_weight,
             bias=f"transformer.h.{block_idx}.attn.c_attn.bias_h{head_idx}_value" if shape.split_qkv_bias else None,
         )
-        # Store every stream's new K/V (row s of the batched projection) into
-        # its own cache region FIRST, so the batched K/V projection tiles
-        # (kb/vb) free before the memory-heavy per-stream attention loop (at
-        # ctx-512 each stream's V + v_int8 is ~100 KB — every KB of headroom
-        # matters).
+        # Lever A: quantize the batched (n_streams, d_head) K/V projection
+        # tiles to INT8 once — every stream's row shares the projection's
+        # static calibration scale, so one QUANT serves all 16 per-stream
+        # stores bit-identically to the old per-stream load-then-quantize.
+        # `scale_keys` carries all per-stream kv_load consumer names; the
+        # emitter asserts they resolve to one scale.
+        kq = _add(graph, "kv_quant", f"block{block_idx}_head{head_idx}_kquant",
+                  [kb], (n_streams, shape.d_head),
+                  layer=block_idx, kind="key", head=head_idx,
+                  scale_keys=[f"block{block_idx}_head{head_idx}_s{s}_kload"
+                              for s in range(n_streams)])
+        vq = _add(graph, "kv_quant", f"block{block_idx}_head{head_idx}_vquant",
+                  [vb], (n_streams, shape.d_head),
+                  layer=block_idx, kind="value", head=head_idx,
+                  scale_keys=[f"block{block_idx}_head{head_idx}_s{s}_vload"
+                              for s in range(n_streams)])
+        # Store every stream's new K/V (row s of the quantized projection)
+        # into its own cache region FIRST, so the batched K/V projection
+        # tiles (kb/vb) free before the memory-heavy per-stream attention
+        # loop (at ctx-512 each stream's K/V tile is ~33 KB — every KB of
+        # headroom matters).
         for s in range(n_streams):
             pfx = f"block{block_idx}_head{head_idx}_s{s}"
-            _add(graph, "kv_store", f"{pfx}_kstore", [kb], (),
+            _add(graph, "kv_store", f"{pfx}_kstore", [kq], (),
                  layer=block_idx, kind="key", head=head_idx, tokens=1,
                  stream=s, src_row=s, decode=True)
-            _add(graph, "kv_store", f"{pfx}_vstore", [vb], (),
+            _add(graph, "kv_store", f"{pfx}_vstore", [vq], (),
                  layer=block_idx, kind="value", head=head_idx, tokens=1,
                  stream=s, src_row=s, decode=True)
         stream_outs = []
@@ -421,13 +437,14 @@ def _emit_batched_attention_block(graph: IRGraph, prev: str, block_idx: int,
             pfx = f"block{block_idx}_head{head_idx}_s{s}"
             # Extract stream s's single query row.
             q_s = _add(graph, "row_copy", f"{pfx}_q", [qb], (1, shape.d_head), src_row=s)
-            # Load stream s's own K cache, then QK^T.
+            # Load stream s's own K cache (INT8, store-time quantized), then QK^T.
             k_s = _add(graph, "kv_load", f"{pfx}_kload", [], (key_len, shape.d_head),
                        layer=block_idx, kind="key", head=head_idx, tokens=key_len,
-                       stream=s, decode=True)
+                       stream=s, decode=True, dtype="int8")
             qkt = _add(graph, "matmul_qkt", f"{pfx}_qkt", [q_s, k_s], (1, key_len),
                        block_idx=block_idx, head_idx=head_idx, query_len=1, key_len=key_len,
-                       masked=True, runtime_config_attn=True, scale=inv_sqrt)
+                       masked=True, runtime_config_attn=True, scale=inv_sqrt,
+                       k_int8_from_cache=True)
             scaled = _add(graph, "scale_mul", f"{pfx}_scale", [qkt], (1, key_len),
                           query_len=1, key_len=key_len, scale=inv_sqrt)
             sm = _add(graph, "softmax", f"{pfx}_softmax", [scaled], (1, key_len),
@@ -435,9 +452,10 @@ def _emit_batched_attention_block(graph: IRGraph, prev: str, block_idx: int,
                       causal_identity=True)
             v_s = _add(graph, "kv_load", f"{pfx}_vload", [], (key_len, shape.d_head),
                        layer=block_idx, kind="value", head=head_idx, tokens=key_len,
-                       stream=s, decode=True)
+                       stream=s, decode=True, dtype="int8")
             attn_v = _add(graph, "matmul_attn_v", f"{pfx}_attnv", [sm, v_s], (1, shape.d_head),
-                          block_idx=block_idx, head_idx=head_idx, query_len=1, key_len=key_len)
+                          block_idx=block_idx, head_idx=head_idx, query_len=1, key_len=key_len,
+                          v_int8_from_cache=True)
             stream_outs.append(attn_v)
         # Gather the 16 per-stream (1, d_head) outputs into one (n_streams, d_head) tile.
         head_outputs.append(_add(

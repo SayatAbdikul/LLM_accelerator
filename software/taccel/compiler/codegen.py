@@ -837,6 +837,8 @@ class CodeGenerator:
             self._emit_kv_store(node)
         elif op == "kv_load":
             self._emit_kv_load(node)
+        elif op == "kv_quant":
+            self._emit_kv_quant(node)
         elif op == "logits_store":
             self._emit_logits_store(node)
         elif op == "cls_prepend":
@@ -984,6 +986,10 @@ class CodeGenerator:
     def _emit_kv_load(self, node: IRNode):
         from .emit.kv import emit_kv_load
         emit_kv_load(self, node)
+
+    def _emit_kv_quant(self, node: IRNode):
+        from .emit.kv import emit_kv_quant
+        emit_kv_quant(self, node)
 
     def _emit_logits_store(self, node: IRNode):
         from .emit.kv import emit_logits_store
