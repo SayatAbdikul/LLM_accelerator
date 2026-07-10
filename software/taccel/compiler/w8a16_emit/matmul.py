@@ -37,7 +37,7 @@ from ...isa.instructions import (
 )
 from ...isa.opcodes import ABUF_SIZE, ACCUM_SIZE, BUF_ABUF, BUF_ACCUM, BUF_WBUF, WBUF_SIZE
 from ..tiler import TILE, pad_dim
-from ._common import UNIT, _abuf_alloc_fp32, _zero_fill_fp32_padding_rows
+from ._common import UNIT, _abuf_alloc_fp32, _m_exact_rows, _zero_fill_fp32_padding_rows
 
 if TYPE_CHECKING:
     from ..codegen import CodeGenerator
@@ -222,7 +222,17 @@ def emit_matmul_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     m_tiles = M_pad // TILE
     k_tiles = K_pad // TILE
     aq_m_tiles, aq_k_tiles = _act_quant_tiles(M_pad, K_pad)
-    cg._emit(ConfigTileInsn(M=aq_m_tiles - 1, N=aq_k_tiles - 1, K=0))
+    # Lever C: MAX_ABS + QUANT walk exactly the real activation rows. The
+    # act-quant view reshapes M_pad logical rows into aq_m_tiles*TILE rows
+    # (f=aq_m_tiles*TILE/M_pad per logical row), so the real-row count is
+    # M*f. The pad rows are zero-filled just above (max over real+zero ==
+    # max over real → byte-identical scale) and the QUANT'd pad rows feed
+    # only the systolic MATMUL's junk output (dropped by the m_exact DEQUANT).
+    _aq_full_rows = aq_m_tiles * TILE
+    cg._emit(ConfigTileInsn(
+        M=aq_m_tiles - 1, N=aq_k_tiles - 1, K=0,
+        m_exact=_m_exact_rows(M * _aq_full_rows // M_pad, _aq_full_rows),
+    ))
     cg._emit(
         MaxAbsReduceFp32Insn(
             src1_buf=BUF_ABUF, src1_off=in_alloc.offset_units,
@@ -294,9 +304,14 @@ def emit_matmul_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
 
     # ----- Stage 4: MATMUL (INT8 × INT8 → INT32 ACCUM) -----
     # W4A16 plan Phase 2: set CONFIG_TILE bit [28] when the weight is INT4.
+    # Lever C: the DEQUANT epilogue (Stage 5) reuses this CONFIG and writes
+    # exactly the real output rows. The MATMUL ignores m_exact (systolic),
+    # so setting it here truncates only the SFU dequant; pad output rows
+    # stay stale and are re-zeroed by the next matmul's MAX_ABS pad-fill.
     cg._emit(ConfigTileInsn(
         M=m_tiles - 1, N=N_pad // TILE - 1, K=k_tiles - 1,
         weight_int4=(cg.weight_dtypes.get(weight_name) == "int4"),
+        m_exact=_m_exact_rows(M, M_pad),
     ))
     cg._emit(MatmulInsn(
         src1_buf=BUF_ABUF, src1_off=int8_scratch.offset_units,
@@ -441,7 +456,13 @@ def emit_matmul_w8a16_large_weight_tiled(
     # Row-split via _act_quant_tiles when K_pad exceeds the SFU row cap
     # (byte-identical reshape; f=1 for K_pad <= 1024).
     aq_m_tiles, aq_k_tiles = _act_quant_tiles(M_pad, K_pad)
-    cg._emit(ConfigTileInsn(M=aq_m_tiles - 1, N=aq_k_tiles - 1, K=0))
+    # Lever C: real-row truncation, same reshape reasoning as the simple
+    # path (M*f reshaped rows; pad rows zero-filled above → identical scale).
+    _aq_full_rows = aq_m_tiles * TILE
+    cg._emit(ConfigTileInsn(
+        M=aq_m_tiles - 1, N=aq_k_tiles - 1, K=0,
+        m_exact=_m_exact_rows(M * _aq_full_rows // M_pad, _aq_full_rows),
+    ))
     cg._emit(MaxAbsReduceFp32Insn(
         src1_buf=BUF_ABUF, src1_off=in_alloc.offset_units,
         src2_buf=BUF_ABUF, src2_off=0,
@@ -540,7 +561,11 @@ def emit_matmul_w8a16_large_weight_tiled(
             pc_scale_dram_full + bias_offset_in_blob + n_start * 2,
         )
         cg._emit(SyncInsn(resource_mask=0b001))
-        cg._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tile_units - 1, K=0))
+        # Lever C: real-row DEQUANT (M rows; pad rows stay stale).
+        cg._emit(ConfigTileInsn(
+            M=m_tiles - 1, N=n_tile_units - 1, K=0,
+            m_exact=_m_exact_rows(M, M_pad),
+        ))
         cg._emit(DequantAccumFp32ScaledInsn(
             src1_buf=BUF_ACCUM, src1_off=0,
             src2_buf=BUF_WBUF, src2_off=pc_scale_slice_alloc.offset_units,
@@ -730,7 +755,11 @@ def emit_matmul_w8a16_large_weight_tiled(
         cg._emit(SyncInsn(resource_mask=0b001))
 
         # DEQUANT_ACCUM_FP32_SCALED → FP{32,16} N-tile output in ABUF.
-        cg._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tile_units - 1, K=0))
+        # Lever C: real-row DEQUANT (M rows; pad rows stay stale).
+        cg._emit(ConfigTileInsn(
+            M=m_tiles - 1, N=n_tile_units - 1, K=0,
+            m_exact=_m_exact_rows(M, M_pad),
+        ))
         cg._emit(DequantAccumFp32ScaledInsn(
             src1_buf=BUF_ACCUM, src1_off=0,
             src2_buf=BUF_WBUF, src2_off=pc_scale_slice_alloc.offset_units,
@@ -877,7 +906,13 @@ def _emit_matmul_w8a16_large_input_streaming(
             sreg = cg._alloc_sreg_pair()
             k_tiles_units = k_len // TILE
             aq_m_tiles, aq_k_tiles = _act_quant_tiles(M_pad, k_len)
-            cg._emit(ConfigTileInsn(M=aq_m_tiles - 1, N=aq_k_tiles - 1, K=0))
+            # Lever C: real-row truncation on the per-K-tile MAX_ABS + QUANT
+            # (M_logical*f reshaped rows; pad rows zero-filled above).
+            _aq_full_rows = aq_m_tiles * TILE
+            cg._emit(ConfigTileInsn(
+                M=aq_m_tiles - 1, N=aq_k_tiles - 1, K=0,
+                m_exact=_m_exact_rows(M_logical * _aq_full_rows // M_pad, _aq_full_rows),
+            ))
             cg._emit(MaxAbsReduceFp32Insn(
                 src1_buf=BUF_ABUF, src1_off=in_tile_alloc.offset_units,
                 src2_buf=BUF_ABUF, src2_off=0,
@@ -977,7 +1012,12 @@ def _emit_matmul_w8a16_large_input_streaming(
             # Stage 6: DEQUANT → FP32 K-partial (write directly to
             # tile_accum for k_idx==0 since there's nothing to add yet;
             # otherwise use a scratch and VADD).
-            cg._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tile_units - 1, K=0))
+            # Lever C: real-row DEQUANT (and the k>0 VADD that reuses this
+            # CONFIG) walk M_logical rows; pad rows stay stale.
+            cg._emit(ConfigTileInsn(
+                M=m_tiles - 1, N=n_tile_units - 1, K=0,
+                m_exact=_m_exact_rows(M_logical, M_pad),
+            ))
             if k_idx == 0:
                 cg._emit(DequantAccumFp32ScaledInsn(
                     src1_buf=BUF_ACCUM, src1_off=0,

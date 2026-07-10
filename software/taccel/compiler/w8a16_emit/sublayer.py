@@ -50,7 +50,12 @@ def emit_layernorm_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
     N_pad = pad_dim(node.output_shape[1])
     m_tiles = M_pad // TILE
     n_tiles = N_pad // TILE
-    cg._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=0))
+    # Lever C: LN over exactly the real rows; pad rows (LN(0)=beta today)
+    # go stale and are re-zeroed by the next matmul's MAX_ABS pad-fill.
+    cg._emit(ConfigTileInsn(
+        M=m_tiles - 1, N=n_tiles - 1, K=0,
+        m_exact=_m_exact_rows(node.output_shape[0], M_pad),
+    ))
 
     # Load gamma/beta as FP16 into WBUF (2 bytes/elem). The simulator
     # handler reads `2 * N_pad` FP16 values from src2_off (gamma then beta).
@@ -182,7 +187,12 @@ def emit_gelu_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
 
             # GELU_FP32 in-place over this N-tile.
             tile_n_tiles = n_len // TILE
-            cg._emit(ConfigTileInsn(M=m_tiles - 1, N=tile_n_tiles - 1, K=0))
+            # Lever C: GELU over the real rows only (element-wise; pad rows
+            # stay stale, re-zeroed downstream at the next MAX_ABS).
+            cg._emit(ConfigTileInsn(
+                M=m_tiles - 1, N=tile_n_tiles - 1, K=0,
+                m_exact=_m_exact_rows(node.output_shape[0], M_pad),
+            ))
             cg._emit(GeluFp32Insn(
                 src1_buf=BUF_ABUF, src1_off=tile_alloc.offset_units,
                 src2_buf=BUF_ABUF, src2_off=0,
@@ -213,7 +223,11 @@ def emit_gelu_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
         return
 
     # ABUF-resident input: simple one-shot GELU.
-    cg._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=0))
+    # Lever C: GELU over the real rows only.
+    cg._emit(ConfigTileInsn(
+        M=m_tiles - 1, N=n_tiles - 1, K=0,
+        m_exact=_m_exact_rows(node.output_shape[0], M_pad),
+    ))
 
     in_alloc = _abuf_alloc_fp32(cg, in_name, M_pad, N_pad)
     out_alloc = _abuf_alloc_fp32(cg, node.name, M_pad, N_pad)
@@ -421,7 +435,12 @@ def emit_vadd_fp32(cg: "CodeGenerator", node: "IRNode") -> None:
         cg._load_dram_to_abuf_fp(in1_name, M_pad, N_pad)
         in1_reloaded = True
 
-    cg._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=0))
+    # Lever C: residual add over the real rows only; pad rows stay stale
+    # and never propagate (next LN / matmul MAX_ABS is m_exact / zero-filled).
+    cg._emit(ConfigTileInsn(
+        M=m_tiles - 1, N=n_tiles - 1, K=0,
+        m_exact=_m_exact_rows(node.output_shape[0], M_pad),
+    ))
 
     src1_alloc = _abuf_alloc_fp32(cg, in0_name, M_pad, N_pad)
     src2_alloc = _abuf_alloc_fp32(cg, in1_name, M_pad, N_pad)
