@@ -300,19 +300,25 @@ def inject_kv_cache_nodes(graph: IRGraph, config: ModelConfig, *,
         # M4-debug: defer kv_load node emission until its consumer
         # (matmul_qkt for K, matmul_attn_v for V) is encountered.
         load_name = f"{copied.name}_kv_load"
+        kv_load_attrs = {
+            "layer": int(layer),
+            "kind": kind,
+            "head": int(head),
+            "tokens": int(seq_len),
+            "decode": True,
+            "dtype": "int8",
+        }
+        if kind == "value":
+            # A2: V loads straight to WBUF (the MATMUL src2 home) — no
+            # ABUF staging + helper BUF_COPY. K stays in ABUF: its
+            # BUF_COPY performs the transpose on the way to WBUF.
+            kv_load_attrs["dst"] = "wbuf"
         kv_load_node = IRNode(
             op="kv_load",
             name=load_name,
             inputs=[],
             output_shape=(int(seq_len), config.d_head),
-            attrs={
-                "layer": int(layer),
-                "kind": kind,
-                "head": int(head),
-                "tokens": int(seq_len),
-                "decode": True,
-                "dtype": "int8",
-            },
+            attrs=kv_load_attrs,
         )
         pending_kv_load[load_name] = kv_load_node
         if kind == "key":

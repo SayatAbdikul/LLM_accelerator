@@ -27,7 +27,7 @@ from ...isa.instructions import (
     SetScaleInsn,
     SyncInsn,
 )
-from ...isa.opcodes import ABUF_SIZE, BUF_ABUF
+from ...isa.opcodes import ABUF_SIZE, BUF_ABUF, BUF_WBUF
 from ..ir import IRNode
 from ..kv_cache import normalize_kv_kind
 from ..tiler import TILE, pad_dim
@@ -198,6 +198,11 @@ def emit_kv_load(cg: "CodeGenerator", node: IRNode) -> None:
     xfer_bytes = kv_transfer_bytes(cg, node, decode_default=decode_mode)
     addr_reg = int(node.attrs.get("addr_reg", 2))
     dst_buf = int(node.attrs.get("dst_buf", BUF_ABUF))
+    # Lever A2: `dst="wbuf"` loads the tile straight into WBUF (the
+    # MATMUL src2 home), skipping the ABUF staging + helper BUF_COPY.
+    # Precedent: the pc_scale vectors already DMA-load into WBUF.
+    if str(node.attrs.get("dst", "")) == "wbuf":
+        dst_buf = BUF_WBUF
     tokens = int(node.attrs.get("tokens", 1))
     dtype_int8 = str(node.attrs.get("dtype", "")) == "int8"
     if (dtype_int8 and decode_mode and tokens > 1
@@ -234,7 +239,10 @@ def emit_kv_load(cg: "CodeGenerator", node: IRNode) -> None:
         # before the alloc to expose a contiguous free region.
         if dst_buf == BUF_ABUF and alloc_bytes > 16 * 1024:
             cg._compact_abuf()
-        alloc = cg.mem.abuf.alloc(node.name, alloc_bytes)
+        if dst_buf == BUF_WBUF:
+            alloc = cg.mem.wbuf.alloc(node.name, alloc_bytes)
+        else:
+            alloc = cg.mem.abuf.alloc(node.name, alloc_bytes)
         dst_off = alloc.offset_units
     if decode_mode and tokens > 1:
         # Full-context kv_load (tokens = seq_len): must always read from

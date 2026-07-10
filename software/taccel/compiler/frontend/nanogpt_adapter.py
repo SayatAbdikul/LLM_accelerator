@@ -450,9 +450,11 @@ def _emit_batched_attention_block(graph: IRGraph, prev: str, block_idx: int,
             sm = _add(graph, "softmax", f"{pfx}_softmax", [scaled], (1, key_len),
                       query_len=1, key_len=key_len, masked=True, runtime_config_attn=True,
                       causal_identity=True)
+            # A2: V loads straight to WBUF (the MATMUL src2 home) — no ABUF
+            # staging + helper BUF_COPY on the serialized critical path.
             v_s = _add(graph, "kv_load", f"{pfx}_vload", [], (key_len, shape.d_head),
                        layer=block_idx, kind="value", head=head_idx, tokens=key_len,
-                       stream=s, decode=True, dtype="int8")
+                       stream=s, decode=True, dtype="int8", dst="wbuf")
             attn_v = _add(graph, "matmul_attn_v", f"{pfx}_attnv", [sm, v_s], (1, shape.d_head),
                           block_idx=block_idx, head_idx=head_idx, query_len=1, key_len=key_len,
                           v_int8_from_cache=True)

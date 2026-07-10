@@ -416,12 +416,18 @@ def emit_matmul_attn_v_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
         cg, node.inputs[0], M_pad, Kseq_pad
     )
     if v_int8_from_cache:
-        v_cache_alloc = cg.mem.abuf.get(node.inputs[1])
-        if v_cache_alloc is None:
-            raise KeyError(
-                f"Missing ABUF allocation '{node.inputs[1]}' (int8 kv_load) "
-                f"for {node.name}"
-            )
+        # Lever A2: the kv_load lands the INT8 V straight in WBUF (the
+        # MATMUL src2 home) — no ABUF staging, no helper BUF_COPY. The
+        # ABUF branch remains for A1-style loads (dst not "wbuf").
+        v_cache_wbuf = cg.mem.wbuf.get(node.inputs[1])
+        v_cache_alloc = None
+        if v_cache_wbuf is None:
+            v_cache_alloc = cg.mem.abuf.get(node.inputs[1])
+            if v_cache_alloc is None:
+                raise KeyError(
+                    f"Missing WBUF/ABUF allocation '{node.inputs[1]}' "
+                    f"(int8 kv_load) for {node.name}"
+                )
         # kv_load pulled pad_dim(key_len) zero-tail rows; only a layout-
         # window cap (never at GPT-2 shapes) leaves rows to zero-fill.
         loaded_rows = kv_int8_full_rows(cg, key_len)
@@ -429,9 +435,13 @@ def emit_matmul_attn_v_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
             zero_pad_dram = cg._dram_offset_required(
                 "__zero_pad__", f"zeroing int8 V padding rows for '{node.name}'"
             )
+            if v_cache_wbuf is not None:
+                fill_buf, fill_base = BUF_WBUF, v_cache_wbuf.offset_units
+            else:
+                fill_buf, fill_base = BUF_ABUF, v_cache_alloc.offset_units
             cg._emit_dma_load(
-                BUF_ABUF,
-                v_cache_alloc.offset_units + (loaded_rows * N_pad) // UNIT,
+                fill_buf,
+                fill_base + (loaded_rows * N_pad) // UNIT,
                 (Kseq_pad - loaded_rows) * N_pad,
                 3,
                 zero_pad_dram,
@@ -507,7 +517,7 @@ def emit_matmul_attn_v_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     # ----- Stage 2: QUANT_FP32_INT8(V) into an ABUF scratch -----
     # Lever A: skipped for cache-int8 V — the kv_load tile IS the INT8 V.
     if v_int8_from_cache:
-        v_int8_off = v_cache_alloc.offset_units
+        v_int8_off = v_cache_alloc.offset_units if v_cache_alloc is not None else None
     else:
         cg._emit(ConfigTileInsn(M=k_tiles - 1, N=n_tiles - 1, K=0))
         sreg_v = cg._alloc_sreg()
@@ -533,33 +543,39 @@ def emit_matmul_attn_v_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     # ----- Stage 3: BUF_COPY V_int8 (ABUF) → V (WBUF), no transpose -----
     # V's natural layout is [K, N] = [seq_len, d_head], which is what
     # MATMUL expects for src2. No transpose needed.
-    length_units = (Kseq_pad * N_pad) // UNIT
-    v_wbuf = cg.mem.wbuf.alloc(f"v_head{head_idx}_{node.name}", Kseq_pad * N_pad)
-    cg._emit(
-        BufCopyInsn(
-            src_buf=BUF_ABUF, src_off=v_int8_off,
-            dst_buf=BUF_WBUF, dst_off=v_wbuf.offset_units,
-            length=length_units,
-            src_rows=0,
-            transpose=0,
+    # Lever A2: skipped entirely when the kv_load already landed the INT8
+    # V in WBUF — the helper copy (2 cyc / 16 B, serialized against every
+    # engine) drops out of the per-core critical path.
+    if v_int8_from_cache and v_cache_wbuf is not None:
+        v_wbuf = v_cache_wbuf
+    else:
+        length_units = (Kseq_pad * N_pad) // UNIT
+        v_wbuf = cg.mem.wbuf.alloc(f"v_head{head_idx}_{node.name}", Kseq_pad * N_pad)
+        cg._emit(
+            BufCopyInsn(
+                src_buf=BUF_ABUF, src_off=v_int8_off,
+                dst_buf=BUF_WBUF, dst_off=v_wbuf.offset_units,
+                length=length_units,
+                src_rows=0,
+                transpose=0,
+            )
         )
-    )
-    cg._emit(SyncInsn(resource_mask=0b001))
+        cg._emit(SyncInsn(resource_mask=0b001))
 
-    # M4-debug: same as QKT — free FP32 V (v_loaded) and V_int8 ABUF
-    # regions now since the MATMUL reads V from WBUF, not ABUF. At
-    # GPT-2 decode 256-token scale this frees 64 KB + 16 KB = 80 KB.
-    # (Cache-int8 path: the only ABUF copy is the kv_load tile itself.)
-    # Gated by v_size >= 16 KB to preserve unit-test allocation
-    # inspection at d_head=64 / seq_len=16 (= 4 KB v_loaded).
-    v_size_bytes = Kseq_pad * N_pad * (1 if v_int8_from_cache else cg.elem_bytes)
-    if v_size_bytes >= 16 * 1024:
-        if not v_int8_from_cache:
-            cg.mem.abuf.free(f"{node.name}__v_int8")
-        v_in_name = node.inputs[1]
-        if cg.last_uses.get(v_in_name, -1) <= cg.current_node_idx:
-            if cg.mem.abuf.get(v_in_name) is not None:
-                cg.mem.abuf.free(v_in_name)
+        # M4-debug: same as QKT — free FP32 V (v_loaded) and V_int8 ABUF
+        # regions now since the MATMUL reads V from WBUF, not ABUF. At
+        # GPT-2 decode 256-token scale this frees 64 KB + 16 KB = 80 KB.
+        # (Cache-int8 path: the only ABUF copy is the kv_load tile itself.)
+        # Gated by v_size >= 16 KB to preserve unit-test allocation
+        # inspection at d_head=64 / seq_len=16 (= 4 KB v_loaded).
+        v_size_bytes = Kseq_pad * N_pad * (1 if v_int8_from_cache else cg.elem_bytes)
+        if v_size_bytes >= 16 * 1024:
+            if not v_int8_from_cache:
+                cg.mem.abuf.free(f"{node.name}__v_int8")
+            v_in_name = node.inputs[1]
+            if cg.last_uses.get(v_in_name, -1) <= cg.current_node_idx:
+                if cg.mem.abuf.get(v_in_name) is not None:
+                    cg.mem.abuf.free(v_in_name)
 
     # ----- Stage 4: DMA-load the staged FP16 PC scale vector -----
     pc_scale_sym = f"{node.name}__attn_v_pc_scale"
@@ -609,7 +625,12 @@ def emit_matmul_attn_v_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     # Cleanup.
     cg.mem.abuf.free(f"{node.name}__sm_int8")
     cg.mem.abuf.free(f"{node.name}__v_int8")
-    cg.mem.wbuf.free(f"v_head{head_idx}_{node.name}")
+    if v_int8_from_cache and v_cache_wbuf is not None:
+        # A2: the MATMUL consumed the kv_load's WBUF tile directly; free it
+        # here (generate()'s last-use sweep only covers ABUF allocations).
+        cg.mem.wbuf.free(node.inputs[1])
+    else:
+        cg.mem.wbuf.free(f"v_head{head_idx}_{node.name}")
     cg.mem.wbuf.free(f"_attn_v_pc_{node.name}")
 
     # M4-debug: at production decode scale (Kseq_pad >= 64), spill the
