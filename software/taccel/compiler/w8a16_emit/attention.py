@@ -34,7 +34,7 @@ from ...isa.instructions import (
 )
 from ...isa.opcodes import ABUF_SIZE, ACCUM_SIZE, BUF_ABUF, BUF_ACCUM, BUF_WBUF, WBUF_SIZE
 from ..tiler import TILE, pad_dim
-from ._common import UNIT, _abuf_alloc_fp32, _fp16_to_uint16
+from ._common import UNIT, _abuf_alloc_fp32, _fp16_to_uint16, _m_exact_rows
 
 if TYPE_CHECKING:
     from ..codegen import CodeGenerator
@@ -178,7 +178,15 @@ def emit_matmul_qkt_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     k_scale = float(cg.calibration_scales.get(node.inputs[1], DEFAULT_ACT_SCALE))
 
     # ----- Stage 1: QUANT_FP32_INT8(Q) into an ABUF scratch -----
-    cg._emit(ConfigTileInsn(M=m_tiles - 1, N=k_tiles - 1, K=0))
+    # Lever C: quantize exactly the real query rows; the pad rows of q_int8
+    # stay stale ABUF and are consumed only by the systolic MATMUL (junk
+    # output rows that the m_exact DEQUANT below then skips) — never reach
+    # logits. m_exact=0 (full) whenever query_len fills M_pad (e.g. prefill
+    # on a 16-multiple), keeping the CONFIG word byte-identical there.
+    cg._emit(ConfigTileInsn(
+        M=m_tiles - 1, N=k_tiles - 1, K=0,
+        m_exact=_m_exact_rows(query_len, M_pad),
+    ))
     sreg_q = cg._alloc_sreg()
     cg._emit(
         SetScaleInsn(
@@ -284,7 +292,16 @@ def emit_matmul_qkt_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     out_row_units = (N_pad * cg.elem_bytes) // UNIT
     for s in range(num_strips):
         # CONFIG_TILE for one Q strip: M=1 tile (16 rows), N=full N_pad, K=full K_pad.
-        cg._emit(ConfigTileInsn(M=0, N=n_tiles - 1, K=k_tiles - 1))
+        # Lever C: m_exact = the real query rows landing in THIS strip
+        # (clamped to the 16-row tile). The systolic MATMUL ignores it and
+        # still fills all 16 rows (junk in the pad rows); the DEQUANT that
+        # reuses this CONFIG walks only the real rows, so the QKT output's
+        # pad rows stay stale — masked-softmax downstream reads real rows only.
+        strip_rows = max(0, min(query_len - s * TILE, TILE))
+        cg._emit(ConfigTileInsn(
+            M=0, N=n_tiles - 1, K=k_tiles - 1,
+            m_exact=_m_exact_rows(strip_rows, TILE),
+        ))
         q_strip_off = q_int8_alloc.offset_units + (s * TILE * K_pad) // UNIT
         cg._emit(
             MatmulInsn(
@@ -484,7 +501,13 @@ def emit_matmul_attn_v_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     v_scale = float(cg.calibration_scales.get(node.inputs[1], DEFAULT_ACT_SCALE))
 
     # ----- Stage 1: QUANT_FP32_INT8(softmax) into an ABUF scratch -----
-    cg._emit(ConfigTileInsn(M=m_tiles - 1, N=k_tiles - 1, K=0))
+    # Lever C: quantize exactly the real query rows of the softmax output
+    # (its pad rows are stale/masked junk either way and feed only the
+    # systolic MATMUL's junk output rows, dropped by the m_exact DEQUANT).
+    cg._emit(ConfigTileInsn(
+        M=m_tiles - 1, N=k_tiles - 1, K=0,
+        m_exact=_m_exact_rows(query_len, M_pad),
+    ))
     sreg_sm = cg._alloc_sreg()
     cg._emit(
         SetScaleInsn(
@@ -600,7 +623,13 @@ def emit_matmul_attn_v_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     # the full output. Real GPT-2 graphs hit the M3-C sizing-guard
     # path; M3-B's NotImplementedError above ensures we don't silently
     # produce a malformed bundle there.
-    cg._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=k_tiles - 1))
+    # Lever C: the DEQUANT epilogue writes exactly the real query rows of
+    # attn_v; pad rows stay stale and are re-zeroed by the next matmul's
+    # MAX_ABS pad-row fill before they influence any scale.
+    cg._emit(ConfigTileInsn(
+        M=m_tiles - 1, N=n_tiles - 1, K=k_tiles - 1,
+        m_exact=_m_exact_rows(query_len, M_pad),
+    ))
     cg._emit(
         MatmulInsn(
             src1_buf=BUF_ABUF, src1_off=sm_int8_alloc.offset_units,

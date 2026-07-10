@@ -93,6 +93,25 @@ def _zero_fill_fp32_padding_rows(
     cg._emit(SyncInsn(resource_mask=0b001))
 
 
+def _m_exact_rows(real_rows: int, m_pad: int) -> int:
+    """Exact SFU row count for a CONFIG_TILE ``m_exact`` field (lever C).
+
+    Returns 0 — the legacy "full tiles" sentinel — when the real row count
+    fills the padded tile, so the encoder emits a CONFIG_TILE word byte-
+    identical to the pre-lever-C bundle. Otherwise returns the exact real
+    row count, which makes the SFU row loops walk only ``real_rows`` rows
+    instead of the 16-row-quantized ``m_pad``, skipping the padding-row
+    work (the whole point of the lever for single-token decode).
+
+    Only valid on CONFIGs that feed SFU ops — the systolic MATMUL and the
+    helper engine ignore the field by design (see the C-2 RTL commit).
+    Callers pass ``real_rows >= 1``; the 0-row case does not arise (no
+    strip is entirely padding) and 0 is overloaded as "full" anyway.
+    """
+    real = int(real_rows)
+    return 0 if real >= int(m_pad) else real
+
+
 def _abuf_alloc_fp32(cg: "CodeGenerator", name: str, M_pad: int, N_pad: int):
     """Allocate an ABUF region sized for an [M_pad, N_pad] FP-precision tile.
 

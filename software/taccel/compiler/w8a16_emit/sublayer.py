@@ -31,7 +31,7 @@ from ...isa.instructions import (
 )
 from ...isa.opcodes import BUF_ABUF, BUF_WBUF
 from ..tiler import TILE, pad_dim
-from ._common import UNIT, _abuf_alloc_fp32
+from ._common import UNIT, _abuf_alloc_fp32, _m_exact_rows
 
 if TYPE_CHECKING:
     from ..codegen import CodeGenerator
@@ -269,7 +269,15 @@ def emit_softmax_fp32(cg: "CodeGenerator", node: "IRNode", *, masked: bool = Fal
     N_pad = pad_dim(node.output_shape[1])
     m_tiles = M_pad // TILE
     n_tiles = N_pad // TILE
-    cg._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=0))
+    # Lever C: run the (masked-)softmax over exactly the real query rows.
+    # The CONFIG_ATTN masking below keys off query_row_base + row_idx, so
+    # with m_exact=1 the single decode row (row 0) still masks correctly;
+    # pad rows go unprocessed (stale ABUF, never read by the attn_v QUANT
+    # which is itself m_exact-truncated).
+    cg._emit(ConfigTileInsn(
+        M=m_tiles - 1, N=n_tiles - 1, K=0,
+        m_exact=_m_exact_rows(node.output_shape[0], M_pad),
+    ))
 
     # Pick up the IR-level `masked` attr; OR with the keyword for
     # direct-caller convenience (the M2 dispatch in `_emit_softmax`

@@ -32,7 +32,7 @@ from ..ir import IRNode
 from ..kv_cache import normalize_kv_kind
 from ..tiler import TILE, pad_dim
 from ._common import UNIT
-from ..w8a16_emit._common import _fp16_to_uint16
+from ..w8a16_emit._common import _fp16_to_uint16, _m_exact_rows
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..codegen import CodeGenerator
@@ -139,7 +139,14 @@ def emit_kv_quant(cg: "CodeGenerator", node: IRNode) -> None:
     rows = int(node.output_shape[0]) if node.output_shape else 1
     M_pad = pad_dim(rows)
     K_pad = pad_dim(cg.config.d_head)
-    cg._emit(ConfigTileInsn(M=M_pad // TILE - 1, N=K_pad // TILE - 1, K=0))
+    # Lever C: quantize exactly the real projected rows. The kv_store that
+    # consumes this tile transfers only `tokens` (== rows) rows to the
+    # cache, so the pad rows are never stored — quantizing them was pure
+    # waste. b16 batches 16 real streams (rows==M_pad → m_exact=0, no-op).
+    cg._emit(ConfigTileInsn(
+        M=M_pad // TILE - 1, N=K_pad // TILE - 1, K=0,
+        m_exact=_m_exact_rows(rows, M_pad),
+    ))
     sreg = cg._alloc_sreg()
     cg._emit(
         SetScaleInsn(
