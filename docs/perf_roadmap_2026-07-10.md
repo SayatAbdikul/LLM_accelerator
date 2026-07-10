@@ -1,0 +1,302 @@
+# Performance roadmap — tokens/sec levers, post-Phase-2 (2026-07-10)
+
+Successor to `perf_roadmap_2026-07-08.md`, grounded in the Phase-2 batched-decode
+measurement (commit `2d877be`) plus a fresh per-opcode retire-gap profile of the
+batch-1 decode step at HEAD `7291fd5` (mode-1 synth RTL, honest-BW `--fast-beats`,
+34.41 MHz). Batch-16 profile run in flight; its aggregate counters are the
+committed ones. All shapes: GPT-2 124M, decode compiled for the ctx-512 budget
+(`key_len=513`, `Kseq_pad=528`, `valid_kv_len` patched to 512).
+
+**Measured state:**
+
+| shape | cyc/step | cyc/tok | tok/s | sfu | sys | helper | dma beats |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| decode B=1, pos 511 | 33,868,695 | 33,868,695 | 1.016 | 11.89M | 12.39M | 1.90M | 11.14M |
+| decode B=16, pos 510 | 197,138,919 | 12,321,182 | **2.792** | 106.81M | 35.51M | **28.53M** | 28.78M |
+
+Verified this session: the rebuilt HEAD binary reproduces the b1 33,868,695
+**exactly**; the b16 re-measurement lands −0.07% vs the committed 197,274,279
+(248,658 vs 249,810 insns — sub-0.5% bundle-emission variation, immaterial).
+The per-opcode profiles (below) match the analytic RTL cost model to a few %.
+
+---
+
+## 0. UPDATE (same day) — lever A LANDED (commits `931b373` A1, `4163a08` A2)
+
+Store-time int8 KV (A1: `kv_quant` node + int8 loads, KV DRAM/DMA halved,
+per-core K/V window QUANTs gone) + V kv_load direct DRAM→WBUF (A2: per-core
+helper V copy gone). Bit-exact end to end: pre/post golden logits byte-diff
+12/12 identical per commit (tiny + 124M, b1 + b16, 3 steps each at the bench
+window shapes), mode-1 RTL == mode-0 golden byte-match on the batched program,
+full suite has zero new failures vs a clean-HEAD baseline (16 pre-existing
+failures reproduce identically on unmodified HEAD — fixture SHA drift,
+output-aware-search `n_embd` KeyError, W4 tile_config tuple, fp16-embedding-era
+synthetic tests; 3 KV-contract tests updated to the int8 contract).
+
+**Measured after lever A (same protocol as the baseline table):**
+
+| shape | cyc/step | cyc/tok | tok/s | Δ vs base | sfu | sys | dma beats |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| decode B=1, pos 511 | 30,566,487 | 30,566,487 | **1.126** | **+10.8%** | 10.13M | 12.39M | 10.53M |
+| decode B=16, pos 510 | 145,048,383 | 9,065,524 | **3.796** | **+36.0%** | 78.55M | 35.51M | 19.33M |
+
+Closure (b1): A1 −2,387,232 cyc — sys_busy unchanged to the cycle
+(12,390,189), dma −609,408 beats == prediction exactly (−573,696 halved KV
+loads, −34,560 deleted zero-fills, −1,152 halved stores), sfu −1.77M (288
+per-core 528-row K/V QUANTs out, 288 single-tile kv_quants in). A2 −914,976
+cyc with sfu/sys/dma all bit-identical to A1 — pure helper+sync: 144 V
+BUF_COPYs (−608k busy) plus lighter `_compact_abuf` churn (V no longer
+stages 33 KB in ABUF). Program sizes: b1 94,878→93,726 insns, b16
+248,658→221,634; b16 KV 604→302 MB (bundle 971→666 MB).
+
+---
+
+## 1. Where the cycles go
+
+### 1.1 Batch-1 decode step, measured per-opcode (fresh profile, HEAD)
+
+| op | gap cyc | % | count | cyc/op |
+|---|---:|---:|---:|---:|
+| MATMUL | 12,391,812 | 36.6 | 1,623 | 7,635 |
+| LOAD (visible) | 6,571,193 | 19.4 | 11,033 | 596 |
+| MASKED_SOFTMAX_FP32 | 3,907,728 | 11.5 | 144 | 27,137 |
+| QUANT_FP32_INT8 | 2,912,105 | 8.6 | 1,321 | 2,205 |
+| DEQUANT_ACCUM_FP32_SCALED | 2,006,231 | 5.9 | 1,335 | 1,503 |
+| SYNC (≈ helper drain) | 1,959,361 | 5.8 | 14,499 | 135 |
+| LAYERNORM_FP32 | 1,088,025 | 3.2 | 25 | 43,521 |
+| MAX_ABS_REDUCE_FP32 | 863,563 | 2.5 | 745 | 1,159 |
+| DEQUANT/VADD/GELU/ctl rest | ~2,169,000 | 6.4 | | |
+
+busy counters: sfu 11.89M, sys 12.39M, **helper 1.90M** (BUF_COPY retire-gap is
+4.0 — its execution is absorbed by the following SYNC's gap; use
+`busy_cycles.helper`).
+
+### 1.2 Batch-16 step, measured per-opcode (fresh profile, HEAD)
+
+| op | gap cyc | % | count | cyc/op | note |
+|---|---:|---:|---:|---:|---|
+| MASKED_SOFTMAX_FP32 | 61,712,640 | 31.3 | 2,304 | 26,785 | 15/16 rows are padding |
+| MATMUL | 35,519,220 | 18.0 | 5,943 | 5,977 | == sys_busy |
+| QUANT_FP32_INT8 | 32,167,721 | 16.3 | 9,961 | 3,229 | 2304× each of K/V/sm/q + shared |
+| SYNC | 29,335,681 | 14.9 | 61,866 | 474 | ≈ helper execution (busy 28.53M) |
+| LOAD (visible) | 23,994,497 | 12.2 | 20,972 | 1,144 | of 28.78M beats — KV barely hides |
+| DEQUANT_ACCUM_FP32 (0x17) | 8,409,600 | 4.3 | 4,608 | 1,825 | qkt + av dequants (pc-vector) |
+| DEQUANT_SCALED / LN / MAXABS / VADD / GELU | ~4.5M | 2.3 | | | shared, B-invariant |
+| ctl rest (SET_ADDR/CONFIG/STORE/…) | ~1.6M | 0.8 | | | |
+
+Closure: SFU 106.81M (54.2%) + sys 35.51M (18.0%) + **helper 28.53M (14.5%,
+serialized — K^T transposes + V→WBUF copies ≈ 19.4M, row_copy/gather/concat +
+`_compact_abuf` churn ≈ 9M)** + visible DMA ~24.2M (12.3%) + ctl ~2.1M ≈
+197.1M. Per (stream,head) core ×2304: softmax 26.8K + quants ~13.4K + dequants
+~3.7K SFU; matmuls 10.7K sys; copies ~12.4K helper; ~63 insns; K+V fp16 loads
+8,448 beats mostly unhidden (nothing legal to hide them under in the serial
+SFU-heavy chain).
+
+### 1.3 The three structural wastes (all in the attention core)
+
+1. **16-row tile tax.** CONFIG_TILE M is in 16-row units (`sfu_engine.sv:511`
+   `(tile_m+1)<<4`); every per-stream SFU op walks 16 rows for 1 real row.
+   Softmax alone: 62.5M of which ~58.6M is padding rows.
+2. **Per-step KV re-quantization.** K and V are cached **fp16** and re-loaded,
+   re-quantized (static calibration scales!), and re-copied/transposed into
+   WBUF every step for every (stream,head): ~20M SFU + ~19M helper+copy +
+   double the KV DMA. Quantization with a static scale is a deterministic pure
+   function — doing it once at store time is **byte-identical**.
+3. **Per-(stream,head) op explosion.** 2304 attention cores × ~63 insns, each
+   paying matmul fixed costs (130 cyc/tile + ACCUM pre-clear 64/tile),
+   per-core SET_ADDR/SYNC/CONFIG, `_compact_abuf` churn, and 4,608 broadcast
+   pc_scale loads.
+
+---
+
+## 2. Ranked levers
+
+tok/s = fmax / cyc_per_token; cycle levers and fmax levers multiply.
+Estimates are per-step cycles at B=16 ctx-512, from the validated cost model
+(±15% on sub-splits; A/B/C interact — combined numbers are the honest ones).
+
+| # | lever | step cyc → | tok/s | effort | risk | bit-exact? |
+|---|---|---|---:|---|---|---|
+| A | int8 KV cache (store-time quant) | 197M → ~154M | ~3.65 | ~1 wk, compiler+layout | low | **yes** (static scales) |
+| C | `m_exact` row count (ISA ext) | +A → ~86M | ~6.5 | days RTL, ~1 wk total | low-med | yes (freeze §6 revision) |
+| B | packed attention core (12 heads → 1) | +A+C → ~63M | **~9** | 2-3 wk compiler | med | yes (needs C for per-head scales) |
+| D | de-serialize K^T transpose / helper | +ABC → ~53M | ~10.5-11 | RTL (DMA transpose) or layout trick | med | yes |
+| E | fmax cluster div_p6+sqrt (≥24 GB box) | ×1.12–1.18 | ~12-13 | multi-day EDA | med | yes |
+| F | multi-clock domains (SFU slow island) | ~×1.7-2 on top | ~18+ | multi-week CDC | highest | yes |
+| G | W4 weights (RTL doesn't decode int4 yet) | −~5M beats | small post-B | RTL+PPL gate | med | **no** (PPL-gated) |
+| H | B=32 (needs ABUF freed by A/B) | ~+15-20%/tok | — | small after B | low | yes |
+| I | serving completeness: logits ×16, multi-token prefill | ~free / big TTFT win | — | small / 1-2 wk | low | yes |
+
+(Empirically grounded: A's SFU cut is the measured K/V QUANT share ≈ 25.3M of
+the 32.2M QUANT class; C's cut is the measured softmax 61.7M → 3.9M plus the
+0x17 dequants 8.4M → ~0.6M and sm-quant; B's is the measured attention-matmul
+24.7M → ~11.2M plus helper/ctl consolidation; D's is the residual ~9.4M of
+serialized K^T transposes inside the 28.53M helper.)
+
+### 2A. int8 KV cache — store-time quantization (do first) — **DELIVERED, see §0**
+
+All four attention quant boundaries use **static calibration scales**
+(`attention.py:141-163, 167-185, 398-422, 435-453`) — so quantizing K/V rows
+**once at kv_store time** produces bit-identical int8 bytes to today's
+per-step re-quant. Store `k_int8`/`v_int8` (layout already supports
+`elem_bytes=1`, `kv_cache.py:63,123`) instead of fp16:
+
+- kills QUANT-K/QUANT-V ×4608: **−20.3M SFU**
+- kills the V ABUF→WBUF copy (DMA int8 V straight to WBUF — LOAD already
+  targets WBUF, e.g. the pc_scale load `attention.py:230-234`): **−9.7M helper**
+- halves KV DMA: 19.5M → 9.7M beats: **−~5M visible**
+- frees the 66KB fp16 V + transients per stream → ABUF headroom (compaction
+  churn drops; ctx>512 and B=32 unblock; KV DRAM halves → ctx-1024 batched
+  fits the 1 GB budget: 302MB KV + 392MB weights)
+- also −~2.2M on batch-1 decode (~+7% single-stream)
+
+V stores become 12×64B per (layer,stream) (per-head rows); K keeps its
+per-(layer,head,stream) row-major layout, per-step BUF_COPY-transpose to WBUF
+stays (see D). New-row quant: the (16,64) K/V projection tiles are quantized
+once per (layer,head) — full 16-row utilization — then rows stored.
+Gate: byte-match cosim (outputs identical by construction) + kv-layout tests.
+
+### 2C. `m_exact` — exact SFU row count (small ISA extension, big cut)
+
+CONFIG_TILE bits **[28:0] are free and already ignored by the RTL decoder**
+(`decode_unit.sv:158-160` extracts only [58:29]; the W4 bit [28] exists only
+in software). Add a 5-bit `m_exact` (0 = full tile, backward compatible —
+every existing bundle byte-identical):
+
+- RTL: **one mux** at the dispatch latch (`sfu_engine.sv:882`) —
+  `m_rows_q <= use_exact ? m_exact : dispatch_m_rows_w`. `m_rows_q` is used
+  *only* as the row-loop bound at the 7 loop sites, never in addressing or the
+  OOB check; mode-0 DPI and mode-1 synth share the FSM, so one change bounds
+  both. fmax-neutral by construction (a 15-bit mux far from the fp32 cluster).
+- Golden: `simulator.py` gen-2 handlers — loop `m_exact` rows and **partial
+  write** (leave rows [m_exact,16) untouched); ~14 sites, mechanical.
+- Freeze: §6 dated revision + `gen_gen2_fixtures.py` regen + SHA re-pin
+  (exact W4-extension recipe, commit `81ad53f`).
+- Compiler: emit `m_exact=1` on the per-stream attention SFU ops (softmax,
+  qkt-dequant, sm-quant, av-dequant). MAX_ABS keeps full rows (it's a
+  reduction; bounding changes semantics — padding rows are zeroed today, so
+  bounded is equal-valued, but leave it full-tile for safety).
+
+Effect at B=16: softmax 62.5M → 3.9M, qkt-dequant 5.1M → 0.3M, sm-quant
+2.5M → 0.2M. **With A: step ≈ 78M → ~7.1 tok/s (2.5×).** Also worth ~+6% on
+batch-1 decode (softmax 3.9M → 0.24M).
+
+### 2B. Packed attention core — one QK^T/softmax/AV per (layer,stream)
+
+Restructure the per-stream loop from 12 per-head cores to **one packed core**:
+
+- **Q_pack** (16,768) int8: block-diagonal — row h holds head h's query in
+  columns [64h,64h+64), zeros elsewhere (one-time zeroed region; 12 tiny
+  BUF_COPY row-inserts per stream from the per-(layer,head) q_int8 tiles,
+  which are quantized once for all 16 streams). Zeros contribute exactly 0 to
+  int8 dot products → scores bit-identical.
+- **QK^T**: one matmul (16, 768, 528) vs 12× (16,64,528). Same MACs, but the
+  130-cyc/tile overhead + ACCUM pre-clear amortize: 12×7.84K → ~32.8K
+  (2 WBUF passes: K^T (768,264) = 198KB ≤ 256KB WBUF). **Attn systolic
+  24.7M → ~11.2M.**
+- **scores** (12 real rows, 528): dequant per head-row (12 × 1-row DEQUANT
+  via `m_exact`, each with that head's constant pc vector) → **one
+  MASKED_SOFTMAX (m_exact=12)** ≈ 20.3K vs 12×27.1K. All rows share
+  keep_through (lockstep) — the per-row causal ramp already handles rows
+  identically at `query_row_base=position`.
+- **probs quant**: 12 × 1-row QUANT with each head's static sm_scale
+  (`m_exact=1`, ~72 cyc each) — preserves exact per-head scales, no coupling.
+- **AV**: one matmul (16,528,768) against V (528,768) int8 loaded
+  **directly DRAM→WBUF** (per-(layer,stream) (pos,768) int8 V layout from A;
+  k-split ×2 with `flags_accumulate` since 405KB > WBUF). Output (16,768):
+  diag block (row h, cols 64h..) is head h's output — dequant once with a
+  per-column composite vector (sm_scale_h·v_scale_h on column block h — the
+  existing per-N pc_scale mechanism, `codegen.py:468-476`, just non-uniform),
+  then 12 tiny diag-extract BUF_COPYs replace gather_rows + its spills.
+- **K^T**: per-head slice transposes into WBUF row offsets (same bytes as
+  today, ~9.7M helper — target of D).
+
+Instruction count: 2304 cores × ~63 → 192 × ~40 insns (−~135K insns/step);
+pc_scale blob dedup falls out (192×2 vectors vs 4608 broadcasts, −2.6MB DRAM).
+ABUF peak drops (no fp16 V, no 16 co-resident score tiles — the old
+gather-softmax blocker is moot). **A+B+C step ≈ 52M → ~10.5 tok/s (3.8×).**
+Gate: byte-match per stream (scores/probs/outputs identical by construction —
+same int8 inputs, same scales, same reduction orders); `test_batched_decode`
+suite; PPL spot-check unnecessary (no numeric change).
+
+### 2D. De-serialize the K^T transpose (~10M helper, post-B the #2 block)
+
+Helper is forbidden to overlap anything (`taccel_top.sv:558-561`), so the
+per-step 9.7M-cycle K^T transpose is pure serial time. Options, cheapest
+first: (i) **K^T-blocked DRAM layout** — store K^T in (64,16) column blocks;
+appending a token = 64 strided bytes = 4 beats ×16-byte... requires strided
+DMA (not supported) → instead 64 small stores/step/(head,stream) is worse;
+skip. (ii) **DMA transpose-on-load** into WBUF (new dma_engine addressing
+mode, moderate RTL, no ISA change if keyed off a CONFIG bit): kills the
+helper pass entirely AND overlaps legally with systolic → **−~10M, ~13
+tok/s**. (iii) relax helper∥DMA/sys overlap arms (contract change + port
+arbitration — bundle with F). Note: with B, transposes run 12×192 on int8;
+any of these also shrinks batch-1 decode.
+
+### 2E/2F. fmax and clock domains (multiplicative, unchanged from 07-08 doc)
+
+- **E**: div_p6 + sqrt-Mpad restructure: +12–18% on everything; still blocked
+  on a ≥24 GB box (`/tmp/pnr_final.sh` ready).
+- **F**: post-A+B+C the step is ~78% sys+helper+dma+ctl — blocks that
+  synth at 109–875 MHz vs the SFU's 34.41. A slow-SFU-island CDC design
+  roughly halves the remaining step again (~20 tok/s at B=16). Heaviest
+  verification burden; byte-match contract is timing-agnostic so cosim
+  survives. Only worth starting after A–D land.
+
+### 2G–2I. Second tier
+
+- **G. W4 weights**: golden/ISA carry `weight_int4` (CONFIG_TILE bit 28) but
+  the **RTL never decodes it** — real RTL work (systolic B-load unpack).
+  Halves weight DMA (9.9M → ~5.2M beats); mostly hidden post-B; PPL-gated
+  (TurboQuant sweep suggests even 4-bit KV is tolerable, so W4 weights are
+  plausible). Bigger win for prefill/single-stream than batched decode.
+- **H. B=32**: graph/layout generalize (guard at `tiny_fixture.py:426` +
+  bench); shared FFN/weights amortize 2×; per-stream attention scales
+  linearly. Post-A/B ABUF fits it. ~+15–20% per-token.
+- **I. Serving completeness**: logits ×16 is ~free (+92K beats, ~180 insns —
+  finish it); **multi-token batched prefill** reuses the packed-attention
+  machinery with M=16 real query rows per stream — 16× on prompt
+  processing (TTFT), currently ~1 tok/s equivalent.
+
+---
+
+## 3. Recommended sequence
+
+1. **A — int8 KV** (~1 wk): byte-exact, unlocks ABUF, halves KV DMA,
+   −25M SFU, −10M helper. Lands alone → ~3.65 tok/s.
+2. **C — m_exact** (~1 wk incl. freeze revision): 1-mux RTL + golden partial
+   write + emit plumbing. With A → **~6.5 tok/s**. (Also +6-7% batch-1.)
+3. **B — packed attention** (2–3 wk): the structural consolidation.
+   → **~9 tok/s** batched, and it shrinks single-stream attention too.
+4. **D — kill the transpose serialization** (RTL DMA-transpose preferred)
+   → ~10.5–11 tok/s.
+5. **E — fmax** when a ≥24 GB box appears (×1.12–1.18) → ~12–13.
+6. **H, I** opportunistically; **F (multi-clock)** as the next big rock;
+   **G (W4)** if/when prefill or DRAM footprint matters.
+
+Waterfall (B=16, ctx-512, honest-BW, 34.41 MHz unless noted):
+2.79 → A 3.65 → +C 6.5 → +B ~9 → +D ~10.5-11 → +E ~12-13 → +F ~18+ tok/s.
+Single-stream decode rides along: 1.016 → ~1.09 (A) → ~1.16 (A+C) → ~1.3 (B,D).
+**A landed (§0): b1 1.126 (beat the ~1.09 estimate); b16 3.796 (beat the ~3.65 estimate) — the waterfall now starts from 3.80.**
+
+## 4. Floors (what "done" looks like at this fmax)
+
+Per token at B=16 ctx-512: FFN+proj systolic ~680K; attn systolic (packed)
+~700K; shared SFU ~350K; softmax floor ~245K; KV int8 DMA ~600K beats;
+weights ~620K beats (hides under FFN). Fully-serialized floor ≈ ~3.3M/tok
+(≈ 10.4 tok/s); with legal DMA∥sys overlap fully exploited ≈ ~2.7M
+(≈ 12.7 tok/s); E pushes toward ~15; past that it's F (clock domains) or
+wider hardware (array/SFU lanes).
+
+## 5. Measurement notes
+
+- Profile scripts (this session): `scratchpad/profile_step.py` (retire-gap
+  attribution incl. helper via `busy_cycles`), `build_bins.py`,
+  `rebuild_mode1.sh`, `pipeline.sh` — clone of `/tmp/sfu_profile_m1.py`
+  extended to decode/batched bins.
+- BUF_COPY retire-gap ≈ 4.0 always — helper time lands in the following
+  SYNC's gap; read `busy_cycles.helper`.
+- Batch-16 empirical per-opcode profile: landed (§1.2), full results in
+  `scratchpad/prof_b16_p510.txt` + `_sum.json`. Aggregates agree with commit
+  `2d877be` to −0.07% (bundle-emission variation of ~1,150 insns between that
+  build and this rebuild; b1 reproduces exactly).
