@@ -174,12 +174,13 @@ def emit_qkt_dequant(cg: "CodeGenerator", node: "IRNode") -> None:
     Reads the packed matmul's ACCUM (must be intact — no AV matmul between). The
     composite PC vector (blockL_headH_sS_qkt__qkt_pc_scale) is staged by codegen.
     """
-    head_idx = int(node.attrs["head_idx"])
     query_len = int(node.attrs.get("query_len", 1))
     key_len = int(node.attrs["key_len"])
-    M_pad = pad_dim(query_len)
+    # `accum_row` = this head's row within its group's ACCUM tile (0-based
+    # local index); falls back to head_idx for the whole-layer (single-group)
+    # case. Decode has query_len==1, so a group's ACCUM is (group_pad, N_pad).
+    accum_row = int(node.attrs.get("accum_row", node.attrs["head_idx"]))
     N_pad = pad_dim(key_len)
-    m_tiles = M_pad // TILE
     n_tiles = N_pad // TILE
 
     # PC scale vector -> WBUF (staged at DRAM-layout time for this node).
@@ -192,10 +193,15 @@ def emit_qkt_dequant(cg: "CodeGenerator", node: "IRNode") -> None:
     cg._emit_dma_load(BUF_WBUF, pc_alloc.offset_units, pc_bytes, 0, pc_dram)
     cg._emit(SyncInsn(resource_mask=0b001))
 
+    # Same (M_pad, N_pad) FP16 score tile the per-head path produced (row 0 =
+    # this head's scores). ABUF is bounded by the builder interleaving each
+    # group's softmax/AV so only `group` score tiles are live at once.
+    M_pad = pad_dim(query_len)
+    m_tiles = M_pad // TILE
     out_alloc = _abuf_alloc_fp32(cg, node.name, M_pad, N_pad)
 
-    # ACCUM holds (n_head_pad, N_pad) INT32; row head_idx = this head's scores.
-    accum_row_units = (head_idx * N_pad * 4) // UNIT
+    # ACCUM holds (group_pad, N_pad) INT32; row accum_row = this head's scores.
+    accum_row_units = (accum_row * N_pad * 4) // UNIT
     cg._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=0, m_exact=1))
     cg._emit(DequantAccumFp32Insn(
         src1_buf=BUF_ACCUM, src1_off=accum_row_units,

@@ -437,64 +437,75 @@ def _emit_batched_attention_block(graph: IRGraph, prev: str, block_idx: int,
                  stream=s, src_row=s, decode=True)
         qb_by_head.append(qb)
 
-    # Lever B — packed QK^T. For each stream, the 12 per-head QK^T matmuls
-    # collapse into ONE block-diagonal matmul (Q_pack @ K_all^T); each head's
-    # scores are split back out by a per-head dequant reading its ACCUM row.
-    # Everything downstream (softmax / attn_v / gather / concat) is UNCHANGED and
-    # byte-identical. The packed core needs K_all^T resident in WBUF and every
-    # head's K cache co-resident in ABUF, so it engages only where both fit;
-    # otherwise we fall back to the proven per-head path. Making the ctx-512 b16
-    # headline shape fit needs the N-split of K_all^T + a streaming per-head
-    # K-load (to bound ABUF) — lever B2, see scratchpad/leverB_design.md.
-    kt_bytes = shape.d_model * pad_dim(key_len)            # INT8 K_all^T in WBUF
-    kcache_bytes = shape.n_head * pad_dim(key_len) * shape.d_head  # co-resident K caches
-    use_packed = kt_bytes <= WBUF_SIZE and kcache_bytes <= ABUF_SIZE // 2
+    # Lever B — packed QK^T. Per stream, the per-head QK^T matmuls collapse into
+    # block-diagonal packed matmuls (Q_pack @ K_all^T), each head's scores split
+    # back out by a per-head dequant reading its ACCUM row. softmax / attn_v /
+    # gather / concat are UNCHANGED and byte-identical. A packed group needs its
+    # K_all^T resident in WBUF and its heads' K caches co-resident in ABUF, so we
+    # pack `group` heads at a time — the largest group that fits both budgets
+    # (leaving room for the batched queries + score tiles). At GPT-2 124M ctx-512
+    # a full 12-head pack is 405 KB WBUF / 396 KB ABUF, but a 2-head group is
+    # 68 KB / 68 KB, so it packs in pairs (~1.5-1.9x QK^T vs ~3x full). Each
+    # group's K caches free before the next group's load, so ABUF holds only
+    # `group` caches at a time. group==1 gives no benefit -> per-head fallback.
+    kcache_one = pad_dim(key_len) * shape.d_head            # one INT8 K cache
+    reserve = (shape.n_head * pad_dim(n_streams) * shape.d_head * 2   # qb (FP16)
+               + shape.n_head * pad_dim(key_len) * 2                  # score tiles (FP16, 1 row)
+               + 16 * 1024)                                           # Q_pack + headroom
+    g_wbuf = max(1, WBUF_SIZE // (shape.d_head * pad_dim(key_len)))
+    g_abuf = max(1, (ABUF_SIZE - reserve) // max(kcache_one, 1))
+    group = max(1, min(shape.n_head, g_wbuf, g_abuf))
 
-    if use_packed:
+    if group >= 2:
         head_stream_outs = [[None] * n_streams for _ in range(shape.n_head)]
         for s in range(n_streams):
-            # Load stream s's own K cache for every head (INT8, store-time quantized).
-            k_loads = []
-            q_scale_keys, k_scale_keys = [], []
-            for head_idx in range(shape.n_head):
-                pfx = f"block{block_idx}_head{head_idx}_s{s}"
-                k_loads.append(_add(graph, "kv_load", f"{pfx}_kload", [], (key_len, shape.d_head),
-                                    layer=block_idx, kind="key", head=head_idx, tokens=key_len,
-                                    stream=s, decode=True, dtype="int8"))
-                q_scale_keys.append(f"{pfx}_q")
-                k_scale_keys.append(f"{pfx}_kload")
-            packed = _add(
-                graph, "packed_qkt_matmul", f"block{block_idx}_s{s}_pqkt",
-                qb_by_head + k_loads, (pad_dim(shape.n_head), key_len),
-                block_idx=block_idx, n_head=shape.n_head, d_head=shape.d_head,
-                d_model=shape.d_model, key_len=key_len, stream=s, query_len=1,
-                q_scale_keys=q_scale_keys, k_scale_keys=k_scale_keys,
-            )
-            # 12 dequants first — ACCUM must stay intact across all of them.
-            scores = []
-            for head_idx in range(shape.n_head):
-                pfx = f"block{block_idx}_head{head_idx}_s{s}"
-                scores.append(_add(
-                    graph, "qkt_dequant", f"{pfx}_qkt", [packed], (1, key_len),
-                    block_idx=block_idx, head_idx=head_idx, query_len=1, key_len=key_len,
-                    d_head=shape.d_head, scale=inv_sqrt,
-                    q_scale_key=f"{pfx}_q", k_scale_key=f"{pfx}_kload",
-                ))
-            for head_idx in range(shape.n_head):
-                pfx = f"block{block_idx}_head{head_idx}_s{s}"
-                scaled = _add(graph, "scale_mul", f"{pfx}_scale", [scores[head_idx]], (1, key_len),
-                              query_len=1, key_len=key_len, scale=inv_sqrt)
-                sm = _add(graph, "softmax", f"{pfx}_softmax", [scaled], (1, key_len),
-                          query_len=1, key_len=key_len, masked=True, runtime_config_attn=True,
-                          causal_identity=True)
-                # A2: V loads straight to WBUF (the MATMUL src2 home).
-                v_s = _add(graph, "kv_load", f"{pfx}_vload", [], (key_len, shape.d_head),
-                           layer=block_idx, kind="value", head=head_idx, tokens=key_len,
-                           stream=s, decode=True, dtype="int8", dst="wbuf")
-                attn_v = _add(graph, "matmul_attn_v", f"{pfx}_attnv", [sm, v_s], (1, shape.d_head),
-                              block_idx=block_idx, head_idx=head_idx, query_len=1, key_len=key_len,
-                              v_int8_from_cache=True)
-                head_stream_outs[head_idx][s] = attn_v
+            for g0 in range(0, shape.n_head, group):
+                heads = list(range(g0, min(g0 + group, shape.n_head)))
+                # Load this group's K caches (INT8, store-time quantized). They
+                # free after the group's packed matmul, before the next group's.
+                k_loads, q_keys, k_keys = [], [], []
+                for h in heads:
+                    pfx = f"block{block_idx}_head{h}_s{s}"
+                    k_loads.append(_add(graph, "kv_load", f"{pfx}_kload", [], (key_len, shape.d_head),
+                                        layer=block_idx, kind="key", head=h, tokens=key_len,
+                                        stream=s, decode=True, dtype="int8"))
+                    q_keys.append(f"{pfx}_q")
+                    k_keys.append(f"{pfx}_kload")
+                packed = _add(
+                    graph, "packed_qkt_matmul", f"block{block_idx}_s{s}_g{g0}_pqkt",
+                    [qb_by_head[h] for h in heads] + k_loads, (pad_dim(len(heads)), key_len),
+                    block_idx=block_idx, n_head=len(heads), d_head=shape.d_head,
+                    d_model=len(heads) * shape.d_head, key_len=key_len, stream=s, query_len=1,
+                    q_scale_keys=q_keys, k_scale_keys=k_keys,
+                )
+                # All of the group's dequants run before its first attn_v matmul
+                # (which reuses ACCUM); the next group re-computes ACCUM afresh.
+                scores = {}
+                for j, h in enumerate(heads):
+                    pfx = f"block{block_idx}_head{h}_s{s}"
+                    scores[h] = _add(
+                        graph, "qkt_dequant", f"{pfx}_qkt", [packed], (1, key_len),
+                        block_idx=block_idx, head_idx=h, accum_row=j, query_len=1,
+                        key_len=key_len, d_head=shape.d_head, scale=inv_sqrt,
+                        q_scale_key=f"{pfx}_q", k_scale_key=f"{pfx}_kload",
+                    )
+                # Consume the group's scores now, so only `group` score tiles
+                # are ever live (keeps ABUF bounded at the ctx-512 shape).
+                for h in heads:
+                    pfx = f"block{block_idx}_head{h}_s{s}"
+                    scaled = _add(graph, "scale_mul", f"{pfx}_scale", [scores[h]], (1, key_len),
+                                  query_len=1, key_len=key_len, scale=inv_sqrt)
+                    sm = _add(graph, "softmax", f"{pfx}_softmax", [scaled], (1, key_len),
+                              query_len=1, key_len=key_len, masked=True, runtime_config_attn=True,
+                              causal_identity=True)
+                    # A2: V loads straight to WBUF (the MATMUL src2 home).
+                    v_s = _add(graph, "kv_load", f"{pfx}_vload", [], (key_len, shape.d_head),
+                               layer=block_idx, kind="value", head=h, tokens=key_len,
+                               stream=s, decode=True, dtype="int8", dst="wbuf")
+                    attn_v = _add(graph, "matmul_attn_v", f"{pfx}_attnv", [sm, v_s], (1, shape.d_head),
+                                  block_idx=block_idx, head_idx=h, query_len=1, key_len=key_len,
+                                  v_int8_from_cache=True)
+                    head_stream_outs[h][s] = attn_v
         for head_idx in range(shape.n_head):
             head_outputs.append(_add(
                 graph, "gather_rows", f"block{block_idx}_head{head_idx}_attn_out",
