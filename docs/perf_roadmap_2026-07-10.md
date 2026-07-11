@@ -85,6 +85,49 @@ the systolic/K^T-transpose path (D), not the SFU.
 
 ---
 
+## 0.2 UPDATE — lever B FOUNDATION landed (`dabbeb9`), B2 pending
+
+Block-diagonal **packed QK^T**: the 12 per-head QK^T systolic matmuls of one
+(layer, stream) collapse into ONE matmul `Q_pack @ K_all^T`, where `Q_pack`
+(16, d_model) is block-diagonal (head h's INT8 query at row h, cols
+[d_head·h, d_head·h+d_head), zeros elsewhere) and `K_all^T` (d_model, key_len)
+stacks the 12 per-head transposed K caches at block rows. Row h of the INT8
+matmul = head h's INT32 scores (the 704 zero columns add exactly nothing), so
+a per-head dequant of ACCUM row h reproduces the exact per-head score tile;
+softmax / attn_v / gather / concat are UNCHANGED. Pure compiler change — no
+ISA / RTL / golden touch. Byte-exact: golden 12/12 (tiny+124M, b1+b16), tiny
+mode-1 RTL == mode-0 golden byte-match, zero new test failures.
+
+**Two roadmap corrections proven this pass:**
+- **AV packing is SYSTOLIC-NEUTRAL.** per-head AV = 4 n-tiles ×192 = 768
+  tile-ops/layer; packed AV = 48 n-tiles ×16 = 768 tile-ops/layer — identical,
+  and packed computes 11/12 junk off-diagonal blocks. It also needs a V
+  column-interleave into (key_len, d_model) that BUF_COPY can't do (no strided
+  scatter). So lever B is **QK^T-only**; AV stays per-head. The entire
+  attention-systolic win (~24.7M → ~13.1M/step, the QK^T share) is in QK^T.
+- **Softmax packing (12→1, m_exact=n_head) is byte-exact but NOT needed:** the
+  decode PADDED mask (valid_kv_len=pos+1) makes all packed head-rows share the
+  same causal window, so one MASKED_SOFTMAX == 12; but post-C softmax is
+  already ~free, and keeping per-head softmax lets the per-head dequant feed it
+  unchanged (byte-identical). Deferred.
+
+**Guard:** the packed core needs `K_all^T` resident in WBUF (d_model·key_len_pad
+INT8) AND every head's K cache co-resident in ABUF (n_head·key_len_pad·d_head).
+At 124M ctx-512 b16 both blow the budgets (K_all^T 405 KB > 256 KB WBUF; 12 K
+caches 396 KB > 128 KB ABUF), so it **falls back to the per-head path —
+UNCHANGED at 7.192 tok/s**. Packing engages on tiny + short-context 124M decode.
+
+**B2 (the ctx-512 headline win, ~7.19 → ~9):** make it fit. Two options —
+(i) **N-split** `K_all^T` into ≤256 KB WBUF passes + **stream the per-head
+K-load** (load→transpose→free one 33 KB cache at a time via a shared ABUF
+scratch, so ABUF holds 1 not 12); or (ii) **grouped pack** — pack g heads at a
+time with g the largest that fits (g≈2 at ctx-512 → ~1.5-1.9× QK^T vs ~3× full),
+no N-split/streaming, 6 group-matmuls/stream. Both need a fresh 124M golden
+byte-diff + mode-1 bench measure + full suite. Foundation code + design in
+`software/taccel/compiler/w8a16_emit/packed_attn.py` + scratchpad/leverB_design.md.
+
+---
+
 ## 1. Where the cycles go
 
 ### 1.1 Batch-1 decode step, measured per-opcode (fresh profile, HEAD)
