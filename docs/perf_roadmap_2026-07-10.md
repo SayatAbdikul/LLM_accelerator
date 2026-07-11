@@ -141,6 +141,50 @@ Waterfall now: 2.79 → A 3.80 → +C **7.19** → +B(grouped) **7.84** → +B(f
 
 ---
 
+## 0.3 UPDATE — lever B STREAMING-K group-widening landed (group 2 → 4)
+
+The grouped pack's group=2 cap was **not** WBUF — it was the co-resident INT8 K
+caches in ABUF *during the matmul* (`group × 33.8 KB`). Those caches free before
+the dequant score tiles allocate, so the matmul phase and the dequant phase never
+overlap. **Streaming the K loads** — the packed emitter now loads each head's
+INT8 K cache into ONE reused ABUF scratch (`load → transpose → free`) instead of
+consuming `group` pre-loaded caches — collapses that term to a single 33.8 KB
+scratch. The group then rises to where the *dequant phase* binds: the `group`
+per-head FP16 score tiles (16×N_pad) + one softmax-output tile + the batched
+query projections. At 124M ctx-512 that is **group=4 → 3 groups/stream (was 6)**;
+packed QK^T matmuls 1152 → 576. `K_all^T` bytes and every downstream op are
+untouched, so it is byte-exact by construction (no ISA/RTL/golden change; pure
+compiler). K loads are no longer standalone `kv_load` nodes (V loads remain);
+the packed node carries `stream_k` + global `k_heads`.
+
+**Measured (mode-1 honest-BW, 34.41 MHz, b16 pos-510):**
+
+| metric | grouped (g=2) | streaming (g=4) | Δ |
+|---|---:|---:|---:|
+| step cyc | 70,208,091 | 66,799,599 | −4.9% |
+| sys_busy | 28,987,197 | 25,724,157 | **−11.3%** (further QK^T consolidation) |
+| sfu_busy | 10,056,082 | 10,056,082 | 0 (systolic-only, exact) |
+| dma_beats | 19,476,400 | 19,476,400 | 0 (same K bytes, exact) |
+| **tok/s** | **7.842** | **8.242** | **+5.1%** (+195% over base) |
+
+Byte-exact: tiny b1/b16 golden identical, tiny mode-1 RTL==golden byte-match
+(`test_batched_decode` 7/7), **gpt2 124M b1/b16 golden byte-identical** to the
+grouped baseline; 95 compiler/decoder tests green, zero new failures. b1 unchanged
+(1.633 — inject_kv_cache path, untouched).
+
+**Remaining stretch to ~9 (full pack, group=12, one matmul/stream):** the WBUF
+`K_all^T` for 12 heads (405 KB) still exceeds 256 KB, so the group-4→12 step needs
+the N-split (≤256 KB WBUF passes writing distinct ACCUM column ranges, per-pass
+dequants) — ACCUM is *not* the binder (16×N_pad INT32 = 33 KB). MATMUL writes/
+clears only its (M,N) tile at `dst_off` (golden `systolic.py:81`, RTL
+`systolic_controller.sv:112-115`), so coexisting N-pass ACCUM regions are safe;
+add a forced-small-WBUF cosim test for RTL coverage (tiny packs one pass).
+
+Waterfall now: 2.79 → A 3.80 → +C **7.19** → +B(grouped) **7.84** →
++B(streaming g=4) **8.24** → +B(full g=12/N-split) ~9 → +D ~10.5-11 → +E ~12-13.
+
+---
+
 ## 1. Where the cycles go
 
 ### 1.1 Batch-1 decode step, measured per-opcode (fresh profile, HEAD)

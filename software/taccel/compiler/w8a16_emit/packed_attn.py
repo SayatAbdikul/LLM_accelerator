@@ -40,6 +40,7 @@ from ...isa.instructions import (
     SyncInsn,
 )
 from ...isa.opcodes import BUF_ABUF, BUF_ACCUM, BUF_WBUF, WBUF_SIZE
+from ..kv_cache import normalize_kv_kind
 from ..tiler import TILE, pad_dim
 from ._common import UNIT, _abuf_alloc_fp32, _fp16_to_uint16
 
@@ -53,8 +54,16 @@ DEFAULT_ACT_SCALE = 6.0 / 127.0
 def emit_packed_qkt_matmul(cg: "CodeGenerator", node: "IRNode") -> None:
     """Block-diagonal packed Q @ K^T for all heads of one (layer, stream).
 
-    inputs = [qb_0..qb_{H-1}, kload_0..kload_{H-1}] (batched query projections +
-    per-(head,stream) INT8 K caches). Leaves ACCUM = (n_head_pad, key_len) INT32.
+    Two K-residency modes (byte-identical K_all^T, so identical scores):
+      - pre-loaded: inputs = [qb_0..qb_{H-1}, kload_0..kload_{H-1}] (batched
+        query projections + per-(head,stream) INT8 K caches already in ABUF).
+      - ``stream_k`` (default on the batched path): inputs = [qb_0..qb_{H-1}]
+        only; the emitter loads each head's INT8 K cache into a REUSED ABUF
+        scratch (load -> transpose -> free), so at most ONE cache is resident.
+        The global head index per WBUF block comes from ``attrs['k_heads']``.
+        Streaming lifts the co-resident-K-cache ABUF cap that otherwise pins the
+        group size, letting more heads pack into one matmul.
+    Leaves ACCUM = (n_head_pad, key_len) INT32.
     """
     from ..emit.kv import kv_int8_full_rows  # lazy: import cycle w/ emit.kv
 
@@ -116,7 +125,7 @@ def emit_packed_qkt_matmul(cg: "CodeGenerator", node: "IRNode") -> None:
         ))
         cg._emit(SyncInsn(resource_mask=0b100))
 
-    # ----- K_all^T: 12 per-head INT8 transposes into one WBUF tile -----
+    # ----- K_all^T: per-head INT8 transposes into one WBUF tile -----
     kt_wbuf = cg.mem.wbuf.alloc(f"{node.name}__ktall", Kc_pad * N_pad)  # INT8
     if Kc_pad * N_pad > WBUF_SIZE:
         raise NotImplementedError(
@@ -124,13 +133,43 @@ def emit_packed_qkt_matmul(cg: "CodeGenerator", node: "IRNode") -> None:
             f"WBUF {WBUF_SIZE} B — needs the B2 N-split (not yet implemented)"
         )
     loaded_rows = kv_int8_full_rows(cg, key_len)
+    # Two K-residency modes with byte-identical K_all^T bytes:
+    #   - pre-loaded (grouped path): each head's INT8 K cache is already an ABUF
+    #     kv_load input (inputs[n_head+h]); transpose it in place.
+    #   - streamed (`stream_k`, full/wide pack): load one head's INT8 K cache
+    #     into a reused ABUF scratch, transpose into the WBUF block, free the
+    #     scratch — so at most ONE K cache is resident (not `group`). This lifts
+    #     the co-resident-K-cache ABUF cap that otherwise pins the group size,
+    #     without touching the transpose bytes or the downstream dequant/AV.
+    stream_k = bool(node.attrs.get("stream_k"))
     for h in range(n_head):
-        k_alloc = cg.mem.abuf.get(node.inputs[n_head + h])
-        if k_alloc is None:
-            raise KeyError(
-                f"Missing ABUF alloc '{node.inputs[n_head + h]}' (int8 K cache) "
-                f"for {node.name}"
+        dst_off = kt_wbuf.offset_units + (d_head * h * N_pad) // UNIT
+        if stream_k:
+            head_g = int(node.attrs["k_heads"][h])
+            layer = int(node.attrs["block_idx"])
+            entry = cg.kv_layout.entry(
+                layer, normalize_kv_kind("key"), head_g, stream
             )
+            kscratch = cg.mem.abuf.alloc(
+                f"{node.name}__kstream", N_pad * d_head
+            )  # INT8, reused per head
+            # Full-context int8 load from position 0 (mirrors emit_kv_load's
+            # decode `tokens>1` branch: base-relocated, no kv_base patch).
+            cg._emit_dma_load(
+                BUF_ABUF, kscratch.offset_units, loaded_rows * d_head, 2, 0,
+                dram_off_units=entry.dram_off_units,
+                relocation_symbol=entry.base_symbol,
+            )
+            cg._emit(SyncInsn(resource_mask=0b001))
+            k_src_off = kscratch.offset_units
+        else:
+            k_alloc = cg.mem.abuf.get(node.inputs[n_head + h])
+            if k_alloc is None:
+                raise KeyError(
+                    f"Missing ABUF alloc '{node.inputs[n_head + h]}' "
+                    f"(int8 K cache) for {node.name}"
+                )
+            k_src_off = k_alloc.offset_units
         if loaded_rows < N_pad:
             # Zero the INT8 K pad rows in the cache tile (matches per-head path).
             zpad = cg._dram_offset_required(
@@ -138,20 +177,21 @@ def emit_packed_qkt_matmul(cg: "CodeGenerator", node: "IRNode") -> None:
             )
             cg._emit_dma_load(
                 BUF_ABUF,
-                k_alloc.offset_units + (loaded_rows * d_head) // UNIT,
+                k_src_off + (loaded_rows * d_head) // UNIT,
                 (N_pad - loaded_rows) * d_head, 3, zpad,
             )
             cg._emit(SyncInsn(resource_mask=0b001))
         # transpose (N_pad, d_head) INT8 -> (d_head, N_pad) at row d_head*h
-        dst_off = kt_wbuf.offset_units + (d_head * h * N_pad) // UNIT
         cg._emit(BufCopyInsn(
-            src_buf=BUF_ABUF, src_off=k_alloc.offset_units,
+            src_buf=BUF_ABUF, src_off=k_src_off,
             dst_buf=BUF_WBUF, dst_off=dst_off,
             length=(N_pad * d_head) // UNIT,
             src_rows=N_pad // TILE,
             transpose=1,
         ))
         cg._emit(SyncInsn(resource_mask=0b001))
+        if stream_k:
+            cg.mem.abuf.free(f"{node.name}__kstream")
 
     # ----- one packed MATMUL Q_pack @ K_all^T -> ACCUM -----
     cg._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=k_tiles - 1))

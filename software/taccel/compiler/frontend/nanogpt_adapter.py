@@ -448,12 +448,21 @@ def _emit_batched_attention_block(graph: IRGraph, prev: str, block_idx: int,
     # 68 KB / 68 KB, so it packs in pairs (~1.5-1.9x QK^T vs ~3x full). Each
     # group's K caches free before the next group's load, so ABUF holds only
     # `group` caches at a time. group==1 gives no benefit -> per-head fallback.
-    kcache_one = pad_dim(key_len) * shape.d_head            # one INT8 K cache
-    reserve = (shape.n_head * pad_dim(n_streams) * shape.d_head * 2   # qb (FP16)
-               + shape.n_head * pad_dim(key_len) * 2                  # score tiles (FP16, 1 row)
-               + 16 * 1024)                                           # Q_pack + headroom
-    g_wbuf = max(1, WBUF_SIZE // (shape.d_head * pad_dim(key_len)))
-    g_abuf = max(1, (ABUF_SIZE - reserve) // max(kcache_one, 1))
+    # Lever B (streaming K): the packed matmul streams each head's INT8 K cache
+    # (load -> transpose -> free) so only ONE cache is ABUF-resident during the
+    # matmul; the co-resident-K-cache term no longer caps the group. The two
+    # remaining binds are (a) WBUF holding the group's K_all^T in ONE pass, and
+    # (b) ABUF during the dequant/softmax phase — where the `group` per-head
+    # FP16 score tiles (M_pad=16 x N_pad) coexist with one softmax-output tile
+    # plus every batched query projection (scale_mul renames the score tile in
+    # place, so it adds no tile). K_all^T bytes and every downstream op are
+    # unchanged, so a wider group is byte-exact — it only fuses more heads'
+    # QK^T into one matmul, amortizing the per-matmul fixed cost.
+    npad = pad_dim(key_len)
+    score_one = 16 * npad * 2                                   # (16, N_pad) FP16
+    qb_total = shape.n_head * pad_dim(n_streams) * shape.d_head * 2
+    g_wbuf = max(1, WBUF_SIZE // (shape.d_head * npad))         # group's K_all^T
+    g_abuf = max(1, (ABUF_SIZE - qb_total - score_one - 8 * 1024) // score_one)
     group = max(1, min(shape.n_head, g_wbuf, g_abuf))
 
     if group >= 2:
@@ -461,22 +470,21 @@ def _emit_batched_attention_block(graph: IRGraph, prev: str, block_idx: int,
         for s in range(n_streams):
             for g0 in range(0, shape.n_head, group):
                 heads = list(range(g0, min(g0 + group, shape.n_head)))
-                # Load this group's K caches (INT8, store-time quantized). They
-                # free after the group's packed matmul, before the next group's.
-                k_loads, q_keys, k_keys = [], [], []
-                for h in heads:
-                    pfx = f"block{block_idx}_head{h}_s{s}"
-                    k_loads.append(_add(graph, "kv_load", f"{pfx}_kload", [], (key_len, shape.d_head),
-                                        layer=block_idx, kind="key", head=h, tokens=key_len,
-                                        stream=s, decode=True, dtype="int8"))
-                    q_keys.append(f"{pfx}_q")
-                    k_keys.append(f"{pfx}_kload")
+                # Streaming K: the packed matmul loads each head's INT8 K cache
+                # itself (no standalone kv_load node), so at most one cache is
+                # ABUF-resident. `k_heads` gives the global head index per WBUF
+                # block for the in-emitter kv-cache lookup. The k_scale keys
+                # still name the (missing-on-batched-path -> default 6/127)
+                # per-stream scales the dequants resolve, byte-identical.
+                q_keys = [f"block{block_idx}_head{h}_s{s}_q" for h in heads]
+                k_keys = [f"block{block_idx}_head{h}_s{s}_kload" for h in heads]
                 packed = _add(
                     graph, "packed_qkt_matmul", f"block{block_idx}_s{s}_g{g0}_pqkt",
-                    [qb_by_head[h] for h in heads] + k_loads, (pad_dim(len(heads)), key_len),
+                    [qb_by_head[h] for h in heads], (pad_dim(len(heads)), key_len),
                     block_idx=block_idx, n_head=len(heads), d_head=shape.d_head,
                     d_model=len(heads) * shape.d_head, key_len=key_len, stream=s, query_len=1,
                     q_scale_keys=q_keys, k_scale_keys=k_keys,
+                    stream_k=True, k_heads=heads,
                 )
                 # All of the group's dequants run before its first attn_v matmul
                 # (which reuses ACCUM); the next group re-computes ACCUM afresh.

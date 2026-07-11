@@ -88,7 +88,13 @@ def test_batched_decode_graph_is_per_stream():
     assert c["softmax"] == per_stream
     assert c["row_copy"] == 0                      # query packed straight from projection
     assert c["kv_store"] == 2 * per_stream         # key + value per stream
-    assert c["kv_load"] == 2 * per_stream
+    # Streaming K (lever B): K caches are loaded INSIDE the packed matmul
+    # emitter (no standalone kv_load node), so only the per-head V loads remain
+    # as graph nodes. Each packed node carries stream_k + its global k_heads.
+    assert c["kv_load"] == per_stream              # value loads only
+    packed = [n for n in fe.graph.nodes if n.op == "packed_qkt_matmul"]
+    assert all(n.attrs.get("stream_k") for n in packed)
+    assert all(n.attrs["k_heads"] == list(range(n_head)) for n in packed)
     assert c["gather_rows"] == n_layer * n_head   # one gather per head
     # Every KV node carries a stream tag spanning all 16 streams.
     kv = [n for n in fe.graph.nodes if n.op in ("kv_store", "kv_load")]
