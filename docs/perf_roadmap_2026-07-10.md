@@ -111,20 +111,33 @@ mode-1 RTL == mode-0 golden byte-match, zero new test failures.
   already ~free, and keeping per-head softmax lets the per-head dequant feed it
   unchanged (byte-identical). Deferred.
 
-**Guard:** the packed core needs `K_all^T` resident in WBUF (d_model·key_len_pad
-INT8) AND every head's K cache co-resident in ABUF (n_head·key_len_pad·d_head).
-At 124M ctx-512 b16 both blow the budgets (K_all^T 405 KB > 256 KB WBUF; 12 K
-caches 396 KB > 128 KB ABUF), so it **falls back to the per-head path —
-UNCHANGED at 7.192 tok/s**. Packing engages on tiny + short-context 124M decode.
+**Grouped pack (`5f47277`) LANDS the ctx-512 win.** A full 12-head pack blows
+the budgets at ctx-512 (K_all^T 405 KB > 256 KB WBUF; 12 K caches 396 KB >
+128 KB ABUF), so pack **g heads at a time** with g the largest that fits — g=2
+at ctx-512 (68 KB / 68 KB) → 6 group-matmuls/stream. Each group's K caches free
+before the next group's load, and each group's softmax/attn_v consume its score
+tiles immediately, so ABUF holds only `group` caches + score tiles. tiny packs
+as one group (== dabbeb9); 124M ctx-512 packs group=2.
 
-**B2 (the ctx-512 headline win, ~7.19 → ~9):** make it fit. Two options —
-(i) **N-split** `K_all^T` into ≤256 KB WBUF passes + **stream the per-head
-K-load** (load→transpose→free one 33 KB cache at a time via a shared ABUF
-scratch, so ABUF holds 1 not 12); or (ii) **grouped pack** — pack g heads at a
-time with g the largest that fits (g≈2 at ctx-512 → ~1.5-1.9× QK^T vs ~3× full),
-no N-split/streaming, 6 group-matmuls/stream. Both need a fresh 124M golden
-byte-diff + mode-1 bench measure + full suite. Foundation code + design in
-`software/taccel/compiler/w8a16_emit/packed_attn.py` + scratchpad/leverB_design.md.
+**Measured (mode-1 honest-BW, 34.41 MHz, b16 pos-510):**
+
+| metric | pre-B (C) | grouped pack | Δ |
+|---|---:|---:|---:|
+| step cyc | 76,550,463 | 70,208,091 | −8.3% |
+| sys_busy | 35,513,277 | 28,987,197 | **−18.4%** (the QK^T consolidation) |
+| sfu_busy | 10,056,082 | 10,056,082 | 0 (systolic-only) |
+| **tok/s** | **7.192** | **7.842** | **+9.0%** (+181% over base) |
+
+Byte-exact: golden 12/12 identical, tiny mode-1 RTL==golden byte-match, zero new
+failures. b1 unchanged (1.633 — inject_kv_cache path, untouched).
+
+**Remaining stretch to ~9 (full pack, ~3× QK^T vs the grouped ~1.5-1.9×):**
+N-split `K_all^T` into ≤256 KB WBUF passes + stream the per-head K-load
+(load→transpose→free one 33 KB cache at a time) so all 12 heads pack in one
+matmul. Code + design: `w8a16_emit/packed_attn.py` + scratchpad/leverB_design.md.
+
+Waterfall now: 2.79 → A 3.80 → +C **7.19** → +B(grouped) **7.84** → +B(full)/D
+~9-11 → +E ~12-13.
 
 ---
 
