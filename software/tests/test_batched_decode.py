@@ -77,11 +77,17 @@ def test_batched_decode_graph_is_per_stream():
     fe = load_nanogpt_batched_decode(config=_tiny_nanogpt_config(), key_len=3, n_streams=n_streams)
     c = collections.Counter(n.op for n in fe.graph.nodes)
     per_stream = n_layer * n_head * n_streams
-    assert c["matmul_qkt"] == per_stream
+    # Lever B: the 12-per-head QK^T matmuls collapse into ONE block-diagonal
+    # packed matmul per (layer, stream); each head's scores are split back out
+    # by a per-head dequant. Q is quantized straight from the batched projection
+    # (no separate row_copy). softmax / attn_v stay per-head, byte-identical.
+    assert c["matmul_qkt"] == 0
+    assert c["packed_qkt_matmul"] == n_layer * n_streams   # one per (layer, stream)
+    assert c["qkt_dequant"] == per_stream                  # one per (layer, head, stream)
     assert c["matmul_attn_v"] == per_stream
     assert c["softmax"] == per_stream
-    assert c["row_copy"] == per_stream            # per-stream query extract
-    assert c["kv_store"] == 2 * per_stream        # key + value per stream
+    assert c["row_copy"] == 0                      # query packed straight from projection
+    assert c["kv_store"] == 2 * per_stream         # key + value per stream
     assert c["kv_load"] == 2 * per_stream
     assert c["gather_rows"] == n_layer * n_head   # one gather per head
     # Every KV node carries a stream tag spanning all 16 streams.

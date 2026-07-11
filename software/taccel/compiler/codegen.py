@@ -449,6 +449,38 @@ class CodeGenerator:
                 self.dram_blob.extend(blob)
                 offset += len(blob)
 
+            # Lever B: stage the composite PC vector for each `qkt_dequant`
+            # node (the split-out dequant of the packed QK^T). Identical
+            # composite + cast order as the per-head `matmul_qkt` loop above —
+            # the scale keys resolve to the same 6/127 defaults on the batched
+            # path, so these bytes are byte-identical to the per-head bundle.
+            for node in graph.nodes:
+                if node.op != "qkt_dequant":
+                    continue
+                q_scale = float(self.calibration_scales.get(
+                    node.attrs["q_scale_key"], DEFAULT_ACT_SCALE))
+                k_scale = float(self.calibration_scales.get(
+                    node.attrs["k_scale_key"], DEFAULT_ACT_SCALE))
+                inv_sqrt_d_head = float(
+                    node.attrs.get("scale", int(node.attrs["d_head"]) ** -0.5)
+                )
+                composite_fp32 = (
+                    np.float32(q_scale)
+                    * np.float32(k_scale)
+                    * np.float32(inv_sqrt_d_head)
+                )
+                N_pad = pad_dim(
+                    int(self.kv_layout.max_seq_len)
+                    if self.kv_layout is not None
+                    else int(self.config.max_seq_len)
+                )
+                pc_fp16 = np.full(N_pad, np.float16(composite_fp32), dtype=np.float16)
+                sym = f"{node.name}__qkt_pc_scale"
+                self.dram_layout[sym] = offset
+                blob = pc_fp16.tobytes()
+                self.dram_blob.extend(blob)
+                offset += len(blob)
+
             # W8A32 (M3-B): stage a per-matmul_attn_v FP16 PC scale vector.
             # emit_matmul_attn_v_w8a16 uses DEQUANT_ACCUM_FP32 (M1, no
             # _SCALED) with a constant composite scale `sm_scale × v_scale`
@@ -817,6 +849,12 @@ class CodeGenerator:
             self._emit_matmul(node)
         elif op == "matmul_qkt":
             self._emit_qkt(node)
+        elif op == "packed_qkt_matmul":
+            from .w8a16_emit import emit_packed_qkt_matmul
+            emit_packed_qkt_matmul(self, node)
+        elif op == "qkt_dequant":
+            from .w8a16_emit import emit_qkt_dequant
+            emit_qkt_dequant(self, node)
         elif op == "matmul_attn_v":
             self._emit_attn_v(node)
         elif op == "layernorm":

@@ -28,6 +28,7 @@ points; calling them from inside a helper infinitely recurses. Use
 """
 from .attention import emit_matmul_attn_v_w8a16, emit_matmul_qkt_w8a16
 from .matmul import emit_matmul_w8a16, emit_matmul_w8a16_large_weight_tiled
+from .packed_attn import emit_packed_qkt_matmul, emit_qkt_dequant
 from .sublayer import (
     emit_gelu_fp32,
     emit_layernorm_fp32,
@@ -42,6 +43,8 @@ __all__ = [
     "emit_matmul_qkt_w8a16",
     "emit_matmul_w8a16",
     "emit_matmul_w8a16_large_weight_tiled",
+    "emit_packed_qkt_matmul",
+    "emit_qkt_dequant",
     "emit_softmax_fp32",
     "emit_vadd_fp32",
 ]
