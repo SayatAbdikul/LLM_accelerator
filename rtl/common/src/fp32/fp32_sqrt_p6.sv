@@ -13,6 +13,14 @@
 //   so every stage drops below the div_p5 tier (~27.5 ns PNR), moving the floor
 //   onto the divider.
 //
+//   2026-07-12 (lever E): the even-exp RADICAND BUILD (M_pad/R_exp: the exp_a_odd
+//   mux + 50-bit {sig_a,0} assembly) is now done in STAGE 1 and REGISTERED, rather
+//   than rebuilt combinationally at the top of stage 2. That build was on the
+//   stage-2 rB_r critical path (the 3-way primitive floor); moving it into stage 1
+//   (which only did unpack and had slack) drops the standalone sky130 synth+STA
+//   floor 32.10 -> 29.64 ns, LATENCY-NEUTRAL (still 6 stages). Costs one extra
+//   50-bit register (rA_Mpad) — a pure timing/area trade, arithmetic unchanged.
+//
 // EQUIVALENCE:
 //   Identical arithmetic to fp32_sqrt / _p2 / _p3 / _p4 (unpack, subnormal
 //   normalize, even-exponent radicand build, restoring radix-2 recurrence, RNE
@@ -96,10 +104,26 @@ module fp32_sqrt_p6 (
     end
   end
 
+  // Build the even-exp radicand M_pad / R_exp in STAGE 1 (lever E: moved out of
+  // the stage-2 rB_r critical path). Value-identical to the old stage-2 build.
+  logic              s1_exp_odd;
+  logic [49:0]       s1_Mpad;
+  logic signed [9:0] s1_Rexp;
+  always_comb begin
+    s1_exp_odd = exp_a[0];
+    if (s1_exp_odd) begin
+      s1_Mpad = {sig_a, 26'd0};            // top bit at 49
+      s1_Rexp = (exp_a - 10'sd1) >>> 1;
+    end else begin
+      s1_Mpad = {1'b0, sig_a, 25'd0};      // top bit at 48
+      s1_Rexp = exp_a >>> 1;
+    end
+  end
+
   // ---- pipeline register A (stage 1 -> stage 2) ----
   logic              rA_valid;
-  logic [23:0]       rA_sig;
-  logic signed [9:0] rA_expa;
+  logic [49:0]       rA_Mpad;
+  logic signed [9:0] rA_Rexp;
   logic              rA_s, rA_anan, rA_negf, rA_azero, rA_ainf;
 
   always_ff @(posedge clk or negedge rst_n) begin
@@ -107,8 +131,8 @@ module fp32_sqrt_p6 (
       rA_valid <= 1'b0;
     end else begin
       rA_valid <= valid_in;
-      rA_sig   <= sig_a;
-      rA_expa  <= exp_a;
+      rA_Mpad  <= s1_Mpad;
+      rA_Rexp  <= s1_Rexp;
       rA_s     <= s;
       rA_anan  <= a_nan;
       rA_negf  <= a_neg_finite;
@@ -118,23 +142,14 @@ module fp32_sqrt_p6 (
   end
 
   // =====================================================================
-  // STAGE 2 (combinational): build even-exp radicand M_pad / R_exp from the
-  // registered sig_a/exp_a, then iters 24..S2_LO (the nonzero-block region).
+  // STAGE 2 (combinational): iters 24..S2_LO (the nonzero-block region). The
+  // even-exp radicand M_pad / R_exp is now registered (built in stage 1), so this
+  // stage is pure iteration — the M_pad build no longer sits on the rB_r path.
   // =====================================================================
-  logic              exp_a_odd;
-  assign exp_a_odd = rA_expa[0];
-
   logic [49:0]       M_pad;
   logic signed [9:0] R_exp;
-  always_comb begin
-    if (exp_a_odd) begin
-      M_pad = {rA_sig, 26'd0};            // top bit at 49
-      R_exp = (rA_expa - 10'sd1) >>> 1;
-    end else begin
-      M_pad = {1'b0, rA_sig, 25'd0};      // top bit at 48
-      R_exp = rA_expa >>> 1;
-    end
-  end
+  assign M_pad = rA_Mpad;
+  assign R_exp = rA_Rexp;
 
   logic [51:0] s2_r;
   logic [24:0] s2_q;

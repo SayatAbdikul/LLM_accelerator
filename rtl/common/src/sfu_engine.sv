@@ -229,16 +229,22 @@ module sfu_engine
     F_G2_LN_OUT_W3      = 7'd62,  // ln_norm div 4th stage
     F_G2_SM_OUT_W3      = 7'd63,  // sm_div 4th stage
     F_G2_LN_DENOM_W3    = 7'd64,  // ln_sqrt p4 4th stage (LATENCY=4)
-    F_G2_LN_MEAN_W4     = 7'd65,  // ln_mean div_p5 5th stage (LATENCY=5)
-    F_G2_LN_DENOM_PRE_W4= 7'd66,  // ln_var_norm div_p5 5th stage (LATENCY=5)
-    F_G2_SM_OUT_W4      = 7'd67,  // sm_div div_p5 5th stage (LATENCY=5)
+    F_G2_LN_MEAN_W4     = 7'd65,  // ln_mean div_p6 5th stage (was div_p5, lever E)
+    F_G2_LN_DENOM_PRE_W4= 7'd66,  // ln_var_norm div_p6 5th stage (was div_p5, lever E)
+    F_G2_SM_OUT_W4      = 7'd67,  // sm_div 5th stage (retired serial drain; streaming now)
     F_G2_LN_DENOM_W4    = 7'd68,  // ln_sqrt p6 5th stage (LATENCY=6)
     F_G2_LN_DENOM_W5    = 7'd69,  // ln_sqrt p6 6th stage (LATENCY=6)
     F_G2_CW             = 7'd70,  // fused compute+write (FP16 elementwise ops)
     F_G2_QLC            = 7'd71,  // QUANT fused load+compute (FP16 in / INT8 out)
     F_G2_DQL            = 7'd72,  // DEQUANT fused int32-load+compute+write
     F_G2_VLC            = 7'd73,  // VADD fused src2-load+compute+write
-    F_G2_GLC            = 7'd74   // GELU fused load+compute+write (FP16 in / FP16 out)
+    F_G2_GLC            = 7'd74,  // GELU fused load+compute+write (FP16 in / FP16 out)
+    // 2026-07-12 (lever E): fp32_div_p6 (LATENCY=6) replaces div_p5 at the scalar
+    // divider sites. ONE more wait state (W5) each so ln_mean / ln_var_norm sample
+    // y 6 cycles after the operands are presented. (The streaming ln_norm/sm_div
+    // drains re-tune via the collect threshold iter>=7, no new state.)
+    F_G2_LN_MEAN_W5     = 7'd75,  // ln_mean div_p6 6th stage (LATENCY=6)
+    F_G2_LN_DENOM_PRE_W5= 7'd76   // ln_var_norm div_p6 6th stage (LATENCY=6)
   } sfu_state_t;
 
   sfu_state_t state;
@@ -314,8 +320,8 @@ module sfu_engine
   logic         sm_have_vis_q;      // any visible element seen
   logic signed [15:0] sm_keep_through_q;
   // Software-pipelined F_G2_SM_OUT_NORM lagging collect pointer: the element
-  // whose divider quotient (sm_norm_w) emerges this cycle (= iter_idx_q - 6:
-  // 1 sm_exp_q reg + 5 div_p5 stages). Feeds sm_visible_coll_w and the out_h_q
+  // whose divider quotient (sm_norm_w) emerges this cycle (= iter_idx_q - 7:
+  // 1 sm_exp_q reg + 6 div_p6 stages, lever E). Feeds sm_visible_coll_w and the out_h_q
   // write target so the masked write matches the draining element. Analogous to
   // ln_coll_q in the LN output pipeline.
   logic [10:0]  sm_coll_q;

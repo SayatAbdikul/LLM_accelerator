@@ -263,6 +263,48 @@ Waterfall now: … +B(interleaved g=7) **8.38** → **+D 9.78** → +E ~11-13
 
 ---
 
+## 0.6 UPDATE — lever E LANDED (fmax cluster: div_p6 + sqrt M_pad restructure)
+
+Broke the 3-way SFU primitive floor (post-PNR 29.06 ns = 34.41 MHz): `fp32_div_p5`
+stage 2/4 + `fp32_sqrt_p6` stage 2 co-bind. Two changes, landed together (each
+alone leaves the other as the floor):
+1. **`fp32_sqrt_p6`** — moved the even-exp radicand build (M_pad/R_exp) off the
+   stage-2 `rB_r` path into stage 1 and registered it. **Latency-neutral** (still
+   6 stages → zero SFU FSM change). Floor 32.10 → 29.64 ns.
+2. **`fp32_div_p6`** (new 6-stage divider) — recuts the 29-iter restoring divide
+   into ~5-iter stages (STA-tuned split 25/20/15/10/5 = 4/5/5/5/5/5). Floor
+   31.17 → 28.85 ns. LATENCY 5→6 ⇒ SFU re-tune: 4 dividers→p6, +2 scalar wait
+   states, streaming-drain collect threshold iter≥6→≥7.
+
+Measured on a 15 GB box via **standalone per-primitive** sv2v→yosys→OpenSTA
+`report_clock_min_period` (the full-SFU flatten OOMs; the floor is primitive-
+internal so standalone measures it — monotonicity-checked vs div_p4/p5, sqrt_p4/p6).
+
+| metric | baseline (div_p5) | lever E (div_p6) | Δ |
+|---|---:|---:|---:|
+| **cluster floor (ns)** | **32.10** | **29.64** | **−7.7% period / +8.3% fmax** |
+| step cyc (b16 pos-511) | 57,201,711 | 57,205,215 | +3,504 (+0.006%) |
+| sys_busy / dma_beats | 25,017,789 / 19,775,920 | 25,017,789 / 19,775,920 | **0 / 0 (byte-identical)** |
+| **tok/s (pos-510 ref)** | **9.779** | **~10.59** | **+8.3%** (+280% over base) |
+
+Clean same-position A/B (baseline = git-stash rebuild): sys/dma byte-identical ⇒
+provably SFU-only; step Δ == sfu Δ ⇒ cycle-neutral (the +3,504 is the div-drain).
+The whole gain is the +8.3% fmax (position-independent clock scalar). Byte-exact:
+`test_fp32_div_p6`/`_sqrt_p6` 10 M/0 each; `test_sfu_synth` 11/11 (LN + softmax
+ulp=0); `test_batched_decode` 7/7 incl. RTL==golden bytes; golden untouched.
+Detail in `docs/lever_e_fmax_cluster.md`.
+
+**PNR stamp deferred:** the absolute 34.41 → ~37.3 MHz confirmation needs the
+full-SFU synth+STA/PNR, which OOMs this 15 GB box (needs ≥24 GB). The relative
+floor drop is measured here; dma_floor establishes the SFU floor is primitive-
+bound, so it transfers. tok/s rests on measured cycle-neutrality × measured
+relative floor drop (same basis as the memory's HW-blocked 6-fusion stamp).
+
+Waterfall now: … **+D 9.78** → **+E ~10.6** (fmax; PNR stamp pending ≥24 GB) →
+next: F clock-domains (~18-20) or opportunistic H/I (compiler-only).
+
+---
+
 ## 1. Where the cycles go
 
 ### 1.1 Batch-1 decode step, measured per-opcode (fresh profile, HEAD)

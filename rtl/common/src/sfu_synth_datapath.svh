@@ -324,10 +324,10 @@
   // dummy sinks keep PINCONNECTEMPTY / sv2v / yosys quiet.
   logic ln_mean_vo, ln_var_norm_vo, ln_norm_vo, sm_div_vo, ln_sqrt_vo;
   fp32_add  u_ln_sum_add (.a(ln_sum_acc_q), .b(synth_a_bits), .y(ln_sum_add_w));
-  // 2026-05-30: 4-stage pipelined divider (LATENCY=4). FSM presents the
-  // registered ln_sum_acc_q and samples ln_mean_div_w 4 cycles later
-  // (F_G2_LN_MEAN -> _W -> _W2 -> _W3 -> _S). valid_in tied high; valid_out unused.
-  fp32_div_p5 u_ln_mean  (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
+  // 2026-07-12 (lever E): 6-stage pipelined divider (LATENCY=6, fp32_div_p6). FSM
+  // presents the registered ln_sum_acc_q and samples ln_mean_div_w 6 cycles later
+  // (F_G2_LN_MEAN -> _W -> _W2 -> _W3 -> _W4 -> _W5 -> _S). valid_in tied high.
+  fp32_div_p6 u_ln_mean  (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
                           .a(ln_sum_acc_q), .b(ln_n_fp32),
                           .valid_out(ln_mean_vo), .y(ln_mean_div_w));
   fp32_add  u_ln_diff    (.a(synth_a_bits), .b(ln_neg_mean),  .y(ln_diff_w));
@@ -338,10 +338,11 @@
   // accumulate (-> ln_var_acc_q) sit in separate pipeline stages. Breaks the
   // ~42 ns sub->mul->add SFU floor into ~28 ns + ~14 ns. Bit-exact.
   fp32_add  u_ln_var_add (.a(ln_var_acc_q), .b(ln_dsq_q),     .y(ln_var_add_w));
-  // 2026-05-30: 4-stage pipelined divider. var_acc/n sampled 4 cycles after the
-  // registered ln_var_acc_q is presented (F_G2_LN_DENOM_PRE -> _W -> _W2 -> _W3
-  // -> _S); the +eps add then sits after the divider output register.
-  fp32_div_p5 u_ln_var_norm(.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
+  // 2026-07-12 (lever E): 6-stage divider (LATENCY=6, fp32_div_p6). var_acc/n
+  // sampled 6 cycles after the registered ln_var_acc_q is presented
+  // (F_G2_LN_DENOM_PRE -> _W -> _W2 -> _W3 -> _W4 -> _W5 -> _S); the +eps add then
+  // sits after the divider output register.
+  fp32_div_p6 u_ln_var_norm(.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
                             .a(ln_var_acc_q), .b(ln_n_fp32),
                             .valid_out(ln_var_norm_vo), .y(ln_var_norm_w));
   fp32_add  u_ln_var_eps (.a(ln_var_norm_w),.b(ln_eps_sel_w), .y(ln_var_eps_w));
@@ -357,17 +358,16 @@
   fp32_sqrt_p6 u_ln_sqrt (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
                           .a(ln_var_eps_q),
                           .valid_out(ln_sqrt_vo), .y(ln_denom_w));
-  // 2026-05-30: 4-stage pipelined divider. Consumes the registered ln_diff_q;
-  // ln_norm_w (= div y) is valid in F_G2_LN_OUT, 4 cycles after F_G2_LN_OUT_NORM
-  // presents it (_W -> _W2 -> _W3 -> _OUT). The downstream gamma multiply reads
-  // ln_norm_w directly (the divider output register replaces the old ln_norm_q
-  // latch), so no extra cycle is spent re-registering.
-  fp32_div_p5 u_ln_norm  (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
+  // 2026-07-12 (lever E): 6-stage pipelined divider (LATENCY=6, fp32_div_p6).
+  // Consumes the registered ln_diff_q in the software-pipelined F_G2_LN_OUT_DIFF
+  // drain; the collect pointer ln_coll_q = iter_idx_q - 7 (1 ln_diff_q feed reg +
+  // 6 div stages). The downstream gamma multiply reads ln_norm_w directly.
+  fp32_div_p6 u_ln_norm  (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
                           .a(ln_diff_q),    .b(ln_denom_q),
                           .valid_out(ln_norm_vo), .y(ln_norm_w));
   // 2026-05-31: LN_OUT divider-drain pipelining. The gamma/beta applied to a
-  // given divider output (ln_norm_w) belong to the COLLECT element (iter-5),
-  // not the feed element (iter_idx_q). Index them by ln_coll_q so the multiply
+  // given divider output (ln_norm_w) belong to the COLLECT element (ln_coll_q =
+  // iter_idx_q-7 with div_p6), not the feed element (iter_idx_q). Index them by ln_coll_q so the multiply
   // -add matches the element emerging from u_ln_norm this cycle. (synth_gamma/
   // beta_bits stay iter_idx_q-indexed for the other ops that use them.)
   logic [31:0] ln_gamma_coll_w, ln_beta_coll_w;
@@ -399,12 +399,12 @@
   fp32_add     u_sm_diff   (.a(synth_a_bits), .b(sm_neg_max),    .y(sm_diff_w));
   fp32_exp     u_sm_exp    (.a(sm_diff_w),                        .y(sm_exp_w));
   fp32_add     u_sm_sum_add(.a(sm_exp_sum_q), .b(sm_exp_w),       .y(sm_sum_add_w));
-  // 2026-05-30: 4-stage pipelined divider (LATENCY=4). Dividend is the
-  // REGISTERED sm_exp_q (latched in F_G2_SM_OUT_NORM) so fp32_exp is isolated
-  // from the divider stage-1. sm_norm_w (= div y) is valid in F_G2_SM_OUT,
-  // 4 cycles after F_G2_SM_OUT_DIV presents it (_W -> _W2 -> _W3 -> _OUT);
-  // f2h reads it directly.
-  fp32_div_p5  u_sm_div    (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
+  // 2026-07-12 (lever E): 6-stage pipelined divider (LATENCY=6, fp32_div_p6).
+  // Dividend is the REGISTERED sm_exp_q (latched in F_G2_SM_OUT_NORM) so fp32_exp
+  // is isolated from the divider stage-1. The software-pipelined F_G2_SM_OUT_NORM
+  // drain collects at sm_coll_q = iter_idx_q - 7 (1 sm_exp_q feed reg + 6 div
+  // stages); f2h reads sm_norm_w directly.
+  fp32_div_p6  u_sm_div    (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
                             .a(sm_exp_q),     .b(sm_exp_sum_q),
                             .valid_out(sm_div_vo), .y(sm_norm_w));
   fp32_to_fp16 u_sm_out_h  (.a(sm_norm_w),                        .y(sm_out_h_w));
@@ -497,7 +497,7 @@
     endcase
   end
   // Collect-indexed visibility for the software-pipelined F_G2_SM_OUT_NORM: the
-  // element whose quotient emerges on sm_norm_w is sm_coll_q (= iter_idx_q-6),
+  // element whose quotient emerges on sm_norm_w is sm_coll_q (= iter_idx_q-7),
   // NOT the feed element iter_idx_q, so its output mask must be evaluated at
   // sm_coll_q. Mirrors sm_visible_w exactly with sm_coll_q. Only gen-2
   // OP_MASKED_SOFTMAX_FP32 reaches mode-1 here; the gen-1 arms are decode-illegal

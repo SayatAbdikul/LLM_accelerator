@@ -363,7 +363,10 @@
         F_G2_LN_MEAN_W3: begin    // div_p5 4th stage
           state <= F_G2_LN_MEAN_W4;
         end
-        F_G2_LN_MEAN_W4: begin    // div_p5 5th stage (LATENCY=5)
+        F_G2_LN_MEAN_W4: begin    // div_p6 5th stage
+          state <= F_G2_LN_MEAN_W5;
+        end
+        F_G2_LN_MEAN_W5: begin    // div_p6 6th stage (LATENCY=6)
           state <= F_G2_LN_MEAN_S;
         end
         F_G2_LN_MEAN_S: begin
@@ -414,7 +417,10 @@
         F_G2_LN_DENOM_PRE_W3: begin   // div_p5 4th stage
           state <= F_G2_LN_DENOM_PRE_W4;
         end
-        F_G2_LN_DENOM_PRE_W4: begin   // div_p5 5th stage (LATENCY=5)
+        F_G2_LN_DENOM_PRE_W4: begin   // div_p6 5th stage
+          state <= F_G2_LN_DENOM_PRE_W5;
+        end
+        F_G2_LN_DENOM_PRE_W5: begin   // div_p6 6th stage (LATENCY=6)
           state <= F_G2_LN_DENOM_PRE_S;
         end
         F_G2_LN_DENOM_PRE_S: begin
@@ -459,7 +465,7 @@
         // full: each cycle it feeds row[iter_idx_q]-mean into ln_diff_q (the
         // FEED/master pointer) and, once the pipe has filled (iter>=6: 1 ln_diff_q
         // reg + 5 divider stages), collects the quotient now emerging on
-        // ln_norm_w for element ln_coll_q (= iter_idx_q-6), applying that
+        // ln_norm_w for element ln_coll_q (= iter_idx_q-7 with div_p6), applying that
         // element's gamma/beta (ln_gamma/beta_coll_w, indexed by ln_coll_q in
         // the datapath) and writing out_h_q[ln_coll_q]. The phase costs
         // n_elems+6 cycles instead of 6*n_elems (~6x on the OUT pass).
@@ -481,10 +487,10 @@
             // FEED: present row[iter_idx_q]-mean to the divider input register.
             if ({5'h0, iter_idx_q} < n_elems_q)
               ln_diff_q <= ln_diff_w;
-            // COLLECT: after the 6-deep pipe fills (1 ln_diff_q reg + 5 div_p5
-            // stages), ln_norm_w holds element ln_coll_q's quotient; finalize
-            // and write it (in element order).
-            if (iter_idx_q >= 11'd6) begin
+            // COLLECT: after the 7-deep pipe fills (1 ln_diff_q reg + 6 div_p6
+            // stages, lever E), ln_norm_w holds element ln_coll_q's quotient
+            // (ln_coll_q = iter_idx_q - 7); finalize and write it (element order).
+            if (iter_idx_q >= 11'd7) begin
               out_h_q[ln_coll_q[9:0]] <= ln_out_h_w;
               ln_coll_q               <= ln_coll_q + 11'd1;
             end
@@ -542,12 +548,12 @@
         // 2026-06-01: divider-drain SOFTWARE-PIPELINED SM output (same transform
         // as F_G2_LN_OUT_DIFF). The old NORM->DIV->W->W2->W3->W4->OUT chain
         // processed ONE element per 7 cycles — it fed a single exp(row[iter]-max)
-        // into the fully-pipelined fp32_div_p5 u_sm_div, then idled 5 cycles
-        // draining it. Since u_sm_div accepts a new dividend EVERY cycle, this
+        // into the fully-pipelined fp32_div_p6 u_sm_div, then idled draining it.
+        // Since u_sm_div accepts a new dividend EVERY cycle, this
         // single state instead keeps the divider full: each cycle it feeds
         // exp(row[iter_idx_q]-max) into sm_exp_q (the FEED pointer) and, once the
-        // pipe has filled (iter>=6: 1 sm_exp_q reg + 5 div_p5 stages), collects the
-        // quotient now emerging on sm_norm_w for element sm_coll_q (= iter-6),
+        // pipe has filled (iter>=7: 1 sm_exp_q reg + 6 div_p6 stages), collects the
+        // quotient now emerging on sm_norm_w for element sm_coll_q (= iter-7),
         // applying that element's visibility mask (sm_visible_coll_w, indexed by
         // sm_coll_q) and writing out_h_q[sm_coll_q]. Phase costs n_elems+6 cycles
         // instead of 7*n_elems (~7x on the OUT pass).
@@ -570,10 +576,11 @@
             // FEED: present exp(row[iter_idx_q]-max) to the divider input reg.
             if ({5'h0, iter_idx_q} < sm_iter_bound_w)
               sm_exp_q <= sm_exp_w;
-            // COLLECT: after the 6-deep pipe fills (1 sm_exp_q reg + 5 div_p5
-            // stages), sm_norm_w holds element sm_coll_q's quotient; finalize
-            // (f2h + visibility mask) and write it (in element order).
-            if (iter_idx_q >= 11'd6) begin
+            // COLLECT: after the 7-deep pipe fills (1 sm_exp_q reg + 6 div_p6
+            // stages, lever E), sm_norm_w holds element sm_coll_q's quotient
+            // (sm_coll_q = iter_idx_q - 7); finalize (f2h + visibility mask) and
+            // write it (in element order).
+            if (iter_idx_q >= 11'd7) begin
               if (sm_have_vis_q && sm_visible_coll_w && (sm_exp_sum_q != 32'h0))
                 out_h_q[sm_coll_q[9:0]] <= sm_out_h_w;
               else
