@@ -103,7 +103,7 @@ module decode_unit
   //           [4:1]   sreg      [0]     flags
   //
   //  M-TYPE:  [58:57] buf_id    [56:41] sram_off  [40:25] xfer_len
-  //           [24:23] addr_reg  [22:7]  dram_off
+  //           [24:23] addr_reg  [22:7]  dram_off  [6:3] cols_log2 [0] transpose
   //
   //  B-TYPE:  [58:57] src_buf   [56:41] src_off   [40:39] dst_buf
   //           [38:23] dst_off   [22:7]  length    [6:1]   src_rows
@@ -135,11 +135,14 @@ module decode_unit
     insn.flags    = insn_data[0];
 
     // M-type fields (buf_id/sram_off overlap with src1_buf/src1_off)
-    insn.m_buf_id   = insn_data[58:57];
-    insn.m_sram_off = insn_data[56:41];
-    insn.m_xfer_len = insn_data[40:25];
-    insn.m_addr_reg = insn_data[24:23];
-    insn.m_dram_off = insn_data[22:7];
+    insn.m_buf_id    = insn_data[58:57];
+    insn.m_sram_off  = insn_data[56:41];
+    insn.m_xfer_len  = insn_data[40:25];
+    insn.m_addr_reg  = insn_data[24:23];
+    insn.m_dram_off  = insn_data[22:7];
+    // Lever D transpose-load geometry (reserved bits, 0 on plain loads/stores).
+    insn.m_cols_log2 = insn_data[6:3];
+    insn.m_transpose = insn_data[0];
 
     // B-type fields
     insn.b_src_buf   = insn_data[58:57];

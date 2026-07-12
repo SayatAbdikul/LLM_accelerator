@@ -225,6 +225,44 @@ Waterfall now: 2.79 → A 3.80 → +C **7.19** → +B(grouped) **7.84** →
 
 ---
 
+## 0.5 UPDATE — lever D LANDED (DMA transpose-load; byte-exact)
+
+De-serialized the ~9.4M-cycle/step helper K^T-transpose pass by folding the
+transpose into the DMA **load**: a new transposed-LOAD mode reads the contiguous
+(N_pad, d_head) INT8 K cache and writes its (d_head, N_pad) transpose straight to
+the WBUF K_all^T block — one DMA per head, replacing the per-head ABUF scratch
+load + serial BUF_COPY(transpose=1) helper op. Byte-identical K^T bytes ⇒ packed
+scores unchanged. The plan's "strided-beat write" premise was **wrong** (the
+transpose is byte-granularity, not beat-granularity); the real mechanism is a
+16-row-stripe byte-transpose datapath in `dma_engine.sv` (buffer a stripe, write
+C transposed columns to strided WBUF rows). Geometry rides the reserved M-type
+bits (transpose + cols_log2) → byte-compatible encoding, no ISA freeze. Detail in
+`docs/lever_d_dma_transpose.md`.
+
+| metric | interleaved g=7 (f152b07) | +lever D | Δ |
+|---|---:|---:|---:|
+| step cyc | 65,706,735 | 56,299,503 | **−9,407,232 (−14.3%)** |
+| sys_busy | 24,636,477 | 24,636,477 | 0 (exact) |
+| sfu / dma | 10,056,082 / 19,476,400 | 10,056,082 / 19,476,400 | 0 (exact) |
+| **tok/s** | **8.379** | **9.779** | **+16.7%** (+250% over base) |
+
+The step cut equals the predicted ~9.4M helper pass exactly; sys/sfu/dma are
+byte-for-byte invariant — pure helper-pass deletion. Byte-exact: tiny b16 golden
+identical + RTL==golden (`test_batched_decode`, 128 transpose loads exercised);
+gpt2 124M b1 (`b882d500`) and b16/window-511 (`2f37c52c`) golden byte-identical to
+baseline; test_dma 29/29 (incl. 3 new transpose cases); test_isa/assembler green.
+
+Note: the RTL cosim harness (`testbench.h`) needed a portable soft-float16
+fallback to build on this box's g++-9 (`_Float16` needs GCC 12+); it is bit-exact
+to numpy (validated all 65536 halves + 8.3M f32 + 6.3M f64 incl. ties) and native
+on newer compilers. Rebuild `run_program_synth` with **`-GDRAM_SIZE=1073741824`**
+(1<<30) — the 16 MB Makefile default faults the 124M bench (FAULT_DRAM_OOB).
+
+Waterfall now: … +B(interleaved g=7) **8.38** → **+D 9.78** → +E ~11-13
+(fmax, ≥24 GB box).
+
+---
+
 ## 1. Where the cycles go
 
 ### 1.1 Batch-1 decode step, measured per-opcode (fresh profile, HEAD)

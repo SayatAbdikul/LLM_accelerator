@@ -146,11 +146,16 @@ class TestDMAInstructions:
         assert dec.addr_reg == 2
         assert dec.dram_off == 500
 
-    def test_load_with_stride(self):
+    def test_load_transpose(self):
+        # Lever D: transposed LOAD carries transpose + cols_log2 in the reserved
+        # M-type bits; plain loads keep those 0 (byte-compatible encoding).
         dec = round_trip(LoadInsn(buf_id=BUF_ABUF, sram_off=0, xfer_len=16,
-                                   addr_reg=1, dram_off=32, stride_log2=4, flags=1))
-        assert dec.stride_log2 == 4
-        assert dec.flags == 1
+                                   addr_reg=1, dram_off=32, transpose=1, cols_log2=2))
+        assert dec.transpose == 1
+        assert dec.cols_log2 == 2
+        plain = round_trip(LoadInsn(buf_id=BUF_ABUF, sram_off=0, xfer_len=16,
+                                     addr_reg=1, dram_off=32))
+        assert plain.transpose == 0 and plain.cols_log2 == 0
 
     def test_max_xfer_len(self):
         dec = round_trip(LoadInsn(buf_id=BUF_WBUF, sram_off=0, xfer_len=0xFFFF,

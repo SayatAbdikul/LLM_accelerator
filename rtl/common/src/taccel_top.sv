@@ -861,6 +861,8 @@ module taccel_top
     .xfer_len        (insn.m_xfer_len),
     .base_addr       (addr_rdata),
     .dram_off        (insn.m_dram_off),
+    .is_transpose    (insn.m_transpose),
+    .cols_log2       (insn.m_cols_log2),
     // Status
     .dma_busy        (dma_busy),
     .dma_rd_busy     (dma_rd_busy),

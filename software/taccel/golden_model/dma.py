@@ -11,7 +11,10 @@ The 56-bit base address is loaded in two steps:
 Transfer semantics
 ------------------
 All transfers are contiguous, 16-byte aligned, and measured in 16-byte units.
-There is no strided or scatter/gather mode (M-TYPE stride_log2 is reserved).
+Lever D adds a transposed LOAD (`insn.transpose`): the contiguous DRAM read is
+interpreted as (R, C) INT8 and its (C, R) transpose is written to SRAM, where
+C = 16 << insn.cols_log2 and R = xfer_bytes // C. This mirrors the byte-level
+BUF_COPY transpose (`execute_buf_copy`) so the DMA can produce K^T directly.
 
 Out-of-bounds accesses raise DRAMAccessError.  Real hardware uses a fixed DRAM
 size; writing beyond it is a fault (the golden model matches this behaviour).
@@ -36,6 +39,20 @@ def execute_load(state, insn):
 
     # Read from DRAM
     dram_data = bytes(state.dram[dram_byte_addr:dram_byte_addr + xfer_bytes])
+
+    if getattr(insn, "transpose", 0):
+        # Lever D: transposed load. Interpret the contiguous read as (R, C)
+        # INT8 and write its (C, R) transpose (row-major = the K^T WBUF tile),
+        # byte-identical to load + BUF_COPY(transpose=1).
+        cols = 16 << int(insn.cols_log2)
+        if xfer_bytes % cols != 0:
+            raise ValueError(
+                f"transpose load xfer_bytes {xfer_bytes} not a multiple of "
+                f"C={cols} (cols_log2={insn.cols_log2})"
+            )
+        rows = xfer_bytes // cols
+        src = np.frombuffer(dram_data, dtype=np.int8).reshape(rows, cols)
+        dram_data = src.T.copy().tobytes()
 
     # Write to SRAM
     memory.write_bytes(state, insn.buf_id, insn.sram_off, dram_data)

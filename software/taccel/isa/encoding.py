@@ -88,8 +88,10 @@ def encode(insn: Instruction) -> bytes:
         word |= (insn.xfer_len & MASK_16BIT) << M_XFER_LEN_SHIFT
         word |= (insn.addr_reg & MASK_2BIT) << M_ADDR_REG_SHIFT
         word |= (insn.dram_off & MASK_16BIT) << M_DRAM_OFF_SHIFT
-        word |= (insn.stride_log2 & MASK_4BIT) << M_STRIDE_LOG2_SHIFT
-        word |= (insn.flags & MASK_3BIT) << M_FLAGS_SHIFT
+        # Lever D: transpose-load geometry in the reserved M-type bits
+        # (0 for every non-transpose load/store → byte-compatible).
+        word |= (insn.cols_log2 & MASK_4BIT) << M_STRIDE_LOG2_SHIFT
+        word |= (insn.transpose & 0x1) << M_FLAGS_SHIFT
 
     elif fmt == InsnFormat.B_TYPE:
         word |= (insn.src_buf & MASK_2BIT) << B_SRC_BUF_SHIFT
@@ -162,8 +164,8 @@ def decode(data: bytes) -> Instruction:
             xfer_len=(word >> M_XFER_LEN_SHIFT) & MASK_16BIT,
             addr_reg=(word >> M_ADDR_REG_SHIFT) & MASK_2BIT,
             dram_off=(word >> M_DRAM_OFF_SHIFT) & MASK_16BIT,
-            stride_log2=(word >> M_STRIDE_LOG2_SHIFT) & MASK_4BIT,
-            flags=(word >> M_FLAGS_SHIFT) & MASK_3BIT,
+            cols_log2=(word >> M_STRIDE_LOG2_SHIFT) & MASK_4BIT,
+            transpose=(word >> M_FLAGS_SHIFT) & 0x1,
         )
 
     elif fmt == InsnFormat.B_TYPE:

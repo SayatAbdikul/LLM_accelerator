@@ -614,6 +614,51 @@ static void test_store_bresp_fault() {
 }
 
 // ============================================================================
+// test: Lever D transposed LOAD — LOAD_T (R,C)→(C,R) into WBUF, STORE back,
+// compare against the CPU transpose. Covers cols_log2=0 (C=16) and =2 (C=64).
+// ============================================================================
+static void run_transpose_case(const char* name, int rows, int cols_log2) {
+    SimHarness s;
+    const int C = 16 << cols_log2;
+    const int R = rows;
+    const int nbytes = R * C;
+    const int beats = nbytes / 16;
+    constexpr uint64_t SRC = 0x40000;
+    constexpr uint64_t DST = 0x90000;
+
+    std::vector<uint8_t> src(nbytes);
+    for (int i = 0; i < nbytes; i++) src[i] = (uint8_t)((i * 7 + 3) & 0xFF);
+    s.dram.write_bytes(SRC, src.data(), src.size());
+
+    // reference: transposed[c*R + r] = src[r*C + c]
+    std::vector<uint8_t> ref(nbytes);
+    for (int r = 0; r < R; r++)
+        for (int c = 0; c < C; c++)
+            ref[c * R + r] = src[r * C + c];
+
+    s.load({
+        insn::SET_ADDR_LO(0, SRC), insn::SET_ADDR_HI(0, 0),
+        insn::LOAD_T(1/*WBUF*/, 0, beats, 0, 0, cols_log2),
+        insn::SYNC(0b001),
+        insn::SET_ADDR_LO(1, DST), insn::SET_ADDR_HI(1, 0),
+        insn::STORE(1/*WBUF*/, 0, beats, 1, 0),
+        insn::SYNC(0b001),
+        insn::HALT(),
+    });
+
+    s.run(2000000);
+    if (!s.dut->done || s.dut->fault) TEST_FAIL(name, "did not halt cleanly");
+    for (int i = 0; i < nbytes; i++) {
+        if (s.dram.read_byte(DST + i) != ref[i]) TEST_FAIL(name, "transpose mismatch");
+    }
+    TEST_PASS(name);
+}
+
+static void test_transpose_load_c16() { run_transpose_case("transpose_load_c16_r32", 32, 0); }
+static void test_transpose_load_c64() { run_transpose_case("transpose_load_c64_r32", 32, 2); }
+static void test_transpose_load_c32() { run_transpose_case("transpose_load_c32_r16", 16, 1); }
+
+// ============================================================================
 // main
 // ============================================================================
 int main(int argc, char** argv) {
@@ -636,6 +681,9 @@ int main(int argc, char** argv) {
     test_fetch_interleave_between_dma_bursts();
     test_dma_read_faults();
     test_store_bresp_fault();
+    test_transpose_load_c16();
+    test_transpose_load_c32();
+    test_transpose_load_c64();
 
     printf("\n%d / %d tests passed\n", tests_pass, tests_run);
     return (tests_pass == tests_run) ? 0 : 1;

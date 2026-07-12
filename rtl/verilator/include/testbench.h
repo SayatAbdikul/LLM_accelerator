@@ -105,6 +105,15 @@ extern "C" int sfu_fp32_quantize_i8(double value_r, double out_scale_r) {
 // erf sfu_fp32_gelu used by the gen-1 INT8 path).
 // ---------------------------------------------------------------------------
 
+// FP16 <-> FP32/FP64 conversions. `_Float16` is only available on GCC 12+ /
+// clang 15+. On older toolchains (e.g. GCC 9) we fall back to a portable
+// integer soft-float16 that is BIT-EXACT to numpy's float16 semantics
+// (round-half-to-even, subnormals, overflow->inf) — validated over all 65536
+// halves + 8.3M float32 + 6.3M float64 incl. every tie case (see
+// scratchpad/softf16.cpp). The golden model uses numpy, so the cosim
+// byte-match self-checks these on every fp16 value the program produces.
+#if defined(__FLT16_MANT_DIG__) || defined(__FLT16_MAX__)
+
 // IEEE-754 half bit pattern -> FP32 (== numpy float16->float32, exact).
 extern "C" double sfu_fp16_bits_to_fp32(int bits) {
     uint16_t h = static_cast<uint16_t>(bits & 0xFFFF);
@@ -132,6 +141,85 @@ extern "C" int sfu_fp64_to_fp16_bits(double value_r) {
     std::memcpy(&h, &hv, sizeof(h));
     return static_cast<int>(h);
 }
+
+#else  // ---- portable soft-float16 fallback (no _Float16 type) ----
+
+// Round value = mant1 * 2^(E - mbits) (mant1 has the implicit leading 1 at bit
+// `mbits`) to a half bit pattern, round-half-to-even.
+static inline uint16_t tb_round_to_half(uint32_t sign16, int E, uint64_t mant1, int mbits) {
+    int he = E + 15;  // biased half exponent
+    if (he >= 0x1F) return static_cast<uint16_t>(sign16 | 0x7C00);  // overflow -> inf
+    if (he <= 0) {  // subnormal / underflow
+        int shift = (mbits - 10) + (1 - he);
+        if (shift > 63) return static_cast<uint16_t>(sign16);
+        uint64_t half = static_cast<uint64_t>(1) << (shift - 1);
+        uint64_t frac = mant1 & ((static_cast<uint64_t>(1) << shift) - 1);
+        uint16_t h = static_cast<uint16_t>(mant1 >> shift);
+        if (frac > half || (frac == half && (h & 1))) h++;
+        return static_cast<uint16_t>(sign16 | h);
+    }
+    int shift = mbits - 10;  // normal
+    uint64_t half = static_cast<uint64_t>(1) << (shift - 1);
+    uint64_t frac = mant1 & ((static_cast<uint64_t>(1) << shift) - 1);
+    uint16_t hm = static_cast<uint16_t>((mant1 >> shift) & 0x3FF);
+    uint16_t h  = static_cast<uint16_t>((he << 10) | hm);
+    if (frac > half || (frac == half && (h & 1))) h++;  // carry into exp is natural
+    return static_cast<uint16_t>(sign16 | h);
+}
+
+extern "C" double sfu_fp16_bits_to_fp32(int bits) {
+    uint16_t hh = static_cast<uint16_t>(bits & 0xFFFF);
+    uint32_t sign = static_cast<uint32_t>(hh & 0x8000) << 16;
+    uint32_t exp  = (hh >> 10) & 0x1F;
+    uint32_t mant = hh & 0x3FF;
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) { f = sign; }
+        else {
+            int e = 0;
+            while ((mant & 0x400) == 0) { mant <<= 1; e++; }
+            mant &= 0x3FF;
+            f = sign | (static_cast<uint32_t>(113 - e) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1F) {
+        f = sign | 0x7F800000u | (mant << 13);
+    } else {
+        f = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+    float out; std::memcpy(&out, &f, 4);
+    return static_cast<double>(out);
+}
+
+extern "C" int sfu_fp32_to_fp16_bits(double value_r) {
+    float fv = static_cast<float>(value_r);
+    uint32_t f; std::memcpy(&f, &fv, 4);
+    uint32_t sign16 = (f >> 16) & 0x8000;
+    uint32_t be = (f >> 23) & 0xFF;
+    uint32_t mant = f & 0x7FFFFF;
+    if (be == 0xFF) return static_cast<int>(sign16 | (mant ? 0x7E00 : 0x7C00));
+    if (be == 0) {
+        if (mant == 0) return static_cast<int>(sign16);
+        return static_cast<int>(tb_round_to_half(sign16, -126, mant, 23));
+    }
+    return static_cast<int>(tb_round_to_half(sign16, static_cast<int>(be) - 127,
+                                             static_cast<uint64_t>(mant) | 0x800000u, 23));
+}
+
+extern "C" int sfu_fp64_to_fp16_bits(double value_r) {
+    uint64_t f; std::memcpy(&f, &value_r, 8);
+    uint32_t sign16 = static_cast<uint32_t>((f >> 48) & 0x8000);
+    uint32_t be = static_cast<uint32_t>((f >> 52) & 0x7FF);
+    uint64_t mant = f & 0xFFFFFFFFFFFFFull;
+    if (be == 0x7FF) return static_cast<int>(sign16 | (mant ? 0x7E00 : 0x7C00));
+    if (be == 0) {
+        if (mant == 0) return static_cast<int>(sign16);
+        return static_cast<int>(tb_round_to_half(sign16, -1022, mant, 52));
+    }
+    return static_cast<int>(tb_round_to_half(sign16, static_cast<int>(be) - 1023,
+                                             mant | (static_cast<uint64_t>(1) << 52), 52));
+}
+
+#endif  // _Float16 availability
 
 // gelu_new (tanh) in FP32 — matches golden _exec_gelu_fp32 (0x1B):
 //   x*0.5*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
@@ -238,6 +326,14 @@ inline uint64_t LOAD(int buf_id, int sram_off, int xfer_len,
            (uint64_t(xfer_len)   << M_XFER_LEN_SHIFT) |
            (uint64_t(addr_reg&3) << M_ADDR_REG_SHIFT) |
            (uint64_t(dram_off)   << M_DRAM_OFF_SHIFT);
+}
+// Lever D: transposed LOAD. transpose bit → M_FLAGS[0]; cols_log2 → the
+// reserved M_STRIDE_LOG2 field [6:3]. C = 16 << cols_log2.
+inline uint64_t LOAD_T(int buf_id, int sram_off, int xfer_len,
+                       int addr_reg, int dram_off, int cols_log2) {
+    return LOAD(buf_id, sram_off, xfer_len, addr_reg, dram_off) |
+           (uint64_t(cols_log2 & 0xF) << 3) |   // M_STRIDE_LOG2_SHIFT
+           (uint64_t(1) << 0);                  // M_FLAGS_SHIFT (transpose)
 }
 inline uint64_t STORE(int buf_id, int sram_off, int xfer_len,
                       int addr_reg, int dram_off) {

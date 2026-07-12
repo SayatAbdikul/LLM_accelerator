@@ -22,8 +22,15 @@ def emit_dma_load(cg: "CodeGenerator", buf_id: int, sram_off_units: int,
                   dram_off_units: int = 0,
                   relocation_symbol: Optional[str] = None,
                   runtime_patch_kind: Optional[str] = None,
-                  runtime_base_symbol: Optional[str] = None) -> None:
-    """Emit SET_ADDR + LOAD sequence."""
+                  runtime_base_symbol: Optional[str] = None,
+                  transpose: int = 0,
+                  cols_log2: int = 0) -> None:
+    """Emit SET_ADDR + LOAD sequence.
+
+    Lever D: with ``transpose=1`` the LOAD reads the contiguous (R, C) INT8
+    region and writes its (C, R) transpose to SRAM (``C = 16 << cols_log2``),
+    replacing a separate BUF_COPY(transpose=1) helper pass.
+    """
     lo_pc = len(cg.instructions)
     cg.instructions.extend(_set_addr(addr_reg, dram_byte_offset))
     if relocation_symbol is None and runtime_patch_kind is None:
@@ -43,6 +50,8 @@ def emit_dma_load(cg: "CodeGenerator", buf_id: int, sram_off_units: int,
         xfer_len=min(xfer_units, 0xFFFF),
         addr_reg=addr_reg,
         dram_off=dram_off_units,
+        transpose=transpose,
+        cols_log2=cols_log2,
     ))
 
 

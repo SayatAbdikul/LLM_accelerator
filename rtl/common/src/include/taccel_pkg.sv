@@ -155,12 +155,18 @@ package taccel_pkg;
 
     // ---- M-TYPE: LOAD, STORE ----
     // Bits [58:57]=buf_id, [56:41]=sram_off, [40:25]=xfer_len,
-    //      [24:23]=addr_reg, [22:7]=dram_off
+    //      [24:23]=addr_reg, [22:7]=dram_off, [6:3]=cols_log2, [0]=transpose
+    // Lever D: a transposed LOAD (m_transpose=1) reads the contiguous (R, C)
+    // INT8 region and writes its (C, R) transpose; C = 16 << m_cols_log2.
+    // The two fields occupy the reserved M-type bits (0 for every plain
+    // load/store), so pre-existing bundles decode byte-identically.
     logic [1:0]  m_buf_id;
     logic [15:0] m_sram_off;
     logic [15:0] m_xfer_len;
     logic [1:0]  m_addr_reg;
     logic [15:0] m_dram_off;
+    logic        m_transpose;
+    logic [3:0]  m_cols_log2;
 
     // ---- B-TYPE: BUF_COPY ----
     // Bits [58:57]=src_buf, [56:41]=src_off, [40:39]=dst_buf,

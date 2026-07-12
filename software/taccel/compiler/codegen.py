@@ -1081,14 +1081,17 @@ class CodeGenerator:
                        dram_off_units: int = 0,
                        relocation_symbol: Optional[str] = None,
                        runtime_patch_kind: Optional[str] = None,
-                       runtime_base_symbol: Optional[str] = None):
-        """Emit SET_ADDR + LOAD sequence."""
+                       runtime_base_symbol: Optional[str] = None,
+                       transpose: int = 0,
+                       cols_log2: int = 0):
+        """Emit SET_ADDR + LOAD sequence (transpose = lever-D K^T load)."""
         from .emit.dma import emit_dma_load
         emit_dma_load(self, buf_id, sram_off_units, size_bytes, addr_reg,
                       dram_byte_offset, dram_off_units=dram_off_units,
                       relocation_symbol=relocation_symbol,
                       runtime_patch_kind=runtime_patch_kind,
-                      runtime_base_symbol=runtime_base_symbol)
+                      runtime_base_symbol=runtime_base_symbol,
+                      transpose=transpose, cols_log2=cols_log2)
 
     def _emit_dma_store(self, buf_id: int, sram_off_units: int, size_bytes: int,
                         addr_reg: int, dram_byte_offset: int, *,

@@ -210,8 +210,13 @@ class MTypeInsn(Instruction):
     xfer_len: int = 0
     addr_reg: int = 0
     dram_off: int = 0
-    stride_log2: int = 0
-    flags: int = 0
+    # Lever D: transposed LOAD. `transpose=1` reads a contiguous (R, C) INT8
+    # region from DRAM and writes its (C, R) transpose to SRAM; `cols_log2`
+    # encodes C = 16 << cols_log2 (the input row width / output row count).
+    # Both occupy the M-type reserved bits (stride_log2 field / flags bit0),
+    # which every non-transpose load/store leaves 0 → byte-compatible encoding.
+    transpose: int = 0
+    cols_log2: int = 0
 
     def __post_init__(self):
         _validate_buf(self.buf_id, "buf_id")
@@ -222,10 +227,10 @@ class MTypeInsn(Instruction):
             raise ValueError(f"addr_reg must be 0-3, got {self.addr_reg}")
         if not (0 <= self.dram_off <= 0xFFFF):
             raise ValueError(f"dram_off must be 0-65535, got {self.dram_off}")
-        if not (0 <= self.stride_log2 <= 15):
-            raise ValueError(f"stride_log2 must be 0-15, got {self.stride_log2}")
-        if not (0 <= self.flags <= 7):
-            raise ValueError(f"flags must be 0-7, got {self.flags}")
+        if not (0 <= self.transpose <= 1):
+            raise ValueError(f"transpose must be 0 or 1, got {self.transpose}")
+        if not (0 <= self.cols_log2 <= 15):
+            raise ValueError(f"cols_log2 must be 0-15, got {self.cols_log2}")
 
 
 @dataclass

@@ -64,9 +64,9 @@ class Disassembler:
                 f"addr_reg={insn.addr_reg}",
                 f"dram_off={insn.dram_off}",
             ]
-            if insn.stride_log2 > 0 or insn.flags & 1:
-                parts.append(f"stride_log2={insn.stride_log2}")
-                parts.append(f"flags={insn.flags}")
+            if insn.transpose or insn.cols_log2 > 0:
+                parts.append(f"transpose={insn.transpose}")
+                parts.append(f"cols_log2={insn.cols_log2}")
             return f"{name} {', '.join(parts)}"
         elif isinstance(insn, BufCopyInsn):
             parts = [

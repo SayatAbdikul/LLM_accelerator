@@ -167,8 +167,8 @@ def parse_line(line: str) -> Tuple[Optional[str], Optional[Instruction]]:
             xfer_len=parse_int(params.get('xfer_len', '0')),
             addr_reg=parse_int(params.get('addr_reg', '0')),
             dram_off=parse_int(params.get('dram_off', '0')),
-            stride_log2=parse_int(params.get('stride_log2', '0')),
-            flags=parse_int(params.get('flags', '0')),
+            transpose=parse_int(params.get('transpose', '0')),
+            cols_log2=parse_int(params.get('cols_log2', '0')),
         )
 
     elif opcode == Opcode.BUF_COPY:

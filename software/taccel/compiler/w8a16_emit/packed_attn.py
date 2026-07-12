@@ -142,8 +142,38 @@ def emit_packed_qkt_matmul(cg: "CodeGenerator", node: "IRNode") -> None:
     #     the co-resident-K-cache ABUF cap that otherwise pins the group size,
     #     without touching the transpose bytes or the downstream dequant/AV.
     stream_k = bool(node.attrs.get("stream_k"))
+    # Lever D: when streaming full-context K with loaded_rows == N_pad (no pad
+    # tail) and a power-of-two d_head/16 with C = d_head <= 64 (DMA T_MAX_COLS),
+    # transpose K^T directly in the DMA load — one DMA per head straight to the
+    # WBUF block, replacing the ABUF scratch load + serial helper BUF_COPY. The
+    # K^T bytes are byte-identical (same DRAM INT8 cache, same (N_pad,d_head).T),
+    # so the packed scores are unchanged. Otherwise fall back to load+BufCopy.
+    dh_tiles = d_head // TILE
+    dma_transpose = (
+        stream_k and loaded_rows == N_pad
+        and (dh_tiles & (dh_tiles - 1)) == 0   # d_head/16 is a power of two
+        and d_head <= 64                        # DMA transpose buffer limit
+    )
+    cols_log2 = dh_tiles.bit_length() - 1       # log2(d_head/16)
     for h in range(n_head):
         dst_off = kt_wbuf.offset_units + (d_head * h * N_pad) // UNIT
+        if dma_transpose:
+            head_g = int(node.attrs["k_heads"][h])
+            layer = int(node.attrs["block_idx"])
+            entry = cg.kv_layout.entry(
+                layer, normalize_kv_kind("key"), head_g, stream
+            )
+            # Transposed full-context int8 load (position 0, base-relocated):
+            # DRAM (N_pad, d_head) INT8 -> WBUF (d_head, N_pad) at head h's block.
+            cg._emit_dma_load(
+                BUF_WBUF, dst_off, loaded_rows * d_head, 2, 0,
+                dram_off_units=entry.dram_off_units,
+                relocation_symbol=entry.base_symbol,
+                transpose=1, cols_log2=cols_log2,
+            )
+            cg._emit(SyncInsn(resource_mask=0b001))
+            continue
+        # ---- fallback: stream/preloaded K into ABUF, then BufCopy transpose ----
         if stream_k:
             head_g = int(node.attrs["k_heads"][h])
             layer = int(node.attrs["block_idx"])
