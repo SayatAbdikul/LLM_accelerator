@@ -422,6 +422,15 @@ def emit_matmul_attn_v_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     m_tiles = M_pad // TILE
     n_tiles = N_pad // TILE
     k_tiles = Kseq_pad // TILE
+    # Lever B (interleaved packed attention): when this AV matmul runs while the
+    # packed QK^T scores of the OTHER heads in its group are still live in
+    # ACCUM[0..], `av_accum_off` (units) parks the AV output tile PAST that
+    # scores block so it doesn't clobber the not-yet-dequanted rows. This lets
+    # the group interleave dequant->softmax->AV per head (only 1-2 score tiles
+    # live) instead of dequanting all `group` heads up front. The AV arithmetic
+    # is unchanged — only the ACCUM address moves — so it is byte-exact. Default
+    # 0 (writes ACCUM[0]) keeps every non-packed / grouped bundle identical.
+    av_accum_off = int(node.attrs.get("av_accum_off", 0))
 
     # Lever A: the decode V input is the kv_load's INT8 tile (store-time
     # quantized with the same static scale this emitter would apply).
@@ -634,7 +643,7 @@ def emit_matmul_attn_v_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
         MatmulInsn(
             src1_buf=BUF_ABUF, src1_off=sm_int8_alloc.offset_units,
             src2_buf=BUF_WBUF, src2_off=v_wbuf.offset_units,
-            dst_buf=BUF_ACCUM, dst_off=0,
+            dst_buf=BUF_ACCUM, dst_off=av_accum_off,
             flags=0,
         )
     )
@@ -643,7 +652,7 @@ def emit_matmul_attn_v_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     # DEQUANT_ACCUM_FP32: accum × wt_scale_pc → FP{32,16} attn_v in ABUF.
     cg._emit(
         DequantAccumFp32Insn(
-            src1_buf=BUF_ACCUM, src1_off=0,
+            src1_buf=BUF_ACCUM, src1_off=av_accum_off,
             src2_buf=BUF_WBUF, src2_off=pc_scale_alloc.offset_units,
             dst_buf=BUF_ABUF, dst_off=out_alloc.offset_units,
             flags=cg.fp_precision_flag,

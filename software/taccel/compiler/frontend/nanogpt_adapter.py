@@ -448,25 +448,28 @@ def _emit_batched_attention_block(graph: IRGraph, prev: str, block_idx: int,
     # 68 KB / 68 KB, so it packs in pairs (~1.5-1.9x QK^T vs ~3x full). Each
     # group's K caches free before the next group's load, so ABUF holds only
     # `group` caches at a time. group==1 gives no benefit -> per-head fallback.
-    # Lever B (streaming K): the packed matmul streams each head's INT8 K cache
-    # (load -> transpose -> free) so only ONE cache is ABUF-resident during the
-    # matmul; the co-resident-K-cache term no longer caps the group. The two
-    # remaining binds are (a) WBUF holding the group's K_all^T in ONE pass, and
-    # (b) ABUF during the dequant/softmax phase — where the `group` per-head
-    # FP16 score tiles (M_pad=16 x N_pad) coexist with one softmax-output tile
-    # plus every batched query projection (scale_mul renames the score tile in
-    # place, so it adds no tile). K_all^T bytes and every downstream op are
-    # unchanged, so a wider group is byte-exact — it only fuses more heads'
-    # QK^T into one matmul, amortizing the per-matmul fixed cost.
+    # Lever B (streaming K + interleaved AV): the packed matmul streams each
+    # head's INT8 K cache (load -> transpose -> free, one resident) AND the
+    # group now INTERLEAVES dequant -> scale -> softmax -> AV per head, with
+    # each head's AV output PARKED past the QK^T scores in ACCUM (av_accum_off)
+    # so it never clobbers the rows of heads not yet dequanted. So neither the
+    # co-resident K caches NOR the `group` per-head score tiles cap the group
+    # any more — the only remaining bind is WBUF holding the group's K_all^T in
+    # ONE pass. K_all^T bytes and every downstream op are unchanged, so a wider
+    # group is byte-exact; it just fuses more heads' QK^T into one matmul.
+    # (Going beyond g_wbuf — a full 12-head pack — needs the N-split of K_all^T
+    # into <=WBUF column passes; a follow-up.)
     npad = pad_dim(key_len)
-    score_one = 16 * npad * 2                                   # (16, N_pad) FP16
-    qb_total = shape.n_head * pad_dim(n_streams) * shape.d_head * 2
     g_wbuf = max(1, WBUF_SIZE // (shape.d_head * npad))         # group's K_all^T
-    g_abuf = max(1, (ABUF_SIZE - qb_total - score_one - 8 * 1024) // score_one)
-    group = max(1, min(shape.n_head, g_wbuf, g_abuf))
+    group = max(1, min(shape.n_head, g_wbuf))
 
     if group >= 2:
         head_stream_outs = [[None] * n_streams for _ in range(shape.n_head)]
+        # ACCUM layout per group: [0 : 16*N_pad) INT32 holds the packed QK^T
+        # scores (all `group` head rows). Each head's AV output is parked just
+        # past that block (av_accum_units) so the interleaved AVs never clobber
+        # the scores of heads not yet dequanted. (UNIT = 16 bytes; INT32 = 4 B.)
+        av_accum_units = (16 * npad * 4) // 16
         for s in range(n_streams):
             for g0 in range(0, shape.n_head, group):
                 heads = list(range(g0, min(g0 + group, shape.n_head)))
@@ -486,22 +489,22 @@ def _emit_batched_attention_block(graph: IRGraph, prev: str, block_idx: int,
                     q_scale_keys=q_keys, k_scale_keys=k_keys,
                     stream_k=True, k_heads=heads,
                 )
-                # All of the group's dequants run before its first attn_v matmul
-                # (which reuses ACCUM); the next group re-computes ACCUM afresh.
-                scores = {}
+                # Interleave dequant -> scale -> softmax -> AV per head. The
+                # packed QK^T scores stay intact in ACCUM[0..] across the whole
+                # group (each AV writes past them at av_accum_units), so only
+                # ~2 per-head score tiles are ever live regardless of group
+                # size — this is what lifts the group past the old score-tile
+                # ABUF cap. Byte-identical to the split-loop order: each head's
+                # dequant/softmax/AV depends only on its own ACCUM row + V.
                 for j, h in enumerate(heads):
                     pfx = f"block{block_idx}_head{h}_s{s}"
-                    scores[h] = _add(
+                    score = _add(
                         graph, "qkt_dequant", f"{pfx}_qkt", [packed], (1, key_len),
                         block_idx=block_idx, head_idx=h, accum_row=j, query_len=1,
                         key_len=key_len, d_head=shape.d_head, scale=inv_sqrt,
                         q_scale_key=f"{pfx}_q", k_scale_key=f"{pfx}_kload",
                     )
-                # Consume the group's scores now, so only `group` score tiles
-                # are ever live (keeps ABUF bounded at the ctx-512 shape).
-                for h in heads:
-                    pfx = f"block{block_idx}_head{h}_s{s}"
-                    scaled = _add(graph, "scale_mul", f"{pfx}_scale", [scores[h]], (1, key_len),
+                    scaled = _add(graph, "scale_mul", f"{pfx}_scale", [score], (1, key_len),
                                   query_len=1, key_len=key_len, scale=inv_sqrt)
                     sm = _add(graph, "softmax", f"{pfx}_softmax", [scaled], (1, key_len),
                               query_len=1, key_len=key_len, masked=True, runtime_config_attn=True,
@@ -512,7 +515,7 @@ def _emit_batched_attention_block(graph: IRGraph, prev: str, block_idx: int,
                                stream=s, decode=True, dtype="int8", dst="wbuf")
                     attn_v = _add(graph, "matmul_attn_v", f"{pfx}_attnv", [sm, v_s], (1, shape.d_head),
                                   block_idx=block_idx, head_idx=h, query_len=1, key_len=key_len,
-                                  v_int8_from_cache=True)
+                                  v_int8_from_cache=True, av_accum_off=av_accum_units)
                     head_stream_outs[h][s] = attn_v
         for head_idx in range(shape.n_head):
             head_outputs.append(_add(

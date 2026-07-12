@@ -180,8 +180,48 @@ clears only its (M,N) tile at `dst_off` (golden `systolic.py:81`, RTL
 `systolic_controller.sv:112-115`), so coexisting N-pass ACCUM regions are safe;
 add a forced-small-WBUF cosim test for RTL coverage (tiny packs one pass).
 
+---
+
+## 0.4 UPDATE — lever B interleaved AV → group=7 landed; QK^T packing is DONE
+
+Removed the LAST cap that pinned the group below WBUF: the per-head score tiles.
+All `group` per-head QK^T dequants had to precede any AV because the AV matmul
+wrote ACCUM[0], clobbering the packed scores. Fix: `matmul_attn_v` gains an
+`av_accum_off` (units) that parks its output tile PAST the (16×N_pad) scores
+block; the group then INTERLEAVES dequant→scale→softmax→AV per head with the
+scores staying intact in ACCUM[0..] — so only ~2 score tiles are ever live, and
+the group rises to the WBUF bound. AV arithmetic is unchanged (only the ACCUM
+address moves) → byte-exact. 124M ctx-512 → **group=7 (2 groups/stream, 7+5),
+packed QK^T matmuls 576 → 384**.
+
+| metric | streaming g=4 | interleaved g=7 | Δ |
+|---|---:|---:|---:|
+| step cyc | 66,799,599 | 65,706,735 | −1.6% |
+| sys_busy | 25,724,157 | 24,636,477 | −4.2% |
+| sfu / dma | 10,056,082 / 19,476,400 | 10,056,082 / 19,476,400 | 0 (exact) |
+| **tok/s** | **8.242** | **8.379** | **+1.66%** |
+
+Byte-exact: tiny b1/b16 golden identical + RTL==golden (`test_batched_decode`
+7/7); gpt2 124M b1/b16 golden byte-identical to the 822d350 baseline; 145 tests
+green. b1 unchanged (1.633).
+
+**FINDING — the full 12-head N-split is NOT worth doing; group=7 is the QK^T
+packing ceiling at ctx-512.** The dominant systolic cost scales with the number
+of QK^T *matmul instructions* (measured ~1.08M sys_busy each: g2/6→g4/3→g7/2
+matmuls tracks −3.27M then −1.08M). The 256 KB WBUF holds at most a 7-head
+single-pass `K_all^T` (8 heads = 270 KB > 256 KB), so ctx-512 needs **≥2 QK^T
+passes no matter what** — and group=7 already achieves exactly 2. A group=12
+N-split is *also* 2 passes: both do the identical 1584 tile-ops (48 k-tiles ×
+33 n-tiles) in 2 matmul instructions. The only delta is ACCUM preclears (2×33=66
+vs 17+16=33), worth ~405 K cyc ≈ **+0.5%** — not worth the per-pass-dequant /
+coexisting-ACCUM / forced-split-test complexity. Lever B (QK^T packing) is
+**mined out at ~8.4 tok/s**; the systolic floor is now the AV matmuls + the
+non-packable FFN/projection systolic, and the real next block is the serialized
+helper (lever D).
+
 Waterfall now: 2.79 → A 3.80 → +C **7.19** → +B(grouped) **7.84** →
-+B(streaming g=4) **8.24** → +B(full g=12/N-split) ~9 → +D ~10.5-11 → +E ~12-13.
++B(streaming g=4) **8.24** → +B(interleaved g=7) **8.38** [B ceiling] →
++D ~9.5-10.5 → +E ~11-12.
 
 ---
 
