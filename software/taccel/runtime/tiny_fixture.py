@@ -41,6 +41,10 @@ class TinyFixtureBundle:
     build: DecoderBundleBuild
     config: ModelConfig
     logits_size: int
+    # Lever I-a: number of lockstep decode streams (batch). The logits region
+    # holds one row per stream, so `logits_size == n_streams * pad_dim(vocab) *
+    # elem_bytes`; consumers divide by `n_streams` to recover the row/dtype.
+    n_streams: int = 1
 
 
 @dataclass
@@ -448,6 +452,11 @@ def build_stage3_tiny_decoder_bundle(
         per_tensor_fc1_blocks=gelu_from_accum_blocks,
         use_fp16_activations=True,
     )
+    # Lever I-a (logits×N): the batched decode stream stores one logits row per
+    # stream, so the region must hold `batch` rows. `quantize_fixture_payload`
+    # returns the single-row size; scale it by the stream count (batch=1 keeps
+    # the single-token region byte-identical).
+    logits_size *= batch
     validate_stage5_ptq_preset_for_model(config, resolved_preset)
     calibration_scales = apply_stage5_ptq_scale_policy(calibration_scales, config, resolved_preset)
     # Thread state_dict so the frontend can detect optional `lm_head.bias`
@@ -506,7 +515,8 @@ def build_stage3_tiny_decoder_bundle(
         biases=biases,
         n_streams=batch,
     )
-    return TinyFixtureBundle(build=build, config=config, logits_size=logits_size)
+    return TinyFixtureBundle(build=build, config=config, logits_size=logits_size,
+                             n_streams=batch)
 
 
 build_stage3f_tiny_decoder_bundle = build_stage3_tiny_decoder_bundle
@@ -527,14 +537,17 @@ def run_tiny_decode_trace(tiny: TinyFixtureBundle, prompt_ids: Sequence[int], *,
     """Run a greedy tiny decode trace and retain prefill + per-step logits.
 
     `logits_dtype` (M4-F W8A16): infer from `tiny.logits_size` when None —
-    pad_dim(vocab) * 1 = INT8, *2 = FP16, *4 = FP32.
+    per-stream-row bytes = logits_size / n_streams / pad_dim(vocab); 1 = INT8,
+    2 = FP16, 4 = FP32. (Lever I-a grows the region to `n_streams` rows, so the
+    divisor must include the stream count or the dtype is misread.)
     """
     if max_new_tokens < 0:
         raise ValueError("max_new_tokens must be non-negative")
     if not prompt_ids:
         raise ValueError("prompt_ids must be non-empty")
     if logits_dtype is None:
-        elem_bytes = max(1, int(tiny.logits_size) // pad_dim(int(tiny.config.vocab_size)))
+        row_units = max(1, int(tiny.n_streams)) * pad_dim(int(tiny.config.vocab_size))
+        elem_bytes = max(1, int(tiny.logits_size) // row_units)
         logits_dtype = {1: np.int8, 2: np.float16, 4: np.float32}.get(elem_bytes, np.int8)
     generated = [int(tok) for tok in prompt_ids]
     runner = HostRunner(tiny.build.bundle, logits_dtype=logits_dtype)

@@ -103,10 +103,12 @@ class HostRunner:
         count must match the decode stream's embedding patch-site count (16 for
         a ``batch=16`` bundle, 1 for a single-token bundle).
 
-        NOTE: until step 2c wires the ``store_rows=16`` logits store, this
-        returns only the row-0 logits window; the per-stream logits split
-        arrives with 2c. KV bases are patched with the shared decode base until
-        2b adds the per-stream stream axis.
+        Lever I-a (logits×N): the decode stream stores one logits row per
+        stream, so the returned flat buffer spans the whole ``logits_size``
+        region — all ``len(token_ids)`` rows, contiguous and row-major.
+        Reshape to per-stream logits with ``out.reshape(len(token_ids), -1)``
+        (each row is ``pad_dim(vocab)`` wide; slice ``[:, :vocab]`` for the
+        live logits). KV bases are patched with the shared decode base.
         """
         if position < 0:
             raise ValueError("position must be non-negative")

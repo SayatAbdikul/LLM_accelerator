@@ -145,8 +145,16 @@ def test_batched_decode_runs_clean_in_golden(tmp_path):
     tokens16 = [(1 + s) % vocab for s in range(16)]
     out = runner.run_decode_step_batch(tokens16, position=1)
 
+    # Lever I-a (logits×N): the region now spans all 16 per-stream logits rows,
+    # not just row 0. `out` is the flat int8 view of the whole logits_size
+    # region; reshape to per-stream rows and confirm every stream is populated.
     assert out.shape == (tiny.logits_size,)
-    assert np.any(out)
+    per_stream = out.reshape(16, -1)
+    assert per_stream.shape[1] == tiny.logits_size // 16
+    assert np.all(per_stream.any(axis=1)), "a per-stream logits row is empty (store_rows<16?)"
+    # The 16 streams decode distinct tokens, so their logits rows must differ —
+    # proves the store captured per-stream data, not row 0 replicated 16×.
+    assert len({row.tobytes() for row in per_stream}) > 1, "per-stream rows are all identical"
 
 
 def test_batched_decode_rtl_matches_golden_bytes(tmp_path):

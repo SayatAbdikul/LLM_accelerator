@@ -135,15 +135,24 @@ def _copy_graph_with_logits_store(graph: IRGraph, *, stream_name: str) -> IRGrap
             lm_head_shape = tuple(copied.output_shape)
 
     if lm_head_shape is not None and not has_logits_store:
+        attrs = {
+            "source_shape": lm_head_shape,
+            "symbol": f"{stream_name}_logits_offset",
+        }
+        # Lever I-a (logits×N): the decode stream stores ALL query rows — one
+        # logits row per batched stream — so every stream's logits are emitted,
+        # not just row 0. `lm_head_shape[0]` == n_streams for the batched decode
+        # graph (and == 1 for single-token decode, byte-identical to before).
+        # Prefill keeps its 1-row default (`emit_logits_store` picks the
+        # last-position row for the prefill stream).
+        if stream_name == "decode":
+            attrs["store_rows"] = int(lm_head_shape[0])
         out.add_node(IRNode(
             op="logits_store",
             name=f"{stream_name}_logits_store",
             inputs=["lm_head"],
             output_shape=lm_head_shape,
-            attrs={
-                "source_shape": lm_head_shape,
-                "symbol": f"{stream_name}_logits_offset",
-            },
+            attrs=attrs,
         ))
     return out
 
