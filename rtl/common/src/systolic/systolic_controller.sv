@@ -59,8 +59,18 @@ module systolic_controller
   // ABUF) keep using the shared Port A path below.
   output logic                 sram_w_en,
   output logic [15:0]          sram_w_row,
-  input  logic [127:0]         sram_w_rdata
+  input  logic [127:0]         sram_w_rdata,
+
+  // Observability only (drives no datapath): high while this controller's
+  // shared-Port-A write is the ACCUM PRECLEAR (ST_DST_CLEAR_WR) rather than the
+  // result DRAIN (ST_DRAIN_WR). taccel_top uses it to tell a HARMLESS dropped
+  // write from a CORRUPTING one when the DMA outranks us on the shared bus: the
+  // preclear only writes zeros that ST_DRAIN_WR later overwrites unconditionally,
+  // but a dropped drain write loses a real accumulator result forever.
+  output logic                 obs_a_preclear
 );
+
+  assign obs_a_preclear = (state == ST_DST_CLEAR_WR);
 
   // READ_REQ issues synchronous SRAM reads, READ_USE consumes the returned rows
   // one cycle later, and DRAIN_WR writes the accumulated 16x16 tile back out as

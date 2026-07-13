@@ -182,20 +182,48 @@ def main() -> int:
                   f"fault_code={s.get('fault_code')} — row excluded", flush=True)
             continue
         per_tok = s["cycles"] / args.batch
+        busy = s["busy_cycles"]
+        wait = s.get("sync_wait_cycles", {})
+        port_a = s.get("port_a", {})
+        cycles = s["cycles"]
+        # helper / sfu / systolic are MUTUALLY EXCLUSIVE (the forbidden-overlap
+        # invariant, taccel_top.sv), so they partition the step cleanly. What is
+        # left is exposed DMA + control overhead — and `sync_wait_cycles.dma` is
+        # the control unit stalled on a SYNC waiting for the DMA, i.e. exactly
+        # the DMA that failed to hide. The residual is fetch/dispatch/decode.
+        other = cycles - busy.get("helper", 0) - busy.get("sfu", 0) - busy.get("systolic", 0)
         rows.append({
             "position": pos,
             "ctx": pos + 1,
-            "cycles": s["cycles"],
+            "cycles": cycles,
             "per_tok_cycles": per_tok,
             "status": s["status"],
             "retired": s["retired_instructions"],
-            "sfu_busy": s["busy_cycles"].get("sfu", 0),
-            "sys_busy": s["busy_cycles"].get("systolic", 0),
+            "sfu_busy": busy.get("sfu", 0),
+            "sys_busy": busy.get("systolic", 0),
+            "helper_busy": busy.get("helper", 0),
+            "other": other,
+            "wait_dma": wait.get("dma", 0),
+            "wait_sys": wait.get("systolic", 0),
+            "wait_sfu": wait.get("sfu", 0),
+            "ctl": other - wait.get("dma", 0),
             "dma_beats": s["dma"]["beat_count"],
+            "cobusy": port_a.get("dma_sys_cobusy", 0),
+            "porta_lost": port_a.get("sys_lost", 0),
+            "porta_lost_wr": port_a.get("sys_lost_write", 0),
+            "overlap_violation": s.get("forbidden_overlap_violation", False),
             "tok_s": args.fmax_mhz * 1e6 / per_tok,
         })
-        print(f"  step_cycles={rows[-1]['cycles']:,}  per_tok={per_tok:,.0f}  "
-              f"tok/s@{args.fmax_mhz}MHz={rows[-1]['tok_s']:.3f}", flush=True)
+        r = rows[-1]
+        print(f"  step_cycles={r['cycles']:,}  per_tok={per_tok:,.0f}  "
+              f"tok/s@{args.fmax_mhz}MHz={r['tok_s']:.3f}", flush=True)
+        if r["porta_lost"]:
+            print(f"  *** PORT-A HAZARD: {r['porta_lost']:,} systolic accesses "
+                  f"SILENTLY DROPPED ({r['porta_lost_wr']:,} of them writes) — "
+                  f"DMA||Systolic is corrupting state. See taccel_top.sv.",
+                  flush=True)
+        if r["overlap_violation"]:
+            print("  *** forbidden_overlap_violation SET", flush=True)
         if not args.keep_bins:
             bins[pos].unlink()
 
@@ -208,6 +236,31 @@ def main() -> int:
               f"{r['per_tok_cycles']:>13,.0f} "
               f"{r['sfu_busy']:>12,} {r['sys_busy']:>12,} "
               f"{r['dma_beats']:>12,} {r['tok_s']:>8.3f}")
+
+    # The cycle budget, fully partitioned. `helper` is a THIRD disjoint engine
+    # that this tool used to drop on the floor, hiding it inside "other".
+    print(f"\n=== where the step goes (cycles, % of step) ===")
+    print(f"{'pos':>5} {'sys':>21} {'sfu':>21} {'helper':>21} "
+          f"{'exposed-DMA':>21} {'ctl':>21}")
+    for r in rows:
+        c = r["cycles"]
+        def f(v):
+            return f"{v:>13,} {100 * v / c:5.1f}%"
+        print(f"{r['position']:>5} {f(r['sys_busy'])} {f(r['sfu_busy'])} "
+              f"{f(r['helper_busy'])} {f(r['wait_dma'])} {f(r['ctl'])}")
+
+    # Port-A arbitration audit. cobusy is the DENOMINATOR: zero losses mean
+    # nothing if the DMA and systolic never actually ran concurrently.
+    print(f"\n=== shared Port-A audit (DMA vs systolic) ===")
+    print(f"{'pos':>5} {'dma||sys cobusy':>18} {'sys accesses LOST':>19} "
+          f"{'of which writes':>17}")
+    for r in rows:
+        flag = "  <-- CORRUPTION" if r["porta_lost"] else ""
+        print(f"{r['position']:>5} {r['cobusy']:>18,} {r['porta_lost']:>19,} "
+              f"{r['porta_lost_wr']:>17,}{flag}")
+    if rows and not any(r["cobusy"] for r in rows):
+        print("  WARNING: zero co-busy cycles — the DMA and systolic never "
+              "overlapped, so a zero loss count proves NOTHING here.")
     return 0
 
 

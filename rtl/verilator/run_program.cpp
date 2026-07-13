@@ -120,6 +120,21 @@ struct Summary {
     uint64_t helper_busy_cycles = 0;
     uint64_t sfu_busy_cycles = 0;
     uint64_t systolic_busy_cycles = 0;
+    // Shared-Port-A arbitration (DMA vs systolic). `dma_sys_cobusy_cycles` is
+    // the denominator: a zero loss count is meaningless if the two engines
+    // never overlapped. Any nonzero `sys_porta_lost` is silent corruption —
+    // see the block comment in taccel_top.sv.
+    uint64_t dma_sys_cobusy_cycles = 0;
+    uint64_t sys_porta_lost = 0;
+    uint64_t sys_porta_lost_wr = 0;
+    uint64_t sys_porta_lost_abuf = 0;
+    uint64_t sys_porta_lost_wbuf = 0;
+    uint64_t sys_porta_lost_accum = 0;
+    // The ACCUM losses split into harmless and corrupting. A dropped PRECLEAR
+    // write only loses zeros that ST_DRAIN_WR overwrites anyway; a dropped
+    // DRAIN write loses a real accumulator result forever.
+    uint64_t sys_porta_lost_preclear = 0;
+    uint64_t sys_porta_lost_drain = 0;
     bool forbidden_overlap_violation = false;
     bool fault_context_valid = false;
     uint64_t fault_pc = 0;
@@ -530,6 +545,14 @@ Summary build_summary(Vtaccel_top* dut, int num_classes) {
     summary.helper_busy_cycles = root->taccel_top__DOT__obs_helper_busy_cycles_q;
     summary.sfu_busy_cycles = root->taccel_top__DOT__obs_sfu_busy_cycles_q;
     summary.systolic_busy_cycles = root->taccel_top__DOT__obs_sys_busy_cycles_q;
+    summary.dma_sys_cobusy_cycles = root->taccel_top__DOT__obs_dma_sys_cobusy_cycles_q;
+    summary.sys_porta_lost = root->taccel_top__DOT__obs_sys_porta_lost_q;
+    summary.sys_porta_lost_wr = root->taccel_top__DOT__obs_sys_porta_lost_wr_q;
+    summary.sys_porta_lost_abuf = root->taccel_top__DOT__obs_sys_porta_lost_abuf_q;
+    summary.sys_porta_lost_wbuf = root->taccel_top__DOT__obs_sys_porta_lost_wbuf_q;
+    summary.sys_porta_lost_accum = root->taccel_top__DOT__obs_sys_porta_lost_accum_q;
+    summary.sys_porta_lost_preclear = root->taccel_top__DOT__obs_sys_porta_lost_preclear_q;
+    summary.sys_porta_lost_drain = root->taccel_top__DOT__obs_sys_porta_lost_drain_q;
     summary.forbidden_overlap_violation = root->taccel_top__DOT__obs_forbidden_overlap_violation_q;
     summary.fault_context_valid = root->taccel_top__DOT__obs_fault_valid_q;
     summary.fault_pc = root->taccel_top__DOT__obs_fault_pc_q;
@@ -590,6 +613,18 @@ std::string summary_to_json(const Summary& summary) {
     oss << "    \"helper\": " << summary.helper_busy_cycles << ",\n";
     oss << "    \"sfu\": " << summary.sfu_busy_cycles << ",\n";
     oss << "    \"systolic\": " << summary.systolic_busy_cycles << "\n";
+    oss << "  },\n";
+    // Shared-Port-A arbitration. `dma_sys_cobusy` is the denominator; any
+    // nonzero `sys_lost` is a silently dropped systolic access.
+    oss << "  \"port_a\": {\n";
+    oss << "    \"dma_sys_cobusy\": " << summary.dma_sys_cobusy_cycles << ",\n";
+    oss << "    \"sys_lost\": " << summary.sys_porta_lost << ",\n";
+    oss << "    \"sys_lost_write\": " << summary.sys_porta_lost_wr << ",\n";
+    oss << "    \"sys_lost_abuf\": " << summary.sys_porta_lost_abuf << ",\n";
+    oss << "    \"sys_lost_wbuf\": " << summary.sys_porta_lost_wbuf << ",\n";
+    oss << "    \"sys_lost_accum\": " << summary.sys_porta_lost_accum << ",\n";
+    oss << "    \"sys_lost_preclear\": " << summary.sys_porta_lost_preclear << ",\n";
+    oss << "    \"sys_lost_drain\": " << summary.sys_porta_lost_drain << "\n";
     oss << "  },\n";
     oss << "  \"forbidden_overlap_violation\": "
         << (summary.forbidden_overlap_violation ? "true" : "false") << ",\n";

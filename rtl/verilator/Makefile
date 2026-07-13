@@ -52,7 +52,7 @@ read_filelist  = $(shell grep -E -v '^[[:space:]]*(\#|$$)' $(1))
 CONTROL_SV    := $(addprefix $(SRC_DIR)/, $(call read_filelist,$(CORE_F)))
 CTRL_SV       := $(addprefix $(SRC_DIR)/, $(call read_filelist,$(CORE_CTRL_F)))
 
-.PHONY: all run_program test_decode test_control test_dma test_helpers test_sfu \
+.PHONY: all run_program run_program_synth test_decode test_control test_dma test_helpers test_sfu \
         test_systolic test_systolic_array_chained test_systolic_chained \
         test_systolic_query test_systolic_qkt \
         test_systolic_qkt_basic test_systolic_qkt_replay \
@@ -89,6 +89,35 @@ $(BUILD_DIR)/run_program/Vtaccel_top: $(CONTROL_SV) run_program.cpp
 	$(MAKE) -C $(BUILD_DIR)/run_program -f Vtaccel_top.mk
 
 run_program: $(BUILD_DIR)/run_program/Vtaccel_top
+
+# -----------------------------------------------------------------------
+# run_program_synth: the runner every perf number in docs/ is measured on.
+# Two things differ from `run_program`, and BOTH have been rediscovered the
+# hard way more than once, so they live in a target now instead of a
+# hand-typed verilator line:
+#   -GSFU_SYNTH_MODE=1   the real synthesizable SFU datapath, not the DPI
+#                        reference model (mode-1 == the chip)
+#   -GDRAM_SIZE=1 GiB    the 16 MB default faults GPT-2 124M with DRAM_OOB
+# Always pass --fast-beats when running it: that is the honest-BW memory
+# model (1 beat/cycle). The testbench default (~2.66 cyc/beat) is an artifact.
+# -----------------------------------------------------------------------
+DRAM_SIZE_124M ?= 1073741824
+
+$(BUILD_DIR)/run_program_synth/Vtaccel_top: $(CONTROL_SV) run_program.cpp
+	mkdir -p $(BUILD_DIR)/run_program_synth
+	$(VERILATOR) $(VFLAGS) \
+	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
+	  -GSFU_SYNTH_MODE=1 \
+	  -GDRAM_SIZE=$(DRAM_SIZE_124M) \
+	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
+	  --top-module taccel_top \
+	  --Mdir $(BUILD_DIR)/run_program_synth \
+	  $(CONTROL_SV) \
+	  run_program.cpp \
+	  -CFLAGS "-I$(CURDIR)/include $(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/run_program_synth -f Vtaccel_top.mk
+
+run_program_synth: $(BUILD_DIR)/run_program_synth/Vtaccel_top
 
 # -----------------------------------------------------------------------
 # test_decode: verilate tb_decode_unit + compile + run

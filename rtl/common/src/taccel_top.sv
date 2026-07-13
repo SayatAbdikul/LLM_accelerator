@@ -47,7 +47,12 @@ module taccel_top
   parameter int SFU_SYNTH_MODE = 0,
   // Phase-2 blocking_helper toggle. 0 = DPI (default), 1 = synthesizable
   // dequant_add_pack via 16-lane parallel Phase-1 primitive chain.
-  parameter int HELPER_SYNTH_MODE = 0
+  parameter int HELPER_SYNTH_MODE = 0,
+  // Allow DMA || Systolic concurrency (the weight-prefetch lever). See the long
+  // note in control_unit.sv: as built this is UNSAFE — the two engines share one
+  // Port-A bus with no backpressure, so the systolic's ACCUM drain writes are
+  // silently dropped when the DMA wins. Set 0 for a correct, serialized machine.
+  parameter bit SYS_DMA_OVERLAP = 1'b1
 )
 (
   input  logic        clk,
@@ -300,6 +305,49 @@ module taccel_top
   logic [55:0]  obs_sfu_issue_pc_q /* verilator public_flat_rd */;
   logic [4:0]   obs_sfu_issue_opcode_q /* verilator public_flat_rd */;
 
+  // Shared-Port-A arbitration losses (DMA vs systolic).
+  //
+  // The Port-A mux below is FIXED PRIORITY with NO backpressure
+  // (helper > sfu > dma > systolic), and neither the DMA engine nor the
+  // systolic controller has a grant/stall input. A losing request is therefore
+  // SILENTLY DROPPED: its write never lands, or its read returns the winner's
+  // row. `obs_forbidden_overlap_violation_q` does not cover this pair, because
+  // DMA || Systolic is the one LEGAL concurrency (control_unit.sv:587,590 — the
+  // weight-prefetch lever). But that lever only moved the systolic's WEIGHT READ
+  // to the dedicated Port W; the systolic still drives shared Port A in six
+  // states (src2 stream reads when src2 is not WBUF, the drain RMW read, the
+  // drain write, and the preclear write). So DMA || Systolic is byte-exact
+  // EMPIRICALLY, not BY CONSTRUCTION, and nothing measures it.
+  //
+  //   cobusy  — the DENOMINATOR. A zero loss count proves nothing if the two
+  //             engines never actually overlap in the run being measured.
+  //   lost    — cycles where the systolic asserted Port A and the mux picked
+  //             someone else. ANY of these is real corruption: a dropped ACCUM
+  //             write, or a src2 read that latches the winner's row.
+  //   lost_wr — of those, the WRITES (silent data loss into ACCUM).
+  //   lost_{abuf,wbuf,accum} — bucketed by the systolic's TARGET buffer, which
+  //             forks the fix. An ACCUM/WBUF loss is cured by splitting the
+  //             shared bus per buffer — the SRAMs beneath are already three
+  //             separate dual-port macros (sram_subsystem.sv). An ABUF loss is
+  //             SAME-buffer contention against the DMA's KV re-read, and needs
+  //             real dual-port arbitration instead.
+  logic [63:0]  obs_dma_sys_cobusy_cycles_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_sys_porta_lost_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_sys_porta_lost_wr_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_sys_porta_lost_abuf_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_sys_porta_lost_wbuf_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_sys_porta_lost_accum_q /* verilator public_flat_rd */;
+  // The ACCUM losses split into two VERY different things, and the whole
+  // correctness question turns on the ratio:
+  //   preclear — ST_DST_CLEAR_WR, which writes zeros that ST_DRAIN_WR later
+  //              overwrites unconditionally. Dropping one is HARMLESS.
+  //   drain    — ST_DRAIN_WR, a real accumulator result. Dropping one CORRUPTS
+  //              the matmul output, silently and permanently.
+  logic [63:0]  obs_sys_porta_lost_preclear_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_sys_porta_lost_drain_q /* verilator public_flat_rd */;
+  logic         obs_sys_porta_lost_w;
+  logic         sys_a_preclear_w;
+
   logic         obs_dma_burst_fire_w;
   logic         obs_dma_beat_fire_w;
   logic         obs_terminal_event_w;
@@ -388,6 +436,15 @@ module taccel_top
                       : sfu_sram_a_en    ? sfu_sram_a_wdata
                       : dma_sram_en      ? dma_sram_wdata
                                          : sys_sram_a_wdata;
+
+  // The systolic asserted Port A but the mux selected a higher-priority engine,
+  // so its request is DROPPED and it has no way to know. In the shipped design
+  // the only live term is `dma_sram_en` — helper/sfu vs systolic is already a
+  // forbidden-overlap violation — but the condition is written in full so it
+  // stays exact if the arbitration changes. Pure observability: this wire feeds
+  // counters only, never the datapath.
+  assign obs_sys_porta_lost_w = sys_sram_a_en &
+                                (helper_sram_a_en | sfu_sram_a_en | dma_sram_en);
 
   assign sram_b_en    = helper_sram_b_en ? helper_sram_b_en
                       : sfu_sram_b_en    ? sfu_sram_b_en
@@ -483,6 +540,14 @@ module taccel_top
       obs_helper_issue_opcode_q        <= 5'h0;
       obs_sfu_issue_pc_q               <= 56'h0;
       obs_sfu_issue_opcode_q           <= 5'h0;
+      obs_dma_sys_cobusy_cycles_q      <= 64'h0;
+      obs_sys_porta_lost_q             <= 64'h0;
+      obs_sys_porta_lost_wr_q          <= 64'h0;
+      obs_sys_porta_lost_abuf_q        <= 64'h0;
+      obs_sys_porta_lost_wbuf_q        <= 64'h0;
+      obs_sys_porta_lost_accum_q       <= 64'h0;
+      obs_sys_porta_lost_preclear_q    <= 64'h0;
+      obs_sys_porta_lost_drain_q       <= 64'h0;
     end else if (start && !obs_run_active_q && !done && !fault) begin
       obs_run_active_q                 <= 1'b1;
       obs_cycle_count_q                <= 64'h0;
@@ -510,6 +575,14 @@ module taccel_top
       obs_helper_issue_opcode_q        <= 5'h0;
       obs_sfu_issue_pc_q               <= 56'h0;
       obs_sfu_issue_opcode_q           <= 5'h0;
+      obs_dma_sys_cobusy_cycles_q      <= 64'h0;
+      obs_sys_porta_lost_q             <= 64'h0;
+      obs_sys_porta_lost_wr_q          <= 64'h0;
+      obs_sys_porta_lost_abuf_q        <= 64'h0;
+      obs_sys_porta_lost_wbuf_q        <= 64'h0;
+      obs_sys_porta_lost_accum_q       <= 64'h0;
+      obs_sys_porta_lost_preclear_q    <= 64'h0;
+      obs_sys_porta_lost_drain_q       <= 64'h0;
     end else begin
       if (obs_run_active_q) begin
         obs_cycle_count_q <= obs_cycle_count_q + 64'd1;
@@ -526,6 +599,28 @@ module taccel_top
           obs_sfu_busy_cycles_q <= obs_sfu_busy_cycles_q + 64'd1;
         if (sys_busy)
           obs_sys_busy_cycles_q <= obs_sys_busy_cycles_q + 64'd1;
+
+        // DMA || Systolic is the one legal concurrency, so this is the
+        // denominator against which a Port-A loss count means anything.
+        if (dma_busy && sys_busy)
+          obs_dma_sys_cobusy_cycles_q <= obs_dma_sys_cobusy_cycles_q + 64'd1;
+
+        if (obs_sys_porta_lost_w) begin
+          obs_sys_porta_lost_q <= obs_sys_porta_lost_q + 64'd1;
+          if (sys_sram_a_we)
+            obs_sys_porta_lost_wr_q <= obs_sys_porta_lost_wr_q + 64'd1;
+          if (sys_sram_a_buf == BUF_ABUF)
+            obs_sys_porta_lost_abuf_q <= obs_sys_porta_lost_abuf_q + 64'd1;
+          else if (sys_sram_a_buf == BUF_WBUF)
+            obs_sys_porta_lost_wbuf_q <= obs_sys_porta_lost_wbuf_q + 64'd1;
+          else if (sys_sram_a_buf == BUF_ACCUM)
+            obs_sys_porta_lost_accum_q <= obs_sys_porta_lost_accum_q + 64'd1;
+          // Harmless (zeros that get overwritten) vs corrupting (a real result).
+          if (sys_a_preclear_w)
+            obs_sys_porta_lost_preclear_q <= obs_sys_porta_lost_preclear_q + 64'd1;
+          else if (sys_sram_a_we)
+            obs_sys_porta_lost_drain_q <= obs_sys_porta_lost_drain_q + 64'd1;
+        end
       end
 
       if (obs_retire_pulse_w)
@@ -664,7 +759,9 @@ module taccel_top
     .insn      (insn)
   );
 
-  control_unit u_ctrl (
+  control_unit #(
+    .SYS_DMA_OVERLAP(SYS_DMA_OVERLAP)
+  ) u_ctrl (
     .clk            (clk),
     .rst_n          (rst_n),
     .start          (start),
@@ -930,7 +1027,8 @@ module taccel_top
     .sram_b_rdata    (sys_sram_b_rdata),
     .sram_w_en       (sys_sram_w_en),
     .sram_w_row      (sys_sram_w_row),
-    .sram_w_rdata    (sys_sram_w_rdata)
+    .sram_w_rdata    (sys_sram_w_rdata),
+    .obs_a_preclear  (sys_a_preclear_w)
   );
 
   sram_subsystem u_sram (

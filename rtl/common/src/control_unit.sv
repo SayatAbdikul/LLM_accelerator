@@ -25,7 +25,23 @@
 
 module control_unit
   import taccel_pkg::*;
-(
+#(
+  // DMA || Systolic is the one concurrency this core permits (the weight-prefetch
+  // lever): OP_MATMUL dispatches without checking !dma_busy, and OP_LOAD/STORE
+  // dispatch without checking !sys_busy.
+  //
+  // It is NOT SAFE as built. The two engines share one Port-A bus with a
+  // fixed-priority mux and no backpressure (taccel_top.sv), so when the DMA is
+  // streaming, the systolic's ACCUM drain writes are SILENTLY DROPPED. Measured
+  // on GPT-2 124M b16 decode: 255,818 dropped ST_DRAIN_WR writes per step —
+  // real accumulator results, lost. The byte-exact test gate cannot see this
+  // (the tiny model never overlaps the two engines at all).
+  //
+  // Set to 0 to serialize them and get a correct — but ~7% slower — machine.
+  // This is the reference build for A/B-ing the corruption, and the safe-mode
+  // fallback until the Port-A bus is split per buffer.
+  parameter bit SYS_DMA_OVERLAP = 1'b1
+) (
   input  logic          clk,
   input  logic          rst_n,
   input  logic          start,
@@ -373,7 +389,11 @@ module control_unit
               // before dispatching a new LOAD/STORE — the DMA engine silently drops
               // dispatch pulses that arrive while it is active.
               OP_LOAD, OP_STORE: begin
-                if (sfu_busy || dma_busy) begin
+                // NOTE: this retry condition MUST mirror `dma_dispatch` in the
+                // combinational block. They are maintained separately, and if
+                // they ever disagree the instruction retires WITHOUT dispatching
+                // — i.e. it is silently skipped.
+                if (sfu_busy || dma_busy || (!SYS_DMA_OVERLAP && sys_busy)) begin
                   state <= S_ISSUE;
                 end else begin
                   obs_retire_pulse  <= 1'b1;
@@ -415,7 +435,13 @@ module control_unit
                   obs_ctrl_fault_pc     <= pc_reg;
                   obs_ctrl_fault_opcode <= insn.opcode;
                   state        <= S_FAULT;
-                end else if (sfu_busy || helper_busy) begin
+                // NOTE: this retry condition MUST mirror `sys_dispatch` in the
+                // combinational block. They are maintained separately, and if
+                // they ever disagree the MATMUL retires WITHOUT dispatching —
+                // the systolic FSM only accepts `dispatch` in ST_IDLE, so the
+                // pulse is dropped and the matmul is silently SKIPPED.
+                end else if (sfu_busy || helper_busy ||
+                             (!SYS_DMA_OVERLAP && dma_busy)) begin
                   state <= S_ISSUE;
                 end else begin
                   obs_retire_pulse  <= 1'b1;
@@ -584,10 +610,12 @@ module control_unit
               addr_hi_we = 1'b1;
 
             OP_LOAD, OP_STORE:
-              dma_dispatch = !sfu_busy && !dma_busy;
+              dma_dispatch = !sfu_busy && !dma_busy &&
+                             (SYS_DMA_OVERLAP || !sys_busy);
 
             OP_MATMUL:
-              sys_dispatch = tile_valid && !sfu_busy && !helper_busy;
+              sys_dispatch = tile_valid && !sfu_busy && !helper_busy &&
+                             (SYS_DMA_OVERLAP || !dma_busy);
 
             OP_BUF_COPY:
               helper_dispatch = helper_ready_now;
