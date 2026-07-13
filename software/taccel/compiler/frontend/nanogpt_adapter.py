@@ -300,9 +300,32 @@ def _finish(graph: IRGraph, prev: str, seq_len: int, shape: NanoGPTShape) -> Non
     )
 
 
-def _build_graph(shape: NanoGPTShape, variant: str) -> IRGraph:
+def _build_graph(shape: NanoGPTShape, variant: str, *,
+                 seq_len_override: Optional[int] = None) -> IRGraph:
     if variant == "forward_1token":
         seq_len = 1
+        include_attention = True
+    elif variant == "forward_prefill":
+        # Lever I-b — DENSE MULTI-TOKEN PREFILL: `seq_len_override` real query
+        # rows in ONE pass, causally masked against each other. This reuses the
+        # ordinary dense `_emit_attention_block` unchanged: it is already
+        # seq_len-generic and tags softmax `masked=True, key_len=seq_len`, which
+        # selects the triangular "prefill-causal" mask (mode 0b10).
+        #
+        # WHY IT WINS: M_pad = pad_dim(M), so a ONE-token pass still occupies a
+        # full 16-row systolic m-tile and WASTES 15/16 of the mesh. Feeding 16
+        # real rows fills the tile exactly — the same effect that made batched
+        # decode 6x better per token than b1. Going past a multiple of 16 adds
+        # m-tiles at full price and buys nothing more (see docs/lever_h_b32.md),
+        # so the useful sizes are multiples of 16 up to the prompt length.
+        if seq_len_override is None or int(seq_len_override) < 1:
+            raise ValueError("variant 'forward_prefill' requires seq_len >= 1")
+        seq_len = int(seq_len_override)
+        if seq_len > shape.max_seq_len:
+            raise ValueError(
+                f"forward_prefill seq_len={seq_len} exceeds block_size "
+                f"{shape.max_seq_len}"
+            )
         include_attention = True
     elif variant == "non_attention_seq16":
         seq_len = 16
@@ -321,8 +344,8 @@ def _build_graph(shape: NanoGPTShape, variant: str) -> IRGraph:
         include_attention = True
     else:
         raise ValueError(
-            "variant must be 'forward_1token', 'non_attention_seq16', "
-            "or 'forward_batch16'"
+            "variant must be 'forward_1token', 'forward_prefill', "
+            "'non_attention_seq16', or 'forward_batch16'"
         )
 
     graph = IRGraph()
@@ -338,12 +361,16 @@ def _build_graph(shape: NanoGPTShape, variant: str) -> IRGraph:
 
 
 def load_nanogpt(*, model: Optional[Any] = None, state_dict: Optional[Mapping[str, Any]] = None,
-                 config: Optional[Any] = None, variant: str = "forward_1token") -> FrontendResult:
+                 config: Optional[Any] = None, variant: str = "forward_1token",
+                 seq_len: Optional[int] = None) -> FrontendResult:
     """Return a Stage 1 nanoGPT IR graph and ModelConfig.
 
     The adapter intentionally walks the known nanoGPT config/state_dict shape
     instead of tracing HuggingFace GPT-2. Stage 1 only validates frontend shape
     and graph plumbing; full decoder codegen arrives in later stages.
+
+    `seq_len` is consumed only by `variant="forward_prefill"` (lever I-b), where
+    it is the number of real query rows the dense prefill pass carries.
     """
     if config is None and model is not None:
         config = getattr(model, "config", None)
@@ -359,7 +386,8 @@ def load_nanogpt(*, model: Optional[Any] = None, state_dict: Optional[Mapping[st
     has_lm_head_bias = state_dict is not None and "lm_head.bias" in state_dict
     if has_lm_head_bias and not shape.has_lm_head_bias:
         shape = _dc_replace(shape, has_lm_head_bias=True)
-    return FrontendResult(graph=_build_graph(shape, variant), config=_model_config(shape))
+    return FrontendResult(graph=_build_graph(shape, variant, seq_len_override=seq_len),
+                          config=_model_config(shape))
 
 
 def _emit_batched_attention_block(graph: IRGraph, prev: str, block_idx: int,

@@ -6,7 +6,7 @@ import numpy as np
 
 from ..assembler.assembler import ProgramBundle
 from ..isa.encoding import encode
-from .codegen import CodeGenerator
+from .codegen import CodeGenerator, stage4_forced_weights
 from .ir import IRGraph, IRNode
 from .kv_cache import KVCacheLayout, build_kv_cache_layout, normalize_kv_kind
 from .model_config import ModelConfig
@@ -408,6 +408,27 @@ def build_decoder_program_bundle(
         if dequant_add_residual2_blocks is None
         else set(int(v) for v in dequant_add_residual2_blocks)
     )
+    # Lever I-b: the two streams must stage the SAME stage-4 weight tiles, or
+    # their data blobs diverge and the shared-blob check below rejects them. The
+    # emitter's tiling decision depends on M_pad (a CONSUMER property), so a
+    # dense multi-token prefill graph can tile a weight the 1-row decode graph
+    # does not. Union the two graphs' sets and give it to BOTH codegens. For
+    # every pre-I-b bundle the two graphs have identical matmul shapes, so the
+    # union equals each graph's own set and the blob is byte-unchanged.
+    shared_stage4 = (
+        stage4_forced_weights(prefill_graph, elem_bytes)
+        | stage4_forced_weights(decode_graph, elem_bytes)
+    )
+    # ...and on the same stage-4 N-tile SIZE. An N-tile costs M_pad*n_len*4 of
+    # ACCUM, so the cap depends on the widest M_pad in the bundle. Take the max
+    # across both graphs and give it to both codegens; splitting an N-tile is
+    # systolic-cost-neutral, so a wider prefill costs the decode nothing.
+    # Pre-I-b bundles have M_pad=16 everywhere => 16 => byte-identical.
+    def _max_m_pad(g) -> int:
+        vals = [pad_dim(int(n.output_shape[0])) for n in g.nodes
+                if n.op == "matmul" and len(n.output_shape) == 2]
+        return max(vals) if vals else 16
+    stage4_m_pad = max(_max_m_pad(prefill_graph), _max_m_pad(decode_graph))
     prefill_codegen = CodeGenerator(
         weight_data,
         calibration_scales,
@@ -415,6 +436,8 @@ def build_decoder_program_bundle(
         model_config=model_config,
         stream_name="prefill",
         kv_layout=kv_layout,
+        extra_stage4_weights=shared_stage4,
+        stage4_m_pad=stage4_m_pad,
         dequant_add_residual1_blocks=residual1_dequant_blocks,
         dequant_add_residual2_blocks=residual2_dequant_blocks,
         gelu_from_accum=gelu_from_accum_blocks is not None,
@@ -431,6 +454,8 @@ def build_decoder_program_bundle(
         model_config=model_config,
         stream_name="decode",
         kv_layout=kv_layout,
+        extra_stage4_weights=shared_stage4,
+        stage4_m_pad=stage4_m_pad,
         dequant_add_residual1_blocks=residual1_dequant_blocks,
         dequant_add_residual2_blocks=residual2_dequant_blocks,
         gelu_from_accum=gelu_from_accum_blocks is not None,

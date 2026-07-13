@@ -419,6 +419,7 @@ def build_stage3_tiny_decoder_bundle(
     calibration_scales: Optional[Dict[str, float]] = None,
     ptq_preset: str | Stage5PTQPreset | None = None,
     batch: int = 1,
+    prefill_tokens: int = 1,
 ) -> TinyFixtureBundle:
     """Build the full 1-token tiny decoder ProgramBundle used by Stage 3 tests.
 
@@ -438,6 +439,17 @@ def build_stage3_tiny_decoder_bundle(
     if batch not in (1, 16, 32):
         raise ValueError(
             "build_stage3_tiny_decoder_bundle: batch must be 1, 16, or 32"
+        )
+    prefill_tokens = int(prefill_tokens)
+    if prefill_tokens < 1:
+        raise ValueError("build_stage3_tiny_decoder_bundle: prefill_tokens must be >= 1")
+    if prefill_tokens > 1 and batch != 1:
+        # The batched bundle already reuses its batched DECODE graph for the
+        # prefill slot (it carries per-stream scale vectors and so cannot share
+        # a data blob with a distinct prefill graph). Multi-token prefill is a
+        # single-stream (batch=1) lever — it attacks TTFT, not decode throughput.
+        raise ValueError(
+            "build_stage3_tiny_decoder_bundle: prefill_tokens > 1 requires batch=1"
         )
     resolved_preset = resolve_stage5_ptq_preset(ptq_preset)
     activation_percentile_nodes = dict(resolved_preset.activation_percentile_nodes)
@@ -480,7 +492,36 @@ def build_stage3_tiny_decoder_bundle(
     if gelu_from_accum_blocks:
         _mark_gelu_from_accum_inline(graph, gelu_from_accum_blocks)
     decode_key_len = 1 + int(smoke_decode_steps)
-    prefill_graph = inject_kv_cache_nodes(graph, config, decode=False, seq_len=1)
+    if prefill_tokens > 1:
+        # Lever I-b — DENSE MULTI-TOKEN PREFILL. Build the prefill stream from a
+        # seq_len=P graph so the whole prompt is processed in ONE pass instead of
+        # P decode-shaped passes. `inject_kv_cache_nodes(decode=False)` gives it
+        # kv_store nodes with `tokens=P` (all P positions persisted for the decode
+        # that follows) and NO kv_load — attention is in-graph and causally masked
+        # over the P rows. The prefill kv_store base is a STATIC relocation
+        # (emit/kv.py), so this pass writes positions 0..P-1 — i.e. P is the
+        # PROMPT length, not a re-runnable chunk.
+        #
+        # This composes with the existing single-token decode: the seq_len=P
+        # prefill graph and the decode graph produce BYTE-IDENTICAL data blobs
+        # (verified across N_pad 16/32/64/128), so the one-shared-blob contract
+        # at decoder_bundle.py holds with no split. (That constraint bites only
+        # the BATCHED graph, which carries per-stream scale vectors — hence the
+        # batch>1 guard below.)
+        prefill_frontend = load_nanogpt(
+            config=payload["model_args"],
+            state_dict=payload["state_dict"],
+            variant="forward_prefill",
+            seq_len=int(prefill_tokens),
+        )
+        prefill_src = mark_runtime_embedding_lookups(prefill_frontend.graph)
+        if gelu_from_accum_blocks:
+            _mark_gelu_from_accum_inline(prefill_src, gelu_from_accum_blocks)
+        prefill_graph = inject_kv_cache_nodes(
+            prefill_src, config, decode=False, seq_len=int(prefill_tokens),
+        )
+    else:
+        prefill_graph = inject_kv_cache_nodes(graph, config, decode=False, seq_len=1)
     if batch == 1:
         decode_graph = inject_kv_cache_nodes(graph, config, decode=True, seq_len=decode_key_len)
     else:

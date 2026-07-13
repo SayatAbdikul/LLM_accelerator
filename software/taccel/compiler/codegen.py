@@ -30,6 +30,50 @@ STAGE4_M_TILE = TILE
 STAGE4_MAX_N_TILE = 512
 
 
+def stage4_forced_weights(graph, elem_bytes: int) -> set:
+    """Weights whose consumer matmul will take the large-weight-TILED path.
+
+    This MIRRORS the emitter's dispatch (`w8a16_emit/matmul`), which tiles when
+    ANY of::
+
+        output_bytes = M_pad*N_pad*elem_bytes  > ABUF_SIZE
+        accum_bytes  = M_pad*N_pad*4           > ACCUM_SIZE
+        weight_bytes                           > WBUF_SIZE   (weight-size test)
+
+    The first two scale with **M_pad**, which is a property of the CONSUMER node,
+    not of the weight. So a wide-M graph tiles weights a 1-row graph never does —
+    e.g. lever I-b's dense multi-token prefill at M_pad=64 makes fc1's ACCUM tile
+    64*512*4 = 128 KB > 64 KB and forces fc1 to tile, while the 1-row decode graph
+    leaves it untiled. Staging keyed only on the weight's own size misses that and
+    the emitter then KeyErrors on the missing tile symbol.
+
+    `_layout_weights` also stages any weight with `data.size > WBUF_SIZE`, so this
+    only has to cover the M_pad-driven cases.
+
+    NOTE the two streams of a bundle must stage the SAME set, or their data blobs
+    diverge and `decoder_bundle` rejects them. decoder_bundle therefore unions
+    this across the prefill AND decode graphs and hands the union to both
+    CodeGenerators. For every pre-I-b bundle the two graphs have the same matmul
+    shapes, so the union is identical to each graph's own set and the staged blob
+    is byte-unchanged.
+    """
+    out = set()
+    for node in graph.nodes:
+        if node.op != "matmul" or len(node.inputs) < 2:
+            continue
+        if node.attrs.get("stage4_weight_tiled", False):
+            out.add(node.inputs[1])
+            continue
+        if len(node.output_shape) != 2:
+            continue
+        m_pad = pad_dim(int(node.output_shape[0]))
+        n_pad = pad_dim(int(node.output_shape[1]))
+        if (m_pad * n_pad * elem_bytes > ABUF_SIZE
+                or m_pad * n_pad * 4 > ACCUM_SIZE):
+            out.add(node.inputs[1])
+    return out
+
+
 def _fp16_to_uint16(val: float) -> int:
     """Convert FP32 value to FP16 bit pattern as uint16 (little-endian)."""
     fp16 = np.float16(val)
@@ -73,7 +117,9 @@ class CodeGenerator:
                  kv_layout: Optional[KVCacheLayout] = None,
                  use_fp16_activations: bool = True,  # DEPRECATED: always True now; kept for back-compat
                  biases: Optional[Dict[str, np.ndarray]] = None,
-                 weight_dtypes: Optional[Dict[str, str]] = None):
+                 weight_dtypes: Optional[Dict[str, str]] = None,
+                 extra_stage4_weights: Optional[set] = None,
+                 stage4_m_pad: int = STAGE4_M_TILE):
         """
         Args:
             weight_data: name → (quantized_data, per_channel_scales)
@@ -166,6 +212,15 @@ class CodeGenerator:
         # the FP32 stride. INT8 reloads use M_pad * N_pad bytes; FP32
         # reloads use M_pad * N_pad * 4 bytes.
         self.dram_temp_fp32_outputs: Dict[str, int] = {}
+        # Union of `stage4_forced_weights` across BOTH bundle streams, so the
+        # prefill and decode codegens stage the SAME tiles and their data blobs
+        # stay identical (decoder_bundle requires that). None => this graph's own
+        # set only (byte-unchanged for every pre-I-b bundle).
+        self.extra_stage4_weights: set = set(extra_stage4_weights or ())
+        # Bundle-wide max M_pad, used to size the stage-4 N-tiles (their ACCUM
+        # cost is M_pad*n_len*4). Staging and emit MUST agree on it or the tile
+        # symbols diverge. Default 16 == the old hardcoded strip => byte-identical.
+        self.stage4_m_pad: int = max(int(stage4_m_pad), TILE)
         # M4-A: exposed to per-emitter helpers (see `w8a16_emit.py`).
         # `last_uses` maps output_name → final node index that consumes it.
         # `current_node_idx` is the index of the node currently being emitted.
@@ -263,11 +318,12 @@ class CodeGenerator:
         """
         from .decoder_bundle import pack_int4
 
-        forced_stage4_weights = {
-            node.inputs[1]
-            for node in graph.nodes
-            if node.op == "matmul" and len(node.inputs) > 1 and node.attrs.get("stage4_weight_tiled", False)
-        }
+        # Staging MUST agree with the emitter's tiling decision or the emitter
+        # KeyErrors on a tile symbol we never staged. `extra_stage4_weights` is
+        # the UNION computed across BOTH streams by decoder_bundle — see
+        # `stage4_forced_weights` for why a per-graph set is not enough.
+        forced_stage4_weights = stage4_forced_weights(graph, self.elem_bytes)
+        forced_stage4_weights |= set(self.extra_stage4_weights or ())
         offset = 0
         for name, (data, scales) in self.weight_data.items():
             if self.weight_dtypes.get(name) == "int4":
@@ -312,7 +368,8 @@ class CodeGenerator:
                 continue
             K_pad, N_pad = int(data.shape[0]), int(data.shape[1])
             is_int4 = self.weight_dtypes.get(name) == "int4"
-            for k_start, k_len, n_start, n_len in self._large_weight_tile_plan(K_pad, N_pad):
+            for k_start, k_len, n_start, n_len in self._large_weight_tile_plan(
+                    K_pad, N_pad, self.stage4_m_pad):
                 tile_name = self._large_weight_tile_symbol(name, k_start, k_len, n_start, n_len)
                 self.dram_layout[tile_name] = offset
                 tile = np.ascontiguousarray(data[k_start:k_start + k_len, n_start:n_start + n_len])
@@ -735,11 +792,26 @@ class CodeGenerator:
         return f"{weight_name}__stage4_tile_k{k_start}_{k_len}_n{n_start}_{n_len}"
 
     @staticmethod
-    def _large_weight_tile_plan(K_pad: int, N_pad: int) -> List[Tuple[int, int, int, int]]:
+    def _large_weight_tile_plan(K_pad: int, N_pad: int,
+                                m_pad: int = STAGE4_M_TILE) -> List[Tuple[int, int, int, int]]:
         """Return deterministic (k_start, k_len, n_start, n_len) tiles.
 
-        Tiles are sized for a 16-row activation strip and capped at
+        Tiles are sized for an `m_pad`-row activation strip and capped at
         `STAGE4_MAX_N_TILE` / ACCUM / ABUF.
+
+        **`m_pad` (lever I-b).** The emitter issues ALL M_pad rows in one MATMUL,
+        so the ACCUM cost of an N-tile is `M_pad * n_len * 4` — it scales with the
+        row count. This used to be hardcoded to a 16-row strip (`STAGE4_M_TILE`),
+        which under-counts ACCUM for M_pad > 16: at M_pad=32 it fit only by luck
+        (32*512*4 = 65536 = exactly ACCUM_SIZE) and at M_pad=64 it overflows 2x.
+        Pass the real (bundle-wide max) M_pad and the N-cap shrinks to match.
+        Splitting an N-tile is systolic-COST-NEUTRAL — the cost is
+        `mt*nt*(64 + 130 + 17(kt-1))` and halving `n_len` halves `nt` while
+        doubling the tile count — so this is nearly free.
+
+        Both the DRAM staging (`_layout_weights`) and the emitter must pass the
+        SAME `m_pad` or their tile symbols diverge; `CodeGenerator.stage4_m_pad`
+        carries the bundle-wide value (default 16 => byte-identical to before).
 
         **Full-K preference (no MATMUL flags=1).** Whenever a single
         `[K_pad x n_tile]` INT8 weight tile fits WBUF for some
@@ -767,8 +839,8 @@ class CodeGenerator:
         if K_pad <= 0 or N_pad <= 0:
             raise ValueError("large weight tile dimensions must be positive")
 
-        max_n_by_accum = ACCUM_SIZE // (STAGE4_M_TILE * 4)
-        max_n_by_abuf = ABUF_SIZE // STAGE4_M_TILE
+        max_n_by_accum = ACCUM_SIZE // (m_pad * 4)
+        max_n_by_abuf = ABUF_SIZE // m_pad
         n_cap = min(N_pad, STAGE4_MAX_N_TILE, max_n_by_accum, max_n_by_abuf)
         n_cap = max(TILE, (n_cap // TILE) * TILE)
 
@@ -790,7 +862,7 @@ class CodeGenerator:
         # so HALF is sufficient. Must stay a pure fn of (K_pad,N_pad) so the
         # DRAM staging (_layout_weights) and emit agree on tile symbols.
         wbuf_budget = WBUF_SIZE // 2
-        full_k_fits_abuf = STAGE4_M_TILE * K_pad * 4 <= ABUF_SIZE
+        full_k_fits_abuf = m_pad * K_pad * 4 <= ABUF_SIZE
         max_n_full_k = (wbuf_budget // K_pad) // TILE * TILE
         if full_k_fits_abuf and max_n_full_k >= TILE:
             n_tile = max(TILE, (min(n_cap, max_n_full_k) // TILE) * TILE)
@@ -826,7 +898,7 @@ class CodeGenerator:
     def _large_weight_tiles_for_n(self, K_pad: int, N_pad: int,
                                   n_start: int, n_len: int) -> List[Tuple[int, int, int, int]]:
         return [
-            tile for tile in self._large_weight_tile_plan(K_pad, N_pad)
+            tile for tile in self._large_weight_tile_plan(K_pad, N_pad, self.stage4_m_pad)
             if tile[2] == n_start and tile[3] == n_len
         ]
 

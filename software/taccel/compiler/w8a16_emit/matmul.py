@@ -515,7 +515,7 @@ def emit_matmul_w8a16_large_weight_tiled(
     # _large_weight_tile_plan groups K-tiles within each N-tile in
     # contiguous runs; we collect them per N-tile so K-accumulation
     # via MATMUL flags=0 (first) / flags=1 (subsequent) is correct.
-    tile_plan = cg._large_weight_tile_plan(K_pad, N_pad)
+    tile_plan = cg._large_weight_tile_plan(K_pad, N_pad, cg.stage4_m_pad)
     n_tile_groups: list = []
     for k_start, k_len, n_start, n_len in tile_plan:
         if not n_tile_groups or n_tile_groups[-1][0] != (n_start, n_len):
@@ -859,7 +859,7 @@ def _emit_matmul_w8a16_large_input_streaming(
     bias_name = node.attrs.get("bias")
 
     # Tile plan.
-    tile_plan = cg._large_weight_tile_plan(K_pad, N_pad)
+    tile_plan = cg._large_weight_tile_plan(K_pad, N_pad, cg.stage4_m_pad)
     n_tile_groups: list = []
     for k_start, k_len, n_start, n_len in tile_plan:
         if not n_tile_groups or n_tile_groups[-1][0] != (n_start, n_len):
