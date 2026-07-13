@@ -493,21 +493,28 @@ def build_stage3_tiny_decoder_bundle(
         _mark_gelu_from_accum_inline(graph, gelu_from_accum_blocks)
     decode_key_len = 1 + int(smoke_decode_steps)
     if prefill_tokens > 1:
-        # Lever I-b — DENSE MULTI-TOKEN PREFILL. Build the prefill stream from a
-        # seq_len=P graph so the whole prompt is processed in ONE pass instead of
-        # P decode-shaped passes. `inject_kv_cache_nodes(decode=False)` gives it
-        # kv_store nodes with `tokens=P` (all P positions persisted for the decode
-        # that follows) and NO kv_load — attention is in-graph and causally masked
-        # over the P rows. The prefill kv_store base is a STATIC relocation
-        # (emit/kv.py), so this pass writes positions 0..P-1 — i.e. P is the
-        # PROMPT length, not a re-runnable chunk.
+        # Lever I-b — CHUNKED MULTI-TOKEN PREFILL. The prefill stream becomes the
+        # DECODE graph carrying P query rows instead of 1: it READS the KV cache
+        # (kv_load) and writes its P rows back at a RUNTIME-PATCHED base, so the
+        # SAME program re-runs per chunk and walks a prompt of ANY length
+        # (`HostRunner.run_prefill_chunk`).
         #
-        # This composes with the existing single-token decode: the seq_len=P
-        # prefill graph and the decode graph produce BYTE-IDENTICAL data blobs
-        # (verified across N_pad 16/32/64/128), so the one-shared-blob contract
-        # at decoder_bundle.py holds with no split. (That constraint bites only
-        # the BATCHED graph, which carries per-stream scale vectors — hence the
-        # batch>1 guard below.)
+        # WHY P ROWS WIN: M_pad = pad_dim(P). A 1-token pass still occupies a full
+        # 16-row systolic m-tile and WASTES 15/16 of the mesh; P=16 fills it. Past
+        # a multiple of 16 there is nothing more to win — the mesh cost is linear
+        # in m-tiles (docs/lever_h_b32.md) — so P=16 is both the sweet spot and
+        # the ABUF-safe choice.
+        #
+        # WHY *CHUNKED* AND NOT AN IN-GRAPH DENSE PASS: a decode=False graph
+        # attends only to its own P rows and pins (P, d_model) embedding tiles in
+        # ABUF, which blows past P=16 on 124M (2*P*768*2 > 128 KB) — and its
+        # kv_store base is a STATIC relocation, so it cannot be re-run for a
+        # second chunk. The cache-reading form has the SAME ABUF profile as the
+        # 1-token decode (every tile is M_pad=16) and composes over any prompt.
+        #
+        # `key_len` is the decode window, identical to the decode graph, so the
+        # two streams still produce byte-identical data blobs (the staged
+        # per-channel scale vectors are sized by N_pad = pad_dim(key_len)).
         prefill_frontend = load_nanogpt(
             config=payload["model_args"],
             state_dict=payload["state_dict"],
@@ -518,7 +525,7 @@ def build_stage3_tiny_decoder_bundle(
         if gelu_from_accum_blocks:
             _mark_gelu_from_accum_inline(prefill_src, gelu_from_accum_blocks)
         prefill_graph = inject_kv_cache_nodes(
-            prefill_src, config, decode=False, seq_len=int(prefill_tokens),
+            prefill_src, config, decode=True, seq_len=decode_key_len,
         )
     else:
         prefill_graph = inject_kv_cache_nodes(graph, config, decode=False, seq_len=1)

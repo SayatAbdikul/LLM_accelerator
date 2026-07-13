@@ -53,15 +53,26 @@ class HostRunner:
         for site in self._sites("kv_base", stream):
             self.bundle.patch_runtime_site(site, offset)
 
-    def _patch_decode_attention_context(self, position: int) -> None:
+    def _patch_attention_context(self, stream: str, query_row_base: int,
+                                 valid_kv_len: int) -> None:
+        """Set the causal window for one stream.
+
+        The masked softmax keys its triangle off `query_row_base + row_idx`, so a
+        multi-row chunk based at `query_row_base` masks each of its rows against
+        exactly the keys at or before that row's GLOBAL position.
+        """
         for site in self.bundle.runtime_config_attn_sites:
-            if site.stream != "decode":
+            if site.stream != stream:
                 continue
             self.bundle.patch_config_attn_site(
                 site,
-                query_row_base=int(position),
-                valid_kv_len=int(position) + 1,
+                query_row_base=int(query_row_base),
+                valid_kv_len=int(valid_kv_len),
             )
+
+    def _patch_decode_attention_context(self, position: int) -> None:
+        # One query row at `position`: it sees keys 0..position.
+        self._patch_attention_context("decode", position, int(position) + 1)
 
     def _read_logits(self, offset: int) -> np.ndarray:
         size = int(self.bundle.logits_size)
@@ -89,6 +100,44 @@ class HostRunner:
         # (The single-token prefill graph has no kv_base sites, so this is a
         # no-op there and the b1 path stays byte-identical.)
         self._patch_kv_bases(0, stream="prefill")
+        self.simulator.run_program(self.bundle, "prefill", max_instructions=max_instructions)
+        return self._read_logits(self.bundle.prefill_logits_offset)
+
+    def run_prefill_chunk(self, token_ids: Sequence[int], base_position: int, *,
+                          max_instructions: int = 10_000_000) -> np.ndarray:
+        """Lever I-b: run ONE prefill chunk of P tokens at positions
+        [base_position, base_position + P).
+
+        The prefill stream of a `prefill_tokens=P` bundle is the decode graph with
+        P query rows: it reads the KV cache and writes its P rows back at a
+        runtime-patched base, so this can be called repeatedly to walk a prompt of
+        any length::
+
+            for c in range(0, len(prompt), P):
+                logits = runner.run_prefill_chunk(prompt[c:c + P], c)
+            # `logits` now holds the LAST prompt row's logits = the first token.
+
+        Each pass costs ONE decode-shaped step but consumes P tokens, because
+        M_pad = pad_dim(P): a 1-token pass wastes 15/16 of the 16-row systolic
+        m-tile, and P=16 fills it. The chunk must be exactly P tokens long (the
+        program has P embedding patch sites).
+
+        Returns the prefill logits region; its row is the chunk's LAST token
+        (`emit_logits_store` picks `logical_rows - 1` for the prefill stream), so
+        after the final chunk it is the prompt's next-token distribution.
+        """
+        tokens = [int(tok) for tok in token_ids]
+        if not tokens:
+            raise ValueError("run_prefill_chunk requires at least one token")
+        if base_position < 0:
+            raise ValueError("base_position must be non-negative")
+        p = len(tokens)
+        base = int(base_position)
+        self._patch_embeddings("prefill", tokens, [base + i for i in range(p)])
+        self._patch_kv_bases(base, stream="prefill")
+        # Rows base..base+P-1 see keys 0..base+P-1; the per-row triangle inside
+        # that window comes from `query_row_base + row_idx`.
+        self._patch_attention_context("prefill", base, base + p)
         self.simulator.run_program(self.bundle, "prefill", max_instructions=max_instructions)
         return self._read_logits(self.bundle.prefill_logits_offset)
 

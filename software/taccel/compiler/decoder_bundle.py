@@ -297,8 +297,12 @@ def inject_kv_cache_nodes(graph: IRGraph, config: ModelConfig, *,
                 "layer": int(layer),
                 "kind": kind,
                 "head": int(head),
+                # Lever I-b (chunked prefill): a cache-reading graph stores as
+                # many rows as it has QUERY rows — 1 for the single-token decode
+                # (byte-identical to before), P for a P-row prefill chunk. The
+                # projection's own row count IS the query count.
                 "seq_len": int(seq_len),
-                "tokens": int(1 if decode else seq_len),
+                "tokens": int(copied.output_shape[0] if decode else seq_len),
                 "decode": bool(decode),
             },
         ))

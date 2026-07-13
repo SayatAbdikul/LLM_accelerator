@@ -1,15 +1,19 @@
-"""Lever I-b: DENSE multi-token prefill (TTFT).
+"""Lever I-b: CHUNKED multi-token prefill (TTFT).
 
 The prefill stream used to be decode-shaped — ONE token per pass. Since
-`M_pad = pad_dim(M)`, a 1-token pass still occupies a full 16-row systolic
-m-tile and WASTES 15/16 of the mesh. Feeding P real query rows fills the tile.
-This is the same effect that made batched decode ~6x better per token than b1
-(see docs/lever_h_b32.md), applied to prompt processing.
+`M_pad = pad_dim(P)`, a 1-token pass still occupies a full 16-row systolic m-tile
+and WASTES 15/16 of the mesh. A P=16 chunk fills it. Same effect that makes
+batched decode ~6x better per token than b1 (docs/lever_h_b32.md), applied to
+prompt processing.
 
-The correctness contract is strong and exact: a P-token dense prefill must
-produce BYTE-IDENTICAL logits to the sequential path
-`prefill(t0) + decode(t1..t_{P-1})` — matmuls are row-independent, LN/softmax are
-per-row, and the KV quant scales are static. Anything else is a bug.
+The prefill stream of a `prefill_tokens=P` bundle is the DECODE graph with P query
+rows: it reads the KV cache and writes its P rows at a RUNTIME-PATCHED base, so
+`run_prefill_chunk` re-runs it per chunk and walks a prompt of ANY length at the
+same ABUF cost as a 1-token decode.
+
+The correctness contract is exact: chunking a prompt must produce BYTE-IDENTICAL
+logits to the sequential path `prefill(t0) + decode(t1..t_{L-1})` — matmuls are
+row-independent, LN/softmax are per-row, KV quant scales are static.
 """
 import importlib.util
 import json
@@ -30,7 +34,7 @@ RTL_SYNTH_BINARY = (
 )
 TOOL_PATH = Path(__file__).resolve().parents[1] / "tools" / "train_tiny_fixture.py"
 
-SMOKE = 80          # decode window must cover prompt + generated tokens
+SMOKE = 120         # decode window must cover the longest prompt + generated tokens
 VOCAB = 33          # the tiny fixture's real vocab
 
 
@@ -56,8 +60,8 @@ def test_prefill_tokens_requires_single_stream():
         build_stage3_tiny_decoder_bundle({}, batch=16, prefill_tokens=16)
 
 
-@pytest.mark.parametrize("P", [16, 32, 64])
-def test_prefill_graph_is_dense_multi_token(tmp_path, P):
+@pytest.mark.parametrize("P", [16, 32])
+def test_prefill_graph_is_multi_token(tmp_path, P):
     payload = _build_payload(tmp_path)
     tiny = build_stage3_tiny_decoder_bundle(
         payload, smoke_decode_steps=SMOKE, batch=1, prefill_tokens=P)
@@ -73,17 +77,18 @@ def test_prefill_graph_is_dense_multi_token(tmp_path, P):
     assert len(dec) == 1
 
 
-@pytest.mark.parametrize("P", [16, 32, 64])
-def test_multi_token_prefill_is_byte_identical_to_sequential(tmp_path, P):
-    """The whole point: one dense P-row pass == P sequential decode-shaped passes."""
+@pytest.mark.parametrize("L,P", [(16, 16), (64, 16), (96, 16), (64, 32)])
+def test_chunked_prefill_is_byte_identical_to_sequential(tmp_path, L, P):
+    """The whole point: L/P chunked passes == L sequential decode-shaped passes,
+    for ANY prompt length L."""
     payload = _build_payload(tmp_path)
-    prompt = _prompt(P)
+    prompt = _prompt(L)
 
     seq = build_stage3_tiny_decoder_bundle(payload, smoke_decode_steps=SMOKE, batch=1)
     rs = HostRunner(seq.build.bundle, logits_dtype=np.float16)
     c0 = rs.simulator.state.cycle_count
     logits_seq = rs.run_prefill([prompt[0]])
-    for i in range(1, P):
+    for i in range(1, L):
         logits_seq = rs.run_decode_step(prompt[i], i)
     cyc_seq = rs.simulator.state.cycle_count - c0
 
@@ -91,12 +96,13 @@ def test_multi_token_prefill_is_byte_identical_to_sequential(tmp_path, P):
         payload, smoke_decode_steps=SMOKE, batch=1, prefill_tokens=P)
     rd = HostRunner(dense.build.bundle, logits_dtype=np.float16)
     c0 = rd.simulator.state.cycle_count
-    logits_dense = rd.run_prefill(prompt)
+    for c in range(0, L, P):
+        logits_dense = rd.run_prefill_chunk(prompt[c:c + P], c)
     cyc_dense = rd.simulator.state.cycle_count - c0
 
     assert np.array_equal(np.asarray(logits_seq)[:VOCAB],
                           np.asarray(logits_dense)[:VOCAB]), \
-        "dense prefill logits differ from the sequential path"
+        "chunked prefill logits differ from the sequential path"
 
     # The KV cache the dense pass wrote must let the decode CONTINUE correctly:
     # generate a few tokens from each and require the same sequence.
@@ -104,14 +110,14 @@ def test_multi_token_prefill_is_byte_identical_to_sequential(tmp_path, P):
         out, tok = [], int(np.argmax(np.asarray(logits)[:VOCAB]))
         for g in range(n):
             out.append(tok)
-            lg = runner.run_decode_step(tok, P + g)
+            lg = runner.run_decode_step(tok, L + g)
             tok = int(np.argmax(np.asarray(lg)[:VOCAB]))
         return out
 
     assert _gen(rs, logits_seq) == _gen(rd, logits_dense), \
-        "decode diverges after the dense prefill (KV cache not written correctly)"
+        "decode diverges after the chunked prefill (KV cache not written correctly)"
 
-    # TTFT: the dense pass must be materially cheaper than P sequential passes.
+    # TTFT: chunked prefill must be materially cheaper than L sequential passes.
     assert cyc_dense < cyc_seq / 2, f"no TTFT win: {cyc_seq} -> {cyc_dense}"
 
 
@@ -131,15 +137,16 @@ def test_multi_token_prefill_rtl_matches_golden_bytes(tmp_path):
     bundle = tiny.build.bundle
     prompt = _prompt(P)
 
-    # Golden (mode-0 DPI): run the prefill stream on a fresh bundle.
+    # Golden (mode-0 DPI): run ONE prefill chunk on a fresh bundle.
     runner = HostRunner(bundle, logits_dtype=np.int8)
-    golden = runner.run_prefill(prompt)
+    golden = runner.run_prefill_chunk(prompt, 0)
 
     # RTL: patch the same sites, extract the standalone PREFILL program, run it
     # on a fresh image and dump the logits region. Symmetric with the golden run.
     patcher = HostRunner(bundle, simulator=None)
     patcher._patch_embeddings("prefill", prompt, list(range(P)))
     patcher._patch_kv_bases(0, stream="prefill")
+    patcher._patch_attention_context("prefill", 0, P)
     image = bundle.materialize(reset_runtime=False)
     data_base = int(bundle.data_base)
     prefill_only = bytes(image[int(bundle.prefill_instrs_offset):int(bundle.decode_instrs_offset)])
@@ -163,6 +170,6 @@ def test_multi_token_prefill_rtl_matches_golden_bytes(tmp_path):
     rtl = np.frombuffer((td / "dram.bin").read_bytes(), dtype=np.int8)[:golden.shape[0]]
 
     assert np.array_equal(golden, rtl), (
-        f"RTL != golden on the dense prefill: "
+        f"RTL != golden on the chunked prefill: "
         f"{int(np.sum(golden != rtl))}/{golden.shape[0]} bytes differ"
     )
