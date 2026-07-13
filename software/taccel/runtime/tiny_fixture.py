@@ -423,12 +423,22 @@ def build_stage3_tiny_decoder_bundle(
     """Build the full 1-token tiny decoder ProgramBundle used by Stage 3 tests.
 
     ``batch`` selects the decode-stream shape. ``batch=1`` (default) keeps the
-    single-token decoder byte-identical to before. ``batch=16`` builds the
-    Phase 2 lockstep batched decode stream (16 query rows through the shared
+    single-token decoder byte-identical to before. ``batch=16``/``batch=32``
+    build the lockstep batched decode stream (N query rows through the shared
     non-attention path); the prefill stream stays single-token regardless.
+
+    Lever H (batch=32): the shared work (LN / Q,K,V+out projections / FFN /
+    lm_head — all M-shaped, weights DMA'd once) amortizes over 2x the tokens,
+    while per-stream attention scales linearly. The binding buffer is ACCUM:
+    fc2's 512-col streaming N-tile costs M_pad*n_len*4 = 32*512*4 = 64 KB,
+    exactly ACCUM_SIZE, so B=32 fits with no margin. B>32 additionally needs the
+    Stage-4 tile plan to use the real M_pad — it currently assumes a 16-row
+    strip (`codegen.STAGE4_M_TILE`), which under-counts ACCUM for M_pad>16.
     """
-    if batch not in (1, 16):
-        raise ValueError("build_stage3_tiny_decoder_bundle: batch must be 1 or 16")
+    if batch not in (1, 16, 32):
+        raise ValueError(
+            "build_stage3_tiny_decoder_bundle: batch must be 1, 16, or 32"
+        )
     resolved_preset = resolve_stage5_ptq_preset(ptq_preset)
     activation_percentile_nodes = dict(resolved_preset.activation_percentile_nodes)
     if calibration_scales is None:

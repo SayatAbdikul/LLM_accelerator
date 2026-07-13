@@ -48,9 +48,9 @@ class HostRunner:
         self._patch_sites("token_embed", stream, [int(tok) * row_bytes for tok in token_ids])
         self._patch_sites("pos_embed", stream, [int(pos) * row_bytes for pos in position_ids])
 
-    def _patch_kv_bases(self, position: int) -> None:
+    def _patch_kv_bases(self, position: int, stream: str = "decode") -> None:
         offset = int(position) * int(self.bundle.kv_step_bytes)
-        for site in self._sites("kv_base", "decode"):
+        for site in self._sites("kv_base", stream):
             self.bundle.patch_runtime_site(site, offset)
 
     def _patch_decode_attention_context(self, position: int) -> None:
@@ -81,6 +81,14 @@ class HostRunner:
         if not tokens:
             raise ValueError("run_prefill requires at least one token")
         self._patch_embeddings("prefill", tokens, list(range(len(tokens))))
+        # The batched bundle reuses the batched DECODE graph for its prefill slot
+        # (tiny_fixture), so the prefill stream carries runtime `kv_base` sites.
+        # Left unpatched they read 0, and the KV row stores then address
+        # `0 + dram_off` — which lands inside the weight/data region and silently
+        # CORRUPTS the weights. Prime the lockstep streams at position 0.
+        # (The single-token prefill graph has no kv_base sites, so this is a
+        # no-op there and the b1 path stays byte-identical.)
+        self._patch_kv_bases(0, stream="prefill")
         self.simulator.run_program(self.bundle, "prefill", max_instructions=max_instructions)
         return self._read_logits(self.bundle.prefill_logits_offset)
 

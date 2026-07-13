@@ -29,6 +29,14 @@ RTL_SYNTH_BINARY = (
 
 TOOL_PATH = Path(__file__).resolve().parents[1] / "tools" / "train_tiny_fixture.py"
 
+# Batched tests run at the PRODUCTION attention depth: key_len = 1 + 63 = 64, so
+# Kseq_pad = 64 and the per-head attn_v tiles spill to DRAM-temp exactly as they
+# do on GPT-2 124M. That spill is what bounds ABUF — without it the
+# n_head x n_streams live attn_v tiles are 4 x 32 x 1 KB = the whole 128 KB ABUF,
+# and B=32 cannot even build. (A shallow Kseq_pad < 64 is a toy regime that never
+# occurs in a real decode.)
+BATCHED_SMOKE = 63
+
 
 def _load_tool():
     spec = importlib.util.spec_from_file_location("train_tiny_fixture", TOOL_PATH)
@@ -63,9 +71,14 @@ def test_forward_batch16_frontend_shape():
     assert all(node.output_shape[0] == 16 for node in result.graph.nodes if node.output_shape)
 
 
-def test_build_stage3_rejects_bad_batch():
+@pytest.mark.parametrize("bad", [4, 8, 64])
+def test_build_stage3_rejects_bad_batch(bad):
+    # 64 must STAY rejected: fc2's 512-col streaming N-tile costs M_pad*512*4 of
+    # ACCUM, which is exactly ACCUM_SIZE (64 KB) at M_pad=32 and would be 2x
+    # over at 64. Lifting the cap past 32 requires the Stage-4 tile plan to take
+    # the real M_pad (it assumes a 16-row strip, `codegen.STAGE4_M_TILE`).
     with pytest.raises(ValueError):
-        build_stage3_tiny_decoder_bundle({}, batch=4)
+        build_stage3_tiny_decoder_bundle({}, batch=bad)
 
 
 def test_batched_decode_graph_is_per_stream():
@@ -113,70 +126,80 @@ def _build_payload(tmp_path):
     return torch.load(checkpoint, map_location="cpu")
 
 
-def test_batched_bundle_builds_and_has_16_embedding_sites(tmp_path):
+@pytest.mark.parametrize("batch", [16, 32])
+def test_batched_bundle_builds_and_has_n_embedding_sites(tmp_path, batch):
     payload = _build_payload(tmp_path)
 
-    base = build_stage3_tiny_decoder_bundle(payload, smoke_decode_steps=2, batch=1)
-    tiny = build_stage3_tiny_decoder_bundle(payload, smoke_decode_steps=2, batch=16)
+    base = build_stage3_tiny_decoder_bundle(payload, smoke_decode_steps=BATCHED_SMOKE, batch=1)
+    tiny = build_stage3_tiny_decoder_bundle(payload, smoke_decode_steps=BATCHED_SMOKE, batch=batch)
 
     # Batch dimension flows through the embedding lookups: one runtime patch
-    # site per row (16), vs a single site in the single-token decoder.
+    # site per row (N), vs a single site in the single-token decoder.
     assert len(_decode_sites(base.build.bundle, "token_embed")) == 1
-    assert len(_decode_sites(tiny.build.bundle, "token_embed")) == 16
-    assert len(_decode_sites(tiny.build.bundle, "pos_embed")) == 16
+    assert len(_decode_sites(tiny.build.bundle, "token_embed")) == batch
+    assert len(_decode_sites(tiny.build.bundle, "pos_embed")) == batch
 
     # The single-token bundle's prefill has one embed site; the batched
-    # bundle reuses the batched graph for its prefill slot (16 sites) so the
+    # bundle reuses the batched graph for its prefill slot (N sites) so the
     # two streams share one weight/scale data blob.
     assert len([s for s in base.build.bundle.runtime_patch_sites
                 if s.kind == "token_embed" and s.stream == "prefill"]) == 1
     assert len([s for s in tiny.build.bundle.runtime_patch_sites
-                if s.kind == "token_embed" and s.stream == "prefill"]) == 16
+                if s.kind == "token_embed" and s.stream == "prefill"]) == batch
 
 
-def test_batched_decode_runs_clean_in_golden(tmp_path):
+@pytest.mark.parametrize("batch", [16, 32])
+def test_batched_decode_runs_clean_in_golden(tmp_path, batch):
     payload = _build_payload(tmp_path)
-    tiny = build_stage3_tiny_decoder_bundle(payload, smoke_decode_steps=2, batch=16)
+    tiny = build_stage3_tiny_decoder_bundle(payload, smoke_decode_steps=BATCHED_SMOKE, batch=batch)
 
     runner = HostRunner(tiny.build.bundle, logits_dtype=np.int8)
-    # Batched bundle's prefill slot is the lockstep batched graph (16 rows).
+    # Batched bundle's prefill slot is the lockstep batched graph (N rows).
     vocab = _tiny_nanogpt_config()["vocab_size"]
-    runner.run_prefill([(3 + s) % vocab for s in range(16)])
-    tokens16 = [(1 + s) % vocab for s in range(16)]
-    out = runner.run_decode_step_batch(tokens16, position=1)
+    runner.run_prefill([(3 + s) % vocab for s in range(batch)])
+    tokens = [(1 + s) % vocab for s in range(batch)]
+    out = runner.run_decode_step_batch(tokens, position=1)
 
-    # Lever I-a (logits×N): the region now spans all 16 per-stream logits rows,
-    # not just row 0. `out` is the flat int8 view of the whole logits_size
-    # region; reshape to per-stream rows and confirm every stream is populated.
+    # Lever I-a (logits×N): the region spans all N per-stream logits rows, not
+    # just row 0. `out` is the flat int8 view of the whole logits_size region;
+    # reshape to per-stream rows and confirm every stream is populated.
     assert out.shape == (tiny.logits_size,)
-    per_stream = out.reshape(16, -1)
-    assert per_stream.shape[1] == tiny.logits_size // 16
-    assert np.all(per_stream.any(axis=1)), "a per-stream logits row is empty (store_rows<16?)"
-    # The 16 streams decode distinct tokens, so their logits rows must differ —
-    # proves the store captured per-stream data, not row 0 replicated 16×.
+    per_stream = out.reshape(batch, -1)
+    assert per_stream.shape[1] == tiny.logits_size // batch
+    assert np.all(per_stream.any(axis=1)), "a per-stream logits row is empty (store_rows<N?)"
+    # The N streams decode distinct tokens, so their logits rows must differ —
+    # proves the store captured per-stream data, not row 0 replicated N×.
     assert len({row.tobytes() for row in per_stream}) > 1, "per-stream rows are all identical"
 
 
-def test_batched_decode_rtl_matches_golden_bytes(tmp_path):
+@pytest.mark.parametrize("batch", [16, 32])
+def test_batched_decode_rtl_matches_golden_bytes(tmp_path, batch):
     """Bit-exact contract: mode-1 synth RTL == mode-0 golden on the batched
-    decode program (byte-identical logits)."""
+    decode program (byte-identical logits), for every batched stream's row.
+
+    NOTE this is the TINY model on purpose: RTL-vs-golden *byte*-match is only
+    well-posed below GPT-2 124M's first fp16 overflow (block0_out_proj →
+    ±65504/NaN), past which the golden itself saturates and conformance becomes
+    logits-level (argmax/cosine/perplexity) — see rtl_cosim.py #109.
+    """
     if not RTL_SYNTH_BINARY.exists():
         pytest.skip(f"synth RTL binary not built: {RTL_SYNTH_BINARY}")
     payload = _build_payload(tmp_path)
-    tiny = build_stage3_tiny_decoder_bundle(payload, smoke_decode_steps=2, batch=16)
+    tiny = build_stage3_tiny_decoder_bundle(payload, smoke_decode_steps=BATCHED_SMOKE, batch=batch)
     bundle = tiny.build.bundle
     pos = 1
-    tokens16 = [(3 + s) % 64 for s in range(16)]
+    tokens16 = [(3 + s) % 64 for s in range(batch)]
 
-    # Golden (mode-0 DPI).
+    # Golden (mode-0 DPI). Decode-ONLY, to mirror the RTL side below, which runs
+    # the extracted decode program on a fresh image. Running a prefill here (and
+    # not on the RTL) would compare two different machine states.
     runner = HostRunner(bundle, logits_dtype=np.int8)
-    runner.run_prefill([(5 + s) % 64 for s in range(16)])
     golden = runner.run_decode_step_batch(tokens16, pos)
 
     # Extract the standalone decode program and run it on the synth RTL,
     # dumping the logits region for a byte compare.
     patcher = HostRunner(bundle, simulator=None)
-    patcher._patch_embeddings("decode", tokens16, [pos] * 16)
+    patcher._patch_embeddings("decode", tokens16, [pos] * batch)
     patcher._patch_kv_bases(pos)
     patcher._patch_decode_attention_context(pos)
     image = bundle.materialize(reset_runtime=False)
