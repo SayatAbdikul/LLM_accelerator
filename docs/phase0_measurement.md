@@ -185,13 +185,42 @@ the same program — the serialized arm only *delays* dispatch. And yet:
 
 > **1,605,138 of 1,608,704 logits bytes differ — 99.78%.**
 
-The dropped drain writes are live model state. **The shipped 124M b16 decode path
-computes garbage.**
+### It is garbage, not mantissa noise — checked in the metric that matters
+
+A byte-diff on **fp16** logits could still be low-mantissa jitter, so the claim was
+re-checked as **predicted tokens** (argmax per stream), against the mode-0 golden
+simulator — which models no concurrency at all:
+
+| | argmax agreement with golden | what it predicts |
+|---|---:|---|
+| **serialized** (`=0`) | 4 / 16 | plausible tokens — `262`(` the`), `11`(`,`), `198`(`\n`), `12` |
+| **shipped** (`=1`) | **0 / 16** | **token `0` on 11 of 16 streams**; the rest wild (`35981`, `39488`, `13721`) |
+
+**Token `0` on 11/16 streams is the signature of the bug**: argmax of an *all-zero
+logits row*. That is precisely what a dropped `ST_DRAIN_WR` leaves behind — the
+precleared zeros, never overwritten with the real result. **The shipped chip emits
+broken text.**
+
+### Careful: this does NOT show "serialized == golden"
+
+Serialized agrees with golden on only 4/16 too. That gap is **not** the bus bug — it
+is the project's own documented ill-posedness (`rtl_cosim.py` #109: past 124M's first
+fp16 overflow at `block0_out_proj` the **golden itself saturates**, which is exactly
+why 124M was never byte-gated). Serialized is the correct machine on three independent
+grounds — it drops **zero** writes, it **byte-matches golden on the tiny model** where
+that comparison *is* well-posed (20/20 tests green), and it predicts **plausible**
+tokens — but "RTL == golden at 124M" is not a claim this project can make in either
+direction.
+
+**Open, and separate from this bug:** even a *correct* chip agrees with the golden on
+only 4/16 argmax at 124M. Whether that is benign fp16 saturation or a real quality
+problem is **unmeasured**, and cannot be measured until the bus is fixed. It should be
+the first thing checked afterwards.
 
 **The honest decode number is 9.06 tok/s, not 9.729.** The 9.729 headline is measured
-on a machine whose matmul results are 99.78% wrong; a *correct* machine today costs
-+7.33% (60,736,113 cycles). That 7.33% is the true value of the DMA‖Systolic lever —
-it is a real win, it just has to be *earned* rather than stolen.
+on a machine that predicts the wrong token on every stream; a *correct* machine today
+costs +7.33% (60,736,113 cycles). That 7.33% is the true value of the DMA‖Systolic
+lever — it is a real win, it just has to be *earned* rather than stolen.
 
 ### The design already knew
 
@@ -245,16 +274,26 @@ it to 0 serializes the two engines: correct, and the honest reference for A/B-in
 corruption. It is also the **safe-mode fallback** — a correct machine today, at
 9.06 tok/s, if one is needed before the bus split lands.
 
-### Why the fix is the one already scoped
+### Why the fix is the one already scoped — and where that claim stops
 
-Every single lost access is **DMA→WBUF racing systolic→ACCUM** (ABUF losses: 0, WBUF
-losses: 0). Those are **different SRAMs**. They collide only because they share one
-bus, and ABUF / WBUF / ACCUM are **already three separate dual-port macros**
-(`sram_subsystem.sv:88-153`, where `a_en` is merely fanned out by `a_buf`).
+Every lost access **in this decode shape** is **DMA→WBUF racing systolic→ACCUM**
+(ABUF losses: 0, WBUF losses: 0). Those are **different SRAMs**. They collide only
+because they share one bus, and ABUF / WBUF / ACCUM are **already three separate
+dual-port macros** (`sram_subsystem.sv:88-153`, where `a_en` is merely fanned out by
+`a_buf`).
 
 So splitting Port A per buffer costs **zero new SRAM ports** and eliminates **100% of
-the measured losses by construction** — while keeping the 7.33% the lever was trying
-to buy. It is simultaneously the correctness fix and the performance lever.
+the *measured* losses** — while keeping the 7.33% the lever was trying to buy. It is
+simultaneously the correctness fix and the performance lever.
+
+> **⚠️ Do not inherit "100% safe" from this.** The zeros above are a property of the
+> *decode shape*, not of the split. The KV re-read is **DMA→ABUF**, and attention's
+> src2 stream is **systolic←ABUF** — that pair is **same-buffer**, and a per-buffer
+> split does **not** separate it. It reads 0 here only because those two never
+> currently coincide in time. Before Phase 1 re-enables systolic‖DMA on ABUF, the
+> Port-A audit must be re-run on **prefill and the chunked-prefill shapes**, where the
+> phasing differs. Same-buffer contention needs real dual-port arbitration (or a
+> guaranteed-disjoint schedule), not a fan-out.
 
 ### Revised ranking
 
