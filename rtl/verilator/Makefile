@@ -52,7 +52,7 @@ read_filelist  = $(shell grep -E -v '^[[:space:]]*(\#|$$)' $(1))
 CONTROL_SV    := $(addprefix $(SRC_DIR)/, $(call read_filelist,$(CORE_F)))
 CTRL_SV       := $(addprefix $(SRC_DIR)/, $(call read_filelist,$(CORE_CTRL_F)))
 
-.PHONY: all run_program run_program_synth test_decode test_control test_dma test_helpers test_sfu \
+.PHONY: all run_program run_program_synth run_program_noovl test_decode test_control test_dma test_helpers test_sfu \
         test_systolic test_systolic_array_chained test_systolic_chained \
         test_systolic_query test_systolic_qkt \
         test_systolic_qkt_basic test_systolic_qkt_replay \
@@ -118,6 +118,35 @@ $(BUILD_DIR)/run_program_synth/Vtaccel_top: $(CONTROL_SV) run_program.cpp
 	$(MAKE) -C $(BUILD_DIR)/run_program_synth -f Vtaccel_top.mk
 
 run_program_synth: $(BUILD_DIR)/run_program_synth/Vtaccel_top
+
+# -----------------------------------------------------------------------
+# run_program_noovl: run_program_synth with SYS_DMA_OVERLAP=0.
+#
+# This is the DROP-FREE reference machine, and until the Port-A bus is split
+# it is the ONLY 124M build a byte-exact gate may be run against. The shipped
+# build (SYS_DMA_OVERLAP=1) lets the DMA silently steal the systolic's ACCUM
+# drain writes -- 255,818 of them per b16 decode step -- so a before/after
+# byte comparison on it is measuring the collision pattern, not the change.
+# See docs/phase0_measurement.md.
+#
+# It is also the safe-mode fallback: correct, and +7.33% slower.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/run_program_noovl/Vtaccel_top: $(CONTROL_SV) run_program.cpp
+	mkdir -p $(BUILD_DIR)/run_program_noovl
+	$(VERILATOR) $(VFLAGS) \
+	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
+	  -GSFU_SYNTH_MODE=1 \
+	  -GDRAM_SIZE=$(DRAM_SIZE_124M) \
+	  -GSYS_DMA_OVERLAP=0 \
+	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
+	  --top-module taccel_top \
+	  --Mdir $(BUILD_DIR)/run_program_noovl \
+	  $(CONTROL_SV) \
+	  run_program.cpp \
+	  -CFLAGS "-I$(CURDIR)/include $(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/run_program_noovl -f Vtaccel_top.mk
+
+run_program_noovl: $(BUILD_DIR)/run_program_noovl/Vtaccel_top
 
 # -----------------------------------------------------------------------
 # test_decode: verilate tb_decode_unit + compile + run

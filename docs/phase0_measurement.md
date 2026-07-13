@@ -201,6 +201,13 @@ logits row*. That is precisely what a dropped `ST_DRAIN_WR` leaves behind — th
 precleared zeros, never overwritten with the real result. **The shipped chip emits
 broken text.**
 
+> ⚠️ **This signature is specific to the pre-1a machine and no longer reproduces.**
+> Lever **1a landed** (commit below) and deleted the ACCUM preclear, so a dropped
+> `ST_DRAIN_WR` now leaves **stale ACCUM from a prior matmul** rather than zeros. Re-run
+> the shipped-arm audit today and you get *differently-flavoured* garbage — not token `0`,
+> and not a new bug. The corruption is unchanged in kind and in count; only its residue
+> changed. The bus is still broken; see the corrected ranking below.
+
 ### Careful: this does NOT show "serialized == golden"
 
 Serialized agrees with golden on only 4/16 too. That gap is **not** the bus bug — it
@@ -262,17 +269,28 @@ one shared `a_en/a_buf/a_row/a_wdata` bus. Splitting the bus per buffer costs **
 new SRAM ports** and resolves 100% of the measured losses by construction — every one
 of them is DMA→WBUF racing systolic→ACCUM, i.e. *different* SRAMs.
 
-**Lever 1a (delete the dead ACCUM preclear) is now entangled.** It is still dead work
-(`ST_DRAIN_WR` overwrites the region bijectively, the golden never precleared, and
-`flags=1` count is zero), but 375,590 of the current collisions land on preclear
-writes. Removing it re-phases the systolic against the DMA and changes which writes
-collide. **1a must not land before the bus is fixed**, or it will silently move
-corruption around.
+**Lever 1a (delete the dead ACCUM preclear) — RETRACTED "BLOCKED", 1a has LANDED.**
+This section originally said *"1a must not land before the bus is fixed, or it will
+silently move corruption around."* **That was overstated, and it is withdrawn.** What
+is true is narrower: 1a changes the *residue* of the bus bug (a dropped `ST_DRAIN_WR`
+now leaves stale ACCUM instead of precleared zeros), so **a shipped-vs-shipped byte
+diff is not a valid gate for it**. It does not change the bug's kind or its count, and
+it does not make the machine any less correct than it already was.
+
+1a is byte-exact **by proof**, not by luck, so it needs no drop-free phasing argument:
+the preclear wrote `dst_off + [0, m_tiles·n_tiles·64)`, and the flags=0 drain — a pure
+overwrite — enumerates exactly that span, each row once. Its zeros are therefore never
+observable by any consumer. Gated on the **drop-free** machines (tiny, and 124M with
+`SYS_DMA_OVERLAP=0`), before-vs-after logits are **byte-identical** (1,608,704 /
+1,608,704), with `sys_busy` −2,318,647 and `Δtotal == Δsys_busy` **exactly**.
+
+It also **shrinks the bus fix**: `ST_DST_CLEAR_WR` is gone, so the systolic now has one
+fewer shared-Port-A writer, and 375,590 of the collisions above simply cease to exist.
 
 **A `SYS_DMA_OVERLAP` parameter now exists** (`control_unit.sv`, default 1). Setting
 it to 0 serializes the two engines: correct, and the honest reference for A/B-ing the
 corruption. It is also the **safe-mode fallback** — a correct machine today, at
-9.06 tok/s, if one is needed before the bus split lands.
+9.06 tok/s (**9.42 tok/s** once 1a landed), if one is needed before the bus split does.
 
 ### Why the fix is the one already scoped — and where that claim stops
 
@@ -300,7 +318,7 @@ simultaneously the correctness fix and the performance lever.
 | | was | now |
 |---|---|---|
 | **Split the Port-A bus** | Phase 2, "+15-20%" | **PHASE 1 — CORRECTNESS FIX.** Also recovers the 7.33% legitimately, and the DMA is 35% of the step, so the ceiling above that is higher than estimated |
-| Delete the ACCUM preclear (1a) | Phase 1, +4.3% | **BLOCKED on the bus fix.** 375,590 of today's collisions land on preclear writes; removing it re-phases the systolic against the DMA and moves corruption around |
+| Delete the ACCUM preclear (1a) | Phase 1, +4.3% | **LANDED** (byte-exact by proof; gated on the drop-free machines). −2,318,647 cyc; on the *correct* machine **9.064 → 9.424 tok/s (+3.97%)**. The earlier "BLOCKED" call is retracted above. Bonus: deletes one of the systolic's shared-Port-A writers |
 | Chase the helper engine | suspected 3rd engine | **DEAD — 0.14% of the step** |
 | fc2 full-K (1b), A-load hiding (1c), softmax MAX 8-wide (1d) | Phase 1 | unchanged, still independent |
 

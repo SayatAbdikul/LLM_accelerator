@@ -194,7 +194,22 @@ module systolic_controller
     dispatch_m_tiles_w = {22'h0, tile_m} + 32'd1;
     dispatch_n_tiles_w = {22'h0, tile_n} + 32'd1;
     dispatch_clear_rows_w = (dispatch_m_tiles_w * dispatch_n_tiles_w) << 6;
-    needs_dst_preclear_w = !flags_accumulate && (dst_buf == BUF_ACCUM);
+    // The ACCUM preclear is dead work, and this is a proof rather than an
+    // observation. It only ever ran when !flags_accumulate, and it wrote zeros
+    // to dst_off + [0, m_tiles*n_tiles*64). The flags=0 drain is a pure
+    // overwrite (no read-modify-write) at
+    //   dst_off + mt*n_tiles*64 + 4*(nt + r*n_tiles) + g
+    // over mt in [0,m_tiles), nt in [0,n_tiles), r in [0,16), g in [0,4) --
+    // which enumerates exactly that same span, each row once. So every row the
+    // preclear zeroed is unconditionally rewritten before the MATMUL retires:
+    // its zeros are never observable, by any consumer, ever. (A consumer that
+    // over-reads past the tile span is unaffected too -- the preclear never
+    // covered the over-read region either.) The golden model has never
+    // precleared at all.
+    //
+    // Removing it also drops ST_DST_CLEAR_WR, one of the systolic's three
+    // shared-Port-A writers. See docs/phase0_measurement.md.
+    needs_dst_preclear_w = 1'b0;
 
     rd_lane_w = (state == ST_READ_USE) ? (lane_q + 6'd1) : lane_q;
     ld_row_w  = (state == ST_A_LOAD_LATCH) ? (a_load_row_q + 5'd1) : a_load_row_q;
