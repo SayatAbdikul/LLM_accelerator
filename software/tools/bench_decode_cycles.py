@@ -145,8 +145,12 @@ def main() -> int:
                     help="comma-separated decode positions (ctx = pos+1)")
     ap.add_argument("--fmax-mhz", type=float, default=34.41)
     ap.add_argument("--batch", type=int, default=1,
-                    help="lockstep batched decode width (1 or 16); "
-                         "per-token cost = cycles / batch")
+                    help="lockstep batched decode width (1, 16, or 32); "
+                         "per-token cost = cycles / batch. b16 is the sane "
+                         "operating point: b32 costs +48%% DRAM (991 MB of the "
+                         "1 GB budget) and 100%% of ACCUM for only +3.45%% tok/s, "
+                         "because sys/sfu scale 1:1 with tokens (see "
+                         "docs/lever_h_b32.md)")
     ap.add_argument("--max-cycles", type=int, default=200_000_000)
     ap.add_argument("--keep-bins", action="store_true",
                     help="keep the per-position .bin files next to --out-dir")
