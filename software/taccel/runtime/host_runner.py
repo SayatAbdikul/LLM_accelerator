@@ -74,13 +74,29 @@ class HostRunner:
         # One query row at `position`: it sees keys 0..position.
         self._patch_attention_context("decode", position, int(position) + 1)
 
-    def _read_logits(self, offset: int) -> np.ndarray:
+    def _read_logits(self, offset: int, rows: int = 0) -> np.ndarray:
+        """Read `rows` logits rows from `offset` (0 = the whole region).
+
+        The prefill and decode streams SHARE the logits region, which is sized
+        for whichever stores more rows. A reader must take only its OWN rows:
+        on a `prefill_tokens=16` bundle a 1-row decode step writes row 0 and
+        leaves rows 1..15 holding the last verify pass's logits, so reading the
+        whole region and taking an argmax over it would silently return a token
+        from a stale row.
+        """
         size = int(self.bundle.logits_size)
         if size <= 0:
             return np.asarray([], dtype=self.logits_dtype)
+        if rows > 0:
+            if rows > int(self.bundle.logits_rows):
+                raise ValueError(
+                    f"requested {rows} logits rows but the region holds "
+                    f"{self.bundle.logits_rows}"
+                )
+            size = rows * int(self.bundle.logits_row_bytes)
         if size % self.logits_dtype.itemsize != 0:
             raise ValueError(
-                f"logits_size={size} is not divisible by dtype size "
+                f"logits size={size} is not divisible by dtype size "
                 f"{self.logits_dtype.itemsize}"
             )
         data = bytes(self.simulator.state.dram[int(offset):int(offset) + size])
@@ -101,7 +117,8 @@ class HostRunner:
         # no-op there and the b1 path stays byte-identical.)
         self._patch_kv_bases(0, stream="prefill")
         self.simulator.run_program(self.bundle, "prefill", max_instructions=max_instructions)
-        return self._read_logits(self.bundle.prefill_logits_offset)
+        return self._read_logits(self.bundle.prefill_logits_offset,
+                                 rows=int(self.bundle.prefill_store_rows))
 
     def run_prefill_chunk(self, token_ids: Sequence[int], base_position: int, *,
                           max_instructions: int = 10_000_000) -> np.ndarray:
@@ -122,9 +139,15 @@ class HostRunner:
         m-tile, and P=16 fills it. The chunk must be exactly P tokens long (the
         program has P embedding patch sites).
 
-        Returns the prefill logits region; its row is the chunk's LAST token
-        (`emit_logits_store` picks `logical_rows - 1` for the prefill stream), so
-        after the final chunk it is the prompt's next-token distribution.
+        Returns the FLAT prefill logits region, row-major.
+
+        On a bundle built with ``prefill_tokens=P`` the store now covers all P
+        rows (``store_rows=P, row_index=0``), so row *i* is the next-token
+        distribution for chunk position *i* — the last row is the prompt's next
+        token, and the earlier rows are what speculative decoding verifies
+        against. Use :meth:`run_prefill_chunk_rows` for the (P, cols) view.
+        On a ``prefill_store_rows == 1`` bundle this is the single last-row
+        store exactly as before.
         """
         tokens = [int(tok) for tok in token_ids]
         if not tokens:
@@ -139,7 +162,21 @@ class HostRunner:
         # that window comes from `query_row_base + row_idx`.
         self._patch_attention_context("prefill", base, base + p)
         self.simulator.run_program(self.bundle, "prefill", max_instructions=max_instructions)
-        return self._read_logits(self.bundle.prefill_logits_offset)
+        return self._read_logits(self.bundle.prefill_logits_offset,
+                                 rows=int(self.bundle.prefill_store_rows))
+
+    def run_prefill_chunk_rows(self, token_ids: Sequence[int], base_position: int, *,
+                               max_instructions: int = 10_000_000) -> np.ndarray:
+        """:meth:`run_prefill_chunk` as a (prefill_store_rows, cols) 2-D view.
+
+        Row *i* is the next-token distribution *after* chunk position *i*. This
+        is the speculative-decoding verify primitive: one pass scores every
+        candidate position at once.
+        """
+        flat = self.run_prefill_chunk(token_ids, base_position,
+                                      max_instructions=max_instructions)
+        rows = int(self.bundle.prefill_store_rows)
+        return flat.reshape(rows, -1)
 
     def run_decode_step(self, token_id: int, position: int, *,
                         max_instructions: int = 10_000_000) -> np.ndarray:
@@ -149,7 +186,9 @@ class HostRunner:
         self._patch_kv_bases(int(position))
         self._patch_decode_attention_context(int(position))
         self.simulator.run_program(self.bundle, "decode", max_instructions=max_instructions)
-        return self._read_logits(self.bundle.decode_logits_offset)
+        # One row only: on a spec-dec bundle the region also holds the verify
+        # pass's other 15 rows, and they are stale here.
+        return self._read_logits(self.bundle.decode_logits_offset, rows=1)
 
     def run_decode_step_batch(self, token_ids: Sequence[int], position: int, *,
                               max_instructions: int = 10_000_000) -> np.ndarray:
@@ -174,7 +213,7 @@ class HostRunner:
         self._patch_kv_bases(int(position))
         self._patch_decode_attention_context(int(position))
         self.simulator.run_program(self.bundle, "decode", max_instructions=max_instructions)
-        return self._read_logits(self.bundle.decode_logits_offset)
+        return self._read_logits(self.bundle.decode_logits_offset, rows=len(tokens))
 
     @staticmethod
     def _greedy_token(logits: np.ndarray) -> int:

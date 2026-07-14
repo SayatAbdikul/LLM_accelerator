@@ -478,7 +478,13 @@ def build_stage3_tiny_decoder_bundle(
     # stream, so the region must hold `batch` rows. `quantize_fixture_payload`
     # returns the single-row size; scale it by the stream count (batch=1 keeps
     # the single-token region byte-identical).
-    logits_size *= batch
+    #
+    # Spec-dec: prefill and decode SHARE this region, and a P-token verify pass
+    # stores P rows, so it must hold whichever stream stores more. Sizing it by
+    # `batch` alone would let a P-row prefill store run off the end of
+    # `logits_base` straight into `kv_cache_base` (assembler.py).
+    logits_rows = max(int(batch), int(prefill_tokens))
+    logits_size *= logits_rows
     validate_stage5_ptq_preset_for_model(config, resolved_preset)
     calibration_scales = apply_stage5_ptq_scale_policy(calibration_scales, config, resolved_preset)
     # Thread state_dict so the frontend can detect optional `lm_head.bias`
@@ -565,6 +571,8 @@ def build_stage3_tiny_decoder_bundle(
         model_config=config,
         max_seq_len=config.max_seq_len,
         logits_size=logits_size,
+        logits_rows=logits_rows,
+        prefill_store_rows=int(prefill_tokens),
         requant_pc_weight_names=stage5_requant_pc_weight_names(config, resolved_preset),
         dequant_add_residual1_blocks=stage5_dequant_add_residual1_blocks(config, resolved_preset),
         dequant_add_residual2_blocks=stage5_dequant_add_residual2_blocks(config, resolved_preset),
@@ -595,16 +603,19 @@ def run_tiny_decode_trace(tiny: TinyFixtureBundle, prompt_ids: Sequence[int], *,
     """Run a greedy tiny decode trace and retain prefill + per-step logits.
 
     `logits_dtype` (M4-F W8A16): infer from `tiny.logits_size` when None —
-    per-stream-row bytes = logits_size / n_streams / pad_dim(vocab); 1 = INT8,
-    2 = FP16, 4 = FP32. (Lever I-a grows the region to `n_streams` rows, so the
-    divisor must include the stream count or the dtype is misread.)
+    per-row bytes = logits_size / logits_rows / pad_dim(vocab); 1 = INT8,
+    2 = FP16, 4 = FP32. The divisor is the bundle's `logits_rows` (lever I-a
+    grows the region to `n_streams` rows; spec-dec's P-row prefill store grows
+    it to `max(batch, prefill_tokens)`) — deriving it from `n_streams` alone
+    misreads the dtype the moment prefill stores more rows than decode.
     """
     if max_new_tokens < 0:
         raise ValueError("max_new_tokens must be non-negative")
     if not prompt_ids:
         raise ValueError("prompt_ids must be non-empty")
     if logits_dtype is None:
-        row_units = max(1, int(tiny.n_streams)) * pad_dim(int(tiny.config.vocab_size))
+        rows = max(1, int(tiny.build.bundle.logits_rows))
+        row_units = rows * pad_dim(int(tiny.config.vocab_size))
         elem_bytes = max(1, int(tiny.logits_size) // row_units)
         logits_dtype = {1: np.int8, 2: np.float16, 4: np.float32}.get(elem_bytes, np.int8)
     generated = [int(tok) for tok in prompt_ids]

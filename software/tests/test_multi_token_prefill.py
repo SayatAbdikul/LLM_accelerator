@@ -97,7 +97,10 @@ def test_chunked_prefill_is_byte_identical_to_sequential(tmp_path, L, P):
     rd = HostRunner(dense.build.bundle, logits_dtype=np.float16)
     c0 = rd.simulator.state.cycle_count
     for c in range(0, L, P):
-        logits_dense = rd.run_prefill_chunk(prompt[c:c + P], c)
+        # The chunk stores one logits row per position now (spec-dec's verify
+        # primitive); the LAST row is the chunk's next-token distribution, which
+        # is what the sequential path's final decode step produces.
+        logits_dense = rd.run_prefill_chunk_rows(prompt[c:c + P], c)[-1]
     cyc_dense = rd.simulator.state.cycle_count - c0
 
     assert np.array_equal(np.asarray(logits_seq)[:VOCAB],

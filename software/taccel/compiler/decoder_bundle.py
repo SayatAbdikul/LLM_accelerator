@@ -113,7 +113,8 @@ def _encode_instructions(instructions) -> bytes:
     return bytes(out)
 
 
-def _copy_graph_with_logits_store(graph: IRGraph, *, stream_name: str) -> IRGraph:
+def _copy_graph_with_logits_store(graph: IRGraph, *, stream_name: str,
+                                  store_rows: int = 0) -> IRGraph:
     """Return a graph copy with a logits_store node appended after lm_head when present."""
     out = IRGraph()
     has_logits_store = False
@@ -143,10 +144,19 @@ def _copy_graph_with_logits_store(graph: IRGraph, *, stream_name: str) -> IRGrap
         # logits row per batched stream — so every stream's logits are emitted,
         # not just row 0. `lm_head_shape[0]` == n_streams for the batched decode
         # graph (and == 1 for single-token decode, byte-identical to before).
-        # Prefill keeps its 1-row default (`emit_logits_store` picks the
-        # last-position row for the prefill stream).
         if stream_name == "decode":
             attrs["store_rows"] = int(lm_head_shape[0])
+        # Spec-dec: the prefill stream stores all P query rows, so one verify
+        # pass yields a next-token distribution for EVERY candidate position.
+        # Opt-in (`store_rows` > 1) rather than inferred from the graph shape:
+        # the logits region must be widened in lockstep (`logits_rows`), and a
+        # bundle that stored P rows into a 1-row region would run straight off
+        # the end of `logits_base` into `kv_cache_base`. Left at the default,
+        # prefill keeps its single last-row store (`emit_logits_store` picks
+        # `logical_rows - 1`), byte-identical to before.
+        elif stream_name == "prefill" and store_rows > 1:
+            attrs["store_rows"] = int(store_rows)
+            attrs["row_index"] = 0
         out.add_node(IRNode(
             op="logits_store",
             name=f"{stream_name}_logits_store",
@@ -359,6 +369,8 @@ def build_decoder_program_bundle(
     max_seq_len: Optional[int] = None,
     temp_size: int = 0,
     logits_size: int = 0,
+    logits_rows: int = 1,
+    prefill_store_rows: int = 1,
     requant_pc_weight_names: Optional[set[str]] = None,
     requant_pc_scale_tables: Optional[Dict[str, np.ndarray]] = None,
     dequant_add_residual1_blocks: Optional[set[int]] = None,
@@ -389,7 +401,8 @@ def build_decoder_program_bundle(
         model_config, max_seq_len=max_seq_len, elem_bytes=kv_elem_bytes,
         n_streams=n_streams,
     )
-    prefill_graph = _copy_graph_with_logits_store(prefill_graph, stream_name="prefill")
+    prefill_graph = _copy_graph_with_logits_store(
+        prefill_graph, stream_name="prefill", store_rows=prefill_store_rows)
     decode_graph = _copy_graph_with_logits_store(decode_graph, stream_name="decode")
     if logits_size == 0:
         logits_size = _infer_logits_size(prefill_graph, decode_graph)
@@ -491,6 +504,8 @@ def build_decoder_program_bundle(
         shared_data=prefill_data,
         temp_size=temp_size,
         logits_size=logits_size,
+        logits_rows=logits_rows,
+        prefill_store_rows=max(1, int(prefill_store_rows)),
         kv_cache_size=kv_layout.kv_cache_size,
         # M4-B: byte strides scale by their region's element size.
         # `embedding_row_bytes` is consumed by `HostRunner._patch_embeddings`

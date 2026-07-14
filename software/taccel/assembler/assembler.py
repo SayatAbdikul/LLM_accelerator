@@ -168,6 +168,17 @@ class ProgramBundle:
     shared_data: bytes = b""
     temp_size: int = 0
     logits_size: int = 0
+    # Number of logits ROWS the region holds. The prefill and decode streams
+    # share one logits region (both offsets default to `logits_base`), so the
+    # region is sized for whichever stream stores the most rows -- `batch`
+    # (lever I-a) or `prefill_tokens` (spec-dec's P-row verify pass). A reader
+    # MUST slice to its own stream's row count: a 1-row decode read over a
+    # 16-row region would argmax across 15 rows of stale prefill logits.
+    logits_rows: int = 1
+    # How many rows the PREFILL stream itself stores (1 = the classic last-row
+    # store; P = spec-dec's per-position verify pass). Not derivable from the
+    # prompt length: a dense prefill consumes L tokens but stores one row.
+    prefill_store_rows: int = 1
     kv_cache_size: int = 0
     input_offset: int = 0
     prefill_logits_offset: int = 0
@@ -185,6 +196,7 @@ class ProgramBundle:
     data_base: int = field(init=False)
     temp_base: int = field(init=False)
     logits_base: int = field(init=False)
+    logits_row_bytes: int = field(init=False)
     kv_cache_base: int = field(init=False)
     kv_cache_size_bytes: int = field(init=False)
     required_dram_bytes: int = field(init=False)
@@ -200,6 +212,13 @@ class ProgramBundle:
             raise ValueError("ProgramBundle instruction streams must be 8-byte aligned")
         if min(self.temp_size, self.logits_size, self.kv_cache_size) < 0:
             raise ValueError("ProgramBundle region sizes must be non-negative")
+        if self.logits_rows <= 0:
+            raise ValueError("ProgramBundle.logits_rows must be positive")
+        if self.logits_size % self.logits_rows:
+            raise ValueError(
+                f"logits_size={self.logits_size} must be divisible by "
+                f"logits_rows={self.logits_rows}"
+            )
         if self.embedding_row_bytes <= 0:
             raise ValueError("ProgramBundle.embedding_row_bytes must be positive")
         if self.kv_step_bytes <= 0:
@@ -223,6 +242,7 @@ class ProgramBundle:
             self.prefill_logits_offset = self.logits_base
         if self.decode_logits_offset == 0:
             self.decode_logits_offset = self.logits_base
+        self.logits_row_bytes = self.logits_size // self.logits_rows
 
         self.symbol_offsets = dict(self.symbol_offsets)
         self.symbol_regions = dict(self.symbol_regions)
