@@ -287,6 +287,32 @@ observable by any consumer. Gated on the **drop-free** machines (tiny, and 124M 
 It also **shrinks the bus fix**: `ST_DST_CLEAR_WR` is gone, so the systolic now has one
 fewer shared-Port-A writer, and 375,590 of the collisions above simply cease to exist.
 
+**Measured (commit `4a58734`).** `sys_busy` is arm-independent, so the saving is a
+property of the FSM, not of the overlap:
+
+| | before | after 1a | Δ | tok/s @ 34.41 MHz |
+|---|---:|---:|---:|---|
+| **b16 serialized** (the honest number) | 60,736,113 | 58,417,466 | −2,318,647 | **9.064 → 9.424 (+3.97%)** |
+| b16 shipped *(corrupt — do not quote)* | 56,588,361 | 54,269,714 | −2,318,647 | *(10.145)* |
+| b16 `sys_busy` (both arms) | 24,636,477 | 22,317,830 | −2,318,647 | |
+| **b1 serialized** (the honest number) | 25,225,101 † | 23,942,495 | −1,282,606 | **1.364 → 1.437 (+5.36%)** |
+| b1 shipped *(corrupt — do not quote)* | 21,075,726 | 19,794,743 | −1,280,983 | *(1.738)* |
+| b1 `sys_busy` (both arms) | 12,391,812 | 11,109,206 | −1,282,606 | |
+
+† b1-serialized-before was never run (Phase 0 only measured b1 on the shipped arm), so
+this one cell is *inferred* as `after + Δsys_busy`. That inference is sound because
+`Δtotal == Δsys_busy` **exactly** on the serialized arm at b16, and the serialized arm
+has zero co-busy cycles by construction — there is nothing for the saving to hide under.
+
+**b1 gains more than b16 (+5.36% vs +3.97%), as the plan predicted:** at b1 every dense
+matmul still pads to `M_pad = 16`, so the preclear's fixed cost was paid *once per
+token* rather than amortized across 16.
+
+⚠️ **On the shipped arm, `Δtotal` (1,280,983) ≠ `Δsys_busy` (1,282,606) at b1** — off by
+1,623. That 0.13% slip is the overlap re-phasing against the DMA, and it is precisely
+why the serialized arm is the reference: on a machine that drops writes, even the cycle
+identity stops being exact.
+
 **A `SYS_DMA_OVERLAP` parameter now exists** (`control_unit.sv`, default 1). Setting
 it to 0 serializes the two engines: correct, and the honest reference for A/B-ing the
 corruption. It is also the **safe-mode fallback** — a correct machine today, at
@@ -321,6 +347,24 @@ simultaneously the correctness fix and the performance lever.
 | Delete the ACCUM preclear (1a) | Phase 1, +4.3% | **LANDED** (byte-exact by proof; gated on the drop-free machines). −2,318,647 cyc; on the *correct* machine **9.064 → 9.424 tok/s (+3.97%)**. The earlier "BLOCKED" call is retracted above. Bonus: deletes one of the systolic's shared-Port-A writers |
 | Chase the helper engine | suspected 3rd engine | **DEAD — 0.14% of the step** |
 | fc2 full-K (1b), A-load hiding (1c), softmax MAX 8-wide (1d) | Phase 1 | unchanged, still independent |
+
+### 1a's fmax gate — satisfied by argument, not by an unrun synth
+
+The standing gate says systolic-FSM changes "should be fmax-neutral — confirm, don't
+assume." Confirmed, and **no EDA run is needed to close it**, for a reason worth writing
+down rather than leaving implicit:
+
+- The chip's fmax floor is **SFU-set** (29.64 ns after lever E). The systolic block
+  synthesizes at **109–875 MHz**, i.e. nowhere near the floor.
+- 1a only **removes** logic: one input to the Port-A state mux (`ST_DST_CLEAR_WR`), and
+  `needs_dst_preclear_w` collapses to a constant, making `ST_DST_CLEAR_PREP/_WR`
+  unreachable. It adds no arithmetic and no new registered boundary.
+
+Removing logic from a block with hundreds of MHz of slack cannot push the *chip* past a
+floor set by a different block. Chip fmax cannot regress. (Contrast lever **1d**, which
+*is* inside the SFU and therefore *does* need a standalone sky130 synth + STA.)
+
+### Everything else
 
 **Every perf number in `docs/` for 124M decode was measured on the corrupting build.**
 The *cycle counts* remain valid (cycle counts are data-independent), so the levers'
