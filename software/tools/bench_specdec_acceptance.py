@@ -178,6 +178,10 @@ def main() -> int:
                     help="fake-quant = THE CHIP (W8A16: int8 weights, fp16 acts, "
                          "static scales, QuaRot). w8a32/fp32 are cross-checks, "
                          "NOT the chip.")
+    ap.add_argument("--cache", type=Path, default=None,
+                    help="cache the greedy decodes here (JSON). The decode is the "
+                         "ONLY slow part and is independent of P and of the draft, "
+                         "so a cached run re-sweeps in milliseconds.")
     args = ap.parse_args()
 
     import torch
@@ -200,18 +204,32 @@ def main() -> int:
     # The greedy decode is the slow part and does NOT depend on P (acceptance is
     # a property of the model's own continuation), so decode once and price every
     # P against it.
+    import json as _json
+    key = (f"{args.model}|{args.prompt_tokens}|{args.new_tokens}|{args.samples}"
+           f"|{args.text.name}")
     decoded = []
-    stride = max(1, (len(tokens) - args.prompt_tokens) // max(1, args.samples))
-    for s in range(args.samples):
-        off = s * stride
-        prompt = tokens[off: off + args.prompt_tokens]
-        if len(prompt) < args.prompt_tokens:
-            break
-        print(f"  sample {s + 1}/{args.samples}: greedy-decoding "
-              f"{args.new_tokens} tokens ...", flush=True)
-        decoded.append((prompt,
-                        greedy_continuation(payload, prompt, args.new_tokens,
-                                            model=args.model)))
+    if args.cache and args.cache.exists():
+        blob = _json.loads(args.cache.read_text())
+        if blob.get("key") == key:
+            decoded = [(p, g) for p, g in blob["decoded"]]
+            print(f"  [cache hit] {len(decoded)} greedy decodes from {args.cache}",
+                  flush=True)
+
+    if not decoded:
+        stride = max(1, (len(tokens) - args.prompt_tokens) // max(1, args.samples))
+        for s in range(args.samples):
+            off = s * stride
+            prompt = tokens[off: off + args.prompt_tokens]
+            if len(prompt) < args.prompt_tokens:
+                break
+            print(f"  sample {s + 1}/{args.samples}: greedy-decoding "
+                  f"{args.new_tokens} tokens ...", flush=True)
+            decoded.append((prompt,
+                            greedy_continuation(payload, prompt, args.new_tokens,
+                                                model=args.model)))
+        if args.cache:
+            args.cache.write_text(_json.dumps({"key": key, "decoded": decoded}))
+            print(f"  [cached] -> {args.cache}", flush=True)
 
     base_tok_s0 = args.fmax_mhz * 1e6 / args.step_cycles
     if args.sweep_p:
