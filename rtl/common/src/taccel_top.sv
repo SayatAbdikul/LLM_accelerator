@@ -348,6 +348,36 @@ module taccel_top
   logic         obs_sys_porta_lost_w;
   logic         sys_a_preclear_w;
 
+  // THE BUS-SPLIT AUDIT. Decompose DMA-vs-systolic Port-A CO-ACCESS (both engines
+  // want the bus in the same cycle) by whether they want the SAME SRAM. This is
+  // deliberately independent of who *won*: it measures the hazard, not the
+  // outcome, so it stays meaningful after the arbitration changes.
+  //
+  //   diff_buf — e.g. DMA→WBUF (weight prefetch) vs systolic→ACCUM (drain).
+  //              DIFFERENT macros, already dual-ported. A per-buffer fan-out of
+  //              Port A resolves these completely: both proceed, same cycle.
+  //   same_buf — e.g. DMA→ABUF (the KV re-read) vs systolic←ABUF (attention's
+  //              src2 stream, ST_READ_USE). ONE macro, ONE port. A fan-out does
+  //              NOT separate these — they need real arbitration, a schedule
+  //              guarantee, or a loud fault.
+  //
+  // same_buf is therefore the number that decides the design. It reads 0 in the
+  // decode shape; the open question is prefill / chunked-prefill.
+  logic [63:0]  obs_dma_sys_coaccess_same_buf_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_dma_sys_coaccess_diff_buf_q /* verilator public_flat_rd */;
+  logic         obs_dma_sys_coaccess_w;
+
+  // IS THE INSTRUMENT ALIVE? A `same_buf == 0` result is only meaningful if the
+  // two engines *can* target the same buffer at all. These are the marginals:
+  // how many cycles each engine spends on Port A pointed at ABUF, independent of
+  // the other. If BOTH are non-zero while same_buf is 0, the engines are genuinely
+  // TIME-DISJOINT on ABUF (a real finding). If sys_a_abuf is 0, the systolic never
+  // touches ABUF on Port A and the whole same-buffer worry was misconceived.
+  // Either way we learn which — rather than reading a 0 that could just mean the
+  // counter can't see. (This is the co-busy-denominator lesson from Phase 0.)
+  logic [63:0]  obs_sys_a_abuf_cycles_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_dma_a_abuf_cycles_q /* verilator public_flat_rd */;
+
   logic         obs_dma_burst_fire_w;
   logic         obs_dma_beat_fire_w;
   logic         obs_terminal_event_w;
@@ -383,10 +413,13 @@ module taccel_top
   logic [15:0]  dma_sram_row;
   logic [127:0] dma_sram_wdata, dma_sram_rdata;
 
+  // The systolic's Port-A-class request. It drives the subsystem's Port S, NOT
+  // the shared Port-A mux — that is the bus split.
   logic         sys_sram_a_en,  sys_sram_a_we;
-  logic [1:0]   sys_sram_a_buf;
-  logic [15:0]  sys_sram_a_row;
-  logic [127:0] sys_sram_a_wdata, sys_sram_a_rdata;
+  logic [1:0]   sys_sram_a_buf   /* verilator public_flat_rd */;
+  logic [15:0]  sys_sram_a_row   /* verilator public_flat_rd */;
+  logic [127:0] sys_sram_a_wdata /* verilator public_flat_rd */;
+  logic [127:0] sys_sram_a_rdata;
 
   // SRAM Port B request from Systolic
   logic         sys_sram_b_en;
@@ -401,12 +434,21 @@ module taccel_top
   logic [15:0]  sys_sram_w_row;
   logic [127:0] sys_sram_w_rdata;
 
-  // Arbitrated SRAM wires
+  // Arbitrated SRAM wires. The write-side signals of BOTH channels are read by
+  // the testbench write-log artifacts (systolic_debug_artifacts.h), which sweep
+  // shared-A and Port-S separately now that the two can write in the same cycle;
+  // mark them public so Verilator does not fold them away. Synthesis ignores the
+  // attribute.
   logic         sram_a_en, sram_a_we;
-  logic [1:0]   sram_a_buf;
-  logic [15:0]  sram_a_row;
-  logic [127:0] sram_a_wdata, sram_a_rdata;
+  logic [1:0]   sram_a_buf   /* verilator public_flat_rd */;
+  logic [15:0]  sram_a_row   /* verilator public_flat_rd */;
+  logic [127:0] sram_a_wdata /* verilator public_flat_rd */;
+  logic [127:0] sram_a_rdata;
   logic         sram_a_fault;
+  // Port S (systolic-dedicated Port-A-class channel). `sram_s_collision` is the
+  // same-buffer case a per-buffer fan-out cannot resolve; it becomes a FAULT.
+  logic         sram_s_fault;
+  logic         sram_s_collision;
   logic         sram_b_en;
   logic [1:0]   sram_b_buf;
   logic [15:0]  sram_b_row;
@@ -414,37 +456,44 @@ module taccel_top
   logic         sram_b_fault;
   logic         sram_w_fault;
 
-  // Helper gets first access, then SFU, then DMA, then systolic. Stage D keeps
-  // enough serialization at control level that fixed priority is sufficient.
+  // Helper gets first access, then SFU, then DMA. Stage D keeps enough
+  // serialization at control level that fixed priority is sufficient.
+  //
+  // THE SYSTOLIC IS NO LONGER IN THIS MUX. It used to sit at the bottom of it,
+  // with no backpressure and no grant line, so whenever the DMA wanted Port A in
+  // the same cycle the systolic's access was silently discarded while its FSM
+  // marched on — 257,406 ACCUM drain writes lost per 124M decode step, every
+  // matmul corrupted, no fault, no counter. The two engines were not contending
+  // for memory (ABUF/WBUF/ACCUM are three separate dual-port macros); they were
+  // contending for a WIRE. The systolic now drives the subsystem's Port S, and
+  // the per-buffer fan-out in sram_subsystem.sv lets both proceed in the same
+  // cycle whenever they address different macros — which, measured, is always.
+  // See docs/phase0_measurement.md.
   assign sram_a_en    = helper_sram_a_en ? helper_sram_a_en
                       : sfu_sram_a_en    ? sfu_sram_a_en
-                      : dma_sram_en      ? dma_sram_en
-                                         : sys_sram_a_en;
+                                         : dma_sram_en;
   assign sram_a_we    = helper_sram_a_en ? helper_sram_a_we
                       : sfu_sram_a_en    ? sfu_sram_a_we
-                      : dma_sram_en      ? dma_sram_we
-                                         : sys_sram_a_we;
+                                         : dma_sram_we;
   assign sram_a_buf   = helper_sram_a_en ? helper_sram_a_buf
                       : sfu_sram_a_en    ? sfu_sram_a_buf
-                      : dma_sram_en      ? dma_sram_buf
-                                         : sys_sram_a_buf;
+                                         : dma_sram_buf;
   assign sram_a_row   = helper_sram_a_en ? helper_sram_a_row
                       : sfu_sram_a_en    ? sfu_sram_a_row
-                      : dma_sram_en      ? dma_sram_row
-                                         : sys_sram_a_row;
+                                         : dma_sram_row;
   assign sram_a_wdata = helper_sram_a_en ? helper_sram_a_wdata
                       : sfu_sram_a_en    ? sfu_sram_a_wdata
-                      : dma_sram_en      ? dma_sram_wdata
-                                         : sys_sram_a_wdata;
+                                         : dma_sram_wdata;
 
-  // The systolic asserted Port A but the mux selected a higher-priority engine,
-  // so its request is DROPPED and it has no way to know. In the shipped design
-  // the only live term is `dma_sram_en` — helper/sfu vs systolic is already a
-  // forbidden-overlap violation — but the condition is written in full so it
-  // stays exact if the arbitration changes. Pure observability: this wire feeds
-  // counters only, never the datapath.
-  assign obs_sys_porta_lost_w = sys_sram_a_en &
-                                (helper_sram_a_en | sfu_sram_a_en | dma_sram_en);
+  // Retained as pure observability so the audit keeps reporting a number, and so
+  // a regression that reintroduces the drop is visible rather than silent. With
+  // the split this can only fire on SAME-buffer contention — which now raises
+  // `sram_s_collision` and FAULTS instead of being discarded. It should read 0.
+  assign obs_sys_porta_lost_w = sys_sram_a_en & sram_s_collision;
+
+  // Co-access, not loss: both engines want Port A this cycle, regardless of who
+  // the fixed-priority mux hands it to. See the declaration comment.
+  assign obs_dma_sys_coaccess_w = sys_sram_a_en & dma_sram_en;
 
   assign sram_b_en    = helper_sram_b_en ? helper_sram_b_en
                       : sfu_sram_b_en    ? sfu_sram_b_en
@@ -458,13 +507,22 @@ module taccel_top
 
   assign helper_sram_a_rdata = sram_a_rdata;
   assign dma_sram_rdata      = sram_a_rdata;
-  assign sys_sram_a_rdata    = sram_a_rdata;
+  // sys_sram_a_rdata is driven by the subsystem's Port-S read return (u_sram
+  // .s_rdata) — NOT by the shared Port A any more.
   assign helper_sram_b_rdata = sram_b_rdata;
   assign sfu_sram_b_rdata    = sram_b_rdata;
   assign sys_sram_b_rdata    = sram_b_rdata;
   assign dma_sram_fault_w = dma_sram_en & sram_a_fault;
+  // The systolic's Port-A fault used to be masked behind `~dma_sram_en` — i.e.
+  // an out-of-bounds systolic address was INVISIBLE precisely when the DMA was
+  // also active. That mask was itself a symptom of the shared bus. On Port S the
+  // fault is unconditional, and same-buffer contention (which a per-buffer
+  // fan-out cannot resolve, and which would otherwise silently drop the access,
+  // exactly the bug being fixed) now faults too. A collision is ALWAYS corruption
+  // today, so turning it into a halt cannot break a path that currently works.
   assign sys_sram_fault_now = (sys_sram_b_en & ~helper_sram_b_en & sram_b_fault) |
-                              (sys_sram_a_en & ~helper_sram_a_en & ~sfu_sram_a_en & ~dma_sram_en & sram_a_fault) |
+                              sram_s_fault |
+                              sram_s_collision |
                               (sys_sram_w_en & sram_w_fault);
 
   always_ff @(posedge clk or negedge rst_n) begin
@@ -548,6 +606,10 @@ module taccel_top
       obs_sys_porta_lost_accum_q       <= 64'h0;
       obs_sys_porta_lost_preclear_q    <= 64'h0;
       obs_sys_porta_lost_drain_q       <= 64'h0;
+      obs_dma_sys_coaccess_same_buf_q  <= 64'h0;
+      obs_dma_sys_coaccess_diff_buf_q  <= 64'h0;
+      obs_sys_a_abuf_cycles_q          <= 64'h0;
+      obs_dma_a_abuf_cycles_q          <= 64'h0;
     end else if (start && !obs_run_active_q && !done && !fault) begin
       obs_run_active_q                 <= 1'b1;
       obs_cycle_count_q                <= 64'h0;
@@ -583,6 +645,10 @@ module taccel_top
       obs_sys_porta_lost_accum_q       <= 64'h0;
       obs_sys_porta_lost_preclear_q    <= 64'h0;
       obs_sys_porta_lost_drain_q       <= 64'h0;
+      obs_dma_sys_coaccess_same_buf_q  <= 64'h0;
+      obs_dma_sys_coaccess_diff_buf_q  <= 64'h0;
+      obs_sys_a_abuf_cycles_q          <= 64'h0;
+      obs_dma_a_abuf_cycles_q          <= 64'h0;
     end else begin
       if (obs_run_active_q) begin
         obs_cycle_count_q <= obs_cycle_count_q + 64'd1;
@@ -621,6 +687,22 @@ module taccel_top
           else if (sys_sram_a_we)
             obs_sys_porta_lost_drain_q <= obs_sys_porta_lost_drain_q + 64'd1;
         end
+
+        // THE BUS-SPLIT AUDIT. same_buf is the number that decides the design:
+        // it is the contention a per-buffer Port-A fan-out CANNOT resolve.
+        if (obs_dma_sys_coaccess_w) begin
+          if (sys_sram_a_buf == dma_sram_buf)
+            obs_dma_sys_coaccess_same_buf_q <= obs_dma_sys_coaccess_same_buf_q + 64'd1;
+          else
+            obs_dma_sys_coaccess_diff_buf_q <= obs_dma_sys_coaccess_diff_buf_q + 64'd1;
+        end
+
+        // Marginals — proves the same_buf==0 above is a real disjointness result
+        // and not a blind counter. See the declaration comment.
+        if (sys_sram_a_en && (sys_sram_a_buf == BUF_ABUF))
+          obs_sys_a_abuf_cycles_q <= obs_sys_a_abuf_cycles_q + 64'd1;
+        if (dma_sram_en && (dma_sram_buf == BUF_ABUF))
+          obs_dma_a_abuf_cycles_q <= obs_dma_a_abuf_cycles_q + 64'd1;
       end
 
       if (obs_retire_pulse_w)
@@ -1034,7 +1116,9 @@ module taccel_top
   sram_subsystem u_sram (
     .clk     (clk),
     .rst_n   (rst_n),
-    // Port A: DMA/Systolic (arbitrated)
+    // Port A: helper / SFU / DMA (arbitrated). The systolic is NO LONGER here —
+    // it has its own channel below, so a DMA weight prefetch bound for WBUF can
+    // no longer steal an ACCUM drain write bound for a different macro.
     .a_en    (sram_a_en),
     .a_we    (sram_a_we),
     .a_buf   (sram_a_buf),
@@ -1042,6 +1126,15 @@ module taccel_top
     .a_wdata (sram_a_wdata),
     .a_rdata (sram_a_rdata),
     .a_fault (sram_a_fault),
+    // Port S: the systolic's own Port-A-class channel (the bus split).
+    .s_en        (sys_sram_a_en),
+    .s_we        (sys_sram_a_we),
+    .s_buf       (sys_sram_a_buf),
+    .s_row       (sys_sram_a_row),
+    .s_wdata     (sys_sram_a_wdata),
+    .s_rdata     (sys_sram_a_rdata),
+    .s_fault     (sram_s_fault),
+    .s_collision (sram_s_collision),
     // Port B: systolic source reads
     .b_en    (sram_b_en),
     .b_buf   (sram_b_buf),

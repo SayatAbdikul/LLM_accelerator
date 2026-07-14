@@ -134,6 +134,10 @@ struct Summary {
     // write only loses zeros that ST_DRAIN_WR overwrites anyway; a dropped
     // DRAIN write loses a real accumulator result forever.
     uint64_t sys_porta_lost_preclear = 0;
+    uint64_t dma_sys_coaccess_same_buf = 0;
+    uint64_t dma_sys_coaccess_diff_buf = 0;
+    uint64_t sys_a_abuf_cycles = 0;
+    uint64_t dma_a_abuf_cycles = 0;
     uint64_t sys_porta_lost_drain = 0;
     bool forbidden_overlap_violation = false;
     bool fault_context_valid = false;
@@ -552,6 +556,10 @@ Summary build_summary(Vtaccel_top* dut, int num_classes) {
     summary.sys_porta_lost_wbuf = root->taccel_top__DOT__obs_sys_porta_lost_wbuf_q;
     summary.sys_porta_lost_accum = root->taccel_top__DOT__obs_sys_porta_lost_accum_q;
     summary.sys_porta_lost_preclear = root->taccel_top__DOT__obs_sys_porta_lost_preclear_q;
+    summary.dma_sys_coaccess_same_buf = root->taccel_top__DOT__obs_dma_sys_coaccess_same_buf_q;
+    summary.dma_sys_coaccess_diff_buf = root->taccel_top__DOT__obs_dma_sys_coaccess_diff_buf_q;
+    summary.sys_a_abuf_cycles = root->taccel_top__DOT__obs_sys_a_abuf_cycles_q;
+    summary.dma_a_abuf_cycles = root->taccel_top__DOT__obs_dma_a_abuf_cycles_q;
     summary.sys_porta_lost_drain = root->taccel_top__DOT__obs_sys_porta_lost_drain_q;
     summary.forbidden_overlap_violation = root->taccel_top__DOT__obs_forbidden_overlap_violation_q;
     summary.fault_context_valid = root->taccel_top__DOT__obs_fault_valid_q;
@@ -624,7 +632,11 @@ std::string summary_to_json(const Summary& summary) {
     oss << "    \"sys_lost_wbuf\": " << summary.sys_porta_lost_wbuf << ",\n";
     oss << "    \"sys_lost_accum\": " << summary.sys_porta_lost_accum << ",\n";
     oss << "    \"sys_lost_preclear\": " << summary.sys_porta_lost_preclear << ",\n";
-    oss << "    \"sys_lost_drain\": " << summary.sys_porta_lost_drain << "\n";
+    oss << "    \"sys_lost_drain\": " << summary.sys_porta_lost_drain << ",\n";
+    oss << "    \"coaccess_same_buf\": " << summary.dma_sys_coaccess_same_buf << ",\n";
+    oss << "    \"coaccess_diff_buf\": " << summary.dma_sys_coaccess_diff_buf << ",\n";
+    oss << "    \"sys_a_abuf_cycles\": " << summary.sys_a_abuf_cycles << ",\n";
+    oss << "    \"dma_a_abuf_cycles\": " << summary.dma_a_abuf_cycles << "\n";
     oss << "  },\n";
     oss << "  \"forbidden_overlap_violation\": "
         << (summary.forbidden_overlap_violation ? "true" : "false") << ",\n";

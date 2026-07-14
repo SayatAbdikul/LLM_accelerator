@@ -30,16 +30,25 @@ module control_unit
   // lever): OP_MATMUL dispatches without checking !dma_busy, and OP_LOAD/STORE
   // dispatch without checking !sys_busy.
   //
-  // It is NOT SAFE as built. The two engines share one Port-A bus with a
-  // fixed-priority mux and no backpressure (taccel_top.sv), so when the DMA is
-  // streaming, the systolic's ACCUM drain writes are SILENTLY DROPPED. Measured
-  // on GPT-2 124M b16 decode: 255,818 dropped ST_DRAIN_WR writes per step —
-  // real accumulator results, lost. The byte-exact test gate cannot see this
-  // (the tiny model never overlaps the two engines at all).
+  // It USED TO BE UNSAFE, and the history matters because the failure was silent.
+  // The two engines shared ONE Port-A bus with a fixed-priority mux and no
+  // backpressure, so while the DMA streamed weights the systolic's ACCUM drain
+  // writes were DISCARDED — 257,406 lost ST_DRAIN_WR writes per 124M b16 decode
+  // step, every matmul corrupted, with no fault and no counter. The byte-exact
+  // test gate could not see it: the tiny model never overlaps the two engines,
+  // so its co-busy denominator is ZERO.
   //
-  // Set to 0 to serialize them and get a correct — but ~7% slower — machine.
-  // This is the reference build for A/B-ing the corruption, and the safe-mode
-  // fallback until the Port-A bus is split per buffer.
+  // It is now SAFE BY CONSTRUCTION. ABUF/WBUF/ACCUM are three separate dual-port
+  // macros, so the systolic has its own Port-S channel into sram_subsystem and
+  // the request is fanned out per buffer: DMA→WBUF and systolic→ACCUM address
+  // DIFFERENT macros and both complete in the same cycle. The engines were never
+  // contending for memory, only for a wire. Same-buffer contention — which a
+  // fan-out cannot resolve — raises `s_collision` and FAULTS, so it can never
+  // again pass silently.
+  //
+  // Set to 0 to serialize them anyway: a ~7% slower machine, kept as the
+  // drop-free A/B reference (see the run_program_noovl Makefile target) and as a
+  // safe-mode fallback.
   parameter bit SYS_DMA_OVERLAP = 1'b1
 ) (
   input  logic          clk,

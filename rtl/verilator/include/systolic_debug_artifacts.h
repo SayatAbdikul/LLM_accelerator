@@ -134,7 +134,8 @@ inline bool capture_accum_write_log_record(
     bool retire_valid,
     uint64_t retire_pc,
     int retire_opcode,
-    AccumWriteLogRecord* out) {
+    AccumWriteLogRecord* out,
+    int channel) {
   if (out == nullptr) {
     return false;
   }
@@ -146,7 +147,23 @@ inline bool capture_accum_write_log_record(
   bool selected_en = false;
   bool selected_we = false;
 
-  if (root->taccel_top__DOT__helper_sram_a_en) {
+  // The Port-A bus split (see sram_subsystem.sv) means there are now TWO write
+  // channels, and BOTH can write in the same cycle -- that concurrency is the
+  // entire point of the fix. So this is captured per CHANNEL and the callers
+  // sweep both; collapsing them back into one record per cycle would silently
+  // drop a write from the log, which is precisely the disease being cured.
+  //
+  //   channel 0 = shared Port A  (helper / SFU / DMA, fixed priority)
+  //   channel 1 = Port S         (the systolic's dedicated channel)
+  if (channel == 1) {
+    if (root->taccel_top__DOT__sys_sram_a_en) {
+      writer_source = "sys";
+      issue_pc = root->taccel_top__DOT__obs_sys_issue_pc_q;
+      issue_opcode = root->taccel_top__DOT__obs_sys_issue_opcode_q;
+      selected_en = true;
+      selected_we = root->taccel_top__DOT__sys_sram_a_we;
+    }
+  } else if (root->taccel_top__DOT__helper_sram_a_en) {
     writer_source = "helper";
     issue_pc = root->taccel_top__DOT__obs_helper_issue_pc_q;
     issue_opcode = root->taccel_top__DOT__obs_helper_issue_opcode_q;
@@ -164,17 +181,14 @@ inline bool capture_accum_write_log_record(
     issue_opcode = root->taccel_top__DOT__obs_dma_issue_opcode_q;
     selected_en = true;
     selected_we = root->taccel_top__DOT__dma_sram_we;
-  } else if (root->taccel_top__DOT__sys_sram_a_en) {
-    writer_source = "sys";
-    issue_pc = root->taccel_top__DOT__obs_sys_issue_pc_q;
-    issue_opcode = root->taccel_top__DOT__obs_sys_issue_opcode_q;
-    selected_en = true;
-    selected_we = root->taccel_top__DOT__sys_sram_a_we;
   }
 
-  wdata = &root->taccel_top__DOT__sram_a_wdata;
-  const uint32_t row = root->taccel_top__DOT__sram_a_row;
-  const uint32_t buf = root->taccel_top__DOT__sram_a_buf;
+  wdata = (channel == 1) ? &root->taccel_top__DOT__sys_sram_a_wdata
+                         : &root->taccel_top__DOT__sram_a_wdata;
+  const uint32_t row = (channel == 1) ? root->taccel_top__DOT__sys_sram_a_row
+                                      : root->taccel_top__DOT__sram_a_row;
+  const uint32_t buf = (channel == 1) ? root->taccel_top__DOT__sys_sram_a_buf
+                                      : root->taccel_top__DOT__sram_a_buf;
 
   if (!selected_en || !selected_we || buf != SYSTOLIC_DEBUG_BUF_ACCUM) {
     return false;
@@ -200,7 +214,8 @@ inline bool capture_sram_write_log_record(
     bool retire_valid,
     uint64_t retire_pc,
     int retire_opcode,
-    SramWriteLogRecord* out) {
+    SramWriteLogRecord* out,
+    int channel) {
   if (out == nullptr) {
     return false;
   }
@@ -212,7 +227,23 @@ inline bool capture_sram_write_log_record(
   bool selected_en = false;
   bool selected_we = false;
 
-  if (root->taccel_top__DOT__helper_sram_a_en) {
+  // The Port-A bus split (see sram_subsystem.sv) means there are now TWO write
+  // channels, and BOTH can write in the same cycle -- that concurrency is the
+  // entire point of the fix. So this is captured per CHANNEL and the callers
+  // sweep both; collapsing them back into one record per cycle would silently
+  // drop a write from the log, which is precisely the disease being cured.
+  //
+  //   channel 0 = shared Port A  (helper / SFU / DMA, fixed priority)
+  //   channel 1 = Port S         (the systolic's dedicated channel)
+  if (channel == 1) {
+    if (root->taccel_top__DOT__sys_sram_a_en) {
+      writer_source = "sys";
+      issue_pc = root->taccel_top__DOT__obs_sys_issue_pc_q;
+      issue_opcode = root->taccel_top__DOT__obs_sys_issue_opcode_q;
+      selected_en = true;
+      selected_we = root->taccel_top__DOT__sys_sram_a_we;
+    }
+  } else if (root->taccel_top__DOT__helper_sram_a_en) {
     writer_source = "helper";
     issue_pc = root->taccel_top__DOT__obs_helper_issue_pc_q;
     issue_opcode = root->taccel_top__DOT__obs_helper_issue_opcode_q;
@@ -230,17 +261,14 @@ inline bool capture_sram_write_log_record(
     issue_opcode = root->taccel_top__DOT__obs_dma_issue_opcode_q;
     selected_en = true;
     selected_we = root->taccel_top__DOT__dma_sram_we;
-  } else if (root->taccel_top__DOT__sys_sram_a_en) {
-    writer_source = "sys";
-    issue_pc = root->taccel_top__DOT__obs_sys_issue_pc_q;
-    issue_opcode = root->taccel_top__DOT__obs_sys_issue_opcode_q;
-    selected_en = true;
-    selected_we = root->taccel_top__DOT__sys_sram_a_we;
   }
 
-  wdata = &root->taccel_top__DOT__sram_a_wdata;
-  const uint32_t row = root->taccel_top__DOT__sram_a_row;
-  const uint32_t buf = root->taccel_top__DOT__sram_a_buf;
+  wdata = (channel == 1) ? &root->taccel_top__DOT__sys_sram_a_wdata
+                         : &root->taccel_top__DOT__sram_a_wdata;
+  const uint32_t row = (channel == 1) ? root->taccel_top__DOT__sys_sram_a_row
+                                      : root->taccel_top__DOT__sram_a_row;
+  const uint32_t buf = (channel == 1) ? root->taccel_top__DOT__sys_sram_a_buf
+                                      : root->taccel_top__DOT__sram_a_buf;
 
   if (!selected_en || !selected_we) {
     return false;
@@ -293,9 +321,12 @@ class AccumWriteLogCollector {
       return;
     }
 
-    AccumWriteLogRecord rec;
-    if (capture_accum_write_log_record(root, retire_valid, retire_pc, retire_opcode, &rec)) {
-      log_.records.push_back(rec);
+    for (int ch = 0; ch < 2; ++ch) {
+      AccumWriteLogRecord rec;
+      if (capture_accum_write_log_record(root, retire_valid, retire_pc, retire_opcode,
+                                         &rec, ch)) {
+        log_.records.push_back(rec);
+      }
     }
 
     if (retire_valid && retire_pc == end_pc_) {
@@ -343,20 +374,33 @@ class SramWriteLogCollector {
       return;
     }
 
-    SramWriteLogRecord rec;
-    const bool has_record =
-        capture_sram_write_log_record(root, retire_valid, retire_pc, retire_opcode, &rec);
-    const bool in_issue_window =
-        has_record && (rec.issue_pc >= start_pc_) && (rec.issue_pc <= end_pc_);
+    // Sweep both write channels — shared Port A and the systolic's Port S can
+    // both write in the same cycle now (different SRAM macros). See the note in
+    // capture_sram_write_log_record.
     const bool start_reached = retire_valid && retire_pc == start_pc_;
+    bool any_in_window = false;
+    SramWriteLogRecord recs[2];
+    bool rec_in_window[2] = {false, false};
 
-    if (!active_ && (in_issue_window || start_reached)) {
+    for (int ch = 0; ch < 2; ++ch) {
+      const bool has_record = capture_sram_write_log_record(
+          root, retire_valid, retire_pc, retire_opcode, &recs[ch], ch);
+      rec_in_window[ch] = has_record && (recs[ch].issue_pc >= start_pc_) &&
+                          (recs[ch].issue_pc <= end_pc_);
+      any_in_window |= rec_in_window[ch];
+    }
+
+    if (!active_ && (any_in_window || start_reached)) {
       active_ = true;
       log_.window_reached = true;
     }
 
-    if (active_ && in_issue_window && !is_duplicate(rec)) {
-      log_.records.push_back(rec);
+    if (active_) {
+      for (int ch = 0; ch < 2; ++ch) {
+        if (rec_in_window[ch] && !is_duplicate(recs[ch])) {
+          log_.records.push_back(recs[ch]);
+        }
+      }
     }
 
     if (retire_valid && retire_pc == end_pc_) {
