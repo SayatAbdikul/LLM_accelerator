@@ -1,9 +1,11 @@
 # Lever B3 — speculative decoding: make the 16 rows carry 16 tokens
 
 **Status: LANDED (compiler + host only — zero RTL change).**
+**Measured: b1 1.738 → 5.075 tok/s (2.92×) on wikitext-2, exact-greedy, P=16.**
 
 This is the batch-1 lever. Every other b1 lever shaves cycles off a step; this one
-changes how many tokens a step is worth.
+changes how many tokens a step is worth. It is also the only lever that gets past the
+~3.27 tok/s DMA wall.
 
 ---
 
@@ -152,6 +154,54 @@ break-even at t = r, and a named-corpus figure for t.**
 Note t=4 (**4.79 tok/s**) already clears the **~3.27 tok/s DMA wall** that caps *any*
 non-speculative b1 decode at this clock. Nothing else on the roadmap can pass it.
 
+### t — measured on real text, not assumed
+
+`software/tools/bench_specdec_acceptance.py` measures `t` on wikitext-2 with the
+**chip's own INT8 weight numerics** (`build_weight_only_int8_reference`). It needs no
+RTL: acceptance depends only on the model's greedy continuation, and given that
+sequence the accept rule is a deterministic walk — so one torch decode reproduces
+`speculative_generate` exactly, in seconds instead of hours.
+
+**128-token prompt, 48 generated, 3 samples, prompt-lookup (max_ngram=2):**
+
+| | |
+|---|---:|
+| draft acceptance | **32.3%** (106/328 guesses confirmed) |
+| **tokens per verify pass** | **5.24** |
+| passes / fallback steps | 25 / 13 |
+| **speedup over sequential greedy** | **2.92×** |
+| **b1 throughput** | **1.738 → 5.075 tok/s** |
+
+**This clears the ~3.27 tok/s DMA wall** — the first and only b1 result that does.
+
+⚠️ **Sample size matters, and it bit me.** A 64-token prompt generating 16 tokens
+measured 1.05× — the n-gram had almost no context to match against. The lever looked
+worthless. Do not price a draft on a short sample.
+
+⚠️ **Where the win comes from, stated plainly.** GPT-2 124M's greedy decoding is
+degenerate — it emits long literal repeats — and long literal repeats are exactly
+what a prompt-lookup draft catches (the pass histogram has repeated 11-, 15- and
+16-token accepts). A less repetitive model, or sampling instead of greedy, will show
+a lower `t`. The floor is ~1.0× (adaptive fallback), never a loss.
+
+### P is a real tunable — and 16 is the right default (measured)
+
+Because the systolic/DMA/helper are FLAT in rows and only the SFU scales, the cost
+ratio is a clean line: **r(P) = 1 + 0.0302·(P−1)** (measured r = 1.0903 / 1.2108 /
+1.4531 at P = 4 / 8 / 16; SFU 3.99× / 7.97× / 15.91×).
+
+| P | r | break-even | tok/pass | speedup | tok/s |
+|---|---:|---:|---:|---:|---:|
+| 4 | 1.09 | 1.09 | 2.85 | 2.28× | 3.96 |
+| 8 | 1.21 | 1.21 | 3.85 | 2.66× | 4.62 |
+| **16** | **1.45** | **1.45** | **5.24** | **2.92×** | **5.08** |
+| 32 | 1.94 | 1.94 | 5.24 | 2.35× | 4.08 |
+
+P=32 buys **nothing**: tokens/pass stays at 5.24 because the n-gram draft rarely finds
+more than ~15 continuation tokens, so the extra 16 rows cost SFU and confirm nothing.
+A *stronger* draft would move that optimum right — P is the knob to retune when the
+draft changes, and `prefill_tokens` is already a bundle parameter.
+
 ### The result that re-ranks the roadmap
 
 **The systolic verifies 16 tokens for the price of one — 11,109,206 cycles, identical
@@ -170,6 +220,27 @@ associativity, `sfu_g2_compute.svh:514-531`), which was correctly judged worthle
 for a 1-row decode step (SFU = 3% there) and is now the top b1 lever *because* the
 workload is a 16-row pass (SFU = 35%). Same for anything else that shrinks per-row
 SFU work.
+
+**Where the SFU goes on the verify pass** (retire-gap profile, P=16, base 496):
+
+| SFU op | cyc | % of SFU | cyc/op |
+|---|---:|---:|---:|
+| MASKED_SOFTMAX_FP32 | 3,875,472 | 38.4 | 26,913 |
+| DEQUANT_ACCUM_FP32_SCALED | 2,006,231 | 19.9 | 1,503 |
+| QUANT_FP32_INT8 | 1,142,633 | 11.3 | 865 |
+| LAYERNORM_FP32 | 1,089,225 | 10.8 | 43,569 |
+| MAX_ABS_REDUCE_FP32 | 863,563 | 8.6 | 1,159 |
+| rest (DEQUANT/VADD/GELU) | 1,121,205 | 11.1 | |
+
+Softmax leads but does not dominate — and note this SFU work is now **real**, not
+padding: all 16 rows are live tokens. Unlike the b16 case (where lever C deleted
+15/16 of it as waste), it can only be made *faster per row*, not deleted. Softmax is
+three sequential 1-elem/cycle passes (MAX, EXPSUM, OUT); only **MAX is safely
+widenable** — fp32 max is associative, fp32 add is **not**, so EXPSUM cannot be
+reordered bit-exactly. That caps 1d at ~29% of softmax ⇒ r 1.45 → ~1.40, worth ~+4%
+on the final number. Real, but the honest ranking is: **`t` (the draft) dominates
+`r` (the hardware)** — going from t=2 to t=4 doubles throughput; a heroic SFU push
+buys 4%. **The next big b1 win is a better draft, not more RTL.**
 
 ---
 
