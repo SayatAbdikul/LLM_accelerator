@@ -156,23 +156,28 @@ non-speculative b1 decode at this clock. Nothing else on the roadmap can pass it
 
 ### t — measured on real text, not assumed
 
-`software/tools/bench_specdec_acceptance.py` measures `t` on wikitext-2 with the
-**chip's own INT8 weight numerics** (`build_weight_only_int8_reference`). It needs no
+`software/tools/bench_specdec_acceptance.py` measures `t` on wikitext-2. It needs no
 RTL: acceptance depends only on the model's greedy continuation, and given that
 sequence the accept rule is a deterministic walk — so one torch decode reproduces
-`speculative_generate` exactly, in seconds instead of hours.
+`speculative_generate` exactly, in minutes instead of hours of simulation. A tiny-model
+test (`test_acceptance_bench_simulator_matches_the_shipped_driver`) pins that simulator
+to the **shipped** driver's pass accounting, so the reported number cannot drift away
+from the code that actually runs.
 
-**128-token prompt, 48 generated, 3 samples, prompt-lookup (max_ngram=2):**
+**The model must be the chip.** Default is `--model fake-quant`: `NanoGPTFQReference`
+under the frozen `weight_only_int8_quarot` preset — **W8A16** (INT8 weights, FP16
+activations, static calibration scales, QuaRot). `--model w8a32` (FP32 activations) and
+`--model fp32` are cross-checks, *not* the accelerator; a different model gives a
+different greedy sequence and hence a different `t`.
 
-| | |
-|---|---:|
-| draft acceptance | **32.3%** (106/328 guesses confirmed) |
-| **tokens per verify pass** | **5.24** |
-| passes / fallback steps | 25 / 13 |
-| **speedup over sequential greedy** | **2.92×** |
-| **b1 throughput** | **1.738 → 5.075 tok/s** |
+**Indicative (W8A32 cross-check, 128-token prompt, 48 generated, 3 samples,
+prompt-lookup max_ngram=2):** acceptance 32.3%, **tokens/pass 5.24**, **2.92× ⇒ ~5.08
+tok/s** — past the ~3.27 tok/s DMA wall.
 
-**This clears the ~3.27 tok/s DMA wall** — the first and only b1 result that does.
+> ⚠️ **Headline pending.** The W8A16 (true-chip) re-measurement is the number of record;
+> the 2.92× above is from the W8A32 cross-check and an earlier simulator that carried an
+> off-by-one in the draft context. Treat 2.92× as indicative until the fake-quant run
+> replaces it here.
 
 ⚠️ **Sample size matters, and it bit me.** A 64-token prompt generating 16 tokens
 measured 1.05× — the n-gram had almost no context to match against. The lever looked
@@ -184,23 +189,31 @@ what a prompt-lookup draft catches (the pass histogram has repeated 11-, 15- and
 16-token accepts). A less repetitive model, or sampling instead of greedy, will show
 a lower `t`. The floor is ~1.0× (adaptive fallback), never a loss.
 
-### P is a real tunable — and 16 is the right default (measured)
+### P=16 is optimal because it exactly FILLS THE MESH (measured)
 
-Because the systolic/DMA/helper are FLAT in rows and only the SFU scales, the cost
-ratio is a clean line: **r(P) = 1 + 0.0302·(P−1)** (measured r = 1.0903 / 1.2108 /
-1.4531 at P = 4 / 8 / 16; SFU 3.99× / 7.97× / 15.91×).
+For **P ≤ 16** the systolic/DMA/helper are FLAT in rows and only the SFU scales, so the
+cost ratio is a clean line — **r(P) = 1 + 0.0302·(P−1)** (measured r = 1.0903 / 1.2108 /
+1.4531 at P = 4 / 8 / 16; SFU 3.99× / 7.97× / 15.91×, exactly linear).
 
-| P | r | break-even | tok/pass | speedup | tok/s |
-|---|---:|---:|---:|---:|---:|
-| 4 | 1.09 | 1.09 | 2.85 | 2.28× | 3.96 |
-| 8 | 1.21 | 1.21 | 3.85 | 2.66× | 4.62 |
-| **16** | **1.45** | **1.45** | **5.24** | **2.92×** | **5.08** |
-| 32 | 1.94 | 1.94 | 5.24 | 2.35× | 4.08 |
+⚠️ **That law DIES at the mesh height.** Measured **r(32) = 2.6331**, far above the 1.936
+the line predicts — because `M_pad=32 > SYSTOLIC_DIM=16` walks **two m-tiles at full
+price** and the systolic **doubles**: 11,109,206 → 22,218,412, *exactly* 2.00×. So
+"the systolic verifies P tokens for the price of one" holds **only up to 16 rows**.
 
-P=32 buys **nothing**: tokens/pass stays at 5.24 because the n-gram draft rarely finds
-more than ~15 continuation tokens, so the extra 16 rows cost SFU and confirm nothing.
-A *stronger* draft would move that optimum right — P is the knob to retune when the
-draft changes, and `prefill_tokens` is already a bundle parameter.
+| P | r | break-even | systolic | notes |
+|---|---:|---:|---:|---|
+| 4 | 1.0903 | 1.09 | 1.00× | |
+| 8 | 1.2108 | 1.21 | 1.00× | |
+| **16** | **1.4531** | **1.45** | **1.00×** | **fills the mesh exactly — the optimum** |
+| 32 | **2.6331** | 2.63 | **2.00×** | two m-tiles; tok/pass does not grow ⇒ strictly worse |
+
+P=32 is a double loss: it pays a second m-tile *and* confirms no more tokens (the n-gram
+rarely finds >15 continuation tokens). This is the **same 16-row wall** that made lever H
+(B=32 batching) a dud — the mesh is 16 rows, and nothing above that is free.
+
+**Always MEASURE r at a new P — never extrapolate the line past 16.**
+A stronger draft can only move the optimum *within* [1, 16]; `prefill_tokens` is already
+a bundle parameter, so retuning is free.
 
 ### The result that re-ranks the roadmap
 

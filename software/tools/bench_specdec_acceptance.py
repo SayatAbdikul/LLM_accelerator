@@ -20,10 +20,17 @@ the greedy sequence, the driver is a deterministic walk over it, reproducing
 `speculative_generate` exactly. One greedy decode in torch therefore yields the
 exact `t` the chip would see, in seconds instead of hours of RTL simulation.
 
-The model is the INT8-weight reference (`build_weight_only_int8_reference`) --
-the same weight numerics the chip runs -- so `t` is not measured on a model the
-accelerator does not implement. `--fp32` cross-checks that the quantization is
-not what is driving acceptance.
+Which model
+-----------
+`t` is only meaningful on the model the chip actually runs. The default is
+`--model fake-quant`: `NanoGPTFQReference` under the frozen `weight_only_int8_quarot`
+preset with calibration scales -- i.e. **W8A16**: INT8 weights, FP16 activations,
+static scales, QuaRot. That is the accelerator's numerics.
+
+`--model w8a32` (INT8 weights but FP32 activations, no QuaRot, no scales) and
+`--model fp32` are cross-checks, NOT the chip. Quoting `t` from either as "the
+chip's numerics" would be wrong: a different model produces a different greedy
+sequence, hence a different acceptance rate.
 """
 from __future__ import annotations
 
@@ -48,18 +55,49 @@ DEFAULT_R = 1.4531
 DEFAULT_P = 16
 
 
-def greedy_continuation(payload, prompt, n_new, *, fp32=False):
-    """Greedy-decode `n_new` tokens. Returns the token list."""
+FREEZE_PTQ_PRESET = "weight_only_int8_quarot"
+
+
+def _build_reference(payload, model: str):
+    """The model whose GREEDY sequence defines acceptance.
+
+    `fake-quant` is the accelerator: W8A16 (INT8 weights, FP16 activations, static
+    calibration scales, QuaRot) under the frozen preset. The others are cross-checks.
+    """
     from taccel.runtime.fp32_reference import (
         NanoGPTFP32Reference,
         build_weight_only_int8_reference,
     )
 
-    if fp32:
-        ref = NanoGPTFP32Reference(payload["state_dict"], payload["model_args"])
-    else:
-        ref = build_weight_only_int8_reference(payload, weight_mode="per_channel")
+    if model == "fp32":
+        return NanoGPTFP32Reference(payload["state_dict"], payload["model_args"])
+    if model == "w8a32":
+        return build_weight_only_int8_reference(payload, weight_mode="per_channel")
 
+    from taccel.runtime.calibration import build_calibration_scales
+    from taccel.runtime.fake_quant_reference import NanoGPTFQReference
+    from taccel.runtime.stage5_ptq import (
+        resolve_stage5_ptq_preset,
+        stage5_gelu_from_accum_blocks,
+        stage5_raw_residual1_blocks,
+        stage5_raw_residual2_blocks,
+        stage5_requant_pc_weight_names,
+    )
+
+    preset = resolve_stage5_ptq_preset(FREEZE_PTQ_PRESET)
+    args = payload["model_args"]
+    return NanoGPTFQReference(
+        payload["state_dict"], args, build_calibration_scales(payload),
+        requant_pc_weight_names=stage5_requant_pc_weight_names(args, preset),
+        raw_residual1_blocks=stage5_raw_residual1_blocks(preset),
+        raw_residual2_blocks=stage5_raw_residual2_blocks(preset),
+        gelu_from_accum_blocks=stage5_gelu_from_accum_blocks(preset),
+    )
+
+
+def greedy_continuation(payload, prompt, n_new, *, model="fake-quant"):
+    """Greedy-decode `n_new` tokens. Returns prompt + generated."""
+    ref = _build_reference(payload, model)
     ctx = list(prompt)
     for _ in range(n_new):
         logits = ref.incremental_logits_trace(ctx)[-1]
@@ -80,9 +118,12 @@ def simulate(prompt, greedy, draft, p_rows, r):
     passes = fallbacks = accepted = proposed = 0
     per_pass = []
     while i < n_total:
-        cur = seq[n_prompt + i - 1] if i > 0 else seq[n_prompt - 1]
-        # context as the driver sees it: everything decided so far, plus `cur`
-        context = seq[:n_prompt + i]
+        # Mirror `speculative_generate` EXACTLY. `cur` -- the token the driver holds
+        # but has not emitted yet -- is seq[n_prompt + i], and the driver drafts on
+        # a context that INCLUDES it (`tokens + generated + [cur]`). Dropping it
+        # shifts both the draft context and the truth alignment by one; the tiny-model
+        # test `test_acceptance_bench_simulator_matches_the_shipped_driver` pins this.
+        context = seq[:n_prompt + i + 1]          # ... + [cur]
         budget = n_total - i
         k = min(p_rows - 1, budget - 1)
         guesses = draft.propose(context, k) if k > 0 else []
@@ -93,7 +134,10 @@ def simulate(prompt, greedy, draft, p_rows, r):
             i += 1
             continue
 
-        truth = seq[n_prompt + i: n_prompt + i + len(guesses)]
+        # chain = [cur] + guesses, so guess j is the model's token at
+        # seq[n_prompt + i + 1 + j].
+        base = n_prompt + i + 1
+        truth = seq[base: base + len(guesses)]
         n_acc = 0
         for g, t in zip(guesses, truth):
             if g == t:
@@ -102,7 +146,7 @@ def simulate(prompt, greedy, draft, p_rows, r):
                 break
         proposed += len(guesses)
         accepted += n_acc
-        emitted = min(n_acc + 1, budget)   # accepted + the correction token
+        emitted = min(n_acc + 1, budget)   # cur + the accepted guesses
         passes += 1
         per_pass.append(emitted)
         i += emitted
@@ -129,15 +173,20 @@ def main() -> int:
                     help="measured pass/step cost ratio (bench_specdec_cycles.py)")
     ap.add_argument("--fmax-mhz", type=float, default=34.41)
     ap.add_argument("--step-cycles", type=int, default=19_794_743)
-    ap.add_argument("--fp32", action="store_true",
-                    help="use the FP32 model instead of the INT8-weight one")
+    ap.add_argument("--model", choices=["fake-quant", "w8a32", "fp32"],
+                    default="fake-quant",
+                    help="fake-quant = THE CHIP (W8A16: int8 weights, fp16 acts, "
+                         "static scales, QuaRot). w8a32/fp32 are cross-checks, "
+                         "NOT the chip.")
     args = ap.parse_args()
 
     import torch
     from taccel.runtime.gpt2_perplexity import tokenize_text_file
 
-    print(f"loading {args.checkpoint.name} "
-          f"({'fp32' if args.fp32 else 'int8-weight (chip numerics)'}) ...", flush=True)
+    label = {"fake-quant": "W8A16 fake-quant == THE CHIP",
+             "w8a32": "W8A32 cross-check (fp32 activations -- NOT the chip)",
+             "fp32": "FP32 cross-check -- NOT the chip"}[args.model]
+    print(f"loading {args.checkpoint.name}  [{label}] ...", flush=True)
     payload = torch.load(args.checkpoint, map_location="cpu")
 
     need = args.samples * (args.prompt_tokens + 8) + args.prompt_tokens
@@ -162,14 +211,14 @@ def main() -> int:
               f"{args.new_tokens} tokens ...", flush=True)
         decoded.append((prompt,
                         greedy_continuation(payload, prompt, args.new_tokens,
-                                            fp32=args.fp32)))
+                                            model=args.model)))
 
     base_tok_s0 = args.fmax_mhz * 1e6 / args.step_cycles
     if args.sweep_p:
         print()
         print("=== P sweep (r measured per P by bench_specdec_cycles.py) ===")
         print(f"  {'P':>4} {'r':>8} {'break-even':>11} {'tok/pass':>9} "
-              f"{'speedup':>8} {'tok/s':>8}")
+              f"{'passes':>7} {'fb':>5} {'speedup':>8} {'tok/s':>8}")
         for pair in args.sweep_p.split(","):
             ps, rs = pair.split(":")
             pp, rr = int(ps), float(rs)
@@ -182,8 +231,14 @@ def main() -> int:
             cost = a * rr + b * 1.0
             sp = c / cost if cost else 0.0
             print(f"  {pp:>4} {rr:>8.4f} {rr:>11.2f} "
-                  f"{np.mean(pps) if pps else 0:>9.2f} {sp:>7.2f}x "
+                  f"{np.mean(pps) if pps else 0:>9.2f} {a:>7} {b:>5} {sp:>7.2f}x "
                   f"{base_tok_s0 * sp:>8.3f}")
+        print()
+        print("  NOTE: r is NOT linear past P=16. The systolic verifies P tokens for")
+        print("  the price of ONE only up to the MESH HEIGHT (SYSTOLIC_DIM=16). At")
+        print("  P=32, M_pad=32 walks TWO m-tiles at full price and sys DOUBLES")
+        print("  (measured r(32)=2.6331, sys 2.00x) -- the same 16-row wall that")
+        print("  made batching (lever H, B=32) a dud. Always MEASURE r at a new P.")
         print()
         print("  Emitted tokens are IDENTICAL to greedy at every P (accept rule).")
         return 0

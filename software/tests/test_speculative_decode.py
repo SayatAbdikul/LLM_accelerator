@@ -118,6 +118,48 @@ def test_speculative_costs_fewer_passes_when_the_draft_hits(tmp_path):
     )
 
 
+def test_acceptance_bench_simulator_matches_the_shipped_driver(tmp_path):
+    """The reported speedup must come from the code that SHIPS.
+
+    `bench_specdec_acceptance.simulate()` is a second implementation of the accept
+    loop -- it walks a precomputed greedy sequence instead of driving the chip, which
+    is what makes measuring `t` cheap. If it drifts from `speculative_generate`, the
+    headline tok/s number describes code nobody runs. So pin them together: same
+    prompt, same draft, same pass accounting.
+    """
+    import importlib.util as _il
+    spec_mod = _il.spec_from_file_location(
+        "bench_specdec_acceptance",
+        Path(__file__).resolve().parents[1] / "tools" / "bench_specdec_acceptance.py")
+    bench = _il.module_from_spec(spec_mod)
+    spec_mod.loader.exec_module(bench)
+
+    payload = _build_payload(tmp_path)
+    prompt = _repetitive_prompt(24)
+    n_new = 24
+
+    spec = build_stage3_tiny_decoder_bundle(
+        payload, smoke_decode_steps=SMOKE, batch=1, prefill_tokens=P)
+    rd = HostRunner(spec.build.bundle, logits_dtype=np.float16)
+
+    draft = PromptLookupDraft()
+    stats = SpecDecStats()
+    got = speculative_generate(rd, prompt, n_new, vocab_size=VOCAB,
+                               draft=draft, stats=stats)
+
+    # Feed the simulator the sequence the driver actually produced (which is the
+    # greedy sequence -- that is the whole exactness contract) and require it to
+    # reproduce the driver's pass accounting exactly.
+    passes, fb, emitted, acc, prop, per_pass = bench.simulate(
+        prompt, got, PromptLookupDraft(), P, 1.4531)
+
+    assert emitted == stats.tokens_emitted
+    assert passes == stats.passes, f"passes {passes} != driver {stats.passes}"
+    assert fb == stats.fallback_steps
+    assert acc == stats.accepted and prop == stats.proposed
+    assert per_pass == stats.tokens_per_pass
+
+
 def test_speculative_requires_a_multi_row_prefill_bundle(tmp_path):
     payload = _build_payload(tmp_path)
     seq = build_stage3_tiny_decoder_bundle(payload, smoke_decode_steps=SMOKE, batch=1)
