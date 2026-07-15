@@ -68,20 +68,35 @@ systolic reading the current tile (Port B/W) and draining to ACCUM (Port S) —
 macros.** Requirements: prefetch → WBUF/ABUF (not ACCUM); double-buffered addresses.
 See [[t1-port-probe]], docs/porta_bus_split.md.
 
-## Item 1 (cross-group KV prefetch) — the real lever, at b16
+## Item 1 (cross-group KV prefetch) — the real lever, at b16 — CEILING CONFIRMED
 
-- b16 baseline (prior measured): step 54,269,714 cyc / 10.145 tok/s; sys 22.3M (41%),
-  exposed DMA ~19.8M (36%), SFU 10.1M, ctl 2.0M; co-busy 4,148,317.
-- KV traffic est. (geometry): 512 pos × 64 d_head × 12 heads × 2(K,V) × 12 layers ×
-  16 streams = **9.44M beats** — the largest single DMA term at b16. Weights 7.73M
-  (already prefetched), restaging/act ~est. 6.5M, logits ~0.3M.
-- The packed QK^T emitter (`packed_attn.py:158-234`) loads **all 12 heads' K^T
-  serially, each SYNC-blocked, BEFORE the single packed MATMUL** — so the KV DMA is
-  entirely exposed (nothing overlaps it). At b16 the MATMULs are 16× longer than b1,
-  so prefetching group g+1's K^T/V under group g's QK^T+softmax+AV MATMULs *can*
-  hide it. **Ceiling est. ~7-8M cyc → 54M→~46M → ~12 tok/s (+~18%)** — pending the
-  b16 exposure-by-region decomposition (the KV share of the 4.15M already-co-busy is
-  the exact discount).
+Fresh b16 trace (pos-510): step 54.3M cyc / 10.145 tok/s; sys 22,321,853 (41.1%),
+dma 19,844,527 (36.6%), sfu 10,074,569 (18.6%), ctl 2,010,323. **Total DMA
+19,664,920 beats; exposed 15,533,729; co-busy 4,148,317.**
+
+**The exposed-DMA decomposition (the gate the advisor required) is settled by the
+b1→b16 delta:** exposed DMA grew 6.40M → 15.53M = **+9.13M**, and total DMA grew
+10.53M → 19.66M = **+9.13M** — identical. So *every* extra b16 beat is exposed, and
+that increment is the per-stream KV (b16 reads 16 streams' caches vs b1's 1; KV
+geometry 512×64×12×2×12×16 = 9.44M). **⇒ ~9.4M of b16's exposed DMA is KV, fully
+un-overlapped today. That is item 1's ceiling.** Hide it under the 22.3M systolic ⇒
+**54.3M → ~45M → ~12.2 tok/s (+~20%).**
+
+**The co-busy counter is CORRECT, not blind (resolves the b1==b16=4,148,317 alarm).**
+It measures the weight-prefetch (`pipeline_full_k`) DMA‖MATMUL overlap, which is
+batch-invariant (weights load once). The KV loads (`packed_attn.py:158-234`) load all
+12 heads' K^T **serially, each SYNC-blocked, BEFORE the single packed MATMUL** — so
+they overlap NOTHING and contribute **0 co-busy at both b1 and b16**. Adding 16× KV at
+b16 therefore adds only exposed DMA, leaving co-busy pinned at 4,148,317. The counter
+is a live per-cycle count (`taccel_top.sv:681`); the identity is physics, not a bug.
+**Consequence: when item 1 overlaps the KV under the MATMULs, co-busy WILL rise from
+4.15M toward ~13M — so it is a valid "shown-to-move" gate after all.**
+
+**Validation (ground truth):** the item-1 win MUST show up as **total step cycles
+dropping** (an independent, unimpeachable counter — re-serialization can't fake a
+shorter step), plus byte-exact (tiny RTL==golden batch=16 + 124M SYS_DMA_OVERLAP A/B)
+plus Port-A `lost=0` plus co-busy risen. Total-cycles is the primary metric; co-busy
+is the corroborating denominator.
 
 ## What must be true before the item-1 build (the porta-scar gate)
 
