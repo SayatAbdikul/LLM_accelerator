@@ -34,6 +34,7 @@ pass HANGS on fp32_add's many shifter/subtractor share candidates — the docume
 | fp32_div_p6 (**calibration**) | 28.52 ns | 35.1 MHz | matches committed ~29.64 ns floor |
 | **fp32_add** | **28.49 ns** (delay-opt) | 35.1 MHz | one FP add ≈ the ENTIRE 29 ns budget |
 | **fp32_mul** | **27.34 ns** (delay-opt) | 36.6 MHz | one FP mul, same |
+| helper DEQUANT_ADD (`mul→add`) | 54.15 ns | 18.5 MHz | the fp datapath ≠ the "109 MHz" block number |
 | **fp32_exp** | **~412 ns** (556 ns via -fast / 1.35 pessimism) | **~2.4 MHz** | ~16 serial fp ops (Cody-Waite + Horner) |
 | **EXPSUM** (`add→exp→add`, **1 cycle**) | **~490 ns** (658 ns via -fast / 1.35) | **~2 MHz** | the softmax accumulate; single-cycle in the synth datapath |
 
@@ -73,26 +74,33 @@ timing report — the full-SFU flatten OOMs (PNR deferred to ≥24 GB), and the 
    bit-exact) is only for the **70–90 MHz stretch**, where the add goes co-critical with
    div/sqrt. Whether it is needed at all depends on the add's true delay (below).
 
-## The open reconciliation (decides the STRETCH scope, not the finding)
+## The reconciliation — RESOLVED: the fp primitives really are ~27–28 ns
 
-A single fp32_add at ~28 ns is in tension with the committed **"helper 109 MHz"** — a
-single-cycle fp mul→add would be ~55 ns / ~18 MHz, so either that number predates the fp
-datapath, or my isolated single-primitive shell is abc-pessimistic (div_p6 calibrates
-the flow for *pipelined divide* logic, not a standalone barrel-shifter add). **One
-experiment settles it — synth `blocking_helper_engine` through the same flow:**
-- **~55 ns** → add ≈ 28 ns confirmed, 109 MHz impeached (stale / non-fp path), and the
-  add split IS needed for the 70–90 MHz stretch.
-- **~9 ns** → the isolated shell is pessimistic, add ≈ 9 ns, the SFU is div/sqrt-bound
-  after exp-pipelining, and T3-as-written needs no add work at all.
-Either outcome leaves the core finding (exp first) intact.
+The committed **"helper 109 MHz" (9.17 ns) does NOT reflect the fp datapath** — it is a
+control/copy critical path (or predates the fp datapath). Two independent facts settle it:
+
+1. **A single fp32_mul is 27.34 ns.** Any single-cycle fp path containing a mul is
+   therefore ≥27 ns ⇒ ≤37 MHz — 109 MHz is impossible for the fp datapath by itself.
+2. **The helper's own DEQUANT_ADD fp path (`mul→add`, `blocking_helper_engine.sv:784-786`)
+   measures 54.15 ns = 18.5 MHz** via this flow (the full helper block synth timed out at
+   420 s under delay-opt abc; this is the exact fp sub-path).
+
+And critically, **my flow uses the SAME `abc -liberty -D 5000` as the committed
+`synth_full.sh`** — so 28.49 ns is not a pessimistic artifact, it is the committed
+mapper's own number for a standalone fp32_add. (div_p6 only calibrates the flow for
+divide logic; sta_mul=27 ns + dqadd=54 ns calibrate it for the fp add/mul path.)
+
+**Consequence for T3's stretch:** add ≈ 28 ns is confirmed, so the 2–3-stage fp32_add
+split IS required for the 70–90 MHz target (it is NOT required at 34.41 MHz — 28.49 <
+29.06). The core finding (pipeline exp first) was never in question.
 
 ## Caveat (honest scope)
 
-Synth-only, no PNR, no wire load; the flow is calibrated on div_p6 (28.52 vs committed
-29.64 ns) but that only validates it for divide logic, not the standalone add. add/mul/
-div_p6 are delay-opt `abc -D 5000`; **exp (556) and expsum (658) are `abc -fast` upper
-bounds ÷ the 1.35× add pessimism factor → ~412 / ~490 ns estimates, not mapped delay-opt
-numbers** (those timed out at 400 s). The exact exp multiple wants the deferred ≥24 GB
-full-SFU PNR; but even at 3× optimism the ~16-serial-op exp cloud is ≫29 ns single-cycle,
-so "pipeline exp first" is not in doubt. Flow + shells: `scratchpad/run_sfu_sta.sh`,
-`sta_shells.sv`.
+Synth-only, no PNR, no wire load; flow calibrated three ways (div_p6 28.52 vs 29.64 ns
+for divide logic; sta_mul 27.3 ns + dqadd 54.2 ns for the fp add/mul path), and it uses
+the SAME `abc -D 5000` as the committed `synth_full.sh`. add/mul/div_p6/dqadd are
+delay-opt; **exp (556) and expsum (658) are `abc -fast` upper bounds ÷ the 1.35× add
+pessimism factor → ~412 / ~490 ns estimates, not mapped delay-opt numbers** (those timed
+out at 400 s). The exact exp multiple wants the deferred ≥24 GB full-SFU PNR; but even at
+3× optimism the ~16-serial-op exp cloud is ≫29 ns single-cycle, so "pipeline exp first"
+is not in doubt. Flow + shells: `scratchpad/run_sfu_sta.sh`, `sta_shells.sv`.
