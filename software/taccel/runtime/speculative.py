@@ -1,5 +1,15 @@
 """Speculative decoding for batch-1 — propose, verify in ONE pass, accept.
 
+SCOPE: this is HOST SOFTWARE, not part of the accelerator. It touches no RTL and
+no chip cycle count — the draft runs on the CPU and only the verify pass runs on
+the chip (as an ordinary `prefill_tokens=P` bundle). It is entirely opt-in: it
+does nothing unless a caller explicitly builds a `prefill_tokens > 1` bundle and
+invokes `speculative_generate`. The project's optimization goal is the CHIP
+(architecture + compiler), so this module is a parallel, non-interfering track —
+keep it that way. See [[b1-specdec]] and docs/lever_b3_specdec.md.
+
+
+
 Why this is the batch-1 lever
 -----------------------------
 The systolic mesh is 16 rows. A single-token decode step presents ONE query row

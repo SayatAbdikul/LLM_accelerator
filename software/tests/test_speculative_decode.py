@@ -166,3 +166,30 @@ def test_speculative_requires_a_multi_row_prefill_bundle(tmp_path):
     rs = HostRunner(seq.build.bundle, logits_dtype=np.float16)
     with pytest.raises(ValueError, match="prefill_tokens"):
         speculative_generate(rs, _prompt(8), 4, vocab_size=VOCAB)
+
+
+@pytest.mark.parametrize("batch", [1, 16])
+def test_specdec_is_inert_at_the_default(tmp_path, batch):
+    """A default bundle (prefill_tokens=1) must be BYTE-IDENTICAL to the pre-B3
+    compiler, so speculative decoding cannot perturb an architecture/cycle
+    experiment that does not explicitly opt in.
+
+    The goal of the project is the chip; spec-dec is a non-interfering host-side
+    track. If a change to the shared bundle path (logits_rows, prefill_store_rows,
+    the logits-store emitter, the region layout) ever shifts a default bundle,
+    this fails -- which is the signal that the opt-in boundary has leaked.
+    """
+    import hashlib
+    payload = _build_payload(tmp_path)
+    tiny = build_stage3_tiny_decoder_bundle(payload, smoke_decode_steps=8, batch=batch)
+    b = tiny.build.bundle
+    img = bytes(b.materialize(reset_runtime=False))
+    sha = hashlib.sha256(img).hexdigest()[:16]
+    # Golden hashes captured from commit daef072 (the last commit before lever B3),
+    # verified by rebuilding that commit's compiler on the same fixture.
+    golden = {1: "172b4aa61a3de54e", 16: "e0f9c8ca2a50d259"}
+    assert b.prefill_store_rows == 1, "default bundle must not store multiple prefill rows"
+    assert sha == golden[batch], (
+        f"default batch={batch} bundle changed (sha {sha} != {golden[batch]}): a "
+        f"spec-dec / shared-logits change has leaked into the non-spec-dec path"
+    )

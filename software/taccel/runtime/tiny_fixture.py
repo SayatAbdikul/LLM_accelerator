@@ -440,6 +440,15 @@ def build_stage3_tiny_decoder_bundle(
         raise ValueError(
             "build_stage3_tiny_decoder_bundle: batch must be 1, 16, or 32"
         )
+    # `prefill_tokens` is the SOLE opt-in for the multi-row prefill store that
+    # chunked prefill (lever I-b) and speculative decoding (lever B3) need. At the
+    # default (1) every spec-dec-related field below collapses to its pre-B3 value
+    # (`prefill_store_rows=1`, `logits_rows=batch`, single last-row logits store),
+    # so the emitted bundle is BYTE-IDENTICAL to the pre-spec-dec compiler --
+    # verified by hashing default b1/b16 images against commit daef072. This means
+    # spec-dec cannot perturb an architecture/cycle experiment that does not
+    # explicitly pass prefill_tokens > 1. Keep it that way: nothing in the default
+    # decode/prefill path may branch on spec-dec state.
     prefill_tokens = int(prefill_tokens)
     if prefill_tokens < 1:
         raise ValueError("build_stage3_tiny_decoder_bundle: prefill_tokens must be >= 1")
