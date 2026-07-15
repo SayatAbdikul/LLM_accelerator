@@ -172,10 +172,24 @@ def main() -> int:
         shutil.rmtree(td, ignore_errors=True)
 
     dur, cnt = defaultdict(int), defaultdict(int)
+    # T0.2 exposure census: the gap AFTER event i (until event i+1 retires) is
+    # charged to op i. The trace snapshots cumulative DMA beats / co-busy /
+    # fetch-stall at each retire, so the delta across that gap is the traffic
+    # that happened while op i was the head. exposed = beats not overlapping the
+    # systolic. (Fields absent on pre-T0.2 traces -> 0, harmless.)
+    exposed, cobusied, fstall = defaultdict(int), defaultdict(int), defaultdict(int)
+    have_exposure = "dma_beats" in events[0] if events else False
     for i in range(len(events) - 1):
         op = events[i]["opcode"]
         dur[op] += events[i + 1]["cycle"] - events[i]["cycle"]
         cnt[op] += 1
+        if have_exposure:
+            db = events[i + 1].get("dma_beats", 0) - events[i].get("dma_beats", 0)
+            dc = events[i + 1].get("dma_cobusy", 0) - events[i].get("dma_cobusy", 0)
+            fs = events[i + 1].get("fetch_stall", 0) - events[i].get("fetch_stall", 0)
+            cobusied[op] += dc
+            exposed[op] += max(0, db - dc)  # beats not hidden under the systolic
+            fstall[op] += fs
 
     spanned = sum(dur.values())
     cycles = s["cycles"]
@@ -212,6 +226,30 @@ def main() -> int:
     out(f"\n=== by engine ===")
     for k, v in sorted(grp.items(), key=lambda kv: -kv[1]):
         out(f"  {k:>6}: {v:>14,}  ({100 * v / spanned:5.1f}%)")
+
+    # T0.2: exposed DMA + fetch-stall attributed to the op whose gap the traffic
+    # fell in. Exposed DMA is the T1 overlap prize; fetch-stall separates real
+    # exposed DMA from instruction-fetch starvation on the shared read port.
+    fetch_total = s.get("fetch_ar_stall_cycles", 0)
+    if have_exposure:
+        tot_exp = sum(exposed.values())
+        tot_cob = sum(cobusied.values())
+        out(f"\n=== exposed DMA + fetch-stall by op (T0.2) ===")
+        out(f"  total dma beats {s['dma']['beat_count']:>12,}   "
+            f"exposed {tot_exp:>12,}   hidden(co-busy) {tot_cob:>12,}")
+        out(f"  fetch-stall cycles (read-port contention) {fetch_total:>12,}   "
+            f"({100 * fetch_total / max(cycles, 1):.2f}% of the step)")
+        out(f"\n{'op':>5}  {'name':26} {'exposed':>13} {'co-busy':>13} "
+            f"{'fetch-stall':>12}  engine")
+        for op in sorted(exposed, key=lambda o: -exposed[o]):
+            if exposed[op] == 0 and fstall[op] == 0 and cobusied[op] == 0:
+                continue
+            out(f"0x{op:02X}  {names.get(op, '?'):26} {exposed[op]:>13,} "
+                f"{cobusied[op]:>13,} {fstall[op]:>12,}  {classify(op)}")
+    else:
+        out(f"\n  (no per-op exposure census: trace lacks dma_beats fields — "
+            f"rebuild run_program_synth for T0.2. Summary fetch-stall: "
+            f"{fetch_total:,})")
 
     # The identity that makes this partition trustworthy rather than merely
     # plausible: an engine's gap total must equal its busy counter plus exactly

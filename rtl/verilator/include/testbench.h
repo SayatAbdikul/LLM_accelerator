@@ -544,6 +544,14 @@ public:
     // honest-memory-BW cycle count; NOT a chip change.
     void set_fast_beats(bool v) { fast_beats_ = v; }
 
+    // T0.1 DRAM-bandwidth model knob. `n` = cycles per read beat in steady
+    // state (1 = back-to-back, the `--fast-beats` ideal where bandwidth SCALES
+    // with the core clock; N>1 = N cycles/beat, i.e. a FIXED-rate memory whose
+    // throughput does NOT rise with fmax). 0 = unset (legacy fast_beats_/default
+    // pacing). This exists so the plan's fixed-GB/s sensitivity is SIMULABLE,
+    // not implicit — the pinned model is scales-with-clock (interval 1).
+    void set_beat_interval(int n) { beat_interval_ = n; }
+
     // Drive AXI slave outputs given DUT's master outputs (call every cycle).
     // Handles AR/R (reads, single-beat model) and AW/W/B (writes, multi-beat).
     void tick(Vtaccel_top* dut, int latency = 2) {
@@ -619,18 +627,20 @@ public:
             if (dut->m_axi_r_ready) {
                 read_beat_count_++;
                 bool more = (pending_beat_ <= (int)pending_ar_len_);
-                // fast_beats_: a realistic 1-beat/cycle AXI slave keeps R_VALID
-                // asserted and streams the next beat the very cycle the current
-                // one is accepted (no inter-beat bubble). Default model re-arms
-                // pending_timer_ (~2-3 cyc/beat) — see set_fast_beats().
-                if (fast_beats_ && more && pending_valid_) {
-                    emit_beat();
+                // Inter-beat gap in cycles. beat_interval_ (T0.1) overrides when
+                // set: interval 1 => gap 0 (back-to-back, BW scales with clock);
+                // interval N => gap N-1 (fixed-rate DRAM). Legacy: fast_beats_
+                // => gap 0, default => gap 1 (~2 cyc/beat).
+                const int gap = (beat_interval_ > 0) ? (beat_interval_ - 1)
+                                                     : (fast_beats_ ? 0 : 1);
+                if (gap == 0 && more && pending_valid_) {
+                    emit_beat();  // no bubble: stream the next beat this cycle
                 } else {
                     r_valid_           = false;
                     dut->m_axi_r_valid = 0;
                     dut->m_axi_r_last  = 0;
                     if (more) {
-                        pending_timer_ = 1;  // next beat next cycle
+                        pending_timer_ = gap;  // gap cycles until the next beat
                     }
                 }
             }
@@ -712,6 +722,7 @@ private:
     int      pending_timer_;
     bool     r_valid_;
     bool     fast_beats_ = false;   // 1-beat/cycle streaming (measurement knob)
+    int      beat_interval_ = 0;    // T0.1: cycles/read-beat (0=unset; 1=fast; N=fixed-rate DRAM)
     // Write state
     bool     aw_pending_;
     uint64_t aw_addr_;

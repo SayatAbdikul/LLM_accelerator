@@ -61,6 +61,7 @@ struct CliOptions {
     int max_cycles = 500000;
     int latency = 2;
     bool fast_beats = false;   // --fast-beats: 1-beat/cycle ideal AXI (measurement only)
+    int beat_interval = 0;     // --beat-interval N: cycles/read-beat (T0.1 DRAM-BW model; 0=unset)
     int systolic_window_start_pc = -1;
     int systolic_window_end_pc = -1;
     int accum_write_start_pc = -1;
@@ -120,6 +121,10 @@ struct Summary {
     uint64_t helper_busy_cycles = 0;
     uint64_t sfu_busy_cycles = 0;
     uint64_t systolic_busy_cycles = 0;
+    // T0.2: cycles the fetch unit stalled on the shared AXI read port (fetch/DMA
+    // contention). Lets the overlap campaign separate real exposed DMA from
+    // instruction-fetch starvation.
+    uint64_t fetch_ar_stall_cycles = 0;
     // Shared-Port-A arbitration (DMA vs systolic). `dma_sys_cobusy_cycles` is
     // the denominator: a zero loss count is meaningless if the two engines
     // never overlapped. Any nonzero `sys_porta_lost` is silent corruption —
@@ -154,6 +159,15 @@ struct RetireEvent {
     uint64_t cycle = 0;
     uint64_t pc = 0;
     int opcode = 0;
+    // T0.2 exposure census: cumulative counters snapshotted AT this retire. The
+    // profiler diffs consecutive events, so the gap before opcode i carries
+    // (dma_beats[i]-dma_beats[i-1]) beats of which (dma_cobusy[i]-..[i-1])
+    // overlapped the systolic; the remainder is exposed DMA, attributed to the
+    // op whose gap it fell in. Bucketing by pc-range gives per-phase exposure
+    // (lm_head vs fc2 vs attention).
+    uint64_t dma_beats = 0;
+    uint64_t dma_cobusy = 0;
+    uint64_t fetch_stall = 0;
 };
 
 struct SnapshotRequest {
@@ -550,6 +564,7 @@ Summary build_summary(Vtaccel_top* dut, int num_classes) {
     summary.sfu_busy_cycles = root->taccel_top__DOT__obs_sfu_busy_cycles_q;
     summary.systolic_busy_cycles = root->taccel_top__DOT__obs_sys_busy_cycles_q;
     summary.dma_sys_cobusy_cycles = root->taccel_top__DOT__obs_dma_sys_cobusy_cycles_q;
+    summary.fetch_ar_stall_cycles = root->taccel_top__DOT__obs_fetch_ar_stall_cycles_q;
     summary.sys_porta_lost = root->taccel_top__DOT__obs_sys_porta_lost_q;
     summary.sys_porta_lost_wr = root->taccel_top__DOT__obs_sys_porta_lost_wr_q;
     summary.sys_porta_lost_abuf = root->taccel_top__DOT__obs_sys_porta_lost_abuf_q;
@@ -622,6 +637,7 @@ std::string summary_to_json(const Summary& summary) {
     oss << "    \"sfu\": " << summary.sfu_busy_cycles << ",\n";
     oss << "    \"systolic\": " << summary.systolic_busy_cycles << "\n";
     oss << "  },\n";
+    oss << "  \"fetch_ar_stall_cycles\": " << summary.fetch_ar_stall_cycles << ",\n";
     // Shared-Port-A arbitration. `dma_sys_cobusy` is the denominator; any
     // nonzero `sys_lost` is a silently dropped systolic access.
     oss << "  \"port_a\": {\n";
@@ -678,7 +694,10 @@ std::string trace_to_json(const std::vector<RetireEvent>& retire_events,
         const auto& ev = retire_events[i];
         oss << "    {\"cycle\": " << ev.cycle
             << ", \"pc\": " << ev.pc
-            << ", \"opcode\": " << ev.opcode << "}";
+            << ", \"opcode\": " << ev.opcode
+            << ", \"dma_beats\": " << ev.dma_beats
+            << ", \"dma_cobusy\": " << ev.dma_cobusy
+            << ", \"fetch_stall\": " << ev.fetch_stall << "}";
         if (i + 1 != retire_events.size()) {
             oss << ",";
         }
@@ -853,6 +872,8 @@ CliOptions parse_args(int argc, char** argv) {
             opts.latency = std::stoi(need_value("--latency"));
         } else if (arg == "--fast-beats") {
             opts.fast_beats = true;
+        } else if (arg == "--beat-interval") {
+            opts.beat_interval = std::stoi(need_value("--beat-interval"));
         } else if (arg == "--inject-next-rresp") {
             opts.inject_next_rresp = std::stoi(need_value("--inject-next-rresp"));
         } else if (arg == "--inject-next-rlast") {
@@ -1024,6 +1045,8 @@ int main(int argc, char** argv) {
 
         sim.start_once(opts.latency);
         sim.dram.set_fast_beats(opts.fast_beats);
+        if (opts.beat_interval > 0)
+            sim.dram.set_beat_interval(opts.beat_interval);
         auto* root = sim.dut->rootp;
         window_trace_enabled = !opts.systolic_window_json_out_path.empty();
         if (window_trace_enabled) {
@@ -1194,7 +1217,11 @@ int main(int argc, char** argv) {
             capture_due_pending_snapshot_requests(retire_cycle);
             if (retire_valid) {
                 if (want_retire_trace) {
-                    retire_events.push_back(RetireEvent{retire_cycle, retire_pc, retire_opcode});
+                    RetireEvent ev{retire_cycle, retire_pc, retire_opcode};
+                    ev.dma_beats   = root->taccel_top__DOT__obs_dma_beat_count_q;
+                    ev.dma_cobusy  = root->taccel_top__DOT__obs_dma_sys_cobusy_cycles_q;
+                    ev.fetch_stall = root->taccel_top__DOT__obs_fetch_ar_stall_cycles_q;
+                    retire_events.push_back(ev);
                 }
                 capture_snapshot_requests_for_pc(retire_cycle, retire_pc);
             }

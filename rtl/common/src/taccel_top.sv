@@ -332,6 +332,13 @@ module taccel_top
   //             SAME-buffer contention against the DMA's KV re-read, and needs
   //             real dual-port arbitration instead.
   logic [63:0]  obs_dma_sys_cobusy_cycles_q /* verilator public_flat_rd */;
+  // T0.2 fetch/DMA read-port contention. The fetch unit and the DMA share ONE
+  // single-outstanding AXI read port (see the AR arbiter above); a fetch that
+  // wants the port while it is busy stalls dispatch. This counts those cycles so
+  // the overlap campaign (T1) does not misattribute fetch stalls to "exposed
+  // DMA" — it is the instrument that decides whether the T2 instruction
+  // prefetch buffer must land before or after the aggressive DMA overlap.
+  logic [63:0]  obs_fetch_ar_stall_cycles_q /* verilator public_flat_rd */;
   logic [63:0]  obs_sys_porta_lost_q /* verilator public_flat_rd */;
   logic [63:0]  obs_sys_porta_lost_wr_q /* verilator public_flat_rd */;
   logic [63:0]  obs_sys_porta_lost_abuf_q /* verilator public_flat_rd */;
@@ -599,6 +606,7 @@ module taccel_top
       obs_sfu_issue_pc_q               <= 56'h0;
       obs_sfu_issue_opcode_q           <= 5'h0;
       obs_dma_sys_cobusy_cycles_q      <= 64'h0;
+      obs_fetch_ar_stall_cycles_q      <= 64'h0;
       obs_sys_porta_lost_q             <= 64'h0;
       obs_sys_porta_lost_wr_q          <= 64'h0;
       obs_sys_porta_lost_abuf_q        <= 64'h0;
@@ -638,6 +646,7 @@ module taccel_top
       obs_sfu_issue_pc_q               <= 56'h0;
       obs_sfu_issue_opcode_q           <= 5'h0;
       obs_dma_sys_cobusy_cycles_q      <= 64'h0;
+      obs_fetch_ar_stall_cycles_q      <= 64'h0;
       obs_sys_porta_lost_q             <= 64'h0;
       obs_sys_porta_lost_wr_q          <= 64'h0;
       obs_sys_porta_lost_abuf_q        <= 64'h0;
@@ -670,6 +679,13 @@ module taccel_top
         // denominator against which a Port-A loss count means anything.
         if (dma_busy && sys_busy)
           obs_dma_sys_cobusy_cycles_q <= obs_dma_sys_cobusy_cycles_q + 64'd1;
+
+        // T0.2: the fetch unit wants the shared read port but the AR arbiter
+        // denies it (a read is in flight or the DMA outranks it). Dispatch is
+        // stalled in S_FETCH these cycles — the fetch/DMA contention the T2
+        // prefetch buffer would remove.
+        if (fetch_ar_valid && !fetch_ar_ready)
+          obs_fetch_ar_stall_cycles_q <= obs_fetch_ar_stall_cycles_q + 64'd1;
 
         if (obs_sys_porta_lost_w) begin
           obs_sys_porta_lost_q <= obs_sys_porta_lost_q + 64'd1;

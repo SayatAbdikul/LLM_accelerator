@@ -21,6 +21,20 @@ Usage (from repo root):
 The RTL binary must be built with a DRAM_SIZE that fits the bundle
 (1<<30 for GPT-2 124M) and should be the mode-1 (SFU_SYNTH_MODE=1)
 build for real-chip numbers. --fast-beats (honest-BW) is always passed.
+
+DRAM BANDWIDTH MODEL (T0.1, pinned 2026-07-15).
+  --fast-beats = 1 AXI beat per CORE cycle. This is the PINNED model:
+  memory bandwidth SCALES WITH THE CLOCK, i.e. a faster fmax gets a
+  proportionally faster memory interface (the DRAM controller lives in /
+  keeps up with the core domain). Every tok/s and waterfall number in the
+  architecture plan is under this model.
+
+  The alternative -- a FIXED-GB/s DRAM whose throughput does NOT rise with
+  fmax -- is simulable via the runner's `--beat-interval N` (N cycles per
+  read beat), so the fixed-BW sensitivity is checkable rather than implicit.
+  It is NOT the design point; under it a higher clock re-exposes DMA and the
+  fmax lever's b1 gain collapses (~x2.5 -> ~x1.4). Only pass --beat-interval
+  when deliberately running that sensitivity.
 """
 
 from __future__ import annotations
