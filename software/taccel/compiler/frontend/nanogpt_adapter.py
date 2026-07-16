@@ -538,12 +538,30 @@ def _emit_batched_attention_block(graph: IRGraph, prev: str, block_idx: int,
                               query_len=1, key_len=key_len, masked=True, runtime_config_attn=True,
                               causal_identity=True)
                     # A2: V loads straight to WBUF (the MATMUL src2 home).
+                    # Item-1 KV prefetch: within a packed group the per-head V load
+                    # is software-pipelined. Head 0 loads its own V (blocking);
+                    # every head's AV MATMUL then prefetches the NEXT head's V into
+                    # WBUF with a DEFERRED sync, so that V DMA overlaps the AV
+                    # systolic (MATMUL uses SYNC 0b010, systolic-only, so the DMA
+                    # keeps streaming). The next head's kv_load is a no-op — its
+                    # tile is already resident — and its AV's pc-scale SYNC 0b001
+                    # drains the prefetch before the read. Same DMA‖systolic Port-A
+                    # / Port-W discipline as the weight prefetch. See
+                    # [[dma_compute_overlap]].
                     v_s = _add(graph, "kv_load", f"{pfx}_vload", [], (key_len, shape.d_head),
                                layer=block_idx, kind="value", head=h, tokens=key_len,
-                               stream=s, decode=True, dtype="int8", dst="wbuf")
+                               stream=s, decode=True, dtype="int8", dst="wbuf",
+                               kv_prefetched=(j > 0))
+                    nh = heads[j + 1] if j + 1 < len(heads) else None
                     attn_v = _add(graph, "matmul_attn_v", f"{pfx}_attnv", [sm, v_s], (1, shape.d_head),
                                   block_idx=block_idx, head_idx=h, query_len=1, key_len=key_len,
-                                  v_int8_from_cache=True, av_accum_off=av_accum_units)
+                                  v_int8_from_cache=True, av_accum_off=av_accum_units,
+                                  stream=s,
+                                  v_prefetch_next_head=nh,
+                                  v_prefetch_next_name=(
+                                      f"block{block_idx}_head{nh}_s{s}_vload"
+                                      if nh is not None else None),
+                                  v_prefetch_key_len=key_len)
                     head_stream_outs[h][s] = attn_v
         for head_idx in range(shape.n_head):
             head_outputs.append(_add(

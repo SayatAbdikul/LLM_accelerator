@@ -199,6 +199,12 @@ def emit_kv_store(cg: "CodeGenerator", node: IRNode) -> None:
 
 
 def emit_kv_load(cg: "CodeGenerator", node: IRNode) -> None:
+    # Item-1 KV prefetch: this V tile was already streamed into WBUF (and its
+    # alloc registered under this node's name) by the PREVIOUS head's AV MATMUL
+    # prefetch. Emitting the load again would double the DMA and re-serialize it.
+    # The tile is drained by this head's AV pc-scale SYNC 0b001 before the read.
+    if bool(node.attrs.get("kv_prefetched")):
+        return
     entry = kv_entry_for_node(cg, node)
     dram_off = entry.dram_off_units
     decode_mode = bool(node.attrs.get("decode", cg.stream_name == "decode"))

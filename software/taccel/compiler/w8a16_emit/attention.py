@@ -622,6 +622,38 @@ def emit_matmul_attn_v_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     )
     cg._emit(SyncInsn(resource_mask=0b001))
 
+    # ----- Item-1 KV prefetch: stream the NEXT head's V into WBUF now -----
+    # Issued AFTER the pc-scale drain above (so that barrier never catches this
+    # load) and BEFORE the MATMUL below (which uses SYNC 0b010, systolic-only),
+    # so this V DMA overlaps the current head's AV MATMUL. The next head's
+    # kv_load is a no-op (kv_prefetched) and its own pc-scale SYNC 0b001 drains
+    # this tile before it reads it. Same DMA‖systolic Port-A(write WBUF) /
+    # Port-W(read WBUF) / Port-S(ACCUM) discipline as the weight prefetch — the
+    # systolic never drives shared Port A during a dense MATMUL, so this is
+    # collision-free by construction. See [[dma_compute_overlap]].
+    _pf_head = node.attrs.get("v_prefetch_next_head")
+    if (_pf_head is not None and v_int8_from_cache and cg.kv_layout is not None):
+        from ..kv_cache import normalize_kv_kind  # lazy: import cycle
+        from ..emit.kv import kv_int8_full_rows    # lazy: import cycle
+        _pf_name = node.attrs["v_prefetch_next_name"]
+        _pf_klen = int(node.attrs.get("v_prefetch_key_len", key_len))
+        _pf_stream = int(node.attrs["stream"])
+        _pf_layer = int(node.attrs["block_idx"])
+        _pf_entry = cg.kv_layout.entry(
+            _pf_layer, normalize_kv_kind("value"), int(_pf_head), _pf_stream
+        )
+        _pf_Kseq = pad_dim(_pf_klen)
+        _pf_Npad = pad_dim(head_dim)
+        _pf_alloc = cg.mem.wbuf.alloc(_pf_name, _pf_Kseq * _pf_Npad)  # INT8, 1 B/elem
+        _pf_rows = kv_int8_full_rows(cg, _pf_klen)
+        # Deferred load (NO trailing SYNC): mirrors emit_kv_load's decode
+        # tokens>1 int8 branch — full context from position 0, base-relocated.
+        cg._emit_dma_load(
+            BUF_WBUF, _pf_alloc.offset_units, _pf_rows * head_dim, 2, 0,
+            dram_off_units=_pf_entry.dram_off_units,
+            relocation_symbol=_pf_entry.base_symbol,
+        )
+
     # ----- Stage 5: FP32 output tile (M_pad × N_pad × 4 bytes) -----
     out_alloc = _abuf_alloc_fp32(cg, node.name, M_pad, N_pad)
 

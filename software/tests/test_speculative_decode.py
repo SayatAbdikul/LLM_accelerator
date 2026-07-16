@@ -187,7 +187,12 @@ def test_specdec_is_inert_at_the_default(tmp_path, batch):
     sha = hashlib.sha256(img).hexdigest()[:16]
     # Golden hashes captured from commit daef072 (the last commit before lever B3),
     # verified by rebuilding that commit's compiler on the same fixture.
-    golden = {1: "172b4aa61a3de54e", 16: "e0f9c8ca2a50d259"}
+    # batch=16 re-pinned 2026-07-16 for item-1 (b16 KV V-prefetch): the DEFAULT
+    # packed-attention schedule legitimately changed (V loads software-pipelined
+    # under the AV MATMUL). Logits are BYTE-EXACT (RTL-vs-RTL sha1 unchanged) and
+    # prefill_store_rows stays 1 — spec-dec remains functionally inert; only the
+    # b16 instruction schedule moved. batch=1 is UNAFFECTED (per-head decode path).
+    golden = {1: "172b4aa61a3de54e", 16: "fa75a8991ee385b3"}
     assert b.prefill_store_rows == 1, "default bundle must not store multiple prefill rows"
     assert sha == golden[batch], (
         f"default batch={batch} bundle changed (sha {sha} != {golden[batch]}): a "
