@@ -14,6 +14,8 @@ Sub-modules:
   - `embedding`  — embedding lookups + CLS prepend/extract + pos-embed-add
   - `sfu`        — scale_mul / softmax / gelu / layernorm / vadd
   - `matmul`     — Q@K^T, softmax·V, head concat
+  - `batch`      — row_copy / gather_rows (per-stream row extract for
+                   batched decode)
 """
 from .attn import attention_mask_mode_for_qkt, emit_config_attn_for_qkt
 from .dma import emit_dma_load, emit_dma_store

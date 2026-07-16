@@ -11,6 +11,8 @@ Sub-modules:
   - `matmul`     — matmul (simple + large-weight-tiled +
                    large-input-streaming)
   - `attention`  — matmul_qkt (Q @ K^T), matmul_attn_v (softmax · V)
+  - `packed_attn`— lever-B packed attention: block-diagonal
+                   Q_pack @ K_all^T + per-head score dequant
   - `_common`    — shared free functions (FP16 cast, padding-row
                    zero-fill, ABUF alloc) + the `UNIT = 16` constant
 

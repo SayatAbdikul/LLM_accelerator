@@ -1,8 +1,17 @@
 # Lever E — fmax cluster (break the 3-way SFU primitive floor)
 
-**Goal:** lower the post-PNR SFU critical path (the whole-chip fmax floor, 29.06 ns
-= 34.41 MHz) by recutting the two primitives that co-bind it. Multiplicative with
-every cycle lever. Byte-exact (timing-only change; golden model untouched).
+> **Status note (2026-07-16):** the floor drop (32.10 → 29.64 ns), bit-exactness,
+> and cycle-neutrality below are current. Two caveats discovered later:
+> (1) the tok/s peg (9.779 → ~10.59) is on the pre-Port-A-fix machine — honest
+> current b16 is 11.055 (`docs/perf_roadmap_2026-07-16.md`); (2) "the whole-chip
+> fmax floor" is the **div/sqrt-primitive** floor — the un-pipelined `fp32_exp`
+> clouds (~490 ns single-cycle) were never in a timing report and bind first
+> until T3 step 0 integrates `fp32_exp_p18` (`docs/t0_sfu_fmax_audit.md`).
+> This lever remains exactly right — it is the step *after* exp.
+
+**Goal:** lower the post-PNR SFU critical path (the div/sqrt-primitive fmax floor,
+29.06 ns = 34.41 MHz) by recutting the two primitives that co-bind it. Multiplicative
+with every cycle lever. Byte-exact (timing-only change; golden model untouched).
 
 ## The floor (from [[dma_floor]])
 

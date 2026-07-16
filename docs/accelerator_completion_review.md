@@ -1,5 +1,18 @@
 # TACCEL Accelerator — Comprehensive Review & FPGA-Demo Roadmap
 
+> **HISTORICAL (2026-05-19) — the gap analysis below has been closed and the
+> roadmap superseded.** Since this review: the SFU/helper datapaths were made
+> synthesizable (fp32 primitive library, DPI removed from the netlist path), a
+> full sky130 synth+STA flow and per-block OpenROAD PNR flow landed
+> (`rtl/asic/build/openroad`), post-PNR fmax is 34.41 MHz (contingent on the
+> exp-pipelining prerequisite — `docs/t0_sfu_fmax_audit.md`), and a measured
+> performance campaign took decode from ~1 tok/s to **b1 1.880 / b16 11.055
+> tok/s** (`docs/perf_roadmap_2026-07-16.md`, the current roadmap). The
+> "FPGA demo" end-state was overtaken by the ASIC (sky130) measurement track;
+> `rtl/fpga/` remains a smoke-tested wrapper. Statements below like "no
+> synthesis flow anywhere in the repo" were true on 2026-05-19 and are
+> preserved as record.
+
 **Date:** 2026-05-19
 **Target end-state (user-confirmed):** running on a real FPGA board — tokens/sec on silicon.
 **Exactness policy (user-confirmed):** synthesizable approx units are allowed; each

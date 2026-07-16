@@ -5,6 +5,13 @@
 does legitimately recover the 7.33% that the DMA‖Systolic overlap was "buying" by
 throwing away results.
 
+*(2026-07-16 note: the 10.145 tok/s below was the honest number **at this fix**;
+T1 items 1+2 have since taken b16 to **11.055** and b1 to **1.880** —
+`docs/t1_overlap_items.md`. Separately, the "29.64 ns SFU floor" used as the
+fmax yardstick here is contingent on exp pipelining — `docs/t0_sfu_fmax_audit.md`;
+this doc's own conclusion, that the Port-A path is ~10× under any plausible floor,
+is unaffected.)*
+
 ---
 
 ## What was broken

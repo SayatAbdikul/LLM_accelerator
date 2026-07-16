@@ -1,5 +1,12 @@
 # Phase 2 — SFU/helper integration status (rolling)
 
+> **SUPERSEDED by [`PHASE3_CLOSEOUT.md`](PHASE3_CLOSEOUT.md)** (which says so
+> explicitly). Statuses below are frozen mid-migration and several are stale:
+> GELU is no longer "BLOCKED" (landed via `fp32_gelu_new`, ≤3 ULP),
+> `fp32_exp` is no longer the "86-ULP scaffold" (tightened to ≤3 ULP), and
+> `make synth-check` is GREEN, not "RED at the first DPI import." Kept as
+> the migration-order record.
+
 The plan-mandated op-by-op migration of `sfu_engine.sv` (1725 lines) and
 `blocking_helper_engine.sv` (1511 lines) from `real`+DPI behavioral to
 synthesizable RTL.

@@ -1,5 +1,13 @@
 # TACCEL RTL Plan
 
+> **Status (2026-07-16): historical planning document (gen-1 / ViT-era).** The
+> feature matrix below ("BUF_COPY: No", "SOFTMAX: Not yet", DeiT-tiny as the
+> target workload, "20 ISA instructions") describes a bring-up skeleton that no
+> longer exists: every engine listed as missing has long been implemented,
+> synthesized (sky130), and measured running GPT-2 124M decode end-to-end.
+> Current state-of-truth: [top-level README](../README.md) and
+> [`perf_roadmap_2026-07-16.md`](perf_roadmap_2026-07-16.md).
+
 ## 1. Purpose
 
 This document replaces the original phase-only RTL plan with a software-aligned

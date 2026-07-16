@@ -1,5 +1,12 @@
 # W8A32 deployment scope
 
+> **Status (2026-07-16): historical decision-request — RESOLVED as option
+> (c.1), which shipped.** The premise below ("there is no FP32 ABUF / FP32
+> op in the current ISA"; "the machine is W8A8 by construction") has been
+> overtaken: the gen-2 FP32 sub-layer ops (`0x17–0x1F`) exist, are frozen
+> (`isa_generation_freeze.md`), and are the LIVE W8A16 production path.
+> Option (b)'s `weight_only_host_runner.py` also exists as a reference.
+
 Companion to `/Users/sayat/.claude/plans/w8a32-weights-only-plan.md` (Phase 2).
 Phase 1 (commit `cf59efb`) wired a first-class `weight_only_int8` preset
 through `evaluate_gpt2_perplexity` that reproduces the diagnostic's

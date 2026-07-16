@@ -6,6 +6,14 @@
 > freeze cosim gate (6+1 byte-identical). Current state-of-truth:
 > [top-level README](../README.md) and
 > [`software/docs/isa_generation_freeze.md`](../software/docs/isa_generation_freeze.md).
+>
+> *(2026-07-16: two hardware facts herein are additionally OBSOLETE — the
+> shared-Port-A fixed-priority mux ("Helper > SFU > DMA > Systolic") was
+> replaced by a per-buffer fan-out + dedicated systolic Port S
+> (`porta_bus_split.md`); and `obs_forbidden_overlap_violation_q == 0` does
+> NOT imply arbitration-clean: that checker's blind spot — no DMA∧systolic
+> term — is how a silent-corruption bug lived for months
+> (`phase0_measurement.md`).)*
 
 ## Context
 

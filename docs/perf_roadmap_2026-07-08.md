@@ -1,5 +1,12 @@
 # Performance roadmap — tokens/sec levers (2026-07-08)
 
+> **SUPERSEDED** — twice over: by [`perf_roadmap_2026-07-10.md`](perf_roadmap_2026-07-10.md)
+> (the Phase-2 batched-decode era: levers A/C/B/D/E) and then by
+> [`perf_roadmap_2026-07-16.md`](perf_roadmap_2026-07-16.md) (the honest
+> Port-A re-base + the T0–T4 campaign; **current**). This doc's numbers are
+> the pre-batched-decode single-stream era (prefill-shape ~1.48, decode
+> ~1.05 tok/s); current measured state is b1 1.880 / b16 11.055 tok/s.
+
 Ranked plan for the next tok/s improvements, grounded in a fresh full-chip
 profile at HEAD `0aeb597` ("sfu: software-pipeline the masked-softmax output
 divider-drain"). All numbers: GPT-2 124M, 1-token prefill bundle

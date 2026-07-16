@@ -23,8 +23,18 @@ This repo standardizes RTL verification around two complementary layers:
   - `rtl/verilator/test_systolic.cpp`
   - `rtl/verilator/test_systolic_array_chained.cpp`
   - `rtl/verilator/test_systolic_chained.cpp`
+  - `rtl/verilator/test_accum_snapshot_readback.cpp`
+  - `rtl/verilator/test_systolic_qkt*.cpp` (attention-shape replay/padded/history)
   - `rtl/cocotb/test_systolic.py`
   - `rtl/cocotb/test_systolic_chained.py`
+- Synthesizable-datapath (mode-1) gates — the chip's real datapath, vs the DPI reference:
+  - `make -C rtl/verilator test_sfu_synth` (SFU fp32 datapath, 11 cases)
+  - `make -C rtl/verilator test_helpers_synth`, `test_sfu_helper_synth`
+- FP32 primitive bit-exactness gates (each pipelined primitive vs its
+  combinational parent / DPI golden, millions of vectors, zero diffs):
+  - `test_fp32_add`, `test_fp32_div` (p2), `test_fp32_div_p3/p4/p5/p6`,
+    `test_fp32_sqrt` (p2 via `test_fp32_sqrt`), `test_fp32_sqrt_p3/p4/p6`,
+    `test_fp32_exp_p18`
 - Program-level sign-off:
   - `rtl/verilator/run_program.cpp`
   - `software/tools/compare_rtl_golden.py`
@@ -80,3 +90,19 @@ When a bug is fixed, prefer the smallest regression at the lowest useful layer f
   when needed, golden/RTL trace artifacts for mismatch triage.
 
 Verilator is the primary sign-off simulator. Icarus remains best-effort only.
+
+## Performance Measurement (mode-1)
+
+- `make -C rtl/verilator run_program_synth` builds the measurement runner:
+  `SFU_SYNTH_MODE=1` (the chip's datapath, not the DPI model) and a 1 GiB
+  DRAM (the 16 MB default faults GPT-2 124M). Always run with `--fast-beats`
+  (the pinned honest-bandwidth model); `--beat-interval N` simulates a
+  fixed-rate DRAM instead.
+- `run_program_noovl` (`SYS_DMA_OVERLAP=0`) is the serialization reference
+  for overlap-change A/B gates.
+- The RTL exposes audit counters in `taccel_top.sv` (`obs_*`): DMA‖systolic
+  co-busy, the Port-A lost-write audit (must read 0 post bus-split), and
+  fetch-stall. `software/tools/fast_gate_b16.py` and
+  `software/tools/profile_decode_step.py` sample them; any concurrency
+  change must quote them (see the doctrine in the top-level README —
+  byte-exact alone is a structurally blind gate for overlap changes).

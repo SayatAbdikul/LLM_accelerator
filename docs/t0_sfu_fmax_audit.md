@@ -104,3 +104,29 @@ pessimism factor → ~412 / ~490 ns estimates, not mapped delay-opt numbers** (t
 out at 400 s). The exact exp multiple wants the deferred ≥24 GB full-SFU PNR; but even at
 3× optimism the ~16-serial-op exp cloud is ≫29 ns single-cycle, so "pipeline exp first"
 is not in doubt. Flow + shells: `scratchpad/run_sfu_sta.sh`, `sta_shells.sv`.
+
+## 2026-07-16 addendum — T3 step 0 PRIMITIVE landed (`e6f7006`); integration PENDING
+
+**`rtl/common/src/fp32/fp32_exp_p18.sv` exists and is proven: an 18-stage,
+fully-pipelined (1 elem/cyc, fixed LATENCY=18) exp that is a PURE RETIMING of
+the combinational `fp32_exp`** — identical unpack, Cody-Waite reduction,
+degree-6 Horner, and 2^k scale, with pipeline registers between the same
+`fp32_add`/`fp32_mul` cores, so the output is bit-IDENTICAL (not merely
+within-band). Each stage carries at most ONE fp primitive (add 28.49 / mul
+27.34 ns — under the 29.06 ns budget). Zero-diff gate: `make -C rtl/verilator
+test_fp32_exp_p18` (directed specials + 4M range-uniform + 4M full-bit-pattern
++ 0.5M saturation-boundary vectors vs the combinational exp on the LATENCY-18
+deque).
+
+**What is NOT done: the SFU still elaborates the combinational `fp32_exp` at
+all three single-cycle sites** — the softmax EXPSUM accumulate
+(`sfu_synth_datapath.svh:400`, add→exp→add, the ~490 ns path measured above),
+the SOFTMAX_ATTNV weight (`:568`, add→exp→div), and GELU
+(`fp32_gelu_new.sv`). Step 0 completes only when those consumers are
+restructured to feed one element/cycle and collect LATENCY=18 later (the same
+software-pipeline the lever-E div_p6 softmax-OUT drain uses; accumulate order
+preserved ⇒ byte-exact). **Until then the 34.41 MHz peg stays CONTINGENT as
+described above.** Note also: because step 0 changes datapath *structure* (not
+primitive internals like lever E), the standalone per-stage STA is a weaker
+closure proxy than lever E's was — the final fmax stamp still wants the ≥24 GB
+full-SFU PNR.

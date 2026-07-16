@@ -1,5 +1,14 @@
 # Phase-3 synth-check baseline (2026-05-21, GREEN)
 
+> **Dated baseline (2026-05).** The gate definition and the RED→GREEN story
+> are current; the **pinned cell counts and module inventory are of that
+> date** — the design has since gained the Port-S bus split, the K-split
+> RMW drain, the lever-D transpose DMA path, `m_exact`, and the pipelined
+> fp32 div/sqrt now instantiated in the SFU, so re-run `make -C
+> rtl/verilator synth-check` for current numbers rather than quoting the
+> counts below. sky130 synthesis/STA/PNR (with real timing numbers) lives
+> separately in `rtl/asic/build/` — see `rtl/asic/README.md`.
+
 Empirical baseline from `make synth-check` (yosys generic synth, no FPGA
 part). The gate now **PASSES on the FULL design** (script:
 `rtl/synth/synth_check.ys`; Makefile target: `rtl/verilator/Makefile`
@@ -125,7 +134,7 @@ gaps from the original RED list:
 | `taccel_top.sv` | ✅ synth-clean | |
 | `sfu_engine.sv` | ✅ synth-clean | Phase-3.D + 3.E close-out (this session) |
 | `blocking_helper_engine.sv` | ✅ synth-clean | Phase-3.D + 3.E close-out (this session) |
-| `fp32_*.sv` (11 primitives) | ✅ synth-clean | Phase-1 library |
+| `fp32_*.sv` (11 primitives then; 20 today — pipelined div_p2..p6 / sqrt_p2..p6 / exp_p18 added since) | ✅ synth-clean | Phase-1 library |
 
 ## Gate exit definition (post-close-out)
 

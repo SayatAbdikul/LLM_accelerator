@@ -128,13 +128,21 @@ SREG usage by opcode:
 [40:25]  XFER_LEN    (16 bits, in 16-byte units)
 [24:23]  ADDR_REG    (2 bits, address register 0–3)
 [22:7]   DRAM_OFF    (16 bits, in 16-byte units)
-[6:3]    STRIDE_LOG2 (4 bits) — **RESERVED, must be 0**
-[2:0]    FLAGS       (3 bits) — **RESERVED, must be 0**
+[6:3]    COLS_LOG2   (4 bits) — transposed-LOAD geometry; 0 unless TRANSPOSE=1
+[2:0]    FLAGS       (3 bits) — bit0 = TRANSPOSE (LOAD only); bits [2:1] reserved, 0
 ```
 
 **Effective DRAM byte address** = `addr_regs[ADDR_REG] + DRAM_OFF × 16`
 
-Transfer is contiguous.  There is no strided or scatter/gather mode.
+A plain transfer is contiguous — there is no strided or scatter/gather mode.
+
+**Transposed LOAD (lever D, freeze-revision rider on formerly-reserved
+bits):** when `FLAGS[0]=1` on a LOAD, the DMA reads a contiguous `(R, C)`
+INT8 source with `C = 16 << COLS_LOG2` columns and writes its `(C, R)`
+transpose to SRAM (16-row-stripe byte transpose in the DMA datapath). Both
+fields were "reserved, must be 0" before the revision, so every pre-existing
+binary is byte-compatible. STORE ignores both fields (must be 0). See
+`docs/lever_d_dma_transpose.md`.
 
 ### 2.4 B-TYPE (Buffer Copy)
 
@@ -172,10 +180,19 @@ Full 56-bit address = `(HI_imm28 << 28) | LO_imm28`.
 [58:49]  M           (10 bits, 0-based: actual tiles = M+1)
 [48:39]  N           (10 bits)
 [38:29]  K           (10 bits)
-[28:0]   Unused
+[28:28]  WEIGHT_INT4 (1 bit — W4 weight-dtype dispatch; golden/ISA only, the
+                      RTL does not decode it yet)
+[27:16]  M_EXACT     (12 bits — exact SFU row count; 0 = legacy full tiles)
+[15:0]   Unused
 ```
 
 Tile dimensions in 16-element units.  Persists until next CONFIG_TILE.
+
+**M_EXACT (freeze §6 revision, 2026-07-10):** when non-zero, SFU row loops
+walk exactly `M_EXACT` rows instead of the tile-quantized `(M+1)×16` (rows
+`[M_EXACT, (M+1)×16)` are left untouched by partial-write ops). Consumed by
+the **SFU only** — the systolic MATMUL and the helper engine ignore the
+field. `M_EXACT=0` keeps every pre-revision bundle byte-identical.
 Must be set before any tiled compute instruction (`MATMUL`, `REQUANT`,
 `REQUANT_PC`, `SCALE_MUL`, `VADD`, `DEQUANT_ADD`, `SOFTMAX`,
 `MASKED_SOFTMAX`, `SOFTMAX_ATTNV`, `MASKED_SOFTMAX_ATTNV`, `LAYERNORM`,

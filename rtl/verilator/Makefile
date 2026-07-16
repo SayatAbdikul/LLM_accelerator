@@ -122,14 +122,16 @@ run_program_synth: $(BUILD_DIR)/run_program_synth/Vtaccel_top
 # -----------------------------------------------------------------------
 # run_program_noovl: run_program_synth with SYS_DMA_OVERLAP=0.
 #
-# This is the DROP-FREE reference machine, and until the Port-A bus is split
-# it is the ONLY 124M build a byte-exact gate may be run against. The shipped
-# build (SYS_DMA_OVERLAP=1) lets the DMA silently steal the systolic's ACCUM
-# drain writes -- 255,818 of them per b16 decode step -- so a before/after
-# byte comparison on it is measuring the collision pattern, not the change.
-# See docs/phase0_measurement.md.
+# Historically this was the only correct 124M machine: before the Port-A
+# bus split (daef072, docs/porta_bus_split.md) the overlapped build let the
+# DMA silently steal the systolic's ACCUM drain writes -- 255,818 per b16
+# decode step (docs/phase0_measurement.md). The split fixed that (Port-A
+# audit lost=0, same-buffer collision now FAULTs), so the shipped
+# SYS_DMA_OVERLAP=1 build is byte-correct AND faster.
 #
-# It is also the safe-mode fallback: correct, and +7.33% slower.
+# Keep this target: it is the serialization reference for overlap-change
+# A/B gates (identical bytes at lower concurrency), and the safe-mode
+# fallback if a future overlap bug needs bisecting.
 # -----------------------------------------------------------------------
 $(BUILD_DIR)/run_program_noovl/Vtaccel_top: $(CONTROL_SV) run_program.cpp
 	mkdir -p $(BUILD_DIR)/run_program_noovl

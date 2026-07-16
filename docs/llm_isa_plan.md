@@ -5,6 +5,12 @@
 > [`software/docs/isa_generation_freeze.md`](../software/docs/isa_generation_freeze.md)
 > for the current normative contract. Kept for context on how the decoder
 > ops grew on top of the ViT base.
+>
+> *(2026-07-16 additions: two of its calls were later overtaken — speculative
+> decoding, a stated non-goal, landed as an opt-in host track
+> (`lever_b3_specdec.md`); and chunked prefill shipped WITHOUT the
+> `key_col_base` field this plan deemed necessary — per-row global-position
+> masking sufficed (`lever_i_serving.md`).)*
 
 Status: refined implementation plan, incorporating Rev 0-2 critiques plus the
 Rev 3-6 correctness, runtime-contract, striping, and verification-gate reviews.

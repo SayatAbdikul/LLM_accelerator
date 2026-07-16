@@ -1,5 +1,18 @@
 # Performance roadmap — tokens/sec levers, post-Phase-2 (2026-07-10)
 
+> **SUPERSEDED (2026-07-16) by [`perf_roadmap_2026-07-16.md`](perf_roadmap_2026-07-16.md).**
+> This doc remains the accurate record of levers A/C/B/D/E (§0–0.6), but read
+> it with two corrections: **(1) every tok/s below was measured BEFORE the
+> Port-A correctness fix** — the machine silently dropped systolic drain
+> writes during DMA‖systolic overlap for months (`docs/phase0_measurement.md`),
+> so these numbers carry a hidden ~7.3% subsidy; the fix (`daef072`,
+> `docs/porta_bus_split.md`) re-based b16 to an honest **10.145 tok/s**, and
+> subsequent levers (T1 items 1+2) brought it to **11.055** (b1 **1.880**).
+> **(2) Lever F (multi-clock SFU island) was REJECTED** in favor of
+> single-domain fmax deepening (T3), whose real first blocker is the
+> un-pipelined `fp32_exp`, not div/sqrt (`docs/t0_sfu_fmax_audit.md`).
+> §1's cycle breakdowns predate levers B/D and the m_exact-era schedule.
+
 Successor to `perf_roadmap_2026-07-08.md`, grounded in the Phase-2 batched-decode
 measurement (commit `2d877be`) plus a fresh per-opcode retire-gap profile of the
 batch-1 decode step at HEAD `7291fd5` (mode-1 synth RTL, honest-BW `--fast-beats`,

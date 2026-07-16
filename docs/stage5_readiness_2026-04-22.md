@@ -1,5 +1,8 @@
 # Stage 5 Readiness Baseline - 2026-04-22
 
+> **Status: historical.** Stage 5 (GPT-2 124M) has long since shipped and is
+> the measured production workload; this note is the pre-start baseline record.
+
 This note records the stabilization pass completed before starting Stage 5
 large-vocab/GPT-2 work.
 

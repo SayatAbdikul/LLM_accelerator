@@ -4,6 +4,13 @@
 **Measured on the CHIP's numerics (W8A16): b1 1.746 → 2.906 tok/s (1.67×) at P=4,
 exact-greedy, wikitext-2.**
 
+> **Status note (2026-07-16):** the 2.906 spec-dec number is current; the plain-
+> decode baseline has since moved 1.746 → **1.880** (T1 item 2,
+> `docs/t1_overlap_items.md`), so the ratio vs today's base is ~1.55×. The DMA
+> wall (~3.27 tok/s for non-speculative b1) stands as a floor — but read its
+> "b1 has no hideable DMA" framing alongside item 2, which found and hid 1.49M
+> cycles of it (the wall bounds TOTAL beats, not schedulability).
+
 This is the batch-1 lever. Every other b1 lever shaves cycles off a step; this one
 changes how many tokens a step is worth.
 

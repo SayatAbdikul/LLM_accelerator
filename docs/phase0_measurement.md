@@ -1,5 +1,16 @@
 # Phase 0 — measure + audit
 
+> **OUTCOME (2026-07-16): the fix this doc demanded has LANDED** (`daef072`,
+> `docs/porta_bus_split.md`) — Port A fanned out per buffer + a dedicated
+> systolic Port S; logits byte-identical, lost writes → 0, concurrency kept.
+> Two reading corrections: (1) "honest = 9.06 tok/s" was honest only for the
+> pre-fix serialized fallback; the post-fix honest chain is **10.145 →
+> (T1 items) → 11.055 b16 / 1.880 b1**. (2) The cycle counts labeled
+> *"shipped (corrupt — do not quote)"* below (54,269,714 / 19,794,743) are
+> now the HONEST post-fix step counts — the fix kept the schedule and made
+> the results correct, so quote them freely *post-daef072*. The diagnosis,
+> method, and the blind-gate lesson below are permanent.
+
 Cheap, zero-risk, and it **re-ranks the whole plan**. Two results:
 
 1. **The 38.7% "other" is 91% exposed DMA.** Not the helper engine — the helper is
@@ -261,7 +272,8 @@ the logits diff.**
 ## 3. What this does to the plan
 
 **Phase 2 (split the Port-A bus per buffer) is no longer an optimization. It is the
-fix for a live correctness bug, and it must come first.**
+fix for a live correctness bug, and it must come first.** *(2026-07-16: it did —
+landed as `daef072`; see `docs/porta_bus_split.md`.)*
 
 The good news is that the fix is exactly the one already scoped: ABUF / WBUF / ACCUM
 are **already three separate dual-port SRAMs** (`sram_subsystem.sv:88-153`) behind

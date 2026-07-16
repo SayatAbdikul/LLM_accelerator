@@ -5,6 +5,11 @@
 pre-existing, silent weight-corruption bug and proved the RTL correct at
 `M_pad > SYSTOLIC_DIM`.
 
+> **Status note (2026-07-16):** the conclusion (mined out; do not pursue B=64;
+> sys scales exactly 2×) is current and structural. The absolute tok/s are on
+> the pre-Port-A-fix machine (`daef072`); honest current b16 is 11.055
+> (`docs/perf_roadmap_2026-07-16.md`). B=32 has not been re-measured post-fix.
+
 ## Measured — 124M, pos-510 (ctx-511), mode-1 honest-BW, 34.41 MHz
 
 | | b16 | b32 | ratio | **per-token Δ** |

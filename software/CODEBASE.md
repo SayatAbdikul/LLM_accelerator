@@ -1,11 +1,20 @@
 # TACCEL — Transformer Accelerator Toolchain
 
-> **Status note (2026-05-26):** this document captures the ViT-era architecture
-> (DeiT-tiny INT8 target) the project started from. ISA mechanics, hardware
-> model, assembler/compiler/quantizer/golden-model internals are still
-> accurate; the GPT-2-era decoder ISA, W4 / QuaRot / AWQ + GPTQ runtime,
-> gen-2 freeze, and RTL state are covered in the top-level [`README.md`](../README.md)
-> and [`software/docs/isa_generation_freeze.md`](docs/isa_generation_freeze.md).
+> **Status note (2026-05-26, sharpened 2026-07-16):** this document captures
+> the ViT-era architecture (DeiT-tiny INT8 target) the project started from.
+> **Still accurate:** encoding/assembler mechanics, the golden-model
+> primitives, `utils/`. **Stale — do not navigate by it:** the Project
+> Layout / Compiler / Tests / Accuracy sections cite files that no longer
+> exist (`compiler/compiler.py`, `tools/compile_model.py`, `run_deit.py`,
+> `compare_accuracy.py`, `tests/test_compiler.py`), the opcode table stops
+> at `0x10` (the space is now fully populated through `0x1F`, plus
+> CONFIG_TILE's `m_exact`/`weight_int4` bits and the transposed LOAD — see
+> [`docs/isa_spec.md`](docs/isa_spec.md)), and the entire live decoder
+> toolchain (`compiler/frontend/`, `compiler/emit/`, `compiler/w8a16_emit/`,
+> `compiler/kv_cache.py`, `compiler/decoder_bundle.py`, `runtime/` with
+> `HostRunner`, batched decode, chunked prefill, spec-dec) postdates this
+> doc. Current overview: the top-level [`README.md`](../README.md); ISA
+> contract: [`software/docs/isa_generation_freeze.md`](docs/isa_generation_freeze.md).
 >
 > **RTL layout note (2026-05-26):** the SystemVerilog tree was restructured into
 > `rtl/common/` (verified core + shared filelist), `rtl/fpga/` (FPGA wrappers
@@ -151,7 +160,7 @@ Defines the instruction set constants in three groups:
 | `0x0E` | SOFTMAX | SFU softmax |
 | `0x0F` | LAYERNORM | SFU layer normalization |
 | `0x10` | GELU | SFU GELU activation |
-| `0x11–0x1F` | — | **15 reserved** for future opcodes |
+| `0x11–0x1F` | — | ~~15 reserved~~ **since populated**: `0x11` REQUANT_PC, `0x12` SOFTMAX_ATTNV, `0x13` DEQUANT_ADD, `0x14` CONFIG_ATTN, `0x15/0x16` MASKED_SOFTMAX[_ATTNV], `0x17–0x1F` gen-2 FP32 sub-layer ops (see `docs/isa_spec.md`) |
 
 **`InsnFormat` (IntEnum)** — R_TYPE, M_TYPE, B_TYPE, A_TYPE, C_TYPE, S_TYPE.
 
