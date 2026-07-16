@@ -878,6 +878,30 @@ def _emit_matmul_w8a16_large_input_streaming(
         # this index need zero-fill before per-K-tile MAX_ABS.
         M_logical = int(node.output_shape[0])
 
+        # Item-2 (b1 lever): software-pipeline this n-group's INT8 weight loads.
+        # The tile plan already sizes weight tiles to <= WBUF/2 so TWO fit at
+        # once (codegen._large_weight_tile_plan), but this streaming emitter
+        # historically loaded each weight serially (SYNC 0b001 before its
+        # MATMUL), leaving the FC2 weight DMA fully exposed. Mirror
+        # pipeline_full_k: prefetch k-tile g+1's weight into the alternate WBUF
+        # half during k-tile g's MATMUL (which syncs 0b010, systolic-only, so
+        # the DMA streams under it); the current tile's pc-scale SYNC 0b001
+        # drains the prefetch before the next MATMUL reads it. Byte-exact
+        # (weights are load-order-independent) and Port-safe (same DMA->WBUF
+        # Port-A ‖ systolic Port-W discipline as pipeline_full_k). See
+        # [[dma_compute_overlap]].
+        def _load_w_tile(_ks, _kl):
+            wt_name = cg._large_weight_tile_symbol(weight_name, _ks, _kl, n_start, n_len)
+            wt_dram = cg._dram_offset_required(
+                wt_name, f"loading W8A32 weight tile for '{weight_name}'")
+            wa = cg.mem.wbuf.alloc(f"_w_{node.name}_k{_ks}_n{n_start}", _kl * n_len)
+            cg._emit_dma_load(BUF_WBUF, wa.offset_units, _kl * n_len, 0, wt_dram)
+            return wa
+
+        _pf0_ks, _pf0_kl = k_tile_list[0]
+        cur_w = _load_w_tile(_pf0_ks, _pf0_kl)          # prologue: first weight
+        cg._emit(SyncInsn(resource_mask=0b001))          # ensure it landed
+
         for k_idx, (k_start, k_len) in enumerate(k_tile_list):
             # Stage 1: load FP-precision input K-tile from DRAM into ABUF.
             input_tile_bytes = M_pad * k_len * cg.elem_bytes
@@ -936,19 +960,16 @@ def _emit_matmul_w8a16_large_input_streaming(
             cg._emit(SyncInsn(resource_mask=0b100))
             cg.mem.abuf.free(in_tile_alloc.name)
 
-            # Stage 4: load INT8 weight K-tile to WBUF.
-            weight_tile_name = cg._large_weight_tile_symbol(
-                weight_name, k_start, k_len, n_start, n_len
-            )
-            weight_dram = cg._dram_offset_required(
-                weight_tile_name,
-                f"loading W8A32 weight tile for '{weight_name}'",
-            )
-            w_alloc = cg.mem.wbuf.alloc(
-                f"_w_{node.name}_k{k_start}_n{n_start}", k_len * n_len
-            )
-            cg._emit_dma_load(BUF_WBUF, w_alloc.offset_units, k_len * n_len, 0, weight_dram)
-            cg._emit(SyncInsn(resource_mask=0b001))
+            # Stage 4: PREFETCH the next k-tile's weight (deferred, no sync) so
+            # its DMA overlaps this tile's MATMUL below. `cur_w` (this tile's
+            # weight) is already resident — loaded by the prologue or the prior
+            # iteration's prefetch. The prefetch is drained by this tile's
+            # pc-scale SYNC 0b001 (below) before the next MATMUL reads it.
+            if k_idx + 1 < len(k_tile_list):
+                _nks, _nkl = k_tile_list[k_idx + 1]
+                nxt_w = _load_w_tile(_nks, _nkl)
+            else:
+                nxt_w = None
 
             # Stage 5: INT8 × INT8 MATMUL (flags=0 — each K-tile resets
             # ACCUM because we dequant per-K-tile and FP32 accumulate).
@@ -959,13 +980,14 @@ def _emit_matmul_w8a16_large_input_streaming(
             ))
             cg._emit(MatmulInsn(
                 src1_buf=BUF_ABUF, src1_off=int8_tile_alloc.offset_units,
-                src2_buf=BUF_WBUF, src2_off=w_alloc.offset_units,
+                src2_buf=BUF_WBUF, src2_off=cur_w.offset_units,
                 dst_buf=BUF_ACCUM, dst_off=0,
                 flags=0,
             ))
             cg._emit(SyncInsn(resource_mask=0b010))
             cg.mem.abuf.free(int8_tile_alloc.name)
-            cg.mem.wbuf.free(w_alloc.name)
+            cg.mem.wbuf.free(cur_w.name)
+            cur_w = nxt_w
 
             # Per-K-tile PC scale (+ bias under fp16) load. Kept inside
             # the K loop so weight tile + PC scale never co-exist in WBUF.
