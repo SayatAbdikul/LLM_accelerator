@@ -122,7 +122,10 @@ contract — it must be sequenced with A, not after it.** Treat "synthesizable
 transcendental + its characterized band" as one atomic deliverable per op.
 
 ### C. FPGA platform integration
-- **Memory:** `axi4_slave_model.sv` is a testbench ideal slave. Real board needs a
+- **Memory:** `axi4_slave_model.sv` was a testbench ideal slave. (Deleted
+  2026-07-17: it was in no filelist and no Makefile target — the live behavioural
+  DRAM is the C++ `AXI4SlaveModel` class in `rtl/verilator/include/testbench.h`,
+  a different thing that happens to share the name.) Real board still needs a
   DDR4/HBM controller (Xilinx MIG / Altera EMIF). The compiler assumes ≥1 GiB DRAM
   for 124M (`run_program` faults at the 16 MB Makefile default).
 - **On-chip SRAM:** 128 KB ABUF + 256 KB WBUF + 64 KB ACCUM = **448 KB** behavioral
