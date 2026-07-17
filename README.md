@@ -106,13 +106,18 @@ pytest software/tests/test_compare_rtl_golden.py software/tests/test_batched_dec
 ```
 
 `test_compare_rtl_golden.py` pins the golden simulator's content SHA (freeze
-§6) and asserts the frozen `weight_only_int8_quarot` bundle builds
-deterministically with gen-2 opcodes (its single-stream RTL leg is bridged
-out — task #105; the opt-in 124M logits-metric leg is gated by
-`PYTEST_124M=1`). `test_batched_decode.py` is the live RTL==golden
+§6), asserts the frozen `weight_only_int8_quarot` bundle builds
+deterministically with gen-2 opcodes, and runs the RTL-vs-golden prefill
+byte-match via `tools/rtl_cosim.py` (this leg skips only when `run_program`
+or the tiny fixture is missing; the opt-in 124M logits-metric leg is gated by
+`PYTEST_124M=1`). `test_batched_decode.py` is the other live RTL==golden
 byte-match: tiny decode bundles — including the packed batch-16 attention
 path — run on the Verilator RTL and must produce logits byte-identical to
 the golden simulator.
+
+Byte-exactness is a **tiny-model** gate. On 124M it is ill-posed: past the
+first FP16 overflow both sides go to `inf` together, so use argmax/perplexity
+conformance there instead.
 
 ### Measure decode performance (the numbers in this README)
 

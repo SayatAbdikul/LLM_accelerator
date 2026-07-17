@@ -18,19 +18,22 @@ It has three legs, in increasing strength:
      not exercise gen-2, an RTL byte-match is meaningless.
 
   3. ``test_rtl_cosim_gen2_byte_match`` — the full freeze §4.5 RTL-vs-golden
-     end-to-end byte-match (FP16-ULP per §7 per-op bands). **SKIPPED**, not
-     faked: the only RTL runner (``rtl/verilator/run_program.cpp``) consumes
-     a single-stream DeiT ``ProgramBinary`` (``MAGIC``/``HEADER_FMT`` in
-     ``taccel/assembler/assembler.py``), while the frozen bundle is a
-     two-stream ``ProgramBundle`` driven by ``HostRunner`` (prefill + decode,
-     runtime patch sites, kv-cache). Feasibility for the missing bridge has
-     been *measured* (the ProgramBinary writer and the simulator's 15-field
-     ``trace_manifest`` schema at ``simulator.py:~328`` both already exist);
-     the residual is a bounded bundle-DRAM→ProgramBinary serializer plus a
-     ``trace_manifest``→snapshot-CSV emitter plus a first-divergence drive.
-     That focused block is tracked as task #105 and is intentionally not
-     attempted here as a half-finished artifact. This leg ``skip``s with
-     that pointer — it is never ``xpass``/faked green.
+     end-to-end byte-match (FP16-ULP per §7 per-op bands). **LIVE and passing.**
+     The task-#105 bridge it once waited on was BUILT: ``tools/rtl_cosim.py``
+     serializes the frozen bundle's prefill stream into a single-shot
+     ``ProgramBinary`` that ``rtl/verilator/run_program.cpp`` executes, and
+     ``run_cosim`` drives the comparison. This leg now skips ONLY when its
+     inputs are absent (``run_program`` not built, or the tiny fixture not
+     generated) — never for a missing bridge.
+
+     Corrected 2026-07-17. This docstring previously declared the leg
+     "**SKIPPED**, not faked … tracked as task #105 and is intentionally not
+     attempted here", long after the bridge landed. That stale text was taken
+     at face value and propagated into README.md as "its single-stream RTL leg
+     is bridged out — task #105", which was false: the leg runs and passes.
+     Scope caveats that ARE still real live on the test itself (tiny d128/l2
+     fixture, single-token prefill — freeze §5 stays formally open on GPT-2
+     124M / 257-tok, task #106).
 """
 import hashlib
 import importlib.util

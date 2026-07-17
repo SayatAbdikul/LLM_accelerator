@@ -2,11 +2,31 @@
 run_program.cpp ProgramBinary, for RTL-vs-golden e2e byte-match.
 
 Why this is valid (measured, not assumed — see task #105):
-  * The prefill stream's only runtime patch sites are `token_embed` /
-    `pos_embed` (kv_base / config_attn are decode-only). After patching
+  * For the batch=1 bundle this module builds, the prefill stream's only
+    runtime patch sites are `token_embed` / `pos_embed`. After patching
     embeddings for a single fixed token at position 0, the prefill DRAM
     image is fully static -> a single-shot ProgramBinary faithfully
     reproduces it.
+
+    !! DO NOT GENERALISE THIS (corrected 2026-07-17). This bullet used to
+    claim "kv_base / config_attn are decode-only". That is FALSE in general —
+    it is exactly the assumption commit 2554d63 disproved. `emit_kv_store`
+    selects runtime-patching from `node.attrs["decode"]`, NOT from
+    `cg.stream_name`, so ANY graph carrying decode=True nodes that is
+    installed as a PREFILL stream emits kv_base sites on prefill. That is
+    what a batched (b16/b32) bundle does, and it silently OVERWROTE MODEL
+    WEIGHTS (127 stores at b16; 275 at b32, one hitting a live lm_head
+    weight) because an unpatched kv_base site keeps its compile-time base of
+    0 and stores to `0 + dram_off*16`.
+
+    The claim holds here ONLY because `serialize_prefill_bundle` builds
+    `build_stage3_tiny_decoder_bundle(...)` with no `batch` kwarg (batch=1,
+    whose single-token prefill graph has no kv_base sites). If you ever point
+    this module at a batched bundle, or at a `prefill_tokens=P` chunked-prefill
+    bundle, you MUST also call `runner._patch_kv_bases(0, stream="prefill")`
+    (as `HostRunner.run_prefill` does) before `materialize()` — otherwise the
+    image handed to the RTL has corrupted weights and the resulting
+    RTL-vs-golden mismatch is a bug in THIS HARNESS, not in the chip.
   * `bundle.prefill_pc == prefill_instrs_offset // 8 == 0`, so the codegen
     stream-local trace-manifest PCs equal the executed PCs (no rebasing).
   * `bundle.materialize(reset_runtime=False)` is the runtime-patched flat
