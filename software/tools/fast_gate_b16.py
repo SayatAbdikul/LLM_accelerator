@@ -12,8 +12,29 @@ it finishes in a few minutes and reports exactly the porta-scar gate quantities:
   forbidden_overlap_violation     (must stay false)
   logits sha1                     (byte-exact discriminator vs a known-good machine)
 
+THIS IS A GATE, NOT A REPORT (2026-07-17). It previously `return 0`-ed
+unconditionally after printing: it exited SUCCESS with sys_lost > 0, with
+co-busy NOT risen, and with forbidden_overlap_violation true, and its sha1
+baselines lived only in docs/t1_overlap_items.md. The roadmap (§5.2) names this
+as THE gate for overlap changes, so "prints the numbers and always passes" meant
+the porta-scar doctrine was enforced by nothing that could fail. It now exits
+nonzero on:
+  * sys_lost > 0                     (always — a dropped systolic write is a bug)
+  * forbidden_overlap_violation      (always)
+  * --expect-sha1 mismatch           (opt-in: byte-exactness vs a known machine)
+  * --expect-cobusy-above N not met  (opt-in: proves overlap is REAL, not absent)
+
+CAVEAT on sys_lost — it is necessary, NOT sufficient. Post-daef072 it is close to
+a tautology on a halted run: obs_sys_porta_lost_w = sys_sram_a_en & sram_s_collision,
+and a collision FAULTS the machine, so anything that reaches "halted" tends to have
+lost==0 by construction. It counts DENIED REQUESTS, not LANDED WRITES: an S write
+that fails to land without an address collision is invisible to it. Byte-exactness
+(--expect-sha1) is the discriminator that actually sees that class.
+
 USAGE (from repo root):
   .venv/bin/python software/tools/fast_gate_b16.py --batch 16 --position 510
+  .venv/bin/python software/tools/fast_gate_b16.py --expect-sha1 205682b6515f7e85
+  .venv/bin/python software/tools/fast_gate_b16.py --batch 1 --expect-sha1 eeab004014642d14
 """
 
 from __future__ import annotations
@@ -40,6 +61,16 @@ DEFAULT_RTL = (
 )
 BASELINE_COBUSY = 4_148_317  # HEAD (e6f7006) baseline; item-1 must push this UP
 
+# Known-good logits sha1[:16], measured at 9a82e34 (item-2). These lived only in
+# docs/t1_overlap_items.md:49,96 — a baseline a tool cannot read is not a gate.
+# Keyed by (batch, position). Used as the default for --expect-sha1 when the run
+# matches a known configuration; pass --expect-sha1 explicitly to override, or
+# --no-sha1-check to skip (e.g. after an intentional, re-pinned numerics change).
+KNOWN_LOGITS_SHA1 = {
+    (16, 510): "205682b6515f7e85",
+    (1, 510): "eeab004014642d14",
+}
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -49,6 +80,15 @@ def main() -> int:
     ap.add_argument("--position", type=int, default=510)
     ap.add_argument("--max-cycles", type=int, default=250_000_000)
     ap.add_argument("--label", type=str, default="")
+    ap.add_argument("--expect-sha1", type=str, default=None,
+                    help="fail if the logits sha1[:16] differs. Defaults to the "
+                         "KNOWN_LOGITS_SHA1 entry for (batch, position) if one exists.")
+    ap.add_argument("--no-sha1-check", action="store_true",
+                    help="skip the logits sha1 gate (use only for an intentional, "
+                         "signed-off numerics change).")
+    ap.add_argument("--expect-cobusy-above", type=int, default=None,
+                    help="fail unless Port-A dma_sys_cobusy exceeds this. Use the "
+                         "pre-change value to prove an overlap change is REAL.")
     args = ap.parse_args()
 
     if not args.rtl.exists():
@@ -112,6 +152,54 @@ def main() -> int:
           f"drain={pa.get('sys_lost_drain',0)})")
     print(f"  overlap_violation  {str(s.get('forbidden_overlap_violation')):>15}")
     print(f"  logits sha1        {lh:>15}   (n={len(logits)})")
+
+    # ---- the actual gate ---------------------------------------------------
+    failures: list[str] = []
+
+    if lost:
+        failures.append(
+            f"Port-A sys_lost = {lost:,} (must be 0) — the systolic had writes "
+            f"denied. This is the porta scar: writes dropped with no backpressure "
+            f"while the pointer advances."
+        )
+
+    if s.get("forbidden_overlap_violation"):
+        failures.append(
+            "forbidden_overlap_violation is true — an engine pair that must be "
+            "serialized ran concurrently."
+        )
+
+    expect_sha1 = args.expect_sha1
+    if expect_sha1 is None and not args.no_sha1_check:
+        expect_sha1 = KNOWN_LOGITS_SHA1.get((args.batch, args.position))
+    if expect_sha1 and not args.no_sha1_check:
+        if lh != expect_sha1:
+            failures.append(
+                f"logits sha1 {lh} != expected {expect_sha1} — this machine is NOT "
+                f"byte-identical to the known-good reference. If the change is an "
+                f"intentional numerics change, re-pin KNOWN_LOGITS_SHA1 deliberately."
+            )
+        else:
+            print(f"  sha1 gate          {'MATCH':>15}   (vs {expect_sha1})")
+    elif not args.no_sha1_check:
+        print(f"  sha1 gate          {'no baseline':>15}   "
+              f"(no KNOWN_LOGITS_SHA1 entry for batch={args.batch} pos={args.position})")
+
+    if args.expect_cobusy_above is not None and cobusy <= args.expect_cobusy_above:
+        failures.append(
+            f"Port-A co-busy {cobusy:,} did not rise above "
+            f"{args.expect_cobusy_above:,} — the overlap this change claims is not "
+            f"happening (a byte-exact result with zero added co-busy is a "
+            f"structurally blind pass)."
+        )
+
+    if failures:
+        print("\nGATE FAILED:", file=sys.stderr)
+        for f in failures:
+            print(f"  * {f}", file=sys.stderr)
+        return 1
+
+    print("\nGATE PASSED")
     return 0
 
 
