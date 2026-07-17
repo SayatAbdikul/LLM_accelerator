@@ -284,7 +284,7 @@ module sfu_engine
   logic [31:0]  ln_var_eps_q;
   // Phase-5: latches (row - mean) in F_G2_LN_OUT_DIFF so the divider sees a
   // registered operand. (The Phase-4 ln_norm_q intermediate latch was removed
-  // 2026-05-29: u_ln_norm is now fp32_div_p2, whose output register replaces it
+  // 2026-05-29: u_ln_norm is now fp32_div_p6 (lever E, 2026-07-12), whose output register replaces it
   // — F_G2_LN_OUT reads ln_norm_w directly.)
   logic [31:0]  ln_diff_q;
   // 2026-05-31: LN_OUT divider-drain software-pipelining. The fp32_div_p4
@@ -292,8 +292,8 @@ module sfu_engine
   // DIFF/NORM/W/W2/W3/OUT loop fed one element then idled 4 cycles draining it
   // (6 cyc/elem). The pipelined F_G2_LN_OUT_DIFF runs one state: iter_idx_q is
   // the master/feed counter (presents row[iter]-mean to ln_diff_q each cycle);
-  // ln_coll_q is the lagging collect pointer (= iter_idx_q - 5: one ln_diff_q
-  // reg + 4 divider stages), indexing gamma/beta as the matching divider output
+  // ln_coll_q is the lagging collect pointer (= iter_idx_q - 7: one ln_diff_q
+  // reg + 6 divider stages), indexing gamma/beta as the matching divider output
   // (ln_norm_w) emerges. ~6x on the OUT pass; bit-exact (same ops/operands/order,
   // same divider instance) and fmax-neutral (the feed and collect combinational
   // paths already existed as the DIFF and OUT critical paths; they now just run
@@ -311,7 +311,7 @@ module sfu_engine
   // (same sub/mul/add, same operands, same accumulation order).
   logic [31:0]  ln_dsq_q;
   // 2026-05-29: registers exp(row-max) in F_G2_SM_OUT_NORM so the pipelined
-  // fp32_div_p2 sees a registered dividend (isolates fp32_exp from the
+  // fp32_div_p6 sees a registered dividend (isolates fp32_exp from the
   // divider's stage-1; otherwise exp+div_stage1 would chain ~138 ns).
   logic [31:0]  sm_exp_q;
   // Phase-2 synth-mode SOFTMAX (0x1D) reduction state.

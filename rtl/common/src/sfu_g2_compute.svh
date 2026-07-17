@@ -357,10 +357,10 @@
         F_G2_LN_MEAN_W: begin
           state <= F_G2_LN_MEAN_W2;
         end
-        F_G2_LN_MEAN_W2: begin    // div_p5 3rd stage
+        F_G2_LN_MEAN_W2: begin    // div_p6 3rd stage
           state <= F_G2_LN_MEAN_W3;
         end
-        F_G2_LN_MEAN_W3: begin    // div_p5 4th stage
+        F_G2_LN_MEAN_W3: begin    // div_p6 4th stage
           state <= F_G2_LN_MEAN_W4;
         end
         F_G2_LN_MEAN_W4: begin    // div_p6 5th stage
@@ -402,7 +402,8 @@
         // ~250 ns combinationally on sky130. Now split: PRE latches the
         // (var_acc/n + eps) sum into ln_var_eps_q; the next cycle takes
         // sqrt of that registered value. Same bit-exact output, +1 cycle.
-        // var_norm = var_acc / n via pipelined u_ln_var_norm (LATENCY=2), then
+        // var_norm = var_acc / n via pipelined u_ln_var_norm (fp32_div_p6,
+        // LATENCY=6 — the FSM walks _PRE -> _W .. _W5 -> _S), then
         // +eps. ln_var_acc_q is registered & stable on entry; the +eps add sits
         // after the divider output register. Once-per-row.
         F_G2_LN_DENOM_PRE: begin

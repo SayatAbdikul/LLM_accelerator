@@ -176,7 +176,9 @@ def execute_layernorm(state, insn):
     # Dequantize: INT8 × FP32(in_scale) → FP32
     x = inp.astype(np.float32) * in_scale
 
-    # Normalize in FP32 (epsilon = 1e-6 matches PyTorch LayerNorm default)
+    # Normalize in FP32. epsilon = 1e-6 is the gen-1 ISA contract (it is NOT
+    # PyTorch's LayerNorm default, which is 1e-5); the deployed gen-2 FP32
+    # sub-layer uses 1e-5 (LN_FP32_EPS in sfu_engine.sv).
     eps = np.float32(1e-6)
     mean = x.mean(axis=-1, keepdims=True)
     var  = x.var(axis=-1,  keepdims=True)

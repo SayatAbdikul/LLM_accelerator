@@ -319,7 +319,7 @@
   // reaches here. Drop the mux and pin to C_LN_FP32_EPS (1e-5).
   assign ln_eps_sel_w = C_LN_FP32_EPS;
 
-  // valid_out of the pipelined dividers is unused (fixed-LATENCY=2 use; the
+  // valid_out of the pipelined dividers is unused (fixed-LATENCY=6 use; the
   // FSM samples y a fixed number of cycles after presenting operands). Named
   // dummy sinks keep PINCONNECTEMPTY / sv2v / yosys quiet.
   logic ln_mean_vo, ln_var_norm_vo, ln_norm_vo, sm_div_vo, ln_sqrt_vo;

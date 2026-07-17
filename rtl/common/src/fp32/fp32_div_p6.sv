@@ -27,7 +27,9 @@
 //   round/pack. Divider iterations are ~uniform cost (compare is always 25-bit),
 //   so the split is near-even; stage 1 gets fewer iters (carries unpack), stage 6
 //   fewer (carries round/pack).
-//   SPLIT1=24,SPLIT2=19,SPLIT3=14,SPLIT4=9,SPLIT5=4 -> 5/5/5/5/5/4 iters.
+//   SPLIT1=25,SPLIT2=20,SPLIT3=15,SPLIT4=10,SPLIT5=5 -> 4/5/5/5/5/5 iters
+//   (see the localparams below; the alternative 5/5/5/5/5/4 split STA'd worse:
+//    30.45 ns vs 28.85 ns).
 //
 // INTERFACE: fixed LATENCY=6. Present (a,b,valid_in) on cycle N; (y,valid_out)
 //   are valid on cycle N+6. Fully pipelined: accepts a new pair every cycle.

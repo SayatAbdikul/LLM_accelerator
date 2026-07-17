@@ -150,7 +150,23 @@ class CodeGenerator:
         """
         self.weight_data = weight_data
         self.weight_dtypes = dict(weight_dtypes or {})
-        self.config = model_config or deit_tiny_config()
+        # `model_config` is REQUIRED. It used to fall back to
+        # `deit_tiny_config()`, which silently returns a VISION ENCODER geometry
+        # (deit_tiny_patch16_224: d_model=192, n_layer=12, model_kind="encoder",
+        # embedding_kind="patch_cls") inside what is now a GPT-2 decoder project
+        # — a wrong machine, produced silently rather than loudly, which is this
+        # codebase's signature failure mode. Removing the fallback is byte-inert:
+        # an AST scan of every CodeGenerator(...) call site (12 of them, across
+        # decoder_bundle.py and the tests) found ZERO that omit model_config, so
+        # no reachable path used it. Fail loud instead of compiling for the wrong
+        # model.
+        if model_config is None:
+            raise ValueError(
+                "CodeGenerator requires an explicit model_config. (It used to "
+                "default to deit_tiny_config() — a vision-encoder geometry — "
+                "which silently compiled for the wrong model.)"
+            )
+        self.config = model_config
         if stream_name not in ("prefill", "decode"):
             raise ValueError("stream_name must be 'prefill' or 'decode'")
         self.stream_name = stream_name

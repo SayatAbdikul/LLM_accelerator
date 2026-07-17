@@ -27,7 +27,9 @@ if TYPE_CHECKING:
     from ..codegen import CodeGenerator
 
 
-# Size of one 16-byte addressing unit (matches `taccel/isa/opcodes.UNIT`).
+# Size of one 16-byte addressing unit. Hand-duplicated (no single source of
+# truth exists): see `compiler/emit/_common.py:UNIT`, `golden_model/memory.py:
+# UNIT`, and RTL `taccel_pkg.sv:AXI_DATA_W=128`. All must agree.
 UNIT = 16
 
 

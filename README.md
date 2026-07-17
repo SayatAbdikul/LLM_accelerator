@@ -72,7 +72,8 @@ LLM_accelerator/
 │   │   └── filelists/              # core.f — the single source-of-truth filelist
 │   ├── verilator/                  # Native C++ benches + run_program harness (primary sim);
 │   │                               #   run_program_synth = the perf-measurement build
-│   ├── cocotb/                     # Python-driven ISA-visible benches
+│   ├── cocotb/                     # Python-driven ISA benches — DORMANT since
+│   │                               #   2026-05-26, superseded by rtl/verilator
 │   ├── asic/                       # ASIC wrappers, sky130 SRAM macro stub, synth + STA +
 │   │                               #   OpenROAD per-block PNR flows (build/synth_blocks,
 │   │                               #   build/openroad), OpenLane config
@@ -157,7 +158,9 @@ make -C rtl/verilator all             # decode/control/dma/helpers/sfu/systolic 
 make -C rtl/verilator test_sfu_synth  # mode-1 SFU datapath gate (11 cases)
 make -C rtl/verilator test_fp32_div_p6 test_fp32_sqrt_p6 test_fp32_exp_p18
                                       # pipelined-primitive bit-exactness gates
-make -C rtl/cocotb test_all SIM=verilator      # Python-driven ISA benches
+# NOTE: `make -C rtl/cocotb test_all SIM=verilator` is NOT runnable — cocotb is
+# not a declared dependency, and the tier has been dormant since 2026-05-26
+# (superseded by the Verilator benches above). See rtl/TESTBENCHES.md.
 ```
 
 Bench guide: [`rtl/TESTBENCHES.md`](rtl/TESTBENCHES.md).

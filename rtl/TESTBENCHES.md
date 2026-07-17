@@ -1,9 +1,23 @@
 # RTL Testbench Guide
 
-This repo standardizes RTL verification around two complementary layers:
+RTL verification is standardized on **native Verilator C++ benches** — fast,
+deterministic unit and subsystem checks. This is the live layer; everything in
+"Running Tests" below that starts `make -C rtl/verilator` is expected to pass.
 
-- Native Verilator C++ benches for fast deterministic unit and subsystem checks.
-- cocotb benches for ISA-visible flows, DRAM scoreboarding, and Python reference-model comparison.
+> **The cocotb tier is DORMANT (assessed 2026-07-17) — do not treat it as a gate.**
+> `cocotb` is not declared in `software/requirements.txt` and is not installed, so
+> `make -C rtl/cocotb ...` cannot run here. It has not been touched since
+> 2026-05-26 (`e150095`) and therefore predates ~20 RTL-changing commits — the
+> `m_exact` CONFIG_TILE extension, the Port-A/Port-S split, the lever-D transpose
+> LOAD, the ACCUM preclear deletion and `div_p6`/`sqrt_p6`. Whether these benches
+> still pass is UNKNOWN, because nothing runs them.
+>
+> It is also fully superseded: every cocotb module has a live Verilator
+> counterpart (`test_dma`, `test_decode`+`test_control`, `test_helpers`,
+> `test_sfu`, `test_systolic`, `test_systolic_chained`), and the Verilator tier is
+> far richer (32 targets incl. `test_fp32_exp_p18` and `test_systolic_qkt_*`).
+> The cocotb references below are retained as a map of what it once covered.
+> Either declare + refresh the tier, or retire it — but do not read it as coverage.
 
 ## Bench Ownership
 
@@ -37,8 +51,10 @@ This repo standardizes RTL verification around two complementary layers:
     `test_fp32_exp_p18`
 - Program-level sign-off:
   - `rtl/verilator/run_program.cpp`
-  - `software/tools/compare_rtl_golden.py`
+  - `software/tools/rtl_cosim.py` (the RTL-vs-golden prefill co-sim driver;
+    replaced `compare_rtl_golden.py`, deleted in `aa08309`)
   - `software/tests/test_compare_rtl_golden.py`
+  - `software/tests/test_batched_decode.py`
 
 ## Shared Harnesses
 
@@ -81,13 +97,22 @@ When a bug is fixed, prefer the smallest regression at the lowest useful layer f
 
 ## Program Sign-Off
 
-- Build the native runner with `make -C rtl/verilator run_program`.
-- Compare a precompiled binary with:
-  - `software/tools/compare_rtl_golden.py --summary-out out.json program --program program.bin`
-- Compile and compare a model variant with:
-  - `software/tools/compare_rtl_golden.py --summary-out out.json compile --scenario baseline_default --weights pytorch_model.bin --image sample.jpg`
-- Failed compares automatically leave a work directory with the RTL summary and,
-  when needed, golden/RTL trace artifacts for mismatch triage.
+- Build the native runners with `make -C rtl/verilator run_program run_program_synth`.
+- **Live RTL == golden byte-match gates — there are TWO, both real:**
+  - `pytest software/tests/test_batched_decode.py` — tiny decode bundles incl. the
+    packed batch-16 path and the b32 M_pad>16 two-m-tile walk.
+  - `pytest software/tests/test_compare_rtl_golden.py` — the freeze §4.5 prefill
+    byte-match (`test_rtl_cosim_gen2_byte_match`), plus the frozen-golden blob-SHA
+    pin, which must stay green. The task-#105 bridge this leg once waited on was
+    BUILT (`tools/rtl_cosim.py`); it skips only when `run_program` or the tiny
+    fixture is missing.
+- **RTL-vs-golden prefill co-simulation:** `software/tools/rtl_cosim.py` serializes a
+  frozen decoder-bundle prefill stream into a single-shot ProgramBinary
+  (`--out`, `--token`, `--cosim`).
+- **Byte-exactness is a TINY-model gate only.** On 124M it is ill-posed: past the
+  first FP16 overflow (`block0_out_proj`) the golden model saturates too, so both
+  sides go wrong together (`rtl_cosim.py` #109). Use argmax/perplexity conformance
+  there instead — see `software/tools/evaluate_gpt2_perplexity.py`.
 
 Verilator is the primary sign-off simulator. Icarus remains best-effort only.
 
