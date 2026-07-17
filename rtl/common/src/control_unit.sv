@@ -449,7 +449,20 @@ module control_unit
                 // they ever disagree the MATMUL retires WITHOUT dispatching —
                 // the systolic FSM only accepts `dispatch` in ST_IDLE, so the
                 // pulse is dropped and the matmul is silently SKIPPED.
-                end else if (sfu_busy || helper_busy ||
+                //
+                // `sys_busy` (2026-07-17): the two conditions mirrored each
+                // other perfectly and were BOTH wrong — neither checked the
+                // systolic's OWN busy flag, so a MATMUL arriving while the
+                // mesh was still running retired and advanced PC while its
+                // dispatch pulse was dropped in ST_IDLE. Every other engine
+                // guards itself (LOAD/STORE checks !dma_busy eight lines
+                // below, under a comment noting the DMA silently drops
+                // pulses that arrive while it is active); the systolic did
+                // not. Latent only because every MatmulInsn site emits
+                // SYNC(0b010) immediately after — correctness rested on
+                // compiler convention, and post-lever-1a the residue of a
+                // skipped matmul is STALE ACCUM, not zeros.
+                end else if (sys_busy || sfu_busy || helper_busy ||
                              (!SYS_DMA_OVERLAP && dma_busy)) begin
                   state <= S_ISSUE;
                 end else begin
@@ -622,8 +635,12 @@ module control_unit
               dma_dispatch = !sfu_busy && !dma_busy &&
                              (SYS_DMA_OVERLAP || !sys_busy);
 
+            // !sys_busy mirrors the sequential retry arm above (2026-07-17):
+            // without it a MATMUL issued while the mesh is busy is dropped by
+            // the systolic (it latches `dispatch` only in ST_IDLE) yet still
+            // retires here. See the note on that retry condition.
             OP_MATMUL:
-              sys_dispatch = tile_valid && !sfu_busy && !helper_busy &&
+              sys_dispatch = tile_valid && !sys_busy && !sfu_busy && !helper_busy &&
                              (SYS_DMA_OVERLAP || !dma_busy);
 
             OP_BUF_COPY:
