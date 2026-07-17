@@ -1079,11 +1079,20 @@ inline std::vector<int32_t> unpack_i32_le(const std::vector<uint8_t>& bytes) {
 // ============================================================================
 // Test assertion macro
 // ============================================================================
+// Records the failure and ABORTS THE ENCLOSING (void) TEST FUNCTION, but lets
+// the binary continue to the next test. It must NOT std::exit: doing so meant a
+// single stale expectation silently disabled every later test in the binary
+// (test_control died at 14 of 26 for ~2 months; see test_runner.h:tests_fail).
+// Bumping tests_run without tests_pass makes each binary's existing
+// `tests_pass != tests_run` summary check exit nonzero.
+// Requires test_runner.h at the expansion site (all EXPECT users include it).
 #define EXPECT(cond, msg) \
     do { \
         if (!(cond)) { \
             fprintf(stderr, "FAIL: %s  (at %s:%d)\n", msg, __FILE__, __LINE__); \
-            std::exit(1); \
+            ++tests_fail; \
+            ++tests_run; \
+            return; \
         } \
     } while(0)
 

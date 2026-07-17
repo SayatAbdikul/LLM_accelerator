@@ -257,18 +257,41 @@ static void test_config_attn_faults() {
                            insn::CONFIG_ATTN(0, 16, 0b01) | 1ULL }, 1, 1000);
 }
 
+// CONFIG_ATTN context validation, exercised on the LIVE gen-2 masked op.
+//
+// 2026-07-17: these cases used the gen-1 MASKED_SOFTMAX (0x15) /
+// MASKED_SOFTMAX_ATTNV (0x16), which commit e7b3314 (2026-05-23) STRIPPED from
+// silicon — decode now traps them as FAULT_ILLEGAL_OP (1), so they faulted for
+// the wrong reason and could no longer reach the CONFIG_ATTN check at all. The
+// only masked op left in the design is gen-2 OP_MASKED_SOFTMAX_FP32 (0x1D), so
+// the cases are re-pointed at it via the generic R_TYPE builder (flags=1 is
+// required: control_unit raises FAULT_UNSUPPORTED_OP when fp_flags==0).
+//
+// The expected code stays FAULT_NO_CONFIG (4): control_unit.sv fires it for
+// `is_masked_sfu_op_w && !masked_attn_valid_now`, and is_masked_sfu_op_w
+// includes 0x1D. CONFIG_TILE(1,1,1) encodes tile_n=0, so the op's key columns
+// = (tile_n+1)<<4 = 16 — which is what makes 32 a genuine mismatch below.
+static uint64_t MASKED_SOFTMAX_FP32(int src1_buf, int src1_off, int dst_buf, int dst_off,
+                                    int sreg) {
+    return insn::R_TYPE(0x1D, src1_buf, src1_off, /*src2_buf=*/0, /*src2_off=*/0,
+                        dst_buf, dst_off, sreg, /*flags=*/1);
+}
+
 static void test_masked_sfu_context_faults() {
-    expect_fault_program("masked_softmax_without_config_attn",
+    // No CONFIG_ATTN at all -> attn_valid=0 -> masked_attn_valid_now=0.
+    expect_fault_program("masked_softmax_fp32_without_config_attn",
                          { insn::CONFIG_TILE(1, 1, 1),
-                           insn::MASKED_SOFTMAX(2, 0, 0, 0, 0) }, 4, 1000);
-    expect_fault_program("masked_softmax_padded_len_exceeds_tile",
+                           MASKED_SOFTMAX_FP32(2, 0, 0, 0, 0) }, 4, 1000);
+    // Padded mode requires key_cols >= valid_kv_len: 16 >= 32 is false.
+    expect_fault_program("masked_softmax_fp32_padded_len_exceeds_tile",
                          { insn::CONFIG_TILE(1, 1, 1),
                            insn::CONFIG_ATTN(0, 32, 0b01),
-                           insn::MASKED_SOFTMAX(2, 0, 0, 0, 0) }, 4, 1000);
-    expect_fault_program("masked_attnv_pure_causal_len_mismatch",
+                           MASKED_SOFTMAX_FP32(2, 0, 0, 0, 0) }, 4, 1000);
+    // Pure-causal mode requires key_cols == valid_kv_len: 16 != 32.
+    expect_fault_program("masked_softmax_fp32_pure_causal_len_mismatch",
                          { insn::CONFIG_TILE(1, 1, 1),
                            insn::CONFIG_ATTN(0, 32, 0b10),
-                           insn::MASKED_SOFTMAX_ATTNV(2, 0, 0, 0, 1, 0, 0) }, 4, 1000);
+                           MASKED_SOFTMAX_FP32(2, 0, 0, 0, 0) }, 4, 1000);
 }
 
 // ============================================================================
@@ -298,36 +321,14 @@ static void test_stage_e_paths() {
             insn::DEQUANT_ADD(2, 0, 0, 0, 1, 0, 4),
             insn::HALT()
         }},
-        { "softmax_attnv_dispatch_sync", {
-            insn::CONFIG_TILE(1, 1, 1),
-            insn::SET_SCALE(8, 0x3400),
-            insn::SET_SCALE(9, 0x3400),
-            insn::SET_SCALE(10, 0x3400),
-            insn::SET_SCALE(11, 0x3000),
-            insn::SOFTMAX_ATTNV(2, 0, 0, 0, 1, 0, 8),
-            insn::SYNC(0b100),
-            insn::HALT()
-        }},
-        { "masked_softmax_dispatch_sync", {
-            insn::CONFIG_TILE(1, 1, 1),
-            insn::CONFIG_ATTN(0, 16, 0b11),
-            insn::SET_SCALE(4, 0x3400),
-            insn::SET_SCALE(5, 0x3400),
-            insn::MASKED_SOFTMAX(2, 0, 0, 0, 4),
-            insn::SYNC(0b100),
-            insn::HALT()
-        }},
-        { "masked_softmax_attnv_dispatch_sync", {
-            insn::CONFIG_TILE(1, 1, 1),
-            insn::CONFIG_ATTN(0, 16, 0b11),
-            insn::SET_SCALE(8, 0x3400),
-            insn::SET_SCALE(9, 0x3400),
-            insn::SET_SCALE(10, 0x3400),
-            insn::SET_SCALE(11, 0x3000),
-            insn::MASKED_SOFTMAX_ATTNV(2, 0, 0, 0, 1, 0, 8),
-            insn::SYNC(0b100),
-            insn::HALT()
-        }},
+        // 2026-07-17: the softmax_attnv (0x12) / masked_softmax (0x15) /
+        // masked_softmax_attnv (0x16) dispatch cases were RETIRED here. All
+        // three opcodes were stripped from silicon by e7b3314 and now fault
+        // FAULT_ILLEGAL_OP at decode, so they asserted "halts cleanly" against
+        // ops that cannot execute. Gen-2 masked-softmax dispatch through
+        // SYNC(0b100) is covered by test_sfu.cpp against real vectors (it
+        // drives 0x1D with CONFIG_ATTN and real SRAM contents); duplicating it
+        // here with zero-filled SRAM would add no coverage.
     };
 
     for (const auto& tc : cases) {
@@ -343,67 +344,39 @@ static void test_stage_e_paths() {
 // ============================================================================
 // Test: Stage D SFU ops require CONFIG_TILE
 // ============================================================================
+// A compute op without CONFIG_TILE must raise FAULT_NO_CONFIG (4).
+//
+// 2026-07-17: re-pointed from the gen-1 SOFTMAX (0x0E) / LAYERNORM (0x0F) /
+// GELU (0x10) — stripped by e7b3314, so they now trap as FAULT_ILLEGAL_OP (1)
+// at decode and never reach the tile_valid check — onto their live gen-2
+// counterparts. control_unit.sv lists OP_LAYERNORM_FP32 / OP_GELU_FP32 /
+// OP_MASKED_SOFTMAX_FP32 in the same `if (!tile_valid) -> FAULT_NO_CONFIG` arm,
+// so this asserts exactly the property the gen-1 cases used to.
 static void test_sfu_no_config_faults() {
-    expect_fault_program("softmax_without_config_tile",
-                         { insn::SOFTMAX(2, 0, 0, 0, 0) }, 4, 1000);
-    expect_fault_program("layernorm_without_config_tile",
-                         { insn::LAYERNORM(0, 0, 1, 0, 0, 0, 0) }, 4, 1000);
-    expect_fault_program("gelu_without_config_tile",
-                         { insn::GELU(0, 0, 0, 0, 0) }, 4, 1000);
+    expect_fault_program("layernorm_fp32_without_config_tile",
+                         { insn::R_TYPE(0x1A, 0, 0, 0, 0, 1, 0, 0, /*flags=*/1) },
+                         4, 1000);
+    expect_fault_program("gelu_fp32_without_config_tile",
+                         { insn::R_TYPE(0x1B, 0, 0, 0, 0, 0, 0, 0, /*flags=*/1) },
+                         4, 1000);
+    expect_fault_program("masked_softmax_fp32_without_config_tile",
+                         { MASKED_SOFTMAX_FP32(2, 0, 0, 0, 0) }, 4, 1000);
 }
 
 // ============================================================================
-// Test: Stage D SFU ops dispatch and complete through SYNC(100)
+// RETIRED 2026-07-17: test_sfu_dispatch_paths.
+//
+// All three of its cases dispatched gen-1 SOFTMAX (0x0E) / LAYERNORM (0x0F) /
+// GELU (0x10) and asserted "halts cleanly". Commit e7b3314 (2026-05-23)
+// stripped those opcodes from silicon — decode_unit now traps them as
+// FAULT_ILLEGAL_OP — so every case asserted clean completion of an instruction
+// the machine is required to reject. The equivalent gen-2 ops (LAYERNORM_FP32
+// 0x1A, GELU_FP32 0x1B, MASKED_SOFTMAX_FP32 0x1D) are dispatched through
+// SYNC(0b100) against real input vectors by test_sfu.cpp, which is the
+// appropriate home for datapath dispatch coverage. Their *control* contract
+// (no CONFIG_TILE -> FAULT_NO_CONFIG) is asserted by test_sfu_no_config_faults
+// above.
 // ============================================================================
-static void test_sfu_dispatch_paths() {
-    {
-        SimHarness s;
-        s.load({
-            insn::CONFIG_TILE(1, 1, 1),
-            insn::SET_SCALE(0, 0x3800),
-            insn::SET_SCALE(1, 0x3400),
-            insn::SOFTMAX(0, 0, 1, 0, 0),
-            insn::SYNC(0b100),
-            insn::HALT()
-        });
-        s.run(50000);
-        EXPECT(s.dut->done == 1, "softmax dispatch path should halt cleanly");
-        EXPECT(s.dut->fault == 0, "softmax dispatch path should not fault");
-        TEST_PASS("softmax_dispatch_sync");
-    }
-
-    {
-        SimHarness s;
-        s.load({
-            insn::CONFIG_TILE(1, 1, 1),
-            insn::SET_SCALE(0, 0x3800),
-            insn::SET_SCALE(1, 0x3400),
-            insn::LAYERNORM(0, 0, 1, 0, 0, 0, 0),
-            insn::SYNC(0b100),
-            insn::HALT()
-        });
-        s.run(50000);
-        EXPECT(s.dut->done == 1, "layernorm dispatch path should halt cleanly");
-        EXPECT(s.dut->fault == 0, "layernorm dispatch path should not fault");
-        TEST_PASS("layernorm_dispatch_sync");
-    }
-
-    {
-        SimHarness s;
-        s.load({
-            insn::CONFIG_TILE(1, 1, 1),
-            insn::SET_SCALE(0, 0x3800),
-            insn::SET_SCALE(1, 0x3400),
-            insn::GELU(0, 0, 0, 16, 0),
-            insn::SYNC(0b100),
-            insn::HALT()
-        });
-        s.run(50000);
-        EXPECT(s.dut->done == 1, "gelu dispatch path should halt cleanly");
-        EXPECT(s.dut->fault == 0, "gelu dispatch path should not fault");
-        TEST_PASS("gelu_dispatch_sync");
-    }
-}
 
 // ============================================================================
 // Test: SET_SCALE from SRAM is rejected in Phase A
@@ -572,7 +545,6 @@ int main(int argc, char** argv) {
     test_masked_sfu_context_faults();
     test_stage_e_paths();
     test_sfu_no_config_faults();
-    test_sfu_dispatch_paths();
     test_set_scale_from_buffer_unsupported();
     test_multiburst_dma_supported();
     test_matmul_no_config();

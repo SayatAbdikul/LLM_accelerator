@@ -40,6 +40,14 @@
 
 inline int tests_run  = 0;
 inline int tests_pass = 0;
+// 2026-07-17: failure counter. `EXPECT` (include/testbench.h) used to
+// std::exit(1) on the first failed assertion, so ONE stale expectation
+// silently disabled every test after it in the same binary — test_control
+// died at test 14 of 26 from 2026-05-23 (commit e7b3314, the gen-1 SFU
+// opcode strip) until 2026-07-17, hiding 12 fault-path tests including
+// test_systolic_sram_oob_fault. EXPECT now records and returns; each
+// binary's `tests_pass != tests_run` summary check catches it.
+inline int tests_fail = 0;
 
 #define TEST_PASS(name) do {                                                \
     std::printf("PASS: %s\n", name);                                        \

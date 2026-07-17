@@ -27,6 +27,11 @@ INCLUDE_DIR   := $(SRC_DIR)/include
 SYSTOLIC_DIR  := $(SRC_DIR)/systolic
 TB_DIR        := $(SRC_DIR)/tb
 BUILD_DIR     := build
+# Shared C++ testbench headers. Every test binary's C++ includes these, so
+# they MUST be prerequisites — before 2026-07-17 no rule listed them, so
+# editing include/testbench.h left all 28 binaries silently STALE (make saw
+# nothing newer than the target and skipped the rebuild).
+TB_HEADERS    := $(wildcard include/*.h)
 
 # R6 (2026-05-23): sfu_engine.sv was partitioned into sibling .svh files
 # (sfu_dpi_helpers.svh, sfu_synth_datapath.svh, sfu_g1_compute.svh,
@@ -75,7 +80,7 @@ all: test_decode test_control test_dma test_helpers test_sfu test_systolic
 # -----------------------------------------------------------------------
 # run_program: build the full-program Verilator runner
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/run_program/Vtaccel_top: $(CONTROL_SV) run_program.cpp
+$(BUILD_DIR)/run_program/Vtaccel_top: $(CONTROL_SV) run_program.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/run_program
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -103,7 +108,7 @@ run_program: $(BUILD_DIR)/run_program/Vtaccel_top
 # -----------------------------------------------------------------------
 DRAM_SIZE_124M ?= 1073741824
 
-$(BUILD_DIR)/run_program_synth/Vtaccel_top: $(CONTROL_SV) run_program.cpp
+$(BUILD_DIR)/run_program_synth/Vtaccel_top: $(CONTROL_SV) run_program.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/run_program_synth
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -133,7 +138,7 @@ run_program_synth: $(BUILD_DIR)/run_program_synth/Vtaccel_top
 # A/B gates (identical bytes at lower concurrency), and the safe-mode
 # fallback if a future overlap bug needs bisecting.
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/run_program_noovl/Vtaccel_top: $(CONTROL_SV) run_program.cpp
+$(BUILD_DIR)/run_program_noovl/Vtaccel_top: $(CONTROL_SV) run_program.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/run_program_noovl
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -153,7 +158,7 @@ run_program_noovl: $(BUILD_DIR)/run_program_noovl/Vtaccel_top
 # -----------------------------------------------------------------------
 # test_decode: verilate tb_decode_unit + compile + run
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_decode/Vtb_decode_unit: $(DECODE_SV) test_decode.cpp
+$(BUILD_DIR)/test_decode/Vtb_decode_unit: $(DECODE_SV) test_decode.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_decode
 	$(VERILATOR) $(VFLAGS) \
 	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
@@ -171,7 +176,7 @@ test_decode: $(BUILD_DIR)/test_decode/Vtb_decode_unit
 # -----------------------------------------------------------------------
 # test_control: verilate taccel_top + compile + run
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_control/Vtaccel_top: $(CONTROL_SV) test_control.cpp
+$(BUILD_DIR)/test_control/Vtaccel_top: $(CONTROL_SV) test_control.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_control
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -190,7 +195,7 @@ test_control: $(BUILD_DIR)/test_control/Vtaccel_top
 # -----------------------------------------------------------------------
 # test_dma: verilate taccel_top (with DMA engine) + compile + run
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_dma/Vtaccel_top: $(CONTROL_SV) test_dma.cpp
+$(BUILD_DIR)/test_dma/Vtaccel_top: $(CONTROL_SV) test_dma.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_dma
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -209,7 +214,7 @@ test_dma: $(BUILD_DIR)/test_dma/Vtaccel_top
 # -----------------------------------------------------------------------
 # test_helpers: verilate taccel_top (with helper engine) + compile + run
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_helpers/Vtaccel_top: $(CONTROL_SV) test_helpers.cpp
+$(BUILD_DIR)/test_helpers/Vtaccel_top: $(CONTROL_SV) test_helpers.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_helpers
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -228,7 +233,7 @@ test_helpers: $(BUILD_DIR)/test_helpers/Vtaccel_top
 # -----------------------------------------------------------------------
 # test_sfu: verilate taccel_top (with Stage D SFU) + compile + run
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_sfu/Vtaccel_top: $(CONTROL_SV) test_sfu.cpp
+$(BUILD_DIR)/test_sfu/Vtaccel_top: $(CONTROL_SV) test_sfu.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_sfu
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -251,7 +256,7 @@ test_sfu: $(BUILD_DIR)/test_sfu/Vtaccel_top
 # Used to gate each Phase-2 op migration; the canonical gate is the
 # vadd_fp32 fixture under this build.
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_sfu_synth/Vtaccel_top: $(CONTROL_SV) test_sfu.cpp
+$(BUILD_DIR)/test_sfu_synth/Vtaccel_top: $(CONTROL_SV) test_sfu.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_sfu_synth
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -272,7 +277,7 @@ test_sfu_synth: $(BUILD_DIR)/test_sfu_synth/Vtaccel_top
 # test_helpers_synth: helper regressions with HELPER_SYNTH_MODE=1. Currently
 # migrates the dequant_add_pack op via 16-lane parallel fp32 primitive chain.
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_helpers_synth/Vtaccel_top: $(CONTROL_SV) test_helpers.cpp
+$(BUILD_DIR)/test_helpers_synth/Vtaccel_top: $(CONTROL_SV) test_helpers.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_helpers_synth
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -294,7 +299,7 @@ test_helpers_synth: $(BUILD_DIR)/test_helpers_synth/Vtaccel_top
 # Catches cross-mode interactions; this is the Phase-2 "full synth path"
 # gate for ops/state-machines that have been migrated.
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_sfu_helper_synth/Vtaccel_top: $(CONTROL_SV) test_sfu.cpp
+$(BUILD_DIR)/test_sfu_helper_synth/Vtaccel_top: $(CONTROL_SV) test_sfu.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_sfu_helper_synth
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -315,7 +320,7 @@ test_sfu_helper_synth: $(BUILD_DIR)/test_sfu_helper_synth/Vtaccel_top
 # -----------------------------------------------------------------------
 # test_systolic: verilate taccel_top (with systolic) + compile + run
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_systolic/Vtaccel_top: $(CONTROL_SV) test_systolic.cpp
+$(BUILD_DIR)/test_systolic/Vtaccel_top: $(CONTROL_SV) test_systolic.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_systolic
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -334,7 +339,7 @@ test_systolic: $(BUILD_DIR)/test_systolic/Vtaccel_top
 # -----------------------------------------------------------------------
 # test_systolic_array_chained: unit-test the chained mesh directly
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_systolic_array_chained/Vsystolic_array: \
+$(BUILD_DIR)/test_systolic_array_chained/Vsystolic_array: \ $(TB_HEADERS)
 		$(PKG) $(SRC_DIR)/systolic/systolic_pe.sv $(SRC_DIR)/systolic/systolic_array.sv \
 		test_systolic_array_chained.cpp
 	mkdir -p $(BUILD_DIR)/test_systolic_array_chained
@@ -357,7 +362,7 @@ test_systolic_array_chained: $(BUILD_DIR)/test_systolic_array_chained/Vsystolic_
 # -----------------------------------------------------------------------
 # test_systolic_chained: top-level chained MATMUL verification
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_systolic_chained/Vtaccel_top: $(CONTROL_SV) test_systolic_chained.cpp
+$(BUILD_DIR)/test_systolic_chained/Vtaccel_top: $(CONTROL_SV) test_systolic_chained.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_systolic_chained
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=1 \
@@ -376,7 +381,7 @@ test_systolic_chained: $(BUILD_DIR)/test_systolic_chained/Vtaccel_top
 # -----------------------------------------------------------------------
 # test_accum_snapshot_readback: #114 ACCUM-snapshot readback reproducer
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_accum_snapshot_readback/Vtaccel_top: $(CONTROL_SV) test_accum_snapshot_readback.cpp
+$(BUILD_DIR)/test_accum_snapshot_readback/Vtaccel_top: $(CONTROL_SV) test_accum_snapshot_readback.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_accum_snapshot_readback
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=1 \
@@ -397,7 +402,7 @@ test_accum_snapshot_readback: $(BUILD_DIR)/test_accum_snapshot_readback/Vtaccel_
 # Standalone — links ONLY fp32_add (no taccel_top); zero risk to the
 # proven byte-exact datapath. First brick of the synthesizable SFU library.
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_fp32_add/Vfp32_add: $(FP32_DIR)/fp32_add.sv test_fp32_add.cpp
+$(BUILD_DIR)/test_fp32_add/Vfp32_add: $(FP32_DIR)/fp32_add.sv test_fp32_add.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_fp32_add
 	$(VERILATOR) $(VFLAGS) \
 	  --top-module fp32_add \
@@ -417,7 +422,7 @@ test_fp32_add: $(BUILD_DIR)/test_fp32_add/Vfp32_add
 # path-cutting divider is byte-identical to the host-float golden before
 # any sfu_engine.sv integration.
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_fp32_div/Vfp32_div_p2: $(FP32_DIR)/fp32_div_p2.sv test_fp32_div.cpp
+$(BUILD_DIR)/test_fp32_div/Vfp32_div_p2: $(FP32_DIR)/fp32_div_p2.sv test_fp32_div.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_fp32_div
 	$(VERILATOR) $(VFLAGS) \
 	  --top-module fp32_div_p2 \
@@ -437,7 +442,7 @@ test_fp32_div: $(BUILD_DIR)/test_fp32_div/Vfp32_div_p2
 # streaming harness as test_fp32_div (the in-flight FIFO auto-handles the
 # LATENCY=3 depth).
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_fp32_div_p3/Vfp32_div_p3: $(FP32_DIR)/fp32_div_p3.sv test_fp32_div_p3.cpp
+$(BUILD_DIR)/test_fp32_div_p3/Vfp32_div_p3: $(FP32_DIR)/fp32_div_p3.sv test_fp32_div_p3.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_fp32_div_p3
 	$(VERILATOR) $(VFLAGS) \
 	  --top-module fp32_div_p3 \
@@ -457,7 +462,7 @@ test_fp32_div_p3: $(BUILD_DIR)/test_fp32_div_p3/Vfp32_div_p3
 # streaming harness as test_fp32_div (the in-flight FIFO auto-handles the
 # LATENCY=4 depth).
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_fp32_div_p4/Vfp32_div_p4: $(FP32_DIR)/fp32_div_p4.sv test_fp32_div_p4.cpp
+$(BUILD_DIR)/test_fp32_div_p4/Vfp32_div_p4: $(FP32_DIR)/fp32_div_p4.sv test_fp32_div_p4.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_fp32_div_p4
 	$(VERILATOR) $(VFLAGS) \
 	  --top-module fp32_div_p4 \
@@ -477,7 +482,7 @@ test_fp32_div_p4: $(BUILD_DIR)/test_fp32_div_p4/Vfp32_div_p4
 # streaming harness as test_fp32_div (the in-flight FIFO auto-handles the
 # LATENCY=5 depth).
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_fp32_div_p5/Vfp32_div_p5: $(FP32_DIR)/fp32_div_p5.sv test_fp32_div_p5.cpp
+$(BUILD_DIR)/test_fp32_div_p5/Vfp32_div_p5: $(FP32_DIR)/fp32_div_p5.sv test_fp32_div_p5.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_fp32_div_p5
 	$(VERILATOR) $(VFLAGS) \
 	  --top-module fp32_div_p5 \
@@ -497,7 +502,7 @@ test_fp32_div_p5: $(BUILD_DIR)/test_fp32_div_p5/Vfp32_div_p5
 # streaming harness as test_fp32_div (the in-flight FIFO auto-handles the
 # LATENCY=6 depth). Lever E fmax cluster.
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_fp32_div_p6/Vfp32_div_p6: $(FP32_DIR)/fp32_div_p6.sv test_fp32_div_p6.cpp
+$(BUILD_DIR)/test_fp32_div_p6/Vfp32_div_p6: $(FP32_DIR)/fp32_div_p6.sv test_fp32_div_p6.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_fp32_div_p6
 	$(VERILATOR) $(VFLAGS) \
 	  --top-module fp32_div_p6 \
@@ -517,7 +522,7 @@ test_fp32_div_p6: $(BUILD_DIR)/test_fp32_div_p6/Vfp32_div_p6
 # path-cutting sqrt is byte-identical to the host-float golden before
 # any sfu_engine.sv integration.
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_fp32_sqrt/Vfp32_sqrt_p2: $(FP32_DIR)/fp32_sqrt_p2.sv test_fp32_sqrt.cpp
+$(BUILD_DIR)/test_fp32_sqrt/Vfp32_sqrt_p2: $(FP32_DIR)/fp32_sqrt_p2.sv test_fp32_sqrt.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_fp32_sqrt
 	$(VERILATOR) $(VFLAGS) \
 	  --top-module fp32_sqrt_p2 \
@@ -537,7 +542,7 @@ test_fp32_sqrt: $(BUILD_DIR)/test_fp32_sqrt/Vfp32_sqrt_p2
 # 3-way path-cut sqrt is byte-identical to the host-float golden before
 # any sfu_engine.sv integration.
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_fp32_sqrt_p3/Vfp32_sqrt_p3: $(FP32_DIR)/fp32_sqrt_p3.sv test_fp32_sqrt_p3.cpp
+$(BUILD_DIR)/test_fp32_sqrt_p3/Vfp32_sqrt_p3: $(FP32_DIR)/fp32_sqrt_p3.sv test_fp32_sqrt_p3.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_fp32_sqrt_p3
 	$(VERILATOR) $(VFLAGS) \
 	  --top-module fp32_sqrt_p3 \
@@ -557,7 +562,7 @@ test_fp32_sqrt_p3: $(BUILD_DIR)/test_fp32_sqrt_p3/Vfp32_sqrt_p3
 # 4-way path-cut sqrt is byte-identical to the host-float golden before
 # any sfu_engine.sv integration.
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_fp32_sqrt_p4/Vfp32_sqrt_p4: $(FP32_DIR)/fp32_sqrt_p4.sv test_fp32_sqrt_p4.cpp
+$(BUILD_DIR)/test_fp32_sqrt_p4/Vfp32_sqrt_p4: $(FP32_DIR)/fp32_sqrt_p4.sv test_fp32_sqrt_p4.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_fp32_sqrt_p4
 	$(VERILATOR) $(VFLAGS) \
 	  --top-module fp32_sqrt_p4 \
@@ -576,7 +581,7 @@ test_fp32_sqrt_p4: $(BUILD_DIR)/test_fp32_sqrt_p4/Vfp32_sqrt_p4
 # Standalone — links ONLY fp32_sqrt_p6 (no taccel_top). Unpack-isolated +
 # tail-split sqrt; proves byte-identical to the host-float golden.
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_fp32_sqrt_p6/Vfp32_sqrt_p6: $(FP32_DIR)/fp32_sqrt_p6.sv test_fp32_sqrt_p6.cpp
+$(BUILD_DIR)/test_fp32_sqrt_p6/Vfp32_sqrt_p6: $(FP32_DIR)/fp32_sqrt_p6.sv test_fp32_sqrt_p6.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_fp32_sqrt_p6
 	$(VERILATOR) $(VFLAGS) \
 	  --top-module fp32_sqrt_p6 \
@@ -598,7 +603,7 @@ test_fp32_sqrt_p6: $(BUILD_DIR)/test_fp32_sqrt_p6/Vfp32_sqrt_p6
 # pipelined output (LATENCY=18) is byte-identical to the combinational one.
 # Needs fp32_add + fp32_mul + fp32_exp + fp32_exp_p18 in read order.
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_fp32_exp_p18/Vfp32_exp_p18_tb: $(FP32_DIR)/fp32_exp_p18.sv $(FP32_DIR)/fp32_exp.sv $(FP32_DIR)/fp32_add.sv $(FP32_DIR)/fp32_mul.sv fp32_exp_p18_tb.sv test_fp32_exp_p18.cpp
+$(BUILD_DIR)/test_fp32_exp_p18/Vfp32_exp_p18_tb: $(FP32_DIR)/fp32_exp_p18.sv $(FP32_DIR)/fp32_exp.sv $(FP32_DIR)/fp32_add.sv $(FP32_DIR)/fp32_mul.sv fp32_exp_p18_tb.sv test_fp32_exp_p18.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_fp32_exp_p18
 	$(VERILATOR) $(VFLAGS) \
 	  --top-module fp32_exp_p18_tb \
@@ -617,7 +622,7 @@ test_fp32_exp_p18: $(BUILD_DIR)/test_fp32_exp_p18/Vfp32_exp_p18_tb
 # -----------------------------------------------------------------------
 # test_systolic_query: focused chained query-projection regression
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_systolic_query/Vtaccel_top: $(CONTROL_SV) test_systolic_query.cpp
+$(BUILD_DIR)/test_systolic_query/Vtaccel_top: $(CONTROL_SV) test_systolic_query.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_systolic_query
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=1 \
@@ -674,7 +679,7 @@ test_systolic_qkt: test_systolic_qkt_basic test_systolic_qkt_replay \
 # Pre-fix:  raw_hazard_consecutive FAILS (stale HI sampled → wrong address).
 # Post-fix: all three sub-tests PASS.
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_addr_raw_hazard/Vtaccel_top: $(CONTROL_SV) test_addr_raw_hazard.cpp
+$(BUILD_DIR)/test_addr_raw_hazard/Vtaccel_top: $(CONTROL_SV) test_addr_raw_hazard.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_addr_raw_hazard
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
