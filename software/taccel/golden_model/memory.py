@@ -290,13 +290,28 @@ def read_bytes(state, buf_id: int, offset_units: int, length_bytes: int) -> byte
 
 
 def write_bytes(state, buf_id: int, offset_units: int, data: bytes):
-    """Write raw bytes to SRAM buffer."""
-    _check_sram_bounds(buf_id, offset_units)
+    """Write raw bytes to SRAM buffer.
+
+    Bounds the END of the write, not just its start. Passing only the offset
+    (as every caller of `_check_sram_bounds` still does) leaves that helper's
+    `length_units > 0` branch dead, and the two destinations then disagree on
+    an identical overrun: ACCUM is a numpy view whose slice assignment RAISES,
+    while ABUF/WBUF are `bytearray`s whose slice assignment silently GROWS the
+    object. An out-of-bounds LOAD therefore used to enlarge the modelled SRAM
+    (ABUF 131072 -> 133696 bytes) and every subsequent read succeeded against a
+    buffer bigger than the real chip's — the golden model would bless a bundle
+    the hardware cannot run. Fail loud instead: this is the correctness oracle.
+    """
     byte_offset = offset_units * UNIT
+    end = byte_offset + len(data)
+    buf_bytes = _buf_size(buf_id)
+    if byte_offset < 0 or end > buf_bytes:
+        raise SRAMAccessError(buf_id, offset_units, BUFFER_MAX_OFF.get(buf_id, 0))
+    _check_sram_bounds(buf_id, offset_units)
 
     if buf_id == BUF_ACCUM:
         view = state.accum.view(np.uint8)
-        view[byte_offset:byte_offset + len(data)] = np.frombuffer(data, dtype=np.uint8)
+        view[byte_offset:end] = np.frombuffer(data, dtype=np.uint8)
     else:
         buf = state.get_buffer(buf_id)
-        buf[byte_offset:byte_offset + len(data)] = data
+        buf[byte_offset:end] = data
