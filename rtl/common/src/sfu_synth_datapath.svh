@@ -308,10 +308,6 @@
   logic [31:0] ln_norm_g_w;
   logic [31:0] ln_norm_gb_w;
   logic [15:0] ln_out_h_w;
-  // Phase-3.B gen-1 LN output path: y/scale1 then quantize_i8 (matches DPI
-  // sfu_fp32_quantize_i8 contract — DIVIDE by scale, RNE round, clamp).
-  logic [31:0]       ln_g1_scaled_w;
-  logic signed [7:0] ln_g1_quant_w;
   assign ln_neg_mean = ln_mean_q ^ 32'h8000_0000;
   // n_elems_q (16-bit unsigned) → fp32 via i32_to_fp32 primitive (synth-safe).
   i32_to_fp32 u_ln_n_cvt (.a({16'h0, n_elems_q}), .y(ln_n_fp32));
@@ -376,8 +372,6 @@
   fp32_mul  u_ln_norm_g  (.a(ln_norm_w),    .b(ln_gamma_coll_w), .y(ln_norm_g_w));
   fp32_add  u_ln_norm_gb (.a(ln_norm_g_w),  .b(ln_beta_coll_w),  .y(ln_norm_gb_w));
   fp32_to_fp16 u_ln_out_h(.a(ln_norm_gb_w),                        .y(ln_out_h_w));
-  fp32_div  u_ln_g1_scale(.a(ln_norm_gb_w), .b(synth_scale1_bits), .y(ln_g1_scaled_w));
-  fp32_quantize_i8 u_ln_g1_quant (.a(ln_g1_scaled_w),               .y(ln_g1_quant_w));
 
   // ===================================================================
   // 0x1D MASKED_SOFTMAX_FP32 synth sub-FSM combinational primitives.
@@ -414,67 +408,14 @@
   logic sm_row_gt_max;
   assign sm_row_gt_max = (sm_diff_w[31] == 1'b0) && (sm_diff_w[30:0] != 31'd0);
 
-  // Phase-3.B: gen-1 SOFTMAX/MASKED_SOFTMAX synth output path.
-  //   gen-2 0x1D MASKED_SOFTMAX_FP32 writes out_h_q[i] = fp16(norm).
-  //   gen-1 0x0E SOFTMAX / 0x0F MASKED_SOFTMAX writes
-  //         out_bytes_q[i] = quantize_i8(norm / scale1_q).
-  // DPI golden (testbench.h `sfu_fp32_quantize_i8`) computes
-  //   q = round_half_even((float)value / (float)out_scale)
-  // — DIVIDE by scale, not multiply. The synth chain mirrors that exactly:
-  // fp32_div then fp32_quantize_i8. Note: matches per-rounding-step boundary
-  // behavior only if we don't introduce an intermediate fp32 round between
-  // the divide and the int8 quant; both are bit-exact RNE primitives so the
-  // composition is byte-identical when the upstream sm_norm_w matches.
-  logic [31:0]       synth_scale1_bits;
-  logic [31:0]       sm_g1_scaled_w;
-  logic signed [7:0] sm_g1_quant_w;
-  assign synth_scale1_bits = scale1_q;
-  fp32_div         u_sm_g1_scale (.a(sm_norm_w),       .b(synth_scale1_bits), .y(sm_g1_scaled_w));
-  fp32_quantize_i8 u_sm_g1_quant (.a(sm_g1_scaled_w),                          .y(sm_g1_quant_w));
-
-  // Phase-3.B gen-1 GELU synth datapath. Sequential ITER over 16 lanes per
-  // chunk (or 4 i32-lanes × 4 rows for the i32 GELU). Computes:
-  //   x = (sign_ext(i8_lane) -> fp32) * scale0_q
-  //   y = fp32_gelu_new(x)              (tanh-poly approximation of erf-GELU)
-  //   q = quantize_i8(y / scale1_q)
-  // Approximation note: gen-1 DPI uses erf-GELU (sfu_fp32_gelu). The synth
-  // path uses gelu_new (tanh-poly) because that's the only synthesizable
-  // GELU primitive available (Phase-1 unit #10 fp32_gelu_erf isn't built
-  // yet). For the byte-quantized output the int8 round absorbs the tanh-vs-
-  // erf difference on the fixture inputs (verified by test_sfu_synth
-  // gelu_*_roundtrip).
-  logic signed [7:0] gelu_g1_i8_sel;
-  logic [31:0]       gelu_g1_i32_sel;
-  logic [31:0]       gelu_g1_in_fp32;
-  logic [31:0]       gelu_g1_x_bits;
-  logic [31:0]       gelu_g1_y_bits;
-  logic [31:0]       gelu_g1_scaled_w;
-  logic signed [7:0] gelu_g1_quant_w;
-  logic [31:0]       gelu_g1_in_pick;
-  // synth_scale0_bits is already declared module-scope (DEQUANT_ACCUM_SCALED
-  // block). Reuse it here.
-  // INT8 source: lane comes from gelu_i8_row_q indexed by iter_idx_q[3:0].
-  assign gelu_g1_i8_sel  = $signed(gelu_i8_row_q[8*iter_idx_q[3:0] +: 8]);
-  // INT32 source: lane select by iter_idx_q[3:2] (0..3), row by iter_idx_q[1:0]
-  // (0..3). Matches the original always_comb packing where (lane, row)
-  // packs to byte index (lane + row*4) in gelu_i32_write_data_w.
-  always_comb begin
-    case (iter_idx_q[1:0])
-      2'd0: gelu_g1_i32_sel = gelu_row0_q[32*iter_idx_q[3:2] +: 32];
-      2'd1: gelu_g1_i32_sel = gelu_row1_q[32*iter_idx_q[3:2] +: 32];
-      2'd2: gelu_g1_i32_sel = gelu_row2_q[32*iter_idx_q[3:2] +: 32];
-      default: gelu_g1_i32_sel = gelu_row3_q[32*iter_idx_q[3:2] +: 32];
-    endcase
-  end
-  // Combine the two source selections — the active one is decided by the
-  // state (F_GELU_SYNTH_I8_ITER vs F_GELU_SYNTH_I32_ITER).
-  assign gelu_g1_in_pick = (state == F_GELU_SYNTH_I32_ITER) ? gelu_g1_i32_sel
-                                                            : {{24{gelu_g1_i8_sel[7]}}, gelu_g1_i8_sel};
-  i32_to_fp32      u_gelu_g1_cvt  (.a(gelu_g1_in_pick),                                  .y(gelu_g1_in_fp32));
-  fp32_mul         u_gelu_g1_x    (.a(gelu_g1_in_fp32), .b(synth_scale0_bits),           .y(gelu_g1_x_bits));
-  fp32_gelu_new    u_gelu_g1_y    (.a(gelu_g1_x_bits),                                   .y(gelu_g1_y_bits));
-  fp32_div         u_gelu_g1_s    (.a(gelu_g1_y_bits),  .b(synth_scale1_bits),           .y(gelu_g1_scaled_w));
-  fp32_quantize_i8 u_gelu_g1_q    (.a(gelu_g1_scaled_w),                                 .y(gelu_g1_quant_w));
+  // 2026-07-21 (fmax phase 0a): the gen-1 SOFTMAX and gen-1 GELU synth output
+  // cones were DELETED here. Both were driven but had no reader — their
+  // terminal nets (sm_g1_quant_w, gelu_g1_quant_w) were read nowhere in the
+  // tree, and their driving states (F_GELU_SYNTH_I8_ITER / _I32_ITER) are
+  // never entered (gen-1 OP_SOFTMAX/OP_GELU are illegal at decode). They cost
+  // a full fp32_gelu_new (exp+div, ~700 ns) plus three fp32_div/quantize
+  // chains of FALSE critical path in any full-SFU STA. `synth_scale1_bits`
+  // went with them (its last consumer was the deleted ATTN V cone below).
 
   // Opcode-aware SOFTMAX visibility predicate. The F_G2_SM_* sub-FSM tests
   // sm_visible_w in every state, replacing the inline kt-comparison so the
@@ -551,59 +492,14 @@
       sm_eff_bound_w = sm_iter_bound_w;
   end
 
-  // Phase-3.B ATTN V_LATCH parallel 16-lane synth datapath. Each cycle:
-  //   weight   = exp(row_data_q[k_idx] - row_max) / exp_sum   (visible only)
-  //   per lane: attn_accum_q[idx] += weight * sign_ext(v_lane) * scale1_q
-  // Per-K weight compute is shared; 16 lanes parallel for the V-multiply
-  // and accumulate. Mirrors the DPI V_LATCH (1 cycle per chunk) — no
-  // new state needed; F_ATTN_V_LATCH muxes synth vs DPI on SFU_SYNTH_MODE.
-  logic [31:0] attn_row_at_k_bits;
-  logic [31:0] attn_diff_w;
-  logic [31:0] attn_exp_w;
-  logic [31:0] attn_weight_w;
-  logic [31:0] attn_weight_eff_w;
-  logic        attn_vis_at_k;
-  assign attn_row_at_k_bits = row_data_q[attn_k_idx_q[9:0]];
-  fp32_add u_attn_diff (.a(attn_row_at_k_bits), .b(sm_neg_max),   .y(attn_diff_w));
-  fp32_exp u_attn_exp  (.a(attn_diff_w),                          .y(attn_exp_w));
-  fp32_div u_attn_div  (.a(attn_exp_w), .b(sm_exp_sum_q),         .y(attn_weight_w));
-  assign attn_vis_at_k = (opcode_q == OP_SOFTMAX_ATTNV) ||
-                         attn_visible(row_idx_q, integer'(attn_k_idx_q));
-  assign attn_weight_eff_w = attn_vis_at_k ? attn_weight_w : 32'h0;
-
-  logic [31:0] attn_v_lane_fp32    [0:15];
-  logic [31:0] attn_v_weighted     [0:15];
-  logic [31:0] attn_v_scaled       [0:15];
-  logic [31:0] attn_acc_old_bits   [0:15];
-  logic [31:0] attn_acc_new_bits   [0:15];
-  genvar gv_lane;
-  generate
-    for (gv_lane = 0; gv_lane < 16; gv_lane++) begin : v_lane
-      logic signed [7:0] byte_sel;
-      logic [31:0]       byte_sx;
-      assign byte_sel = $signed(sram_b_rdata[8*gv_lane +: 8]);
-      assign byte_sx  = {{24{byte_sel[7]}}, byte_sel};
-      i32_to_fp32 u_v_cvt (.a(byte_sx),                .y(attn_v_lane_fp32[gv_lane]));
-      fp32_mul    u_v_w   (.a(attn_weight_eff_w),
-                           .b(attn_v_lane_fp32[gv_lane]), .y(attn_v_weighted[gv_lane]));
-      fp32_mul    u_v_s   (.a(attn_v_weighted[gv_lane]),
-                           .b(synth_scale1_bits),         .y(attn_v_scaled[gv_lane]));
-    end
-  endgenerate
-  always_comb begin
-    for (int li = 0; li < 16; li++) begin
-      automatic int idx_li;
-      idx_li = integer'(read_idx_q) * 16 + li;
-      attn_acc_old_bits[li] = attn_accum_q[idx_li[9:0]];
-    end
-  end
-  generate
-    for (gv_lane = 0; gv_lane < 16; gv_lane++) begin : v_acc
-      fp32_add u_v_add (.a(attn_acc_old_bits[gv_lane]),
-                        .b(attn_v_scaled[gv_lane]),
-                        .y(attn_acc_new_bits[gv_lane]));
-    end
-  endgenerate
+  // 2026-07-21 (fmax phase 0a): the Phase-3.B ATTN V_LATCH 16-lane synth cone
+  // was DELETED here. It was the single largest dead cone in the SFU: a shared
+  // add→exp→div weight chain plus 16 lanes of (i32_to_fp32, fp32_mul, fp32_mul,
+  // fp32_add) accumulating into attn_acc_new_bits — a net with NO reader. Its
+  // only consumer state, F_ATTN_V_LATCH (7'd20), has no case arm and nothing
+  // transitions into it, so the whole cone was unreachable. Note attn_accum_q
+  // itself is LIVE (the VADD / DEQUANT_ACCUM synth path reads it); only this
+  // 16-lane accumulate cone is gone.
   // ===================================================================
 
   // ===================================================================
