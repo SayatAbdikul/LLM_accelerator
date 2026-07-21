@@ -447,9 +447,27 @@
   logic [31:0] ln_gamma_coll_w, ln_beta_coll_w;
   assign ln_gamma_coll_w = gamma_q[ln_coll_q[9:0]];
   assign ln_beta_coll_w  = beta_q [ln_coll_q[9:0]];
-  fp32_mul  u_ln_norm_g  (.a(ln_norm_w),    .b(ln_gamma_coll_w), .y(ln_norm_g_w));
-  fp32_add  u_ln_norm_gb (.a(ln_norm_g_w),  .b(ln_beta_coll_w),  .y(ln_norm_gb_w));
-  fp32_to_fp16 u_ln_out_h(.a(ln_norm_gb_w),                        .y(ln_out_h_w));
+  // 2026-07-21 (fmax phase 0e): the collect side was mul -> add -> f2h in ONE
+  // cycle behind the divider's registered quotient — 61.07 ns standalone, the
+  // last un-timed LIVE cloud after the SCALED chain. Now one primitive per
+  // stage, so the collect walks THREE cycles behind the divider output:
+  //   c   mul  = ln_norm_w * gamma[ln_coll_q]   -> ln_g_q
+  //   c+1 add  = ln_g_q    + beta(delayed 1)    -> ln_gb_q
+  //   c+2 f2h  = ln_gb_q                        -> out_h_q[ln_wr_q]
+  //
+  // BETA DELAY, same hazard as the SCALED chain: gamma is read when the
+  // quotient emerges, but the add fires a cycle later, by which time ln_coll_q
+  // has advanced and beta_q[ln_coll_q] is a DIFFERENT element's bias. gamma
+  // needs no delay (it is consumed in the same cycle it is read); beta does.
+  logic [31:0] ln_g_q, ln_gb_q, ln_beta_d1_q;
+  fp32_mul  u_ln_norm_g  (.a(ln_norm_w), .b(ln_gamma_coll_w), .y(ln_norm_g_w));
+  fp32_add  u_ln_norm_gb (.a(ln_g_q),    .b(ln_beta_d1_q),    .y(ln_norm_gb_w));
+  fp32_to_fp16 u_ln_out_h(.a(ln_gb_q),                        .y(ln_out_h_w));
+  always_ff @(posedge clk) begin
+    ln_g_q       <= ln_norm_g_w;
+    ln_beta_d1_q <= ln_beta_coll_w;
+    ln_gb_q      <= ln_norm_gb_w;
+  end
 
   // ===================================================================
   // 0x1D MASKED_SOFTMAX_FP32 synth sub-FSM primitives.

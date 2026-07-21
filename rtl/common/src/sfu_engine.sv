@@ -299,6 +299,13 @@ module sfu_engine
   // paths already existed as the DIFF and OUT critical paths; they now just run
   // concurrently, and don't chain).
   logic [10:0]  ln_coll_q;
+  // fmax phase 0e: the LN finalize (mul|add|f2h) is now 2 registers deep, so the
+  // out_h_q write pointer trails the divider-collect pointer by 2. ln_fin_vld_q
+  // is the matching 2-deep valid shift — the finalize path has no valid_out of
+  // its own, and a hardcoded offset would break on a short row.
+  logic [10:0]  ln_wr_q;
+  logic [1:0]   ln_fin_vld_q;
+  logic         ln_coll_en_w;
   // 2026-05-31: LN_VAR accumulator pipelining (fmax lever). The variance pass
   // computed (row-mean)^2 AND accumulated it in ONE cycle: synth_a_bits ->
   // fp32_add(sub) -> fp32_mul(square) -> fp32_add(accumulate) -> ln_var_acc_q,
@@ -650,6 +657,19 @@ module sfu_engine
     else        dq_vld_q <= {dq_vld_q[1:0], dq_feed_en_w};
   end
 
+  // LN finalize strobe + its depth-2 valid chain. ln_coll_en_w is the SINGLE
+  // definition of "a quotient is being collected this cycle" — the same
+  // condition F_G2_LN_OUT_DIFF uses to advance ln_coll_q, so the pointer and
+  // the valid chain cannot drift apart.
+  assign ln_coll_en_w = (state == F_G2_LN_OUT_DIFF) &&
+                        ({5'h0, ln_wr_q} < n_elems_q) &&
+                        (iter_idx_q >= 11'd7) &&
+                        ({5'h0, ln_coll_q} < n_elems_q);
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) ln_fin_vld_q <= 2'h0;
+    else        ln_fin_vld_q <= {ln_fin_vld_q[0], ln_coll_en_w};
+  end
+
 `include "sfu_synth_datapath.svh"
   // ===================================================================
 
@@ -897,6 +917,7 @@ module sfu_engine
       ln_var_eps_q   <= 32'h0;
       ln_diff_q      <= 32'h0;
       ln_coll_q      <= 11'h0;
+      ln_wr_q        <= 11'h0;
       ln_dsq_q       <= 32'h0;
       sm_diff_q      <= 32'h0;
       sm_exp_q       <= 32'h0;

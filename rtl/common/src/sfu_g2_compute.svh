@@ -490,21 +490,32 @@
         //   Gen-1 OP_LAYERNORM (0x0F) is illegal at decode_unit (decode_unit.sv
         //   L45); only gen-2 0x1A LAYERNORM_FP32 reaches here, writing FP16.
         F_G2_LN_OUT_DIFF: begin
-          if ({5'h0, ln_coll_q} >= n_elems_q) begin
-            // every element collected (also the n_elems==0 degenerate case).
+          // EXIT is keyed to the WRITE pointer, not the divider-collect pointer:
+          // since fmax phase 0e the finalize (mul|add|f2h) is itself 2 registers
+          // deep, so ln_wr_q trails ln_coll_q by 2 and is the last thing to
+          // finish. Exiting on ln_coll_q would drop the final two elements.
+          if ({5'h0, ln_wr_q} >= n_elems_q) begin
+            // every element written (also the n_elems==0 degenerate case).
             iter_idx_q <= 11'h0;
             ln_coll_q  <= 11'h0;
+            ln_wr_q    <= 11'h0;
             state      <= F_G2_PACK;
           end else begin
             // FEED: present row[iter_idx_q]-mean to the divider input register.
             if ({5'h0, iter_idx_q} < n_elems_q)
               ln_diff_q <= ln_diff_w;
-            // COLLECT: after the 7-deep pipe fills (1 ln_diff_q reg + 6 div_p6
-            // stages, lever E), ln_norm_w holds element ln_coll_q's quotient
-            // (ln_coll_q = iter_idx_q - 7); finalize and write it (element order).
-            if (iter_idx_q >= 11'd7) begin
-              out_h_q[ln_coll_q[9:0]] <= ln_out_h_w;
-              ln_coll_q               <= ln_coll_q + 11'd1;
+            // DIVIDER COLLECT: after the 7-deep pipe fills (1 ln_diff_q reg + 6
+            // div_p6 stages, lever E), ln_norm_w holds element ln_coll_q's
+            // quotient (ln_coll_q = iter_idx_q - 7). This pointer indexes
+            // gamma/beta; it no longer writes out_h_q.
+            if (ln_coll_en_w)
+              ln_coll_q <= ln_coll_q + 11'd1;
+            // FINALIZE WRITE: 2 cycles behind the divider collect, in element
+            // order exactly as before. ln_fin_vld_q is the 2-deep valid shift of
+            // the collect strobe, so a stalled or short row cannot write garbage.
+            if (ln_fin_vld_q[1]) begin
+              out_h_q[ln_wr_q[9:0]] <= ln_out_h_w;
+              ln_wr_q               <= ln_wr_q + 11'd1;
             end
             iter_idx_q <= iter_idx_q + 11'd1;
           end
