@@ -66,9 +66,23 @@ BASELINE_COBUSY = 4_148_317  # HEAD (e6f7006) baseline; item-1 must push this UP
 # Keyed by (batch, position). Used as the default for --expect-sha1 when the run
 # matches a known configuration; pass --expect-sha1 explicitly to override, or
 # --no-sha1-check to skip (e.g. after an intentional, re-pinned numerics change).
+#
+# 2026-07-21 CORRECTION — the b1 entry was keyed (1, 510) but the number was
+# measured at pos 511: docs/t1_overlap_items.md:90-91 tabulates "b1 pos-511"
+# and "b16 pos-510", and I transcribed both under one position. The two shapes
+# were benchmarked at DIFFERENT positions and always had been. Consequences,
+# both live since e81d4cc introduced the pin:
+#   `--batch 1 --position 510` FAILED spuriously (it compared a pos-510 run
+#     against a pos-511 hash), and
+#   `--batch 1 --position 511` — the shape the docs actually track — silently
+#     ran with NO sha1 check at all, because the lookup missed.
+# So the b1 leg of this gate has never once done what it claimed. Re-verified
+# by running both: (1,511) reproduces eeab004014642d14 exactly; a pos-510 b1
+# run is e43826086a1fbce4 (a different, un-pinned machine — NOT a regression).
+# The position is part of the identity of the measurement; do not merge them.
 KNOWN_LOGITS_SHA1 = {
     (16, 510): "205682b6515f7e85",
-    (1, 510): "eeab004014642d14",
+    (1, 511): "eeab004014642d14",
 }
 
 
@@ -170,8 +184,10 @@ def main() -> int:
         )
 
     expect_sha1 = args.expect_sha1
+    sha1_unchecked = False
     if expect_sha1 is None and not args.no_sha1_check:
         expect_sha1 = KNOWN_LOGITS_SHA1.get((args.batch, args.position))
+        sha1_unchecked = expect_sha1 is None
     if expect_sha1 and not args.no_sha1_check:
         if lh != expect_sha1:
             failures.append(
@@ -198,6 +214,18 @@ def main() -> int:
         for f in failures:
             print(f"  * {f}", file=sys.stderr)
         return 1
+
+    # A missing pin used to print one quiet line and still report "GATE PASSED",
+    # which reads as "byte-exactness verified" when nothing was compared — the
+    # exact way the mis-keyed (1, 510) entry hid for so long. Say so in the
+    # verdict itself; the sha1 is the only leg that sees a silent-corruption
+    # class (`sys_lost == 0` is near-tautological, see the module docstring).
+    if sha1_unchecked:
+        print(f"\nGATE PASSED (WITHOUT the sha1 leg — no pin for batch="
+              f"{args.batch} pos={args.position}; byte-exactness was NOT "
+              f"checked. Known pins: "
+              f"{', '.join(f'b{b}/pos{p}' for b, p in sorted(KNOWN_LOGITS_SHA1))}.)")
+        return 0
 
     print("\nGATE PASSED")
     return 0
