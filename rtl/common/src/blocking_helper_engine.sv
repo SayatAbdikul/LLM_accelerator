@@ -124,7 +124,13 @@ module blocking_helper_engine
     H_DQ_REQ          = 6'd29,
     H_DQ_LATCH        = 6'd30,
     H_DQ_WRITE        = 6'd31,
-    H_FAULT           = 6'd32
+    H_FAULT           = 6'd32,
+    // fmax phase 0c (2026-07-21): drain states for the now-pipelined 16-lane
+    // DEQUANT_ADD chain. One per inserted register stage; they issue no SRAM
+    // activity (the request comb block's `default: ;` covers them).
+    H_DQ_PIPE1        = 6'd33,   // i32->fp32 converts settling
+    H_DQ_PIPE2        = 6'd34,   // the two fp32_muls settling
+    H_DQ_PIPE3        = 6'd35    // the fp32_add settling
   } helper_state_t;
 
   helper_state_t state;
@@ -750,11 +756,45 @@ module blocking_helper_engine
   //     skip_term    = fp32_mul(skip_fp32, skip_scale_fp32)
   //     sum          = fp32_add(acc_term, skip_term)
   //     out[lane]    = fp32_quantize_i8(sum)                   // already clamps
+  //
+  // 2026-07-21 (fmax phase 0c): this was ONE combinational cloud from the
+  // rq_row*_q / skip_row_q registers all the way to sram_a_wdata — cvt -> mul
+  // -> add -> quantize, x16 lanes, measured 54.15 ns standalone. The op is
+  // bundle-dead (codegen.py force-disables OP_DEQUANT_ADD) but the logic is in
+  // the netlist, so it constrains the clock exactly as much as a live path
+  // does. It is now cut into four stages, ONE fp primitive each:
+  //   cycle T   : rq_row3_q lands (H_DQ_LATCH, part 3)
+  //   T+1 PIPE1 : i32_to_fp32 x2   -> src_fp32_q_l / skip_fp32_q_l
+  //   T+2 PIPE2 : fp32_mul x2      -> acc_term_q_l / skip_term_q_l
+  //   T+3 PIPE3 : fp32_add         -> sum_q_l
+  //   T+4 WRITE : fp32_quantize_i8 -> sram_a_wdata
+  // Same primitives, same order, same operands => bit-identical; only the
+  // write strobe moved 3 cycles later. There is no feedback and every input
+  // (rq_row0-3_q, skip_row_q, scale0/1_q) is already registered and stable for
+  // the whole chunk, so the stage registers can free-run: the FSM's three wait
+  // states are what establish validity, exactly as in phases 0b/0d.
+  //
+  // The wait states are NOT gated on HELPER_SYNTH_MODE. Mode 0 evaluates the
+  // DPI dequant_add_pack combinationally at H_DQ_WRITE and does not need them,
+  // but a state machine that differs between the two modes is a bug farm, and
+  // the cycles land on a dead op. Both modes stay byte-identical.
   // ===================================================================
   logic [31:0]  synth_dq_acc_scale_bits;
   logic [31:0]  synth_dq_skip_scale_bits;
   fp16_to_fp32 u_synth_dq_h2f_acc  (.a(scale0_q), .y(synth_dq_acc_scale_bits));
   fp16_to_fp32 u_synth_dq_h2f_skip (.a(scale1_q), .y(synth_dq_skip_scale_bits));
+
+  // Registered scale conversions, so the per-lane muls see a register and not
+  // fp16_to_fp32 chained ahead of them. scale0_q/scale1_q are latched at
+  // dispatch and constant for the whole instruction, so these need no
+  // alignment with the lane pipeline — they have settled many cycles before
+  // the first chunk reaches PIPE2.
+  logic [31:0]  dq_acc_scale_q;
+  logic [31:0]  dq_skip_scale_q;
+  always_ff @(posedge clk) begin
+    dq_acc_scale_q  <= synth_dq_acc_scale_bits;
+    dq_skip_scale_q <= synth_dq_skip_scale_bits;
+  end
 
   logic [127:0] synth_dq_write_data_w;
   genvar g_lane;
@@ -779,12 +819,33 @@ module blocking_helper_engine
         skip_i8_l  = skip_row_q[(g_lane * 8) +: 8];
         skip_i32_l = {{24{skip_i8_l[7]}}, skip_i8_l};
       end
-      i32_to_fp32      u_src    (.a(src_i32_l),       .y(src_fp32_l));
-      i32_to_fp32      u_skp    (.a(skip_i32_l),      .y(skip_fp32_l));
-      fp32_mul         u_acc_mul(.a(src_fp32_l),  .b(synth_dq_acc_scale_bits),  .y(acc_term_l));
-      fp32_mul         u_skp_mul(.a(skip_fp32_l), .b(synth_dq_skip_scale_bits), .y(skip_term_l));
-      fp32_add         u_dq_add (.a(acc_term_l), .b(skip_term_l), .y(sum_l));
-      fp32_quantize_i8 u_dq_q   (.a(sum_l),                       .y(q_i8_l));
+      // Free-running stage registers (see the block comment above): validity
+      // comes from the FSM's H_DQ_PIPE1..3 wait states, not from an enable.
+      logic [31:0] src_fp32_q_l;
+      logic [31:0] skip_fp32_q_l;
+      logic [31:0] acc_term_q_l;
+      logic [31:0] skip_term_q_l;
+      logic [31:0] sum_q_l;
+
+      // stage 1: integer -> fp32
+      i32_to_fp32      u_src    (.a(src_i32_l),  .y(src_fp32_l));
+      i32_to_fp32      u_skp    (.a(skip_i32_l), .y(skip_fp32_l));
+      // stage 2: scale both terms
+      fp32_mul         u_acc_mul(.a(src_fp32_q_l),  .b(dq_acc_scale_q),  .y(acc_term_l));
+      fp32_mul         u_skp_mul(.a(skip_fp32_q_l), .b(dq_skip_scale_q), .y(skip_term_l));
+      // stage 3: sum
+      fp32_add         u_dq_add (.a(acc_term_q_l), .b(skip_term_q_l), .y(sum_l));
+      // stage 4: quantize (consumed combinationally at H_DQ_WRITE)
+      fp32_quantize_i8 u_dq_q   (.a(sum_q_l), .y(q_i8_l));
+
+      always_ff @(posedge clk) begin
+        src_fp32_q_l  <= src_fp32_l;
+        skip_fp32_q_l <= skip_fp32_l;
+        acc_term_q_l  <= acc_term_l;
+        skip_term_q_l <= skip_term_l;
+        sum_q_l       <= sum_l;
+      end
+
       assign synth_dq_write_data_w[(g_lane * 8) +: 8] = q_i8_l;
     end
   endgenerate
@@ -1321,12 +1382,23 @@ module blocking_helper_engine
           endcase
 
           if (rq_part_q == 2'd3) begin
-            state <= H_DQ_WRITE;
+            // Last ACCUM part landed: the 16-lane chain's inputs are all
+            // registered and stable from here, so walk the three pipeline
+            // stages before strobing the write (fmax phase 0c).
+            state <= H_DQ_PIPE1;
           end else begin
             rq_part_q <= rq_part_q + 2'd1;
             state     <= H_DQ_REQ;
           end
         end
+
+        // Drain the pipelined DEQUANT_ADD chain. Pure waits — no SRAM traffic,
+        // no state beyond `state` itself. Splitting them out (rather than a
+        // counter) keeps each stage's purpose readable next to the datapath
+        // comment that names the same four stages.
+        H_DQ_PIPE1: state <= H_DQ_PIPE2;   // converts -> src_fp32_q_l
+        H_DQ_PIPE2: state <= H_DQ_PIPE3;   // muls     -> acc/skip_term_q_l
+        H_DQ_PIPE3: state <= H_DQ_WRITE;   // add      -> sum_q_l
 
         H_DQ_WRITE: begin
           if (sram_a_fault) begin
