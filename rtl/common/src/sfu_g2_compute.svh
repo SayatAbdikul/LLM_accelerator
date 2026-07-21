@@ -63,12 +63,14 @@
           end else if (opcode_q == OP_DEQUANT_ACCUM_FP32) begin
             // 0x17: FP16 = fp32(INT32) * per-column FP16 scale.
             if (SFU_SYNTH_MODE == 1) begin
-              // Synth path: 8-wide compute (fp32_mul + cvt) fused with the
-              // writeback (F_G2_CW) — no separate F_G2_PACK/WRITE drain pass.
-              iter_idx_q    <= 11'h0;
-              write_chunk_q <= 11'h0;
-              cw_have_q     <= 1'b0;
-              state         <= F_G2_CW;
+              // UNREACHABLE in mode 1: F_G2_S2_LATCH reroutes 0x17 to F_G2_S1_REQ
+              // -> F_G2_DQL once the per-col scales are registered, so control
+              // never arrives here. As of fmax phase 0e it must stay that way —
+              // synth_compute_out for 0x17 is now the PIPELINED synth_mul_d3_q,
+              // and F_G2_CW indexes out_h_q by iter_idx_q with no collect lag, so
+              // it would write results 3 elements out of step. Fault instead.
+              fault_code_r <= 4'(FAULT_UNSUPPORTED_OP);
+              state        <= F_FAULT;
             end else begin
 `ifndef SFU_SYNTH_NO_DPI
               // DPI path (default; cosim-pinned).
@@ -103,13 +105,14 @@
             // row_data_q=int32(real); gamma_q=wt-scales; beta_q=bias;
             // scale0_q = scale_regs[sreg] (the fwd act-scale from 0x1F).
             if (SFU_SYNTH_MODE == 1) begin
-              // Synth path: 3-stage combinational chain (mul, mul, add) + cvt
-              // fp16, 8-wide, fused with the writeback (F_G2_CW) — no separate
-              // F_G2_PACK/WRITE drain pass.
-              iter_idx_q    <= 11'h0;
-              write_chunk_q <= 11'h0;
-              cw_have_q     <= 1'b0;
-              state         <= F_G2_CW;
+              // UNREACHABLE in mode 1, same as the 0x17 arm above: F_G2_S2_LATCH
+              // reroutes 0x1E to F_G2_S1_REQ -> F_G2_DQL. The chain is now
+              // PIPELINED (synth_sc_s_q, 3 deep) and F_G2_CW has no collect lag,
+              // so dispatching here would write 3 elements out of step — and
+              // with beta on its own 2-deep delay, plausibly-wrong numbers
+              // rather than an obvious break. Fault instead.
+              fault_code_r <= 4'(FAULT_UNSUPPORTED_OP);
+              state        <= F_FAULT;
             end else begin
 `ifndef SFU_SYNTH_NO_DPI
               // DPI path (default; cosim-pinned).

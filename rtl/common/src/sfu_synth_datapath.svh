@@ -125,8 +125,10 @@
   always_comb begin
     case (opcode_q)
       OP_VADD_FP32:                 synth_compute_out = synth_add_out;
-      OP_DEQUANT_ACCUM_FP32:        synth_compute_out = synth_mul_out;
-      OP_DEQUANT_ACCUM_FP32_SCALED: synth_compute_out = synth_scaled_add;
+      // 0x17 / 0x1E read the PIPELINED results (fmax phase 0e) — both are
+      // handled only by F_G2_DQL, which indexes out_h_q by its collect pointer.
+      OP_DEQUANT_ACCUM_FP32:        synth_compute_out = synth_mul_d3_q;
+      OP_DEQUANT_ACCUM_FP32_SCALED: synth_compute_out = synth_sc_s_q;
       OP_GELU_FP32:                 synth_compute_out = synth_gelu_out;
       default:                      synth_compute_out = 32'd0;
     endcase
@@ -164,22 +166,58 @@
 
   // For 0x1E DEQUANT_ACCUM_FP32_SCALED chain:
   //   out = ((row_data_q * gamma_q) * scale0_q) + beta_q  -> f2h
-  // Three combinational stages, then through the shared fp32_to_fp16.
+  //
+  // 2026-07-21 (fmax phase 0e): this was THREE combinational stages in ONE
+  // cycle, then f2h — measured 86.59 ns standalone, ~3x the primitive floor,
+  // LIVE on every b16 step (it is the DEQUANT_SCALED that follows each matmul).
+  // Now cut so each stage carries one primitive:
+  //   T   mul1 = a * gamma          -> synth_sc_m1_q
+  //   T+1 mul2 = m1 * scale0        -> synth_sc_m2_q
+  //   T+2 add  = m2 + beta(delayed) -> synth_sc_s_q
+  //   T+3 the shared f2h, at the COLLECT index in F_G2_DQL
+  //
+  // BETA MUST BE DELAYED BY 2. gamma and `a` are read at the FEED index, but
+  // the add fires two cycles later, when iter_idx_q has already moved on —
+  // beta_q[iter_idx_q] at that moment belongs to a DIFFERENT element. This is
+  // the same alignment hazard as fp32_gelu_p33's x delay line, and it is silent:
+  // it would corrupt every element by a fixed index skew while still producing
+  // plausible-looking numbers. scale0_q needs no delay (scalar, constant for
+  // the instruction).
   logic [31:0] synth_gamma_bits;
   logic [31:0] synth_beta_bits;
   logic [31:0] synth_scale0_bits;
   logic [31:0] synth_scaled_mul1;
   logic [31:0] synth_scaled_mul2;
   logic [31:0] synth_scaled_add;
+  logic [31:0] synth_sc_m1_q, synth_sc_m2_q, synth_sc_s_q;
+  logic [31:0] synth_beta_d1_q, synth_beta_d2_q;
   assign synth_gamma_bits  = gamma_q[iter_idx_q[9:0]];
   assign synth_beta_bits   = beta_q[iter_idx_q[9:0]];
   assign synth_scale0_bits = scale0_q;
   fp32_mul u_synth_scaled_mul1 (
-    .a(synth_a_bits),     .b(synth_gamma_bits),  .y(synth_scaled_mul1));
+    .a(synth_a_bits),      .b(synth_gamma_bits),  .y(synth_scaled_mul1));
   fp32_mul u_synth_scaled_mul2 (
-    .a(synth_scaled_mul1), .b(synth_scale0_bits), .y(synth_scaled_mul2));
+    .a(synth_sc_m1_q),     .b(synth_scale0_bits), .y(synth_scaled_mul2));
   fp32_add u_synth_scaled_add  (
-    .a(synth_scaled_mul2), .b(synth_beta_bits),   .y(synth_scaled_add));
+    .a(synth_sc_m2_q),     .b(synth_beta_d2_q),   .y(synth_scaled_add));
+
+  // For 0x17 DEQUANT_ACCUM_FP32 (the other op F_G2_DQL serves): its compute is
+  // a single fp32_mul and needs no pipelining, but it shares F_G2_DQL's collect
+  // pointer, so its result is delayed to the SAME depth. Cheaper than giving
+  // the state two write indices, and far less error-prone.
+  logic [31:0] synth_mul_d1_q, synth_mul_d2_q, synth_mul_d3_q;
+
+  // Free-running (validity comes from F_G2_DQL's valid chain, see dq_vld_q).
+  always_ff @(posedge clk) begin
+    synth_sc_m1_q   <= synth_scaled_mul1;
+    synth_sc_m2_q   <= synth_scaled_mul2;
+    synth_sc_s_q    <= synth_scaled_add;
+    synth_beta_d1_q <= synth_beta_bits;
+    synth_beta_d2_q <= synth_beta_d1_q;
+    synth_mul_d1_q  <= synth_mul_out;
+    synth_mul_d2_q  <= synth_mul_d1_q;
+    synth_mul_d3_q  <= synth_mul_d2_q;
+  end
 
   // ===================================================================
   // 8-wide SIMD widening of the F_G2_SYNTH_ITER elementwise loop.
@@ -231,13 +269,29 @@
       fp32_add u_add (.a(a_bits), .b(b_bits),     .y(add_out));
       fp32_mul u_mul (.a(a_bits), .b(b_bits_eff), .y(mul_out));
 
-      // DEQUANT_ACCUM_FP32_SCALED chain (replica of the scaled chain).
+      // DEQUANT_ACCUM_FP32_SCALED chain (replica of the scaled chain), and the
+      // 0x17 mul delay — both pipelined in lockstep with lane 0 (fmax phase
+      // 0e). Note beta rides a 2-deep delay so it stays aligned with the add,
+      // which fires two cycles after gamma/a were read; see the lane-0 comment.
       logic [31:0] scaled_mul1;
       logic [31:0] scaled_mul2;
       logic [31:0] scaled_add;
-      fp32_mul u_scaled_mul1 (.a(a_bits),      .b(gamma_bits),  .y(scaled_mul1));
-      fp32_mul u_scaled_mul2 (.a(scaled_mul1), .b(scale0_q),    .y(scaled_mul2));
-      fp32_add u_scaled_add  (.a(scaled_mul2), .b(beta_bits),   .y(scaled_add));
+      logic [31:0] sc_m1_q, sc_m2_q, sc_s_q;
+      logic [31:0] beta_d1_q, beta_d2_q;
+      logic [31:0] mul_d1_q, mul_d2_q, mul_d3_q;
+      fp32_mul u_scaled_mul1 (.a(a_bits),   .b(gamma_bits),  .y(scaled_mul1));
+      fp32_mul u_scaled_mul2 (.a(sc_m1_q),  .b(scale0_q),    .y(scaled_mul2));
+      fp32_add u_scaled_add  (.a(sc_m2_q),  .b(beta_d2_q),   .y(scaled_add));
+      always_ff @(posedge clk) begin
+        sc_m1_q   <= scaled_mul1;
+        sc_m2_q   <= scaled_mul2;
+        sc_s_q    <= scaled_add;
+        beta_d1_q <= beta_bits;
+        beta_d2_q <= beta_d1_q;
+        mul_d1_q  <= mul_out;
+        mul_d2_q  <= mul_d1_q;
+        mul_d3_q  <= mul_d2_q;
+      end
 
       // GELU replica (identical to lane-0 u_synth_gelu). 2026-07-08: widened
       // to 8 lanes. The old "area hog" guess was falsified by the 2026-05-30
@@ -264,8 +318,8 @@
       always_comb begin
         case (opcode_q)
           OP_VADD_FP32:                 compute_out = add_out;
-          OP_DEQUANT_ACCUM_FP32:        compute_out = mul_out;
-          OP_DEQUANT_ACCUM_FP32_SCALED: compute_out = scaled_add;
+          OP_DEQUANT_ACCUM_FP32:        compute_out = mul_d3_q;
+          OP_DEQUANT_ACCUM_FP32_SCALED: compute_out = sc_s_q;
           OP_GELU_FP32:                 compute_out = gelu_out;
           default:                      compute_out = 32'd0;
         endcase

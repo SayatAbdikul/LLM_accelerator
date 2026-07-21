@@ -403,6 +403,16 @@ module sfu_engine
   // drained every chunk, which cannot happen until collect has produced them.
   logic [10:0]  gelu_coll_q;
   logic         gelu_feed_en_w;
+  // 2026-07-21 (fmax phase 0e): F_G2_DQL's compute track got the same
+  // feed/collect split, for the same reason — its 0x1E chain (mul->mul->add
+  // ->f2h) was one 86.59 ns cycle. dq_coll_q lags iter_idx_q by the pipe depth
+  // 3; dq_vld_q is the depth-3 valid shift that says when a fed chunk has
+  // emerged (the inline pipe has no valid_out of its own, unlike gelu_p33).
+  // Both of F_G2_DQL's ops (0x17 and 0x1E) are delayed to the SAME depth so
+  // the state has ONE write index rather than one per opcode.
+  logic [10:0]  dq_coll_q;
+  logic [2:0]   dq_vld_q;
+  logic         dq_feed_en_w;
   // Streamed-load lagging capture pointer: the chunk index whose SRAM read
   // data is on the bus this cycle (read_idx_q is the leading issue pointer,
   // running one chunk ahead). Lets the F_G2_S1/S2 load loops issue one SRAM
@@ -620,6 +630,25 @@ module sfu_engine
       (write_chunk_q < g2_rows_q[10:0]) &&
       ({5'h0, iter_idx_q[10:3]} < glc_vis_q) &&
       ({5'h0, iter_idx_q} < n_elems_q);
+
+  // DEQUANT (0x17/0x1E) pipeline feed strobe — the single definition of "a
+  // chunk enters the DQL pipe this cycle", mirroring gelu_feed_en_w. F_G2_DQL's
+  // compute track is written as `if (dq_feed_en_w)` so the pointer advance and
+  // the valid chain cannot drift apart.
+  assign dq_feed_en_w =
+      (state == F_G2_DQL) &&
+      !(cw_have_q && sram_a_fault) &&
+      !(dq_load_q && sram_b_fault) &&
+      (write_chunk_q < g2_rows_q[10:0]) &&
+      ({5'h0, iter_idx_q} < n_elems_q) &&
+      ((({5'h0, iter_idx_q} + 16'd8) <= {1'b0, dq_vis_q, 2'b00}) || !dq_load_q);
+
+  // Depth-3 valid chain for the DQL pipe. Free-running like the datapath
+  // registers it tracks; reset only clears validity, never data.
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) dq_vld_q <= 3'h0;
+    else        dq_vld_q <= {dq_vld_q[1:0], dq_feed_en_w};
+  end
 
 `include "sfu_synth_datapath.svh"
   // ===================================================================
@@ -884,6 +913,7 @@ module sfu_engine
       dq_params_done_q <= 1'b0;
       dq_load_q      <= 1'b0;
       dq_vis_q       <= 13'h0;
+      dq_coll_q      <= 11'h0;
       vlc_load_q     <= 1'b0;
       vlc_vis_q      <= 13'h0;
       glc_load_q     <= 1'b0;
@@ -1110,7 +1140,8 @@ module sfu_engine
             end else begin
               ld_cap_q      <= read_idx_q;           // int32 chunk on bus next cyc (==0)
               read_idx_q    <= read_idx_q + 13'd1;   // issue pointer -> chunk 1
-              iter_idx_q    <= 11'h0;
+              iter_idx_q    <= 11'h0;                // dequant pipe FEED pointer
+              dq_coll_q     <= 11'h0;                // dequant pipe COLLECT pointer
               write_chunk_q <= 11'h0;
               cw_have_q     <= 1'b0;
               dq_vis_q      <= 13'h0;
@@ -1355,6 +1386,7 @@ module sfu_engine
             // this cycle when cw_have_q). Advance row / finish.
             cw_have_q        <= 1'b0;
             iter_idx_q       <= 11'h0;
+            dq_coll_q        <= 11'h0;
             write_chunk_q    <= 11'h0;
             dq_vis_q         <= 13'h0;
             dq_load_q        <= 1'b0;
@@ -1386,25 +1418,30 @@ module sfu_engine
                 dq_load_q <= 1'b0;                   // last int32 chunk captured
               end
             end
-            // COMPUTE track: 8-wide dequant chunk iter_idx_q -> out_h_q once its 8
+            // FEED track: present chunk iter_idx_q to the dequant pipe once its 8
             // elements are loaded & visible (iter+8 <= dq_vis_q*4), or the load has
-            // finished (partial last chunk). Same datapath as F_G2_CW.
-            if (({5'h0, iter_idx_q} < n_elems_q) &&
-                ((({5'h0, iter_idx_q} + 16'd8) <= {1'b0, dq_vis_q, 2'b00}) ||
-                 !dq_load_q)) begin
-              for (int lane = 0; lane < 8; lane++) begin
-                automatic logic [10:0] wr_idx = iter_idx_q + 11'(lane);
-                if (({5'h0, iter_idx_q} + 16'(lane)) < n_elems_q)
-                  out_h_q[wr_idx[9:0]] <= synth_out_bits_lane[lane];
-              end
+            // finished (partial last chunk). dq_feed_en_w IS that condition.
+            if (dq_feed_en_w) begin
               iter_idx_q <= iter_idx_q + 11'd8;
             end
-            // WRITE track: stage FP16 chunk write_chunk_q once compute produced it
-            // ({iter>>3} > write_chunk_q -> out_h_q[write_chunk_q] registered) or
-            // compute finished (iter >= n_elems, for the partial last chunk).
+            // COLLECT track: chunk dq_coll_q emerges 3 cycles after it was fed;
+            // dq_vld_q[2] says when. synth_out_bits_lane is the same op-mux ->
+            // f2h shell as before, now fed from the pipeline's last register
+            // (synth_sc_s_q for 0x1E, synth_mul_d3_q for 0x17).
+            if (dq_vld_q[2]) begin
+              for (int lane = 0; lane < 8; lane++) begin
+                automatic logic [10:0] wr_idx = dq_coll_q + 11'(lane);
+                if (({5'h0, dq_coll_q} + 16'(lane)) < n_elems_q)
+                  out_h_q[wr_idx[9:0]] <= synth_out_bits_lane[lane];
+              end
+              dq_coll_q <= dq_coll_q + 11'd8;
+            end
+            // WRITE track: stage FP16 chunk write_chunk_q once COLLECT produced it
+            // ({coll>>3} > write_chunk_q -> out_h_q[write_chunk_q] registered) or
+            // collect finished (coll >= n_elems, for the partial last chunk).
             if ((write_chunk_q < g2_rows_q[10:0]) &&
-                (({3'h0, iter_idx_q[10:3]} > write_chunk_q) ||
-                 ({5'h0, iter_idx_q} >= n_elems_q))) begin
+                (({3'h0, dq_coll_q[10:3]} > write_chunk_q) ||
+                 ({5'h0, dq_coll_q} >= n_elems_q))) begin
               row_write_q   <= g2_write_data_w;       // packs out_h_q[8*write_chunk_q..]
               g2_wr_addr_q  <= write_chunk_q;
               write_chunk_q <= write_chunk_q + 11'd1;
