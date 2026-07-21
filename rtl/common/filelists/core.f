@@ -40,6 +40,7 @@ fp32/fp16_to_fp32.sv
 fp32/i32_to_fp32.sv
 fp32/fp32_quantize_i8.sv
 fp32/fp32_exp.sv
+fp32/fp32_exp_p18.sv
 fp32/fp32_gelu_new.sv
 
 # Execute units

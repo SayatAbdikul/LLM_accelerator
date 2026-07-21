@@ -374,30 +374,55 @@
   fp32_to_fp16 u_ln_out_h(.a(ln_norm_gb_w),                        .y(ln_out_h_w));
 
   // ===================================================================
-  // 0x1D MASKED_SOFTMAX_FP32 synth sub-FSM combinational primitives.
+  // 0x1D MASKED_SOFTMAX_FP32 synth sub-FSM primitives.
   //   neg_max  = sm_row_max_q ^ sign-bit
   //   diff     = row[iter] - row_max               (fp32_add with neg)
-  //   exp_v    = exp(diff)                         (fp32_exp, BANDED)
+  //   exp_v    = exp(diff)                         (fp32_exp_p18, LATENCY=18)
   //   sum_add  = exp_sum_q + exp_v                 (fp32_add)
-  //   norm     = exp_v / exp_sum_q                 (fp32_div)
+  //   norm     = exp_v / exp_sum_q                 (fp32_div_p6, LATENCY=6)
   //   out_h    = fp32_to_fp16(norm)
   // Visibility: F_G2_SM_MAX/EXPSUM/OUT each check
   //   (iter < n_elems_q) && (iter_signed <= sm_keep_through_q)
+  //
+  // 2026-07-21 (fmax phase 0b): `u_sm_exp` was the COMBINATIONAL fp32_exp, which
+  // put the whole ~412 ns exp cloud inside one cycle on TWO reg-to-reg paths:
+  //   EXPSUM   sm_exp_sum_q -> add -> exp -> add -> sm_exp_sum_q   (~490 ns)
+  //   OUT_NORM row_data_q   -> add -> exp -> sm_exp_q              (~440 ns)
+  // Neither was ever in a timing report (the full-SFU flatten OOMs), so the
+  // committed 34.41 MHz — a div/sqrt-PRIMITIVE number — structurally excluded
+  // them. It is now the 18-stage `fp32_exp_p18` (bit-IDENTICAL pure retiming,
+  // 9M-vector zero-diff gate `make test_fp32_exp_p18`), fed one element/cycle
+  // and collected LATENCY later, exactly like the lever-E divider drain.
+  // The two register boundaries that make every path single-primitive:
+  //   sm_diff_q : row_data_q -> u_sm_diff -> REG          (one fp32_add)
+  //               -> exp_p18 stage 1, so the subtract never chains into exp.
+  //   sm_exp_q  : exp_p18 s17 -> s18 output glue -> REG   (glue only)
+  //               and is then the SOLE dividend/addend source, so the
+  //               accumulate is REG -> u_sm_sum_add -> REG (one fp32_add) and
+  //               the divide is REG -> div_p6 stage 1. (sm_exp_q already
+  //               existed as the divider's registered dividend; reusing it for
+  //               the accumulate costs one pipe stage, not a new register.)
+  // Byte-exact: identical primitives, identical operands, and the accumulate
+  // still walks elements in ascending index order (fp add is non-associative —
+  // the collect pointer preserves the order, it does not reorder it).
   logic [31:0] sm_neg_max;
   logic [31:0] sm_diff_w;
   logic [31:0] sm_exp_w;
   logic [31:0] sm_sum_add_w;
   logic [31:0] sm_norm_w;
   logic [15:0] sm_out_h_w;
+  logic        sm_exp_vo;
   assign sm_neg_max = sm_row_max_q ^ 32'h8000_0000;
   fp32_add     u_sm_diff   (.a(synth_a_bits), .b(sm_neg_max),    .y(sm_diff_w));
-  fp32_exp     u_sm_exp    (.a(sm_diff_w),                        .y(sm_exp_w));
-  fp32_add     u_sm_sum_add(.a(sm_exp_sum_q), .b(sm_exp_w),       .y(sm_sum_add_w));
+  fp32_exp_p18 u_sm_exp    (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
+                            .a(sm_diff_q),
+                            .valid_out(sm_exp_vo), .y(sm_exp_w));
+  fp32_add     u_sm_sum_add(.a(sm_exp_sum_q), .b(sm_exp_q),       .y(sm_sum_add_w));
   // 2026-07-12 (lever E): 6-stage pipelined divider (LATENCY=6, fp32_div_p6).
-  // Dividend is the REGISTERED sm_exp_q (latched in F_G2_SM_OUT_NORM) so fp32_exp
-  // is isolated from the divider stage-1. The software-pipelined F_G2_SM_OUT_NORM
-  // drain collects at sm_coll_q = iter_idx_q - 7 (1 sm_exp_q feed reg + 6 div
-  // stages); f2h reads sm_norm_w directly.
+  // Dividend is the REGISTERED sm_exp_q (latched in F_G2_SM_OUT_NORM). The
+  // software-pipelined F_G2_SM_OUT_NORM drain collects at sm_coll_q =
+  // iter_idx_q - 26 (1 sm_diff_q + 18 exp_p18 + 1 sm_exp_q + 6 div stages);
+  // f2h reads sm_norm_w directly.
   fp32_div_p6  u_sm_div    (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
                             .a(sm_exp_q),     .b(sm_exp_sum_q),
                             .valid_out(sm_div_vo), .y(sm_norm_w));

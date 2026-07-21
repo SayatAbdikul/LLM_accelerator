@@ -525,24 +525,53 @@
             iter_idx_q <= iter_idx_q + 11'd1;
           end else begin
             iter_idx_q   <= 11'h0;
+            sm_coll_q    <= 11'h0;   // collect pointer for the pipelined EXPSUM
             // Gen-1 SOFTMAX/ATTNV all illegal at decode; their no-visible
             // FAULT path is unreachable. Gen-2 just falls through to EXPSUM.
             state <= F_G2_SM_EXPSUM;
           end
         end
 
+        // 2026-07-21 (fmax phase 0b): exp-drain SOFTWARE-PIPELINED EXPSUM, the
+        // same feed/collect transform as F_G2_SM_OUT_NORM below (and the LN
+        // F_G2_LN_OUT_DIFF drain). It replaces the single-cycle
+        // `sm_exp_sum_q -> add -> exp -> add -> sm_exp_sum_q` accumulate, which
+        // held the entire ~412 ns combinational fp32_exp inside one clock
+        // period (~490 ns total vs a 29.06 ns budget) and was never in a
+        // timing report.
+        //   FEED    (iter_idx_q): register row[iter]-row_max into sm_diff_q,
+        //                         one element per cycle, into fp32_exp_p18.
+        //   COLLECT (sm_coll_q = iter_idx_q - 20): sm_exp_q now holds
+        //                         exp(row[sm_coll_q]-row_max); accumulate it.
+        // The accumulate stays REG -> fp32_add -> REG and still walks elements
+        // in ASCENDING INDEX ORDER, so the non-associative fp32 sum is
+        // bit-identical — the pointer preserves the order, it does not reorder.
+        // Visibility is evaluated at the collect index (sm_visible_coll_w), the
+        // same correction F_G2_SM_OUT_NORM already makes. Cost is
+        // eff_bound + 20 cycles instead of eff_bound (one 20-cycle drain per
+        // softmax row, ~0.1% of a decode step) — the pipe is kept full, so it
+        // is a fill/drain tail, not a per-element stall.
         F_G2_SM_EXPSUM: begin
-          if ({5'h0, iter_idx_q} < sm_eff_bound_w) begin
-            if (sm_have_vis_q && sm_visible_w)
-              sm_exp_sum_q <= sm_sum_add_w;  // exp_sum += exp(row - row_max)
-            iter_idx_q <= iter_idx_q + 11'd1;
-          end else begin
+          if ({5'h0, sm_coll_q} >= sm_eff_bound_w) begin
+            // every visible element accumulated (also the bound==0 case).
             iter_idx_q <= 11'h0;
             sm_coll_q  <= 11'h0;   // collect pointer for the pipelined SM-OUT
             // Gen-1 SOFTMAX/MASKED_SOFTMAX/{ATTNV,MASKED_ATTNV} all illegal at
             // decode_unit (0x0E/0x15/0x12/0x16). Only gen-2 OP_MASKED_SOFTMAX_FP32
             // reaches here and proceeds to F_G2_SM_OUT_NORM.
             state <= F_G2_SM_OUT_NORM;
+          end else begin
+            // FEED: present row[iter_idx_q]-row_max to the exp pipe input reg.
+            sm_diff_q <= sm_diff_w;
+            // COLLECT: exp_p18's s18 output for element sm_coll_q lands in
+            // sm_exp_q, the sole addend of u_sm_sum_add.
+            sm_exp_q  <= sm_exp_w;
+            if (iter_idx_q >= 11'd20) begin
+              if (sm_have_vis_q && sm_visible_coll_w)
+                sm_exp_sum_q <= sm_sum_add_w;  // exp_sum += exp(row - row_max)
+              sm_coll_q <= sm_coll_q + 11'd1;
+            end
+            iter_idx_q <= iter_idx_q + 11'd1;
           end
         end
 
@@ -551,20 +580,24 @@
         // processed ONE element per 7 cycles — it fed a single exp(row[iter]-max)
         // into the fully-pipelined fp32_div_p6 u_sm_div, then idled draining it.
         // Since u_sm_div accepts a new dividend EVERY cycle, this
-        // single state instead keeps the divider full: each cycle it feeds
-        // exp(row[iter_idx_q]-max) into sm_exp_q (the FEED pointer) and, once the
-        // pipe has filled (iter>=7: 1 sm_exp_q reg + 6 div_p6 stages), collects the
-        // quotient now emerging on sm_norm_w for element sm_coll_q (= iter-7),
-        // applying that element's visibility mask (sm_visible_coll_w, indexed by
-        // sm_coll_q) and writing out_h_q[sm_coll_q]. Phase costs n_elems+6 cycles
-        // instead of 7*n_elems (~7x on the OUT pass).
+        // single state instead keeps the divider full: each cycle it feeds one
+        // element into the exp->divide pipe (the FEED pointer iter_idx_q) and,
+        // once the pipe has filled, collects the quotient now emerging on
+        // sm_norm_w for element sm_coll_q, applying that element's visibility
+        // mask (sm_visible_coll_w, indexed by sm_coll_q) and writing
+        // out_h_q[sm_coll_q]. Phase costs n_elems + PIPE cycles instead of
+        // 7*n_elems (~7x on the OUT pass).
+        //   2026-07-21 (phase 0b): PIPE went 7 -> 26 when the combinational
+        //   fp32_exp became the 18-stage fp32_exp_p18 (1 sm_diff_q + 18 exp +
+        //   1 sm_exp_q + 6 div_p6). Still one element per cycle — only the
+        //   drain tail grew.
         //   Bit-exact: identical fp32 exp/div/f2h, same operands (exp_sum and
         //   row_max are row-constant; the visibility mask tracked to the collect
         //   element), same in-order out_h_q[] writes — only per-element latency is
-        //   overlapped. fmax-neutral: the feed path (exp->sm_exp_q, which already
-        //   isolated fp32_exp from the divider stage-1) and the collect path
-        //   (sm_norm_w->f2h->out_h_q) already existed as the NORM and OUT critical
-        //   paths; they now run concurrently but do not chain. Only gen-2
+        //   overlapped. Post-0b every reg-to-reg slice here is ONE fp primitive:
+        //   row_data_q->add->sm_diff_q, the exp_p18 internal stages, exp s18
+        //   glue->sm_exp_q, sm_exp_q->div stage 1, and the collect path
+        //   sm_norm_w->f2h->out_h_q. Only gen-2
         //   OP_MASKED_SOFTMAX_FP32 (0x1D) reaches here (gen-1 softmax/ATTN illegal
         //   at decode_unit), writing FP16.
         F_G2_SM_OUT_NORM: begin
@@ -574,14 +607,20 @@
             sm_coll_q  <= 11'h0;
             state      <= F_G2_PACK;
           end else begin
-            // FEED: present exp(row[iter_idx_q]-max) to the divider input reg.
-            if ({5'h0, iter_idx_q} < sm_iter_bound_w)
-              sm_exp_q <= sm_exp_w;
-            // COLLECT: after the 7-deep pipe fills (1 sm_exp_q reg + 6 div_p6
-            // stages, lever E), sm_norm_w holds element sm_coll_q's quotient
-            // (sm_coll_q = iter_idx_q - 7); finalize (f2h + visibility mask) and
-            // write it (in element order).
-            if (iter_idx_q >= 11'd7) begin
+            // FEED: row[iter_idx_q]-max into the exp pipe, and exp's output one
+            // stage later into sm_exp_q, the divider's registered dividend.
+            // (2026-07-21 phase 0b: the feed used to be `sm_exp_q <= sm_exp_w`
+            // straight off the COMBINATIONAL exp; exp is now fp32_exp_p18, so
+            // the feed is two register boundaries — sm_diff_q then sm_exp_q.
+            // Both are written unconditionally: entries fed past the row bound
+            // are never collected, so gating them would be dead logic.)
+            sm_diff_q <= sm_diff_w;
+            sm_exp_q  <= sm_exp_w;
+            // COLLECT: after the 26-deep pipe fills (1 sm_diff_q + 18 exp_p18 +
+            // 1 sm_exp_q + 6 div_p6 stages), sm_norm_w holds element sm_coll_q's
+            // quotient (sm_coll_q = iter_idx_q - 26); finalize (f2h + visibility
+            // mask) and write it (in element order).
+            if (iter_idx_q >= 11'd26) begin
               if (sm_have_vis_q && sm_visible_coll_w && (sm_exp_sum_q != 32'h0))
                 out_h_q[sm_coll_q[9:0]] <= sm_out_h_w;
               else

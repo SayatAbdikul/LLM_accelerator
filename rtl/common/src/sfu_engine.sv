@@ -310,20 +310,31 @@ module sfu_engine
   // element i-1's — so throughput stays ~1 elem/cycle (+1 drain/row). Bit-exact
   // (same sub/mul/add, same operands, same accumulation order).
   logic [31:0]  ln_dsq_q;
-  // 2026-05-29: registers exp(row-max) in F_G2_SM_OUT_NORM so the pipelined
-  // fp32_div_p6 sees a registered dividend (isolates fp32_exp from the
-  // divider's stage-1; otherwise exp+div_stage1 would chain ~138 ns).
+  // 2026-07-21 (fmax phase 0b): feed register for the pipelined fp32_exp_p18.
+  // Holds (row[iter_idx_q] - row_max) so the fp32_add subtract never chains
+  // into exp's stage 1. Written every cycle of F_G2_SM_EXPSUM and
+  // F_G2_SM_OUT_NORM; entries fed past the row bound are simply never
+  // collected. Reset value is irrelevant to results (no collect can reach it).
+  logic [31:0]  sm_diff_q;
+  // 2026-05-29: registers exp(row-max) so the pipelined fp32_div_p6 sees a
+  // registered dividend. 2026-07-21: it is now ALSO the exp_p18 collect
+  // register — the sole source for both the EXPSUM accumulate and the OUT_NORM
+  // divide — so exp's s18 output glue never chains into an fp32_add or into
+  // div stage 1. Holds exp(element iter_idx_q - 20).
   logic [31:0]  sm_exp_q;
   // Phase-2 synth-mode SOFTMAX (0x1D) reduction state.
   logic [31:0]  sm_row_max_q;       // running fp32 row_max
   logic [31:0]  sm_exp_sum_q;       // running fp32 exp_sum
   logic         sm_have_vis_q;      // any visible element seen
   logic signed [15:0] sm_keep_through_q;
-  // Software-pipelined F_G2_SM_OUT_NORM lagging collect pointer: the element
-  // whose divider quotient (sm_norm_w) emerges this cycle (= iter_idx_q - 7:
-  // 1 sm_exp_q reg + 6 div_p6 stages, lever E). Feeds sm_visible_coll_w and the out_h_q
-  // write target so the masked write matches the draining element. Analogous to
-  // ln_coll_q in the LN output pipeline.
+  // Lagging collect pointer, shared by BOTH softmax drain states (the element
+  // emerging from the pipe this cycle; the feed pointer is iter_idx_q):
+  //   F_G2_SM_EXPSUM   sm_coll_q = iter_idx_q - 20  (1 sm_diff_q + 18 exp_p18
+  //                                                  + 1 sm_exp_q)
+  //   F_G2_SM_OUT_NORM sm_coll_q = iter_idx_q - 26  (the above + 6 div_p6)
+  // Feeds sm_visible_coll_w, the EXPSUM accumulate gate, and the out_h_q write
+  // target, so every mask is evaluated against the DRAINING element rather than
+  // the feed element. Analogous to ln_coll_q in the LN output pipeline.
   logic [10:0]  sm_coll_q;
   logic [10:0]  write_chunk_q;
   // Streamed-writeback lagging address pointer: the chunk index whose packed
@@ -828,6 +839,7 @@ module sfu_engine
       ln_diff_q      <= 32'h0;
       ln_coll_q      <= 11'h0;
       ln_dsq_q       <= 32'h0;
+      sm_diff_q      <= 32'h0;
       sm_exp_q       <= 32'h0;
       sm_row_max_q   <= 32'h0;
       sm_exp_sum_q   <= 32'h0;
