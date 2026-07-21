@@ -42,6 +42,7 @@ fp32/fp32_quantize_i8.sv
 fp32/fp32_exp.sv
 fp32/fp32_exp_p18.sv
 fp32/fp32_gelu_new.sv
+fp32/fp32_gelu_p33.sv
 
 # Execute units
 decode_unit.sv

@@ -139,12 +139,28 @@
   fp32_quantize_i8 u_synth_quant (.a(synth_mul_out), .y(synth_quant_out));
 
   // For 0x1B GELU_FP32 the synth datapath is the tanh-poly gen-2 GELU
-  // (fp32_gelu_new): depth-9 combinational chain (2*mul + add + mul + mul +
-  // exp + add + div + sub + add + mul). MEASURED-BAND op — bounded by the
-  // internal fp32_exp scaffold accuracy. SOFTMAX-precedent (86-ULP exp ->
-  // 0 fp16 ULP at output via fp16-quant absorption) is the bet.
+  // (2*mul + add + mul + mul + exp + add + div + mul). MEASURED-BAND op —
+  // bounded by the internal fp32_exp scaffold accuracy. SOFTMAX-precedent
+  // (86-ULP exp -> 0 fp16 ULP at output via fp16-quant absorption) is the bet.
+  //
+  // 2026-07-21 (fmax phase 0d): this was `fp32_gelu_new`, a ~700 ns SINGLE-
+  // CYCLE combinational cloud — the largest in the SFU, containing a whole
+  // fp32_exp and a whole fp32_div, ×8 lanes, and never once in a timing report.
+  // It is now the 33-stage `fp32_gelu_p33`, a pure retiming of that same core
+  // (bit-identical, gated by test_fp32_gelu_p33's 8.5M-vector zero-diff run).
+  // CONSUMER CONTRACT: this output is now REGISTERED and arrives LATENCY=33
+  // cycles after its operand was presented. The only state that drives it is
+  // F_G2_GLC, which feeds `synth_a_bits` at iter_idx_q and collects at the
+  // lagging gelu_coll_q, gated by synth_gelu_vo — never by a hardcoded 33.
+  // All 8 lanes share one valid_in, so lane 0's valid_out speaks for all of
+  // them; the replicas sink theirs. F_G2_SYNTH_ITER must NOT be used for
+  // OP_GELU_FP32 any more (it reads the op-mux in-cycle); its one dispatch
+  // site is mode-1-dead and now faults — see sfu_g2_compute.svh F_G2_COMPUTE.
   logic [31:0] synth_gelu_out;
-  fp32_gelu_new u_synth_gelu (.a(synth_a_bits), .y(synth_gelu_out));
+  logic        synth_gelu_vo;
+  fp32_gelu_p33 u_synth_gelu (
+    .clk(clk), .rst_n(rst_n), .valid_in(gelu_feed_en_w),
+    .a(synth_a_bits), .valid_out(synth_gelu_vo), .y(synth_gelu_out));
 
   // For 0x1E DEQUANT_ACCUM_FP32_SCALED chain:
   //   out = ((row_data_q * gamma_q) * scale0_q) + beta_q  -> f2h
@@ -223,17 +239,25 @@
       fp32_mul u_scaled_mul2 (.a(scaled_mul1), .b(scale0_q),    .y(scaled_mul2));
       fp32_add u_scaled_add  (.a(scaled_mul2), .b(beta_bits),   .y(scaled_add));
 
-      // GELU replica (fp32_gelu_new tanh-poly core, identical to lane-0
-      // u_synth_gelu). 2026-07-08: widened to 8 lanes. The old "area hog"
-      // guess was falsified by the 2026-05-30 trim measurement (removing 7
-      // gelu replicas saved only 0.5% of SFU cells, 1,287,144 -> 1,280,022;
-      // the real area went to the scaled-chain replicas), so GELU now strides
-      // 8 like every other elementwise op (~-560K mode-1 cyc = +2.3% tok/s;
-      // see docs/perf_roadmap_2026-07-08.md #4). Each lane is an identical,
-      // independent combinational core -> bit-exact vs the old lane-0-only
-      // 1/cycle loop.
+      // GELU replica (identical to lane-0 u_synth_gelu). 2026-07-08: widened
+      // to 8 lanes. The old "area hog" guess was falsified by the 2026-05-30
+      // trim measurement (removing 7 gelu replicas saved only 0.5% of SFU
+      // cells, 1,287,144 -> 1,280,022; the real area went to the scaled-chain
+      // replicas), so GELU strides 8 like every other elementwise op
+      // (~-560K mode-1 cyc = +2.3% tok/s; docs/perf_roadmap_2026-07-08.md #4).
+      // 2026-07-21 (fmax phase 0d): pipelined to fp32_gelu_p33 in lockstep
+      // with lane 0 — same clk, same valid_in, so all 8 lanes present element
+      // (gelu_coll_q + lane) on the same cycle. Each lane is still an
+      // identical, independent core, so this stays bit-exact vs both the
+      // combinational 8-wide version and the original lane-0-only 1/cycle loop.
+      // valid_out is sunk here; lane 0's synth_gelu_vo is the shared collect
+      // strobe (an unused-but-driven net per lane would be a phase-0a dead
+      // cone, so the FSM deliberately reads ONE of them, not eight).
       logic [31:0] gelu_out;
-      fp32_gelu_new u_gelu (.a(a_bits), .y(gelu_out));
+      logic        gelu_vo_unused;
+      fp32_gelu_p33 u_gelu (
+        .clk(clk), .rst_n(rst_n), .valid_in(gelu_feed_en_w),
+        .a(a_bits), .valid_out(gelu_vo_unused), .y(gelu_out));
 
       // Compute-output op-mux -> shared f2h (replica of synth_compute_out).
       logic [31:0] compute_out;

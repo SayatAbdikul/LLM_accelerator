@@ -35,12 +35,20 @@
             end
           end else if (opcode_q == OP_GELU_FP32) begin
             if (SFU_SYNTH_MODE == 1) begin
-              // Synth path: serialize via F_G2_SYNTH_ITER. The fp32_gelu_new
-              // combinational core (tanh-poly) drives synth_gelu_out; the
-              // shared synth_compute_out -> f2h shell writes out_h_q.
-              // MEASURED-BAND — freeze §7 (≤3 fp16 ULP, anchor).
-              iter_idx_q <= 11'h0;
-              state      <= F_G2_SYNTH_ITER;
+              // UNREACHABLE in mode 1, and as of fmax phase 0d it must stay
+              // that way: F_G2_S1_REQ diverts every mode-1 OP_GELU_FP32 to the
+              // fused F_G2_GLC before F_G2_S1_LATCH can route here, and
+              // F_G2_S1_REQ is the sole entry to this row. That matters now
+              // because synth_gelu_out is the REGISTERED output of the
+              // 33-stage fp32_gelu_p33, while F_G2_SYNTH_ITER reads the
+              // op-mux in-cycle and would write out_h_q with whatever the
+              // pipe happened to be holding — a silent wrong answer, the one
+              // failure mode the pipelining could introduce. So this arm
+              // FAULTS instead of dispatching. Nothing reachable changes; if
+              // some future path does route GELU here, it halts loudly rather
+              // than emitting 33-cycle-stale activations.
+              fault_code_r <= 4'(FAULT_UNSUPPORTED_OP);
+              state        <= F_FAULT;
             end else begin
 `ifndef SFU_SYNTH_NO_DPI
               // DPI path (default; cosim-pinned).

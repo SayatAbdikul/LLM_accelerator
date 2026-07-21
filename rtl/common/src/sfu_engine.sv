@@ -388,6 +388,21 @@ module sfu_engine
   // Load track == F_G2_QLC's; compute+write track == F_G2_VLC's (FP16 out).
   logic         glc_load_q;
   logic [12:0]  glc_vis_q;
+  // 2026-07-21 (fmax phase 0d): the 8 GELU lane cores are the 33-stage
+  // fp32_gelu_p33, so F_G2_GLC's compute track became a software pipeline —
+  // iter_idx_q stays the FEED pointer and gelu_coll_q is the lagging COLLECT
+  // pointer that indexes the out_h_q writeback. gelu_coll_q advances ONLY on
+  // the pipe's own valid_out (synth_gelu_vo), never on a hand-counted offset,
+  // so an arbitrary stall pattern on the feed side (a chunk not yet visible)
+  // costs exactly its own bubbles and nothing more. The WRITE track keys off
+  // gelu_coll_q for the same reason it used to key off iter_idx_q: a chunk is
+  // packable once the pointer has moved PAST it, i.e. it landed in out_h_q on
+  // an earlier cycle. Cross-row contamination is structurally absent — feed
+  // stops at iter_idx_q >= n_elems_q so every slot behind the last real
+  // element carries valid=0, and the row cannot exit until write_chunk_q has
+  // drained every chunk, which cannot happen until collect has produced them.
+  logic [10:0]  gelu_coll_q;
+  logic         gelu_feed_en_w;
   // Streamed-load lagging capture pointer: the chunk index whose SRAM read
   // data is on the bus this cycle (read_idx_q is the leading issue pointer,
   // running one chunk ahead). Lets the F_G2_S1/S2 load loops issue one SRAM
@@ -590,6 +605,21 @@ module sfu_engine
   assign dispatch_g2_mar_w = (opcode == OP_MAX_ABS_REDUCE_FP32) &&
                              (src1_buf == BUF_ABUF) &&
                              (sreg <= 4'd14);   // sreg+1 must be valid
+
+  // GELU pipeline feed strobe (fmax phase 0d). This is the SINGLE definition
+  // of "a chunk is entering the gelu pipe this cycle": F_G2_GLC's compute
+  // track below is written as `if (gelu_feed_en_w)`, so the FSM's pointer
+  // advance and the pipe's valid_in cannot drift apart by construction. The
+  // fault guards mirror F_G2_GLC's leading branches — feeding a doomed row
+  // would be harmless (it is never collected), but a feed condition that is
+  // "the same except for the corners" is exactly how these two ever diverge.
+  assign gelu_feed_en_w =
+      (state == F_G2_GLC) &&
+      !(cw_have_q  && sram_a_fault) &&
+      !(glc_load_q && sram_b_fault) &&
+      (write_chunk_q < g2_rows_q[10:0]) &&
+      ({5'h0, iter_idx_q[10:3]} < glc_vis_q) &&
+      ({5'h0, iter_idx_q} < n_elems_q);
 
 `include "sfu_synth_datapath.svh"
   // ===================================================================
@@ -858,6 +888,7 @@ module sfu_engine
       vlc_vis_q      <= 13'h0;
       glc_load_q     <= 1'b0;
       glc_vis_q      <= 13'h0;
+      gelu_coll_q    <= 11'h0;
       ld_cap_q       <= 13'h0;
       gelu_part_q    <= 2'h0;
       attn_k_idx_q   <= 16'h0;
@@ -1058,7 +1089,8 @@ module sfu_engine
           end else if (SFU_SYNTH_MODE == 1 && opcode_q == OP_GELU_FP32) begin
             ld_cap_q      <= read_idx_q;          // chunk on the bus next cycle (==0)
             read_idx_q    <= read_idx_q + 13'd1;  // issue pointer -> chunk 1
-            iter_idx_q    <= 11'h0;
+            iter_idx_q    <= 11'h0;               // gelu pipe FEED pointer
+            gelu_coll_q   <= 11'h0;               // gelu pipe COLLECT pointer
             glc_vis_q     <= 13'h0;
             glc_load_q    <= 1'b1;
             write_chunk_q <= 11'h0;
@@ -1481,20 +1513,36 @@ module sfu_engine
         // tracks (== F_G2_VLC compute/write), vs the old load -> F_G2_SYNTH_ITER
         // compute -> F_G2_PACK/WRITE three passes. Op cost ~3*g2_rows -> ~g2_rows
         // (the single irreducible port-B operand load; compute+write hide behind
-        // it). Three pointers:
+        // it). FOUR pointers (2026-07-21, fmax phase 0d — the compute track
+        // split in two when the gelu cores became the 33-stage fp32_gelu_p33):
         //   * ld_cap_q / glc_vis_q : FP16 load capture -> row_data_q (8/cyc).
-        //   * iter_idx_q           : 8-wide gelu -> out_h_q, trailing the load
+        //   * iter_idx_q           : gelu pipe FEED, trailing the load
         //                            (chunk iter ready when iter>>3 < glc_vis_q).
+        //   * gelu_coll_q          : gelu pipe COLLECT -> out_h_q, LATENCY=33
+        //                            behind the feed, strobed by synth_gelu_vo.
         //   * write_chunk_q        : FP16 write chunk (== F_G2_CW/VLC pack/addr).
-        // Load=portB, write=portA, compute=regs -> no clash. Bit-exact vs the
-        // unfused path: identical FP16 capture (synth_lat_h2f -> row_data_q),
-        // identical 8-wide gelu (synth_out_bits_lane, the F_G2_SYNTH_ITER
-        // datapath: gelu_out -> f2h), identical FP16 pack (g2_write_data_w) +
-        // addresses in chunk order; only overlapped. fmax-neutral: the
-        // row_data_q->gelu->f2h->out_h_q compute path is the exact
-        // F_G2_SYNTH_ITER path (unchanged), and load->row_data_q / out_h_q->
-        // row_write_q boundaries are preserved; tracks never chain. Mode-0/DPI
-        // never enters here (GELU there: S1_LATCH -> F_G2_COMPUTE DPI whole-row).
+        // Load=portB, write=portA, compute=regs -> no clash.
+        //
+        // STILL bit-exact vs the unfused path, for the SAME reasons as before
+        // (identical FP16 capture, identical per-element gelu arithmetic,
+        // identical FP16 pack + addresses in chunk order) plus one new one: the
+        // pipe is a pure retiming, and elements are fed AND collected strictly
+        // in index order, so no value and no ordering changes — only WHEN each
+        // result lands. Cost: +LATENCY cycles once per row (the drain), nothing
+        // per element, because the pipe is II=1 and the feed rate is unchanged.
+        //
+        // NOT fmax-neutral, and that is the entire point: pre-0d the compute
+        // track was row_data_q -> fp32_gelu_new -> f2h -> out_h_q in ONE cycle,
+        // a ~700 ns combinational cloud (a whole fp32_exp + fp32_div) x8 lanes
+        // that had never appeared in a timing report. It is now feed
+        // (row_data_q -> one fp32_mul -> reg, 28.9 ns) and collect (reg -> f2h
+        // -> out_h_q). Load->row_data_q and out_h_q->row_write_q boundaries are
+        // preserved and the tracks still never chain.
+        //
+        // Mode-0/DPI never enters here (GELU there: S1_LATCH -> F_G2_COMPUTE
+        // DPI whole-row). Mode-1 GELU reaches F_G2_GLC and ONLY F_G2_GLC —
+        // F_G2_SYNTH_ITER reads the op-mux in-cycle and would sample the pipe
+        // mid-flight, so its one (unreachable) dispatch site now faults.
         F_G2_GLC: begin
           integer cap_base;
           if (cw_have_q && sram_a_fault) begin
@@ -1508,6 +1556,7 @@ module sfu_engine
             // this cycle when cw_have_q). Advance row / finish.
             cw_have_q     <= 1'b0;
             iter_idx_q    <= 11'h0;
+            gelu_coll_q   <= 11'h0;
             write_chunk_q <= 11'h0;
             glc_vis_q     <= 13'h0;
             glc_load_q    <= 1'b0;
@@ -1535,23 +1584,35 @@ module sfu_engine
                 glc_load_q <= 1'b0;                    // last chunk captured
               end
             end
-            // COMPUTE track: 8-wide gelu chunk iter_idx_q -> out_h_q once its
-            // chunk is captured & visible (iter>>3 < glc_vis_q). Same datapath as
-            // F_G2_SYNTH_ITER (op-mux selects gelu_out for OP_GELU_FP32).
-            if (({5'h0, iter_idx_q[10:3]} < glc_vis_q) &&
-                ({5'h0, iter_idx_q} < n_elems_q)) begin
-              for (int lane = 0; lane < 8; lane++) begin
-                automatic logic [10:0] wr_idx = iter_idx_q + 11'(lane);
-                if (({5'h0, iter_idx_q} + 16'(lane)) < n_elems_q)
-                  out_h_q[wr_idx[9:0]] <= synth_out_bits_lane[lane];
-              end
+            // FEED track: present chunk iter_idx_q to the 8 gelu pipes once its
+            // chunk is captured & visible (iter>>3 < glc_vis_q). gelu_feed_en_w
+            // IS that condition and is what drives the pipes' valid_in.
+            if (gelu_feed_en_w) begin
               iter_idx_q <= iter_idx_q + 11'd8;
             end
-            // WRITE track: stage FP16 chunk write_chunk_q once compute produced it
-            // ({iter>>3} > write_chunk_q) or compute finished (iter >= n_elems).
+            // COLLECT track: chunk gelu_coll_q emerges from the pipes 33 cycles
+            // after it was fed; synth_gelu_vo (lane 0's valid_out, all 8 lanes
+            // in lockstep) says when. synth_out_bits_lane is the SAME op-mux ->
+            // f2h shell as before — only its input is now a register output
+            // instead of a ~700 ns combinational cloud, and only the write
+            // index moved from the feed pointer to the collect pointer.
+            if (synth_gelu_vo) begin
+              for (int lane = 0; lane < 8; lane++) begin
+                automatic logic [10:0] wr_idx = gelu_coll_q + 11'(lane);
+                if (({5'h0, gelu_coll_q} + 16'(lane)) < n_elems_q)
+                  out_h_q[wr_idx[9:0]] <= synth_out_bits_lane[lane];
+              end
+              gelu_coll_q <= gelu_coll_q + 11'd8;
+            end
+            // WRITE track: stage FP16 chunk write_chunk_q once COLLECT produced
+            // it ({coll>>3} > write_chunk_q) or collect finished (coll >=
+            // n_elems). Identical structure to the pre-0d version with the feed
+            // pointer swapped for the collect pointer: the invariant is "the
+            // pointer has moved past this chunk", which is what guarantees the
+            // chunk's 8 out_h_q entries were registered on an earlier cycle.
             if ((write_chunk_q < g2_rows_q[10:0]) &&
-                (({3'h0, iter_idx_q[10:3]} > write_chunk_q) ||
-                 ({5'h0, iter_idx_q} >= n_elems_q))) begin
+                (({3'h0, gelu_coll_q[10:3]} > write_chunk_q) ||
+                 ({5'h0, gelu_coll_q} >= n_elems_q))) begin
               row_write_q   <= g2_write_data_w;       // packs out_h_q[8*write_chunk_q..]
               g2_wr_addr_q  <= write_chunk_q;
               write_chunk_q <= write_chunk_q + 11'd1;
