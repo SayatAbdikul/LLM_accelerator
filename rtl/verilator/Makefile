@@ -54,8 +54,22 @@ CORE_F        := ../common/filelists/core.f
 CORE_CTRL_F   := ../common/filelists/core_ctrl.f
 read_filelist  = $(shell grep -E -v '^[[:space:]]*(\#|$$)' $(1))
 
+# The `include-d .svh siblings are NOT in core.f (they are not compilation
+# units), so nothing listed them as prerequisites — a change confined to one of
+# them did NOT relink, and every test target happily re-ran a STALE binary
+# while reporting PASS. Found 2026-07-21 while negative-controlling fmax 0e:
+# deliberately breaking the beta alignment in sfu_synth_datapath.svh still gave
+# 11/11, because the edit never reached the build. Any earlier ".svh-only edit,
+# tests green" result is suspect. Same failure family as the dead test_control
+# (7ac65c9) and the printer fast_gate (e81d4cc): the gate was not wired to the
+# thing it claimed to check.
+SVH_SRCS      := $(wildcard $(SRC_DIR)/*.svh)
 CONTROL_SV    := $(addprefix $(SRC_DIR)/, $(call read_filelist,$(CORE_F)))
 CTRL_SV       := $(addprefix $(SRC_DIR)/, $(call read_filelist,$(CORE_CTRL_F)))
+# Use these in PREREQUISITE position; CONTROL_SV/CTRL_SV stay the verilator
+# SOURCE lists (passing a .svh to verilator as a compilation unit fails).
+CONTROL_DEPS  := $(CONTROL_SV) $(SVH_SRCS)
+CTRL_DEPS     := $(CTRL_SV) $(SVH_SRCS)
 
 .PHONY: all run_program run_program_synth run_program_noovl test_decode test_control test_dma test_helpers test_sfu \
         test_systolic test_systolic_array_chained test_systolic_chained \
@@ -80,7 +94,7 @@ all: test_decode test_control test_dma test_helpers test_sfu test_systolic
 # -----------------------------------------------------------------------
 # run_program: build the full-program Verilator runner
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/run_program/Vtaccel_top: $(CONTROL_SV) run_program.cpp $(TB_HEADERS)
+$(BUILD_DIR)/run_program/Vtaccel_top: $(CONTROL_DEPS) run_program.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/run_program
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -108,7 +122,7 @@ run_program: $(BUILD_DIR)/run_program/Vtaccel_top
 # -----------------------------------------------------------------------
 DRAM_SIZE_124M ?= 1073741824
 
-$(BUILD_DIR)/run_program_synth/Vtaccel_top: $(CONTROL_SV) run_program.cpp $(TB_HEADERS)
+$(BUILD_DIR)/run_program_synth/Vtaccel_top: $(CONTROL_DEPS) run_program.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/run_program_synth
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -138,7 +152,7 @@ run_program_synth: $(BUILD_DIR)/run_program_synth/Vtaccel_top
 # A/B gates (identical bytes at lower concurrency), and the safe-mode
 # fallback if a future overlap bug needs bisecting.
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/run_program_noovl/Vtaccel_top: $(CONTROL_SV) run_program.cpp $(TB_HEADERS)
+$(BUILD_DIR)/run_program_noovl/Vtaccel_top: $(CONTROL_DEPS) run_program.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/run_program_noovl
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -176,7 +190,7 @@ test_decode: $(BUILD_DIR)/test_decode/Vtb_decode_unit
 # -----------------------------------------------------------------------
 # test_control: verilate taccel_top + compile + run
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_control/Vtaccel_top: $(CONTROL_SV) test_control.cpp $(TB_HEADERS)
+$(BUILD_DIR)/test_control/Vtaccel_top: $(CONTROL_DEPS) test_control.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_control
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -195,7 +209,7 @@ test_control: $(BUILD_DIR)/test_control/Vtaccel_top
 # -----------------------------------------------------------------------
 # test_dma: verilate taccel_top (with DMA engine) + compile + run
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_dma/Vtaccel_top: $(CONTROL_SV) test_dma.cpp $(TB_HEADERS)
+$(BUILD_DIR)/test_dma/Vtaccel_top: $(CONTROL_DEPS) test_dma.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_dma
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -214,7 +228,7 @@ test_dma: $(BUILD_DIR)/test_dma/Vtaccel_top
 # -----------------------------------------------------------------------
 # test_helpers: verilate taccel_top (with helper engine) + compile + run
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_helpers/Vtaccel_top: $(CONTROL_SV) test_helpers.cpp $(TB_HEADERS)
+$(BUILD_DIR)/test_helpers/Vtaccel_top: $(CONTROL_DEPS) test_helpers.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_helpers
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -233,7 +247,7 @@ test_helpers: $(BUILD_DIR)/test_helpers/Vtaccel_top
 # -----------------------------------------------------------------------
 # test_sfu: verilate taccel_top (with Stage D SFU) + compile + run
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_sfu/Vtaccel_top: $(CONTROL_SV) test_sfu.cpp $(TB_HEADERS)
+$(BUILD_DIR)/test_sfu/Vtaccel_top: $(CONTROL_DEPS) test_sfu.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_sfu
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -256,7 +270,7 @@ test_sfu: $(BUILD_DIR)/test_sfu/Vtaccel_top
 # Used to gate each Phase-2 op migration; the canonical gate is the
 # vadd_fp32 fixture under this build.
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_sfu_synth/Vtaccel_top: $(CONTROL_SV) test_sfu.cpp $(TB_HEADERS)
+$(BUILD_DIR)/test_sfu_synth/Vtaccel_top: $(CONTROL_DEPS) test_sfu.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_sfu_synth
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -277,7 +291,7 @@ test_sfu_synth: $(BUILD_DIR)/test_sfu_synth/Vtaccel_top
 # test_helpers_synth: helper regressions with HELPER_SYNTH_MODE=1. Currently
 # migrates the dequant_add_pack op via 16-lane parallel fp32 primitive chain.
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_helpers_synth/Vtaccel_top: $(CONTROL_SV) test_helpers.cpp $(TB_HEADERS)
+$(BUILD_DIR)/test_helpers_synth/Vtaccel_top: $(CONTROL_DEPS) test_helpers.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_helpers_synth
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -299,7 +313,7 @@ test_helpers_synth: $(BUILD_DIR)/test_helpers_synth/Vtaccel_top
 # Catches cross-mode interactions; this is the Phase-2 "full synth path"
 # gate for ops/state-machines that have been migrated.
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_sfu_helper_synth/Vtaccel_top: $(CONTROL_SV) test_sfu.cpp $(TB_HEADERS)
+$(BUILD_DIR)/test_sfu_helper_synth/Vtaccel_top: $(CONTROL_DEPS) test_sfu.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_sfu_helper_synth
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -320,7 +334,7 @@ test_sfu_helper_synth: $(BUILD_DIR)/test_sfu_helper_synth/Vtaccel_top
 # -----------------------------------------------------------------------
 # test_systolic: verilate taccel_top (with systolic) + compile + run
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_systolic/Vtaccel_top: $(CONTROL_SV) test_systolic.cpp $(TB_HEADERS)
+$(BUILD_DIR)/test_systolic/Vtaccel_top: $(CONTROL_DEPS) test_systolic.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_systolic
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
@@ -362,7 +376,7 @@ test_systolic_array_chained: $(BUILD_DIR)/test_systolic_array_chained/Vsystolic_
 # -----------------------------------------------------------------------
 # test_systolic_chained: top-level chained MATMUL verification
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_systolic_chained/Vtaccel_top: $(CONTROL_SV) test_systolic_chained.cpp $(TB_HEADERS)
+$(BUILD_DIR)/test_systolic_chained/Vtaccel_top: $(CONTROL_DEPS) test_systolic_chained.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_systolic_chained
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=1 \
@@ -381,7 +395,7 @@ test_systolic_chained: $(BUILD_DIR)/test_systolic_chained/Vtaccel_top
 # -----------------------------------------------------------------------
 # test_accum_snapshot_readback: #114 ACCUM-snapshot readback reproducer
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_accum_snapshot_readback/Vtaccel_top: $(CONTROL_SV) test_accum_snapshot_readback.cpp $(TB_HEADERS)
+$(BUILD_DIR)/test_accum_snapshot_readback/Vtaccel_top: $(CONTROL_DEPS) test_accum_snapshot_readback.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_accum_snapshot_readback
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=1 \
@@ -651,7 +665,7 @@ test_fp32_gelu_p33: $(BUILD_DIR)/test_fp32_gelu_p33/Vfp32_gelu_p33_tb
 # -----------------------------------------------------------------------
 # test_systolic_query: focused chained query-projection regression
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_systolic_query/Vtaccel_top: $(CONTROL_SV) test_systolic_query.cpp $(TB_HEADERS)
+$(BUILD_DIR)/test_systolic_query/Vtaccel_top: $(CONTROL_DEPS) test_systolic_query.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_systolic_query
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=1 \
@@ -708,7 +722,7 @@ test_systolic_qkt: test_systolic_qkt_basic test_systolic_qkt_replay \
 # Pre-fix:  raw_hazard_consecutive FAILS (stale HI sampled → wrong address).
 # Post-fix: all three sub-tests PASS.
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_addr_raw_hazard/Vtaccel_top: $(CONTROL_SV) test_addr_raw_hazard.cpp $(TB_HEADERS)
+$(BUILD_DIR)/test_addr_raw_hazard/Vtaccel_top: $(CONTROL_DEPS) test_addr_raw_hazard.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_addr_raw_hazard
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
