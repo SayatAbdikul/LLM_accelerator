@@ -63,7 +63,7 @@ CTRL_SV       := $(addprefix $(SRC_DIR)/, $(call read_filelist,$(CORE_CTRL_F)))
         test_systolic_qkt_basic test_systolic_qkt_replay \
         test_systolic_qkt_padded test_systolic_qkt_history \
         test_addr_raw_hazard \
-        test_accum_snapshot_readback test_fp32_add test_fp32_div test_fp32_div_p3 test_fp32_div_p4 test_fp32_div_p5 test_fp32_div_p6 test_fp32_sqrt test_fp32_sqrt_p3 test_fp32_sqrt_p4 test_fp32_sqrt_p6 test_fp32_exp_p18 \
+        test_accum_snapshot_readback test_fp32_add test_fp32_div test_fp32_div_p3 test_fp32_div_p4 test_fp32_div_p5 test_fp32_div_p6 test_fp32_sqrt test_fp32_sqrt_p3 test_fp32_sqrt_p4 test_fp32_sqrt_p6 test_fp32_exp_p18 test_fp32_gelu_p33 \
         test_sfu_synth test_helpers_synth \
         test_sfu_helper_synth synth-check synth-check-ctrl clean
 # R7 (2026-05-23): test_fp32_*_pipe targets removed. The 12 fp32_*_pipe.sv
@@ -618,6 +618,35 @@ $(BUILD_DIR)/test_fp32_exp_p18/Vfp32_exp_p18_tb: $(FP32_DIR)/fp32_exp_p18.sv $(F
 test_fp32_exp_p18: $(BUILD_DIR)/test_fp32_exp_p18/Vfp32_exp_p18_tb
 	@echo "--- Running pipelined fp32_exp_p18 bit-exact gate ---"
 	$(BUILD_DIR)/test_fp32_exp_p18/Vfp32_exp_p18_tb
+
+# -----------------------------------------------------------------------
+# test_fp32_gelu_p33: 33-stage pipelined fp32_gelu_p33, bit-exact gate
+# (fmax campaign rung 0, phase 0d). Same shape as test_fp32_exp_p18: the
+# golden is the COMBINATIONAL fp32_gelu_new RTL (a measured-band
+# approximation), since this is a PURE RETIMING of it. The tb top
+# instantiates BOTH cores from the same `a`; the harness asserts the
+# pipelined output (LATENCY=33) is byte-identical to the combinational one,
+# including under valid_in bubbles (the 32-deep x delay line's alignment
+# invariant is only observable when the input stream has gaps).
+# Needs add + mul + exp + exp_p18 + div + div_p6 + gelu_new in read order.
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_fp32_gelu_p33/Vfp32_gelu_p33_tb: $(FP32_DIR)/fp32_gelu_p33.sv $(FP32_DIR)/fp32_gelu_new.sv $(FP32_DIR)/fp32_exp_p18.sv $(FP32_DIR)/fp32_exp.sv $(FP32_DIR)/fp32_div_p6.sv $(FP32_DIR)/fp32_div.sv $(FP32_DIR)/fp32_add.sv $(FP32_DIR)/fp32_mul.sv fp32_gelu_p33_tb.sv test_fp32_gelu_p33.cpp $(TB_HEADERS)
+	mkdir -p $(BUILD_DIR)/test_fp32_gelu_p33
+	$(VERILATOR) $(VFLAGS) \
+	  --top-module fp32_gelu_p33_tb \
+	  --Mdir $(BUILD_DIR)/test_fp32_gelu_p33 \
+	  $(FP32_DIR)/fp32_add.sv $(FP32_DIR)/fp32_mul.sv \
+	  $(FP32_DIR)/fp32_div.sv $(FP32_DIR)/fp32_div_p6.sv \
+	  $(FP32_DIR)/fp32_exp.sv $(FP32_DIR)/fp32_exp_p18.sv \
+	  $(FP32_DIR)/fp32_gelu_new.sv $(FP32_DIR)/fp32_gelu_p33.sv \
+	  fp32_gelu_p33_tb.sv \
+	  test_fp32_gelu_p33.cpp \
+	  -CFLAGS "$(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_fp32_gelu_p33 -f Vfp32_gelu_p33_tb.mk
+
+test_fp32_gelu_p33: $(BUILD_DIR)/test_fp32_gelu_p33/Vfp32_gelu_p33_tb
+	@echo "--- Running pipelined fp32_gelu_p33 bit-exact gate ---"
+	$(BUILD_DIR)/test_fp32_gelu_p33/Vfp32_gelu_p33_tb
 
 # -----------------------------------------------------------------------
 # test_systolic_query: focused chained query-projection regression
