@@ -336,21 +336,55 @@
   // Phase-3.E (2026-05-21): g2_clamp_eps performed via bit-level magnitude
   // compare on the positive fp32 (synth-safe). Magnitudes of positive fp32
   // numbers compare numerically as unsigned int (IEEE-754 monotonic).
+  //
+  // 2026-07-24 (fmax MAX_ABS fix): these two divides were plain combinational
+  // `fp32_div` — a full 29-iteration restoring divide in ONE cycle, measured
+  // 175.33 ns on the mode-1 whole-lane netlist (reg -> clamp -> div -> f2h ->
+  // sfu_scale_wdata port -> top-level scale regfile). It never appeared in any
+  // reg-to-reg min-period report because the path ends at a PORT. Now:
+  //   cycle 1 (SCALE_WR entry): synth_eps_q <= clamp(g2_maxabs_q)  [final max]
+  //   cycle 2: mar_feed_q one-shot -> both fp32_div_p6 (bit-identical divide)
+  //   cycle 8: valid_out -> collect regs; F_G2_SCALE_WR writes on mar_vld_q.
+  // The clamp is registered so div stage 1 keeps its standalone depth, and the
+  // writes read f2h off the COLLECT regs (reg -> f2h -> port ≈ short). The op
+  // is rare (745 ops per 124M decode step at BOTH batch shapes — counted in
+  // the decode instr stream), so the +8 cycles/op tail is +5,960 cyc/step =
+  // +0.012% b16 / +0.033% b1, measured exact (Δtotal == Δsfu_busy == 8x745). Sequencing lives in F_G2_SCALE_WR
+  // (sfu_engine.sv): mar_arm_q -> mar_feed_q -> mar_vld_q, gated on the
+  // pipe's valid chain, never a hardcoded latency.
   localparam logic [31:0] C_127_FP32       = 32'h42FE_0000;  // 127.0
   localparam logic [31:0] C_CLAMP_MIN_FP32 = 32'h3B00_0000;  // 2^-9   = 0.001953125
   localparam logic [31:0] C_CLAMP_MAX_FP32 = 32'h4A7D_DC00;  // 4159504.0 = 65504.0*127.0/2.0
   logic [31:0] synth_clamp_eps_bits;
+  logic [31:0] synth_eps_q;
   logic [31:0] synth_inv_eps;
   logic [31:0] synth_eps_inv127;
+  logic [31:0] synth_inv_eps_q;
+  logic [31:0] synth_eps_inv127_q;
+  logic        synth_mar_div_vo;
+  logic        synth_mar_div_vo2;
   logic [15:0] synth_inv_eps_fp16;
   logic [15:0] synth_eps_inv127_fp16;
   assign synth_clamp_eps_bits = (g2_maxabs_q < C_CLAMP_MIN_FP32) ? C_CLAMP_MIN_FP32
                               : (g2_maxabs_q > C_CLAMP_MAX_FP32) ? C_CLAMP_MAX_FP32
                               : g2_maxabs_q;
-  fp32_div u_synth_inv_eps    (.a(C_127_FP32),          .b(synth_clamp_eps_bits), .y(synth_inv_eps));
-  fp32_div u_synth_eps_inv127 (.a(synth_clamp_eps_bits), .b(C_127_FP32),          .y(synth_eps_inv127));
-  fp32_to_fp16 u_synth_inv_eps_h    (.a(synth_inv_eps),    .y(synth_inv_eps_fp16));
-  fp32_to_fp16 u_synth_eps_inv127_h (.a(synth_eps_inv127), .y(synth_eps_inv127_fp16));
+  fp32_div_p6 u_synth_inv_eps (
+    .clk(clk), .rst_n(rst_n), .valid_in(mar_feed_q),
+    .a(C_127_FP32), .b(synth_eps_q),
+    .valid_out(synth_mar_div_vo), .y(synth_inv_eps));
+  fp32_div_p6 u_synth_eps_inv127 (
+    .clk(clk), .rst_n(rst_n), .valid_in(mar_feed_q),
+    .a(synth_eps_q), .b(C_127_FP32),
+    .valid_out(synth_mar_div_vo2), .y(synth_eps_inv127));
+  // Free-running: eps tracks the clamp one cycle behind g2_maxabs_q (stable by
+  // the feed cycle); each collect reg samples y exactly when its pipe says so.
+  always_ff @(posedge clk) begin
+    synth_eps_q <= synth_clamp_eps_bits;
+    if (synth_mar_div_vo)  synth_inv_eps_q    <= synth_inv_eps;
+    if (synth_mar_div_vo2) synth_eps_inv127_q <= synth_eps_inv127;
+  end
+  fp32_to_fp16 u_synth_inv_eps_h    (.a(synth_inv_eps_q),    .y(synth_inv_eps_fp16));
+  fp32_to_fp16 u_synth_eps_inv127_h (.a(synth_eps_inv127_q), .y(synth_eps_inv127_fp16));
 
   // ===================================================================
   // 0x1A LAYERNORM_FP32 synth sub-FSM combinational primitives.

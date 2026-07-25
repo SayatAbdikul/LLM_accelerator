@@ -451,6 +451,14 @@ module sfu_engine
   // 0x1F MAX_ABS_REDUCE_FP32: running global max|x| + 2-cycle write phase.
   logic [31:0] g2_maxabs_q;
   logic        g2_wr_phase_q;
+  // 2026-07-24 (fmax MAX_ABS fix): the 127/eps + eps/127 scale divides are now
+  // fp32_div_p6 pipes (sfu_synth_datapath.svh). Sequencer, all one-shots:
+  //   mar_arm_q  — set on the transition into F_G2_SCALE_WR (eps reg loading)
+  //   mar_feed_q — the pipes' valid_in, exactly one cycle later
+  //   mar_vld_q  — collect regs hold the final quotients; gates the 2 writes
+  logic        mar_arm_q;
+  logic        mar_feed_q;
+  logic        mar_vld_q;
   logic [31:0] attn_row_max_q;
   logic [31:0] attn_exp_sum_q;
   // R9 (2026-05-23): gen-1 LAYERNORM intermediate probes. Cell-cost only
@@ -946,6 +954,9 @@ module sfu_engine
       g2_rows_q      <= 13'h0;
       g2_maxabs_q    <= 0.0;
       g2_wr_phase_q  <= 1'b0;
+      mar_arm_q      <= 1'b0;
+      mar_feed_q     <= 1'b0;
+      mar_vld_q      <= 1'b0;
       gelu_i8_row_q  <= 128'h0;
       gelu_row0_q    <= 128'h0;
       gelu_row1_q    <= 128'h0;
@@ -999,6 +1010,9 @@ module sfu_engine
             g2_rows_q       <= dispatch_g2_rows_w;
             g2_maxabs_q     <= 0.0;
             g2_wr_phase_q   <= 1'b0;
+            mar_arm_q       <= 1'b0;
+            mar_feed_q      <= 1'b0;
+            mar_vld_q       <= 1'b0;
             attn_valid_q    <= attn_valid;
             attn_query_row_base_q <= attn_query_row_base;
             attn_valid_kv_len_q   <= attn_valid_kv_len;
@@ -1241,7 +1255,8 @@ module sfu_engine
               read_idx_q <= 13'h0;
               state      <= F_G2_S1_REQ;
             end else begin
-              state <= F_G2_SCALE_WR;          // all elements seen
+              state     <= F_G2_SCALE_WR;      // all elements seen
+              mar_arm_q <= 1'b1;               // eps reg loads next cycle
             end
           end else begin
             // FP16 src1 tile, 8 elems / 16-byte row. Streamed: capture chunk
@@ -1830,12 +1845,23 @@ module sfu_engine
 
         // 0x1F: write scale_regs[sreg]=127/eps (phase 0), then
         // scale_regs[sreg+1]=eps/127 (phase 1). Writes driven in the
-        // combinational block; here we just sequence the two phases.
+        // combinational block; here we sequence feed -> collect -> 2 phases.
+        // Timeline (entry = cycle 1): eps reg loads cycle 1 (mar_arm_q),
+        // div_p6 valid_in cycle 2 (mar_feed_q), valid_out cycle 8 sets
+        // mar_vld_q, writes cycles 9/10. The wait is gated on the pipes'
+        // valid chain, never a counted latency. Applies to BOTH modes (the
+        // DPI wdata path is comb and simply writes at the delayed cycles).
         F_G2_SCALE_WR: begin
-          if (g2_wr_phase_q == 1'b0)
-            g2_wr_phase_q <= 1'b1;
-          else
-            state <= F_IDLE;
+          mar_arm_q  <= 1'b0;
+          mar_feed_q <= mar_arm_q;
+          if (synth_mar_div_vo)
+            mar_vld_q <= 1'b1;
+          if (mar_vld_q) begin
+            if (g2_wr_phase_q == 1'b0)
+              g2_wr_phase_q <= 1'b1;
+            else
+              state <= F_IDLE;
+          end
         end
 
         F_FAULT: ;
@@ -2014,7 +2040,9 @@ module sfu_engine
       //   scale_regs[sreg+1] = float16(eps/127)   (phase 1)
       // float16() is a single round of the float64 quotient.
       F_G2_SCALE_WR: begin
-        sfu_scale_we = 1'b1;
+        // Writes wait for the div_p6 collect regs (mar_vld_q); before that the
+        // state is just draining the pipes and must not strobe the regfile.
+        sfu_scale_we = mar_vld_q;
         if (g2_wr_phase_q == 1'b0) begin
           sfu_scale_waddr = sreg_q;
           if (SFU_SYNTH_MODE == 1)

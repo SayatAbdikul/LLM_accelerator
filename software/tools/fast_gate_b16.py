@@ -111,6 +111,27 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
+    # Staleness gate (2026-07-24, the 6th "gate not wired to what it checks"
+    # member): this script only EXECUTES the binary — nothing here rebuilds
+    # it, so an RTL edit followed by a gate run silently measures the OLD
+    # machine (it reported Δcycles=0 for a change whose true, later-measured
+    # cost was +5,960 — a byte-inert change makes the stale run look exactly
+    # like a passing gate). Hard-fail instead of guessing.
+    if args.rtl == DEFAULT_RTL:
+        rtl_mtime = args.rtl.stat().st_mtime
+        src_dirs = [REPO_ROOT / "rtl" / "common" / "src",
+                    REPO_ROOT / "rtl" / "verilator"]
+        newest = max(
+            (p for d in src_dirs for p in d.rglob("*")
+             if p.suffix in (".sv", ".svh", ".cpp", ".h") and "build" not in p.parts),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if newest.stat().st_mtime > rtl_mtime:
+            print(f"STALE BINARY: {newest.relative_to(REPO_ROOT)} is newer than "
+                  f"the RTL binary.\n  rebuild first: make -C rtl/verilator "
+                  f"run_program_synth", file=sys.stderr)
+            return 2
+
     import torch  # noqa: deferred heavy import
     from bench_decode_cycles import build_decode_bins
 
