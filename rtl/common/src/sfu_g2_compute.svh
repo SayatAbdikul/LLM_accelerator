@@ -349,13 +349,21 @@
         //   3) Variance: var_acc += (row[iter] - mean)^2
         //   4) Denom: denom = sqrt(var_acc / n + LN_EPS)
         //   5) Output: out[iter] = f2h((row[iter] - mean) / denom * gamma + beta)
+        // 2026-07-25 (fmax 0g): software-pipelined one deep — the accumulate
+        // reads the REGISTERED ln_row_q (element iter-1) so the row_data_q
+        // read mux never chains into the fp32_add. Same accumulation order
+        // (((0+e0)+e1)+...) => bit-exact; +1 fill cycle per row. The final
+        // accumulate (element n-1) fires on the same cycle as the exit, so
+        // ln_sum_acc_q is stable on entry to F_G2_LN_MEAN exactly as before.
         F_G2_LN_SUM: begin
-          if ({5'h0, iter_idx_q} < n_elems_q) begin
+          if (iter_idx_q >= 11'd1)
             ln_sum_acc_q <= ln_sum_add_w;
-            iter_idx_q   <= iter_idx_q + 11'd1;
+          if ({5'h0, iter_idx_q} < n_elems_q) begin
+            ln_row_q   <= synth_a_bits;
+            iter_idx_q <= iter_idx_q + 11'd1;
           end else begin
-            iter_idx_q   <= 11'h0;
-            state        <= F_G2_LN_MEAN;
+            iter_idx_q <= 11'h0;
+            state      <= F_G2_LN_MEAN;
           end
         end
 
@@ -386,23 +394,33 @@
           state        <= F_G2_LN_VAR;
         end
 
-        // 2026-05-31: pipelined to break the ~42 ns sub->mul->add SFU floor.
-        // ln_dsq_q holds element (iter-1)'s (row-mean)^2 (registered last cycle);
-        // accumulate it (ln_var_add_w = ln_var_acc_q + ln_dsq_q, a lone add)
-        // while simultaneously computing element iter's square into ln_dsq_q
-        // (the sub+mul feed). Same accumulation order as the old 1-cycle loop
-        // (((0+dsq0)+dsq1)+...), so bit-exact; costs +1 drain cycle per row.
+        // 2026-05-31 (pipelined) / 2026-07-25 (fmax 0g, deepened to 3): the
+        // feed is now a 3-stage pipe, one primitive (or the read mux) per
+        // stage — this single-cycle mux->sub->square chain was the whole-lane
+        // post-repair_design binder on both hd and hs:
+        //   iter    : ln_row_q  <= row_data_q[iter]        (read mux only)
+        //   iter+1  : ln_diff_q <= ln_row_q - mean         (one fp32_add)
+        //   iter+2  : ln_dsq_q  <= ln_diff_q^2             (one fp32_mul)
+        //   iter+3  : ln_var_acc_q += ln_dsq_q             (lone add, carried)
+        // mean needs no side-operand delay: ln_mean_q is latched once per row
+        // in F_G2_LN_MEAN_S and constant through VAR. Same accumulation order
+        // (((0+dsq0)+dsq1)+...), so bit-exact; +2 drain cycles/row vs the
+        // 1-deep version. Squares latched past the bound expire uncollected
+        // (the exit at iter==n+2 accumulates exactly through element n-1).
         F_G2_LN_VAR: begin
-          // ACCUMULATE element (iter-1)'s square, once the pipe has filled.
-          if (iter_idx_q >= 11'd1)
+          // ACCUMULATE element (iter-3)'s square, once the pipe has filled.
+          if (iter_idx_q >= 11'd3)
             ln_var_acc_q <= ln_var_add_w;
-          if ({5'h0, iter_idx_q} < n_elems_q) begin
-            // FEED: register element iter's (row[iter]-mean)^2.
-            ln_dsq_q   <= ln_diff_sq_w;
+          // Pipe stages advance every cycle in-state.
+          ln_diff_q <= ln_diff_w;
+          ln_dsq_q  <= ln_diff_sq_w;
+          if ({5'h0, iter_idx_q} < (n_elems_q + 16'd2)) begin
+            if ({5'h0, iter_idx_q} < n_elems_q)
+              ln_row_q <= synth_a_bits;   // FEED: register the array read
             iter_idx_q <= iter_idx_q + 11'd1;
           end else begin
-            // iter==n_elems: the final square (element n-1) was just accumulated
-            // by the branch above (iter>=1). Variance sum complete.
+            // iter==n_elems+2: the final square (element n-1) was just
+            // accumulated by the branch above. Variance sum complete.
             iter_idx_q <= 11'h0;
             state       <= F_G2_LN_DENOM_PRE;
           end
@@ -474,10 +492,11 @@
         // it fed a single (row-mean) into the fully-pipelined fp32_div_p5
         // u_ln_norm, then idled draining it. Since u_ln_norm accepts a
         // new dividend EVERY cycle, this single state instead keeps the divider
-        // full: each cycle it feeds row[iter_idx_q]-mean into ln_diff_q (the
-        // FEED/master pointer) and, once the pipe has filled (iter>=6: 1 ln_diff_q
-        // reg + 5 divider stages), collects the quotient now emerging on
-        // ln_norm_w for element ln_coll_q (= iter_idx_q-7 with div_p6), applying that
+        // full: each cycle it feeds row[iter_idx_q] into ln_row_q, then
+        // row-mean into ln_diff_q (the 0g 2-deep feed; iter_idx_q is the
+        // FEED/master pointer) and, once the pipe has filled (iter>=8:
+        // ln_row_q + ln_diff_q regs + 6 divider stages), collects the quotient
+        // now emerging on ln_norm_w for element ln_coll_q (= iter_idx_q-8), applying that
         // element's gamma/beta (ln_gamma/beta_coll_w, indexed by ln_coll_q in
         // the datapath) and writing out_h_q[ln_coll_q]. The phase costs
         // n_elems+6 cycles instead of 6*n_elems (~6x on the OUT pass).
@@ -501,13 +520,17 @@
             ln_wr_q    <= 11'h0;
             state      <= F_G2_PACK;
           end else begin
-            // FEED: present row[iter_idx_q]-mean to the divider input register.
+            // FEED: register the array read (0g), then present row-mean to the
+            // divider input register one cycle behind. ln_diff_q latches
+            // unconditionally in-state: entries past the row bound re-square
+            // the stale ln_row_q and are never collected (collect is bounded).
             if ({5'h0, iter_idx_q} < n_elems_q)
-              ln_diff_q <= ln_diff_w;
-            // DIVIDER COLLECT: after the 7-deep pipe fills (1 ln_diff_q reg + 6
-            // div_p6 stages, lever E), ln_norm_w holds element ln_coll_q's
-            // quotient (ln_coll_q = iter_idx_q - 7). This pointer indexes
-            // gamma/beta; it no longer writes out_h_q.
+              ln_row_q <= synth_a_bits;
+            ln_diff_q <= ln_diff_w;
+            // DIVIDER COLLECT: after the 8-deep pipe fills (ln_row_q +
+            // ln_diff_q regs + 6 div_p6 stages), ln_norm_w holds element
+            // ln_coll_q's quotient (ln_coll_q = iter_idx_q - 8). This pointer
+            // indexes gamma/beta; it no longer writes out_h_q.
             if (ln_coll_en_w)
               ln_coll_q <= ln_coll_q + 11'd1;
             // FINALIZE WRITE: 2 cycles behind the divider collect, in element

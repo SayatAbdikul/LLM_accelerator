@@ -431,20 +431,27 @@
   // FSM samples y a fixed number of cycles after presenting operands). Named
   // dummy sinks keep PINCONNECTEMPTY / sv2v / yosys quiet.
   logic ln_mean_vo, ln_var_norm_vo, ln_norm_vo, sm_div_vo, ln_sqrt_vo;
-  fp32_add  u_ln_sum_add (.a(ln_sum_acc_q), .b(synth_a_bits), .y(ln_sum_add_w));
+  // 2026-07-25 (fmax 0g): all LN row-walk primitives read the REGISTERED row
+  // element ln_row_q (latched from synth_a_bits by the walking states) instead
+  // of the combinational synth_a_bits — the iter_idx_q pointer fanout + the
+  // 1024-entry row_data_q read mux no longer chain into any LN fp op. This was
+  // the post-repair_design lane binder on BOTH hd and hs (mux -> sub -> square
+  // -> ln_dsq_q, single-cycle). Costs 1 extra fill cycle per pass, per row.
+  fp32_add  u_ln_sum_add (.a(ln_sum_acc_q), .b(ln_row_q),     .y(ln_sum_add_w));
   // 2026-07-12 (lever E): 6-stage pipelined divider (LATENCY=6, fp32_div_p6). FSM
   // presents the registered ln_sum_acc_q and samples ln_mean_div_w 6 cycles later
   // (F_G2_LN_MEAN -> _W -> _W2 -> _W3 -> _W4 -> _W5 -> _S). valid_in tied high.
   fp32_div_p6 u_ln_mean  (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
                           .a(ln_sum_acc_q), .b(ln_n_fp32),
                           .valid_out(ln_mean_vo), .y(ln_mean_div_w));
-  fp32_add  u_ln_diff    (.a(synth_a_bits), .b(ln_neg_mean),  .y(ln_diff_w));
-  fp32_mul  u_ln_diff_sq (.a(ln_diff_w),    .b(ln_diff_w),    .y(ln_diff_sq_w));
-  // 2026-05-31: LN_VAR pipelined. The accumulate reads the REGISTERED square
-  // (ln_dsq_q, latched in F_G2_LN_VAR from ln_diff_sq_w) instead of the
-  // combinational ln_diff_sq_w, so sub+mul (-> ln_dsq_q) and the loop-carried
-  // accumulate (-> ln_var_acc_q) sit in separate pipeline stages. Breaks the
-  // ~42 ns sub->mul->add SFU floor into ~28 ns + ~14 ns. Bit-exact.
+  fp32_add  u_ln_diff    (.a(ln_row_q),     .b(ln_neg_mean),  .y(ln_diff_w));
+  // 2026-07-25 (fmax 0g): the square reads the REGISTERED difference ln_diff_q
+  // (latched from ln_diff_w each F_G2_LN_VAR cycle) so sub and square sit in
+  // separate stages. VAR is now a 3-deep feed pipe (ln_row_q -> ln_diff_q ->
+  // ln_dsq_q), each stage one primitive; the loop-carried accumulate below
+  // stays a lone reg -> add -> reg. Bit-exact: identical ops, operands and
+  // accumulation order — the registers only delay them.
+  fp32_mul  u_ln_diff_sq (.a(ln_diff_q),    .b(ln_diff_q),    .y(ln_diff_sq_w));
   fp32_add  u_ln_var_add (.a(ln_var_acc_q), .b(ln_dsq_q),     .y(ln_var_add_w));
   // 2026-07-12 (lever E): 6-stage divider (LATENCY=6, fp32_div_p6). var_acc/n
   // sampled 6 cycles after the registered ln_var_acc_q is presented
@@ -468,14 +475,16 @@
                           .valid_out(ln_sqrt_vo), .y(ln_denom_w));
   // 2026-07-12 (lever E): 6-stage pipelined divider (LATENCY=6, fp32_div_p6).
   // Consumes the registered ln_diff_q in the software-pipelined F_G2_LN_OUT_DIFF
-  // drain; the collect pointer ln_coll_q = iter_idx_q - 7 (1 ln_diff_q feed reg +
-  // 6 div stages). The downstream gamma multiply reads ln_norm_w directly.
+  // drain; the collect pointer ln_coll_q = iter_idx_q - 8 (ln_row_q + ln_diff_q
+  // feed regs + 6 div stages, fmax 0g). The downstream gamma multiply reads
+  // ln_norm_w directly.
   fp32_div_p6 u_ln_norm  (.clk(clk), .rst_n(rst_n), .valid_in(1'b1),
                           .a(ln_diff_q),    .b(ln_denom_q),
                           .valid_out(ln_norm_vo), .y(ln_norm_w));
   // 2026-05-31: LN_OUT divider-drain pipelining. The gamma/beta applied to a
   // given divider output (ln_norm_w) belong to the COLLECT element (ln_coll_q =
-  // iter_idx_q-7 with div_p6), not the feed element (iter_idx_q). Index them by ln_coll_q so the multiply
+  // iter_idx_q-8 with div_p6 + the 0g ln_row_q feed reg), not the feed element
+  // (iter_idx_q). Index them by ln_coll_q so the multiply
   // -add matches the element emerging from u_ln_norm this cycle. (synth_gamma/
   // beta_bits stay iter_idx_q-indexed for the other ops that use them.)
   logic [31:0] ln_gamma_coll_w, ln_beta_coll_w;

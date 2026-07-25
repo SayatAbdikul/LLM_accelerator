@@ -292,8 +292,9 @@ module sfu_engine
   // DIFF/NORM/W/W2/W3/OUT loop fed one element then idled 4 cycles draining it
   // (6 cyc/elem). The pipelined F_G2_LN_OUT_DIFF runs one state: iter_idx_q is
   // the master/feed counter (presents row[iter]-mean to ln_diff_q each cycle);
-  // ln_coll_q is the lagging collect pointer (= iter_idx_q - 7: one ln_diff_q
-  // reg + 6 divider stages), indexing gamma/beta as the matching divider output
+  // ln_coll_q is the lagging collect pointer (= iter_idx_q - 8: ln_row_q +
+  // ln_diff_q feed regs + 6 divider stages), indexing gamma/beta as the
+  // matching divider output
   // (ln_norm_w) emerges. ~6x on the OUT pass; bit-exact (same ops/operands/order,
   // same divider instance) and fmax-neutral (the feed and collect combinational
   // paths already existed as the DIFF and OUT critical paths; they now just run
@@ -317,6 +318,15 @@ module sfu_engine
   // element i-1's — so throughput stays ~1 elem/cycle (+1 drain/row). Bit-exact
   // (same sub/mul/add, same operands, same accumulation order).
   logic [31:0]  ln_dsq_q;
+  // 2026-07-25 (fmax 0g): registered row_data_q read for the LN row walks.
+  // Post-repair_design STA (both hd and hs) showed the lane binder was the
+  // single-cycle iter_idx_q -> 1024-entry row_data_q mux -> sub -> square ->
+  // ln_dsq_q chain — the pointer fanout + read mux chained INTO the fp ops.
+  // ln_row_q holds row_data_q[iter_idx_q] one cycle behind the pointer, so
+  // every LN fp stage (SUM accumulate, VAR sub, VAR square, OUT sub) is
+  // mux-free and exactly one primitive deep. Written by F_G2_LN_SUM / _VAR /
+  // _OUT_DIFF; entries latched past the row bound are never consumed.
+  logic [31:0]  ln_row_q;
   // 2026-07-21 (fmax phase 0b): feed register for the pipelined fp32_exp_p18.
   // Holds (row[iter_idx_q] - row_max) so the fp32_add subtract never chains
   // into exp's stage 1. Written every cycle of F_G2_SM_EXPSUM and
@@ -671,7 +681,7 @@ module sfu_engine
   // the valid chain cannot drift apart.
   assign ln_coll_en_w = (state == F_G2_LN_OUT_DIFF) &&
                         ({5'h0, ln_wr_q} < n_elems_q) &&
-                        (iter_idx_q >= 11'd7) &&
+                        (iter_idx_q >= 11'd8) &&
                         ({5'h0, ln_coll_q} < n_elems_q);
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) ln_fin_vld_q <= 2'h0;
@@ -927,6 +937,7 @@ module sfu_engine
       ln_coll_q      <= 11'h0;
       ln_wr_q        <= 11'h0;
       ln_dsq_q       <= 32'h0;
+      ln_row_q       <= 32'h0;
       sm_diff_q      <= 32'h0;
       sm_exp_q       <= 32'h0;
       sm_row_max_q   <= 32'h0;
