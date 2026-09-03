@@ -65,8 +65,8 @@ def read_int8_tile(state, buf_id: int, offset_units: int, rows: int, cols: int) 
 def read_int4_tile(state, buf_id: int, offset_units: int, rows: int, cols: int) -> np.ndarray:
     """Read a packed INT4 tile from SRAM buffer (W4A16 plan Phase 2, 2026-05-24).
 
-    Layout MUST mirror `decoder_bundle.pack_int4` exactly (the RTL
-    `weight_unpack.sv` Phase 3 module will mirror it too):
+    Layout mirrors `decoder_bundle.pack_int4` exactly. This is currently a
+    Python/golden research format; RTL does not unpack it:
       * 2 nibbles per byte; byte `b[i]` packs element `[..., 2*i]` in the
         LOW nibble and `[..., 2*i + 1]` in the HIGH nibble (two's-complement
         signed values, then masked with 0x0F).

@@ -1,5 +1,15 @@
 # Performance roadmap — the architecture campaign, honest re-base (2026-07-16)
 
+> **Historical campaign record, reconciled 2026-09-03.** Later pipeline work
+> changed the latest cycle counts to **18,318,261 cycles** for b1 at position
+> 511 and **49,998,042 cycles per 16-token step** for b16 at position 510
+> (3,124,878 cycles/token). The logits SHA-1 prefixes are `eeab004014642d14`
+> and `205682b6515f7e85`, respectively. The 34.41 MHz peg and every derived
+> token rate below came from earlier partial-design timing; later integrated
+> exp/GELU/full-lane paths have no successful full-chip PNR sign-off on the
+> available 15 GB host. Use [current project status](project_status.md) for the
+> live state and [the documentation index](README.md) for authority.
+
 Successor to `perf_roadmap_2026-07-10.md`. Two things happened since that doc:
 **(1) the Port-A corruption discovery re-based every number** (the old machine
 silently dropped systolic drain writes during DMA‖systolic overlap — all

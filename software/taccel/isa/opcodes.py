@@ -1,83 +1,29 @@
-"""ISA opcode definitions, instruction formats, and field constants.
+"""Current TACCEL opcode allocation, instruction formats, and field constants.
 
-TACCEL ISA v1 — 64-bit fixed-width instructions, big-endian encoding.
+Instructions are fixed-width 64-bit words serialized big-endian, with the
+5-bit opcode in bits [63:59]. Four resources sit behind the in-order control
+plane: DMA, the 16×16 INT8 systolic array, the generation-2 SFU, and the
+blocking helper engine. SYNC masks cover DMA, systolic, and SFU; the helper is
+blocking.
 
-Architecture overview
----------------------
-Three execution units operate behind an in-order issue stage:
-  - DMA   : LOAD / STORE (DRAM ↔ SRAM)
-  - Systolic : MATMUL (INT8×INT8 → INT32, 16×16 tiled)
-  - SFU   : generation-2 FP32/FP16 LayerNorm, GELU, and masked softmax
+The maintained hardware target is W8A16. Generation-2 R-type opcodes
+0x17..0x1F use FP32 internal arithmetic and require flags[0]=1 in RTL.
+SOFTMAX_FP32 (0x1C) remains Python/golden-only; causal frontends use
+MASKED_SOFTMAX_FP32 (0x1D). The flags=0 W8A32-storage form is likewise a
+Python research path.
 
-The programmer inserts SYNC instructions with a 3-bit resource mask to
-enforce ordering between units.  Without SYNC, the hardware may overlap
-execution of independent units (e.g. a LOAD can overlap a MATMUL).
+Six generation-1 SFU opcode numbers (0x0E, 0x0F, 0x10, 0x12, 0x15, 0x16)
+remain named only so old binaries receive clear retirement diagnostics. The
+integer compatibility helpers at 0x0B, 0x0C, 0x0D, 0x11, and 0x13 remain
+implemented.
 
-W8A32 extension (Phase 3 (c.1), milestones M1 + M2.5-A, 2026-05-12)
-------------------------------------------------------------------
-Nine new R-type opcodes (0x17–0x1F) extend the ISA to support FP32
-inter-layer activations + dynamic per-matmul activation scaling while
-preserving INT8 MXU matmul:
+Current extensions inside formerly reserved fields are:
+  - M-type [6:3] ``cols_log2`` and [0] ``transpose`` for transposed LOAD;
+  - CONFIG_TILE [27:16] ``m_exact`` for the exact SFU row count;
+  - CONFIG_TILE [28] ``weight_int4`` in Python only. RTL ignores bit [28], so
+    hardware-target programs must leave it zero.
 
-  M1 (commit `47141fb`):
-    0x17 DEQUANT_ACCUM_FP32:    per-channel dequant of INT32 ACCUM → FP32 ABUF
-    0x18 QUANT_FP32_INT8:       per-tensor INT8 quant of FP32 ABUF → INT8 ABUF
-    0x19 VADD_FP32:             element-wise FP32 add (residual stream)
-    0x1A LAYERNORM_FP32:        LayerNorm with FP32 I/O
-    0x1B GELU_FP32:             GELU with FP32 I/O
-    0x1C SOFTMAX_FP32:          row-wise softmax with FP32 I/O
-    0x1D MASKED_SOFTMAX_FP32:   causal softmax with FP32 I/O
-
-  M2.5-A (this commit):
-    0x1E DEQUANT_ACCUM_FP32_SCALED:
-       like DEQUANT_ACCUM_FP32 but additionally multiplies by an FP16
-       scalar from a scale register. Used by W8A32 matmul-output
-       lowering to apply the dynamic per-matmul activation scale
-       (max_abs/127) on top of the static per-channel weight scales.
-       M1's 0x17 op stays bit-identical to its M1 contract — 0x1E is
-       a separate opcode that adds the scalar multiply.
-    0x1F MAX_ABS_REDUCE_FP32:
-       scans an FP32 ABUF tile, computes max(|x|), and writes derived
-       FP16 scales to a register pair: scale_regs[sreg] = 127/max_abs
-       (for QUANT_FP32_INT8 input scaling), scale_regs[sreg+1] =
-       max_abs/127 (for DEQUANT_ACCUM_FP32_SCALED output scaling).
-       Eps-guarded for all-zero tiles.
-
-There is no buffer dtype tag — ABUF bytes are reinterpreted as INT8
-(1 byte/elem), FP16 (2 bytes/elem), or FP32 (4 bytes/elem) based on
-the opcode AND the `flags[0]` precision selector (W8A16 extension).
-Codegen owns the dtype layout. A 16x16 FP32 tile occupies 64 16-byte
-buffer units; a 16x16 FP16 tile occupies 32 units; the corresponding
-INT8 tile occupies 16 units.
-
-W8A16 extension (Phase 3 (c.2), milestone M1, 2026-05-14)
----------------------------------------------------------
-The 9 W8A32 opcodes (0x17–0x1F) are polymorphic on `RTypeInsn.flags[0]`:
-  - flags=0  → FP32 storage (W8A32, existing, bit-identical behavior)
-  - flags=1  → FP16 storage (W8A16, new default)
-The opcode set is unchanged; only the per-instruction flag bit selects
-the ABUF dtype. Internal datapath remains FP32 for numerically sensitive
-math (LN variance, softmax exp, GELU x³). Byte-sizing invariant:
-FP16 tile = M_pad × N_pad × 2 (half of FP32, double of INT8).
-
-For DEQUANT_ACCUM_FP32_SCALED (0x1E) specifically, `flags=1` ALSO
-changes the src2 vector layout: src2 = `2N FP16` (N per-channel scales
-followed by N bias values). The epilogue computes
-`fp32 = int32 × pc × act_scale + bias`, then casts to FP16 once. This
-folds bias into the dequant epilogue to avoid FP16 double-rounding
-bias through a separate VADD. Under `flags=0`, src2 = N FP16 PC scales
-only (W8A32 contract, unchanged). Matmuls without bias zero-pad the
-second N entries of the src2 blob.
-
-Reserved fields / opcodes
--------------------------
-- Retired generation-1 SFU slots 0x0E, 0x0F, 0x10, 0x12, 0x15, and 0x16
-  remain named so old binaries can be diagnosed, but cannot be assembled,
-  decoded into executable instructions, or run by the golden model.
-- CONFIG_ATTN reserved bits [32:0] must be zero.
-- M-TYPE stride_log2 [6:3] is reserved and must be zero.
-- M-TYPE flags [2:0] are reserved and must be zero.
-- R-TYPE flags[0] = fp_precision (W8A16). flags[7:1] are reserved.
+See ``software/docs/isa_spec.md`` for the complete support and field matrix.
 """
 from enum import IntEnum
 
@@ -222,8 +168,8 @@ M_SRAM_OFF_SHIFT = 41
 M_XFER_LEN_SHIFT = 25
 M_ADDR_REG_SHIFT = 23
 M_DRAM_OFF_SHIFT = 7
-M_STRIDE_LOG2_SHIFT = 3  # Reserved — must be 0
-M_FLAGS_SHIFT = 0         # Reserved — must be 0
+M_STRIDE_LOG2_SHIFT = 3  # cols_log2 for transposed LOAD; 0 for plain transfer
+M_FLAGS_SHIFT = 0         # transpose for LOAD; 0 for canonical STORE
 
 # B-type fields
 B_SRC_BUF_SHIFT = 57
@@ -243,10 +189,9 @@ C_M_SHIFT = 49
 C_N_SHIFT = 39
 C_K_SHIFT = 29
 # W4A16 plan Phase 2 (2026-05-24). Bit [28] of a CONFIG_TILE instruction
-# selects W4 weight interpretation for the NEXT matmul: when set, the
-# weight tiles in WBUF are read as packed INT4 nibbles (2 per byte,
-# layout per `decoder_bundle.pack_int4`) and unpacked to INT8 lanes
-# before the systolic INT8×INT8 matmul. Bits [27:0] remain reserved-zero.
+# selects packed W4 weight interpretation in Python bundle/golden paths. RTL
+# currently ignores this bit and still reads INT8 lanes, so it must remain zero
+# in hardware-target programs. Bits [27:16] are assigned to m_exact below.
 # The bit lives inside the existing C-type field allocation (M/N/K
 # occupy [58:29], leaving [28:0] free) so adding it is encoder-additive
 # and does NOT widen the instruction word. Default 0 keeps every existing

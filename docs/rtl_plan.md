@@ -1,12 +1,12 @@
 # TACCEL RTL Plan
 
-> **Status (2026-07-16): historical planning document (gen-1 / ViT-era).** The
-> feature matrix below ("BUF_COPY: No", "SOFTMAX: Not yet", DeiT-tiny as the
-> target workload, "20 ISA instructions") describes a bring-up skeleton that no
-> longer exists: every engine listed as missing has long been implemented,
-> synthesized (sky130), and measured running GPT-2 124M decode end-to-end.
-> Current state-of-truth: [top-level README](../README.md) and
-> [`perf_roadmap_2026-07-16.md`](perf_roadmap_2026-07-16.md).
+> **Historical gen-1/ViT plan, reconciled 2026-09-03.** Its feature matrix and
+> instruction counts no longer describe the code. The project now targets the
+> gen-2 W8A16 GPT-2 path, and six legacy gen-1 SFU opcodes are rejected. The
+> current generic gate establishes elaboration/synthesizability, not SKY130
+> sign-off. Use [project status](project_status.md), the current
+> [ISA specification](../software/docs/isa_spec.md), and
+> [documentation index](README.md).
 
 ## 1. Purpose
 

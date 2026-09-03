@@ -1,426 +1,268 @@
 # LLM Accelerator (TACCEL)
 
-An LLM inference accelerator, measured end-to-end on GPT-2 124M: SystemVerilog
-RTL (16×16 INT8 systolic array + FP32 special-function unit + DMA, byte-exact
-against a pinned golden model) plus a Python toolchain (ISA, compiler,
-quantizer, golden simulator, host runtime). The primary target is ASIC
-(sky130: yosys synth + STA, per-block OpenROAD PNR); an FPGA wrapper exists as
-a smoke-tested skeleton.
+TACCEL is a research LLM inference accelerator with a SystemVerilog core and
+a Python compiler/runtime stack. The maintained compute path is GPT-2-class
+decoder inference with INT8 weights, FP16 activation storage, INT32 systolic
+accumulation, and FP32 internal special-function arithmetic.
 
-**Measured decode throughput (GPT-2 124M, W8A16, ctx-512 budget, post-PNR
-34.41 MHz, honest-bandwidth DRAM model):**
+The hardware contains a 16×16 INT8 systolic array, DMA engine, blocking helper
+engine, synthesizable SFU, three on-chip SRAMs, and an in-order issue unit. The
+software provides the ISA, assembler, model frontends, quantization, compiler,
+golden simulator, host runtime, fixtures, and RTL co-simulation tools.
 
-| shape | tok/s | note |
-|---|---:|---|
-| batch-16 decode (16 streams) | **11.055** aggregate | 49,803,314 cyc/step, 3.11M cyc/token |
-| batch-1 decode | **1.880** | 18,300,503 cyc/token; systolic floor ~3.1 |
-| prefill (chunked, 128-tok prompt) | TTFT **5.6 s** | 12.4× faster than sequential prefill |
-| batch-1 + speculative decode (opt-in host track) | 2.906 | P=4, exact-greedy, byte-inert unless enabled |
+> **Documentation state:** audited against commit `3486c01` on 2026-09-03.
+> Start with [the current project status](docs/project_status.md) and
+> [documentation index](docs/README.md). Dated plans and measurement reports
+> are retained as historical evidence and are labeled accordingly.
 
-The project started as an INT8 ViT accelerator (DeiT-tiny) and grew a decoder
-ISA + GPT-2 frontend on top; both lineages remain in the tree.
+## Current status
 
----
-
-## Status snapshot
-
-| Area | State |
+| Area | Current state |
 |---|---|
-| **ISA** | gen-2 frozen 2026-05-19 (19 emitted opcodes, FP32 sub-layer `0x17–0x1F`), 8-byte fixed encoding, 32-slot space. Post-freeze revisions via the freeze §6 mechanism: `m_exact` (CONFIG_TILE[27:16], exact SFU row count) and the DMA transpose-LOAD (reserved M-type bits). Contract: `software/docs/isa_generation_freeze.md`. |
-| **RTL** | All engines synthesizable (yosys `synth-check` GREEN, no `real`/DPI in the netlist path). 16×16 INT8 systolic (chained default), gen-2 FP32 SFU with pipelined div/sqrt (`fp32_div_p6`/`fp32_sqrt_p6`), DMA with transpose-load, per-buffer Port-A fan-out + dedicated systolic drain channel (Port S) with collision-FAULT. ~14.5 k LOC SV. |
-| **Correctness** | Tiny fixture: RTL == golden **byte-identical** (freeze cosim). 124M: RTL-vs-RTL logits SHA gates + argmax/PPL conformance (RTL-vs-golden byte-match is ill-posed past the first fp16 overflow — the golden saturates). The 2026-07 Port-A audit found and fixed a months-old silent-corruption bug in DMA‖systolic overlap; the audit counters (`lost=0`, co-busy) are now part of every overlap gate. |
-| **Performance** | Table above; measured by direct RTL cycle counts (`run_program_synth --fast-beats`) × post-PNR fmax. History and next levers: `docs/perf_roadmap_2026-07-16.md`. |
-| **fmax** | 34.41 MHz post-PNR (sky130, per-block flow; full-chip PNR needs a ≥24 GB box). **Contingent**: the peg excludes the un-pipelined `fp32_exp` clouds; the pipelined replacement (`fp32_exp_p18`, bit-identical) is landed but not yet integrated — `docs/t0_sfu_fmax_audit.md`. Standalone div/sqrt floor after lever E: 29.64 ns. |
-| **Quantization** | W8A16 + QuaRot production preset: **56.23 PPL** (FP32 ceiling 53.42, GPT-2 124M 257-tok). W4A16 + AWQ + GPTQ: 63.04 (tier-1 refinements: ~55.04). KV cache stored INT8 (store-time quant, bit-exact — static scales). |
-| **Serving** | Batched decode B=16 (per-stream KV, all 16 logits rows emitted); chunked multi-token prefill (any prompt length, byte-exact); speculative decoding fenced as an opt-in host track. B=32 measured +3.45% ⇒ batching is mined out at B=16. |
-| **Roadmap** | `docs/perf_roadmap_2026-07-16.md` — occupancy (T1/T2) → clock (T3) → width (T4). Done: T0 instrumentation, T1 items 1+2. Next: T3 step 0 integration (exp pipelining into the SFU), T1 remainder. |
-
----
+| Primary workload | GPT-2 124M / nanoGPT-format causal decoder; the older DeiT frontend remains available but is not the active optimization target. |
+| Numeric path | W8A16: INT8 weights, FP16 activation storage, INT32 accumulators, FP32 SFU internals. The KV cache is stored as INT8. |
+| RTL | The full shared-core hierarchy passes the `sv2v + yosys` hierarchy/check/stat gate. FPGA and ASIC wrapper elaboration targets are also provided. These are not mapped synthesis or physical sign-off. |
+| ISA | Fixed 64-bit, big-endian instructions. Six generation-1 SFU opcodes are retired. The RTL implements the causal generation-2 path; `SOFTMAX_FP32` (`0x1C`) remains software/golden-only and is illegal in RTL. |
+| Verification | 462 Python tests collect. The cleanup validation passed 214 focused Python tests, 94 native RTL checks, the full-design generic elaboration gate, and fixture/hash checks. Optional large-model and replay-data tests remain environment-gated. |
+| Performance | Latest measured cycles are 18,318,261 for B=1 at position 511 and 49,998,042 per B=16 step at position 510. A current full-chip post-layout fmax has not been established after the July SFU/helper pipeline work. |
+| Physical target | SKY130 is the measured ASIC research path. The FPGA directory is an elaboration-ready wrapper skeleton; no board or vendor flow is selected. |
 
 ## Repository layout
 
-```
+```text
 LLM_accelerator/
-├── software/                       # Python toolchain + tests + tools
+├── software/
 │   ├── taccel/
-│   │   ├── isa/                    # Opcodes, instruction dataclasses, 8-byte encoding
-│   │   ├── assembler/              # Two-pass assembler + disassembler, ProgramBinary/Bundle
-│   │   ├── quantizer/              # W8/W4, AWQ, GPTQ, QuaRot, SmoothQuant, TurboQuant, …
-│   │   ├── compiler/               # Graph frontend (nanogpt/GPT-2/DeiT), tiling, memory
-│   │   │                           #   alloc, codegen (emit/ + w8a16_emit/), decoder bundle,
-│   │   │                           #   KV-cache layout, packed attention, prefetch scheduling
-│   │   ├── golden_model/           # Bit-accurate Python simulator (content-pinned)
-│   │   └── runtime/                # HostRunner (decode loop, chunked prefill, spec-dec),
-│   │                               #   PPL eval, calibration, W4 path, disk caches
-│   ├── tests/                      # 56 pytest files: freeze cosim, batched decode,
-│   │                               #   spec-dec inertness pin, ISA/codegen byte-identity, PPL
-│   ├── tools/                      # CLIs: bench_decode_cycles, fast_gate_b16,
-│   │                               #   profile_decode_step, rtl_cosim, evaluate_gpt2_perplexity,
-│   │                               #   asm/disasm, gen_gen2_fixtures, …
-│   └── docs/                       # ISA freeze contract + design notes
-│
+│   │   ├── isa/                 # Opcodes, instruction classes, encoding
+│   │   ├── assembler/           # Text assembly and ProgramBinary/ProgramBundle
+│   │   ├── compiler/            # Frontends, IR, tiling, allocation, W8A16 lowering
+│   │   ├── quantizer/           # W8/W4 research quantizers and calibration helpers
+│   │   ├── golden_model/        # Sequential ISA simulator
+│   │   └── runtime/             # HostRunner, PPL evaluation, fixtures, spec decode
+│   ├── tests/                   # 56 pytest modules
+│   ├── tools/                   # Co-sim, profiling, conversion, evaluation CLIs
+│   └── docs/                    # ISA contract and historical quantization records
 ├── rtl/
 │   ├── common/
-│   │   ├── src/                    # The core: taccel_top, fetch/decode/control, dma_engine,
-│   │   │   │                       #   blocking_helper_engine, sfu_engine (+3 .svh partitions)
-│   │   │   ├── include/            # taccel_pkg.sv (params, opcodes, faults, SYNC bits)
-│   │   │   ├── systolic/           # 16×16 PE array + controller
-│   │   │   ├── memory/             # sram_subsystem (Port A/S/B/W), sram_dp, register_file
-│   │   │   ├── fp32/               # 20 synthesizable IEEE-754 primitives (add, mul,
-│   │   │   │                       #   div_p2..p6, sqrt_p2..p6, exp, exp_p18, gelu, cvt, …)
-│   │   │   └── tb/                 # SV bench models (AXI slave, decode tb)
-│   │   └── filelists/              # core.f — the single source-of-truth filelist
-│   ├── verilator/                  # Native C++ benches + run_program harness (primary sim);
-│   │                               #   run_program_synth = the perf-measurement build
-│   ├── asic/                       # ASIC wrappers, sky130 SRAM macro stub, synth + STA +
-│   │                               #   OpenROAD per-block PNR flows (build/synth_blocks,
-│   │                               #   build/openroad), OpenLane config
-│   ├── fpga/                       # FPGA wrapper + vendor stubs; yosys-fpga smoke gate
-│   └── synth/                      # Generic yosys synth-check gate + Phase-2/3 records
-│
-└── docs/                           # Roadmaps, landed-lever reports, audits (see Doc index)
+│   │   ├── src/                 # Shared synthesizable accelerator RTL
+│   │   └── filelists/core.f     # Source of truth for shared RTL compilation units
+│   ├── verilator/               # Primary native RTL benches and program runners
+│   ├── asic/                    # SKY130 wrappers and synth/STA/PNR scripts
+│   ├── fpga/                    # FPGA wrapper and elaboration stubs
+│   └── synth/                   # Generic synthesis gate and campaign records
+└── docs/                        # Current status plus dated architecture reports
 ```
 
----
+The dormant Cocotb suite, obsolete control-only synthesis gate, retired
+generation-1 SFU implementation, and invalid QKT-history bench were removed in
+`3486c01`. Native Verilator is the only supported RTL simulation framework.
 
 ## Quickstart
 
-### Environment
+Create the Python environment from the repository root:
 
 ```sh
-python -m venv .venv && source .venv/bin/activate
-pip install -r software/requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r software/requirements.txt
 ```
 
-You'll also need Verilator (4.2+) for the RTL benches, and yosys + sv2v for
-the synth gates. All commands run from the repo root; `pytest` picks up
-`software/tests/conftest.py` (adds `software/` to `sys.path`), and direct
-script invocations use `PYTHONPATH=software`.
+RTL builds additionally require Verilator. Synthesis gates require `sv2v` and
+Yosys. The ASIC timing scripts require a SKY130 installation plus OpenSTA or
+OpenROAD, depending on the selected flow.
 
-### Run the correctness gates (golden pins + RTL == golden byte-match)
+### Run the software tests
 
 ```sh
-make -C rtl/verilator run_program run_program_synth   # build the RTL runners once
-pytest software/tests/test_compare_rtl_golden.py software/tests/test_batched_decode.py -v
+.venv/bin/python -m pytest -q software/tests
 ```
 
-`test_compare_rtl_golden.py` pins the golden simulator's content SHA (freeze
-§6), asserts the frozen `weight_only_int8_quarot` bundle builds
-deterministically with gen-2 opcodes, and runs the RTL-vs-golden prefill
-byte-match via `tools/rtl_cosim.py` (this leg skips only when `run_program`
-or the tiny fixture is missing; the opt-in 124M logits-metric leg is gated by
-`PYTEST_124M=1`). `test_batched_decode.py` is the other live RTL==golden
-byte-match: tiny decode bundles — including the packed batch-16 attention
-path — run on the Verilator RTL and must produce logits byte-identical to
-the golden simulator.
-
-Byte-exactness is a **tiny-model** gate. On 124M it is ill-posed: past the
-first FP16 overflow both sides go to `inf` together, so use argmax/perplexity
-conformance there instead.
-
-### Measure decode performance (the numbers in this README)
+Useful optional gates:
 
 ```sh
-make -C rtl/verilator run_program_synth        # mode-1 (synth SFU), 1 GiB DRAM
-PYTHONPATH=software python3 software/tools/bench_decode_cycles.py ...   # decode @ ctx-512
-PYTHONPATH=software python3 software/tools/fast_gate_b16.py            # b16 gate: cycles,
-                                               # tok/s, co-busy, Port-A audit, logits sha1
+PYTEST_SLOW=1 .venv/bin/python -m pytest -q software/tests
+PYTEST_124M=1 .venv/bin/python -m pytest -q \
+  software/tests/test_compare_rtl_golden.py
 ```
 
-`run_program_synth` is the runner every perf number is measured on:
-`SFU_SYNTH_MODE=1` (the real datapath, not the DPI reference) and always
-`--fast-beats` (the pinned honest-bandwidth DRAM model — 1 beat/cycle,
-bandwidth scales with core clock; `--beat-interval N` simulates fixed-GB/s).
-`profile_decode_step.py` adds per-opcode retire-gap attribution + the
-exposed-DMA census (slower). Don't run two 124M sims (or a sim + a yosys
-job) concurrently on a 15 GB box.
+The full suite contains fixture- and environment-dependent tests. Use a clean
+checkout on the same machine as the comparison baseline when evaluating an
+unrelated change; see [project status](docs/project_status.md) for the most
+recent verified scope.
 
-### Evaluate GPT-2 124M perplexity
+### Run the native RTL gates
 
 ```sh
-PYTHONPATH=software python3 software/tools/evaluate_gpt2_perplexity.py \
-    software/tests/fixtures/generated/gpt2_converted_nanogpt.pt \
-    --tokenizer-dir software/tests/fixtures/generated/hf_gpt2 \
-    --calibration-text <calib.txt> --eval-text <eval.txt> \
-    --max-eval-tokens 257 --ptq-preset weight_only_int8_quarot
+make -C rtl/verilator all
+make -C rtl/verilator test_sfu_synth test_helpers_synth
+make -C rtl/verilator test_systolic_array_chained test_systolic_qkt
+make -C rtl/verilator test_fp32_div_p6 test_fp32_sqrt_p6
+make -C rtl/verilator test_fp32_exp_p18 test_fp32_gelu_p33
 ```
 
-Presets: `weight_only_int8`, `weight_only_int8_quarot` (production),
-`weight_only_int4_awq_gptq`, and activation-aware variants — see
-`software/taccel/runtime/stage5_ptq.py`.
+`all` runs the main decode/control/DMA/helper/SFU/systolic benches. The
+synthesizable-datapath, split QKT, chained-array, and FP32 primitive gates are
+separate targets. QKT replay and padded cases skip when their external replay
+directory is unavailable. See [the RTL testbench guide](rtl/TESTBENCHES.md).
 
-### RTL benches
+### Run the RTL-versus-golden gates
 
 ```sh
-make -C rtl/verilator all             # decode/control/dma/helpers/sfu/systolic C++ benches
-make -C rtl/verilator test_sfu_synth  # mode-1 SFU datapath gate (11 cases)
-make -C rtl/verilator test_fp32_div_p6 test_fp32_sqrt_p6 test_fp32_exp_p18
-                                      # pipelined-primitive bit-exactness gates
+make -C rtl/verilator run_program run_program_synth
+.venv/bin/python -m pytest -q \
+  software/tests/test_compare_rtl_golden.py \
+  software/tests/test_batched_decode.py
 ```
 
-Bench guide: [`rtl/TESTBENCHES.md`](rtl/TESTBENCHES.md).
+The tiny decoder fixture is the byte-exact conformance target. GPT-2 124M
+crosses an FP16 non-finite boundary, so large-model validation uses the
+documented logits/argmax/perplexity metrics instead of claiming whole-program
+byte equality.
 
-### Synthesis / timing / PNR
+### Run RTL elaboration gates
 
 ```sh
-make -C rtl/verilator synth-check              # whole-design yosys elaboration gate
-make -C rtl/asic yosys-asic                    # ASIC wrapper smoke gate
-rtl/asic/build/synth_blocks/synth_full.sh <top>    # sky130 synth (abc -D 5000) + .log
-rtl/asic/build/synth_blocks/run_block_sta.sh ...   # OpenSTA per block
-openroad ... rtl/asic/build/openroad/block_pnr.tcl # per-block PNR + STA (sky130A PDK)
+make -C rtl/verilator synth-check
+make -C rtl/asic yosys-asic
+make -C rtl/fpga yosys-fpga
 ```
 
-Memory caveats: yosys's SHARE pass hangs on the SFU (use the `-noshare`
-flows); the full-SFU flatten + PNR OOMs below ~24 GB RAM — per-block and
-per-primitive flows are the supported path on small boxes. Never run two
-yosys jobs concurrently on a 15 GB machine.
+The first command elaborates the complete shared core. The ASIC and FPGA
+commands elaborate their wrappers and target-specific memory bindings. They
+are not substitutes for placement, routing, DRC, or board bring-up.
 
-### Full software test suite
+### Run the golden-model demo
 
 ```sh
-pytest software/tests/ -n auto
+.venv/bin/python software/run_gpt2.py \
+  software/tests/fixtures/generated/gpt2_converted_nanogpt.pt \
+  --prompt-ids 0,1,2 --max-new-tokens 4
 ```
 
-`PYTEST_SLOW=1` enables long PPL gates; `PYTEST_124M=1` enables the 124M
-cosim leg. A small pinned set of failures is pre-existing (fixture SHA drift,
-`n_embd` KeyError cases, W4 `tile_config` tuple, fp16-embedding-era synthetic
-tests) — gate new work against a clean-HEAD baseline, not against zero
-failures.
+The converted checkpoint is optional repository data; commands that need it
+will skip or fail clearly when it is absent.
 
----
+### Evaluate perplexity
+
+```sh
+PYTHONPATH=software .venv/bin/python \
+  software/tools/evaluate_gpt2_perplexity.py \
+  software/tests/fixtures/generated/gpt2_converted_nanogpt.pt \
+  --tokenizer-dir software/tests/fixtures/generated/hf_gpt2 \
+  --calibration-text software/tests/fixtures/generated/wikitext2_stage5_calibration.txt \
+  --eval-text software/tests/fixtures/generated/wikitext2_stage5_eval.txt \
+  --max-eval-tokens 257
+```
+
+Omitting `--ptq-preset` selects the evaluator default
+`output_aware_mlp_lm_head_0_11_pc_full_bc`. Performance fixtures use the
+separate frozen `weight_only_int8_quarot` configuration; do not compare their
+results without naming the preset.
 
 ## Architecture
 
-### Hardware (rtl/common/src)
+### RTL
 
-One in-order control plane driving four engines over three on-chip SRAMs:
+- `taccel_top.sv` connects fetch, control, engines, SRAM ports, AXI, faults,
+  and observability counters.
+- `fetch_unit.sv` fetches fixed 8-byte instructions over a 128-bit AXI read
+  channel.
+- `control_unit.sv` issues in order. DMA may overlap the systolic engine;
+  helper and SFU operations are serialized by the current scheduler.
+- `dma_engine.sv` performs burst LOAD/STORE operations and the INT8
+  transpose-LOAD used for K-cache materialization.
+- `systolic/` implements the chained 16×16 INT8 array and INT32 tiled
+  accumulation.
+- `blocking_helper_engine.sv` implements the retained generation-1 helper
+  operations: REQUANT, REQUANT_PC, SCALE_MUL, VADD, and DEQUANT_ADD.
+- `sfu_engine.sv` implements the active generation-2 W8A16 path. Long
+  exponential, GELU, divide, scale-write, dequant, and LayerNorm paths are
+  pipelined; `fp32_exp_p18` and `fp32_gelu_p33` are integrated.
+- `memory/sram_subsystem.sv` provides ABUF 128 KiB, WBUF 256 KiB, and ACCUM
+  64 KiB. Port S is dedicated to systolic writes; same-buffer Port A/S
+  collisions fault.
 
-- **`taccel_top.sv`** — fetch/decode/issue glue, AXI-read arbitration
-  (fetch vs DMA), SRAM port arbitration, fault collapse, and the
-  observability counters (`obs_*`: DMA/systolic co-busy, Port-A lost-write
-  audit, fetch-stall, per-engine busy) that the perf tooling samples.
-- **`fetch_unit.sv`** — single-beat AXI reads; 8-byte instructions, two per
-  16-byte beat (the sibling is currently re-fetched — a known T2 lever).
-- **`control_unit.sv`** — in-order issue. Concurrency contract: **DMA ‖
-  systolic only** (`SYS_DMA_OVERLAP=1`); SFU and helper are serialized.
-  `SYNC` waits on a resource mask (bit0=DMA, bit1=systolic, bit2=SFU).
-- **`dma_engine.sv`** — AXI4 LOAD/STORE bursts, whole-transfer OOB
-  prevalidation, and the lever-D **transpose-LOAD** (16-row-stripe byte
-  transpose on the fly — this deleted the serialized K^T helper pass).
-- **`systolic/`** — 16×16 INT8 PEs (chained skew default), tile-walk
-  controller with double-buffered A-tiles, K-split accumulate (RMW drain),
-  and dead-preclear elimination.
-- **`sfu_engine.sv`** (+ `sfu_synth_datapath.svh`, `sfu_g2_compute.svh`,
-  `sfu_dpi_helpers.svh`) — the gen-2 FP32 ops (dequant/quant, LN, GELU,
-  masked softmax, max-abs). Mode 0 = DPI reference; mode 1 = the
-  synthesizable fp32-primitive datapath (the chip). `m_exact` bounds row
-  walks to real rows (the lever that removed the 16-row padding tax).
-  Divider/sqrt are 6-stage pipelined; **exp is still combinational in the
-  datapath** — its pipelined replacement `fp32_exp_p18` is verified and
-  awaiting integration (T3 step 0).
-- **`blocking_helper_engine.sv`** — gen-1 helper ops (BUF_COPY, VADD,
-  REQUANT[_PC], SCALE_MUL, DEQUANT_ADD); fully blocking.
-- **`memory/sram_subsystem.sv`** — ABUF **128 KB** / WBUF **256 KB** / ACCUM
-  **64 KB** (448 KB total, 16-byte rows) as three dual-port macros. Channels:
-  shared Port A (DMA/helper/SFU, fanned out per buffer), **Port S**
-  (systolic-dedicated writes — the 2026-07 bus split that fixed the silent
-  drain-drop corruption; same-buffer A/S collision now FAULTs), Port B
-  (systolic src1 reads), **Port W** (systolic src2 reads from WBUF — what
-  makes DMA-prefetch-under-MATMUL port-safe).
-- **`fp32/`** — 20 synthesizable IEEE-754 primitives, each bit-exact to its
-  DPI golden or its combinational parent (`fp32_add/mul/div/sqrt/exp/
-  gelu_new/quantize_i8/…`, pipelined `div_p2..p6`, `sqrt_p2..p6`,
-  `exp_p18`).
+Core parameters are `SYS_DIM=16`, `AXI_DATA_W=128`, four 56-bit address
+registers, and sixteen FP16 scale registers.
 
-Key parameters (`include/taccel_pkg.sv`): `SYS_DIM=16`, `AXI_DATA_W=128`
-(16 B/beat), 56-bit DRAM addressing, 16 FP16 scale regs, 4 addr regs.
-Peak: 256 MACs × 2 ops × 34.41 MHz ≈ **0.018 int8 TOPS** (useful utilization
-~17% at b16, ~3% at b1 — M=1 fills 1 of 16 mesh rows, which is why batching
-and the clock are the levers, not more MACs).
+### Software
 
-### Software (software/taccel)
+1. `isa/` defines the 64-bit encoding and instruction validation.
+2. `assembler/` produces `ProgramBinary` and relocatable two-stream
+   `ProgramBundle` images.
+3. `compiler/` converts DeiT or nanoGPT/GPT-2 graphs into tiled programs,
+   including KV-cache layout, runtime patch sites, packed attention, and
+   chunked prefill.
+4. `quantizer/` and `runtime/calibration/` provide the W8/W4 research and PTQ
+   machinery.
+5. `golden_model/` executes programs sequentially and provides trace tensors.
+6. `runtime/HostRunner` patches embeddings, KV bases, and causal context for
+   prefill, batched decode, chunked prefill, and optional speculative decode.
 
-1. **ISA** (`isa/`) — 32-slot opcode space, 8-byte big-endian encoding.
-   Frozen gen-2 contract + dated §6 revisions (`m_exact`, transpose-LOAD).
-2. **Assembler** (`assembler/`) — two-pass; `ProgramBinary` (cosim) and
-   two-stream `ProgramBundle` (host decode path with runtime patch sites).
-3. **Quantizer** (`quantizer/`) — per-channel W8/W4, AWQ, GPTQ, QuaRot,
-   SmoothQuant, AdaRound, TurboQuant-KV, LN-fold, bias correction.
-4. **Compiler** (`compiler/`) — graph frontend (`frontend/nanogpt_adapter.py`
-   builds the decode/prefill graphs: KV-cache injection at batch=1, packed
-   multi-head attention groups at batch≥2, chunked-prefill graphs, prefetch
-   attributes); tile planning + memory allocation with eviction; codegen
-   split into `emit/` (generic) and `w8a16_emit/` (the W8A16 production
-   path: attention, matmuls with weight-prefetch double-buffering, shared
-   ops); KV layout; decoder bundle with runtime patch sites (KV bases,
-   position, valid_kv_len).
-5. **Golden model** (`golden_model/`) — bit-accurate Python simulator,
-   content-pinned (SHA gate) as the conformance arbiter.
-6. **Runtime** (`runtime/`) — `HostRunner` (decode loop, batched decode,
-   `run_prefill_chunk`, opt-in speculative decoding), PPL evaluator,
-   calibration, fixtures (`tiny_fixture.py` builds tiny + 124M bundles).
-7. **Tools** (`tools/`) — see Quickstart; plus `rtl_cosim.py`,
-   `audit_porta_argmax.py`, spec-dec benches, fixture generators.
-8. **Tests** (`tests/`) — 58 files: encoding round-trips, quantizer parity,
-   codegen byte-identity, freeze cosim, batched-decode RTL==golden,
-   spec-dec inertness byte-pin, PPL gates.
+See [the software codebase guide](software/CODEBASE.md) and
+[the current ISA specification](software/docs/isa_spec.md).
 
-Numerics end to end: weights INT8 (per-channel, QuaRot); activations FP16;
-KV cache INT8 (store-time quant, static scales ⇒ bit-exact); ACCUM INT32;
-SFU FP32 with characterized ULP bands (freeze §7).
+## Performance
 
----
+The latest checked-in cycle measurements are:
 
-## Performance measurement doctrine
+| Shape | Position | Step cycles | Cycles/token |
+|---|---:|---:|---:|
+| B=1 decode | 511 | 18,318,261 | 18,318,261 |
+| B=16 decode | 510 | 49,998,042 | 3,124,878 |
 
-Hard-won rules, enforced by the tooling (the full story:
-`docs/phase0_measurement.md` → `docs/porta_bus_split.md`):
+These measurements use `run_program_synth --fast-beats`. They include the
+July pipeline changes through `451e7df` and preserve the known logits hashes.
+The formerly quoted 34.41 MHz post-PNR number excluded several later-integrated
+long paths and must not be presented as current full-chip closure. At 34.41 MHz
+only as an illustrative conversion, the table corresponds to approximately
+1.879 tok/s for B=1 and 11.012 aggregate tok/s for B=16.
 
-1. **Cycles come from direct runs** (`run_program_synth --fast-beats`,
-   `--json-out`), never from cached profiles. tok/s = fmax / cyc-per-token.
-2. **"Byte-exact" alone is insufficient for concurrency changes.** The tiny
-   cosim gate has zero DMA‖systolic co-busy cycles and is structurally blind
-   — exactly how a Port-A bus bug silently corrupted overlapped matmuls for
-   months while every gate stayed green. Overlap changes must additionally
-   show: total cycles ↓, co-busy quoted and moving the right way, Port-A
-   audit `lost=0`, and an unchanged RTL-vs-RTL logits sha1.
-3. **At 124M, compare RTL to RTL.** RTL-vs-golden byte-match is ill-posed
-   past the first fp16 overflow (the golden saturates); use logits SHA
-   against a baseline RTL run, plus argmax/PPL conformance.
-4. **Default bundles are byte-pinned** (`test_specdec_is_inert_at_the_default`)
-   so opt-in features (spec-dec) provably don't perturb the default path;
-   re-pins are deliberate, reviewed events.
-5. The DRAM model is pinned: bandwidth scales with core clock
-   (`--fast-beats`). Fixed-GB/s sensitivity via `--beat-interval`.
+For fresh measurement:
 
----
+```sh
+make -C rtl/verilator run_program_synth
+PYTHONPATH=software .venv/bin/python software/tools/bench_decode_cycles.py \
+  --positions 0,63,255,511 --batch 1
+PYTHONPATH=software .venv/bin/python software/tools/fast_gate_b16.py \
+  --batch 16 --position 510
+```
 
-## Quality results — GPT-2 124M, 257-token PPL
+Do not report tokens/second from a cycle result without naming the clock and
+DRAM model. The pinned `--fast-beats` model supplies one 128-bit beat per core
+cycle; fixed-bandwidth sensitivity is a different experiment.
 
-| Preset | PPL | Notes |
-|---|---|---|
-| FP32 reference | **53.42** | Ceiling. NumPy reference, no quantization. |
-| `weight_only_int8` | ~175 | Zero-calibration W8A16 baseline. |
-| `weight_only_int8_quarot` | **56.23** | + data-free residual-stream rotation; the production preset (all perf numbers above run this). |
-| `weight_only_int4_awq_gptq` | **63.04** | W4 blocks + W8 lm_head; AWQ α=0.40 + GPTQ. ~50% DRAM weight savings. |
-| W4 + Tier-1 refinements | **~55.04** | + act-order GPTQ, 16 K calibration, AdaRound, bias correction (non-default kwargs, `w4_quant.py`). |
+## Known gaps
 
-The RTL currently executes W8 bundles; W4 exists in golden/ISA
-(`CONFIG_TILE` bit 28) but the RTL doesn't decode it (roadmap item G).
+- A current full-SFU/full-chip post-layout timing result is still needed. The
+  latest whole-lane rerun exceeded the available 15 GB host memory.
+- ASIC SRAM macro composition, IO cells, full-chip PNR, DRC, and LVS are not
+  complete.
+- No FPGA board, clock IP, memory controller, or constraints set is selected.
+- `SOFTMAX_FP32` (`0x1C`) is accepted by Python encoding/golden execution but
+  rejected by RTL. Supported causal decoder graphs use
+  `MASKED_SOFTMAX_FP32`; the noncausal contract still needs a product decision.
+- Python supports packed INT4 metadata and golden-model execution, but RTL
+  does not consume `CONFIG_TILE.weight_int4`. W4 is therefore not an RTL
+  deployment mode.
+- The broad Python suite still includes optional large fixtures, long
+  perplexity tests, and known baseline issues, including four stale Stage-5
+  preset monkeypatch tests. Current status is recorded in
+  [docs/project_status.md](docs/project_status.md).
 
----
+## Documentation
 
-## Roadmap (condensed — full detail in `docs/perf_roadmap_2026-07-16.md`)
-
-The machine is idle, slow-clocked, and narrow — in that order:
-
-- **T1 — compiler overlap (occupancy), in progress.** Items 1+2 landed
-  (+8.96% b16, +8.17% b1, byte-exact, zero RTL): KV V-prefetch inside packed
-  attention groups and FC2 weight-prefetch double-buffering. Remaining: FC2
-  input hoist, next-group K^T prefetch.
-- **T2 — small RTL.** Instruction prefetch buffer (6.9% of b1 is
-  fetch-stall), A-load reuse, drain/flush overlap.
-- **T3 — the clock (the multiplier).** Single-domain 70–90 MHz: pipeline exp
-  into the SFU (step 0 — primitive done, integration pending; also makes the
-  current 34.41 MHz honest), deepen div/sqrt, split add/mul for the stretch.
-  ×2.0–2.6 on everything under the pinned BW model. Full-chip PNR stamp
-  needs a ≥24 GB box.
-- **T4 — 32-byte AXI (conditional).** Only if occupancy+clock make DMA the
-  binding floor. ISA/compiler are width-invisible.
-- **Mined out** (don't revisit): batching beyond B=16, QK^T packing,
-  elementwise SFU fusion, the helper K^T pass, SFU row-padding, preclears.
-- **Hard floors:** b1 systolic 11.11M cyc (M=1: 15/16 of the mesh idle ⇒
-  ~3.1 tok/s at this clock); KV capacity wall (12.3 MB/layer vs 384 KB
-  SRAM) caps KV overlap at attention scope.
-
----
-
-## Doc index
-
-### Current state-of-truth
-
-- [`docs/perf_roadmap_2026-07-16.md`](docs/perf_roadmap_2026-07-16.md) —
-  **the current roadmap**: measured state, the honest re-base, T0–T4.
-- [`software/docs/isa_generation_freeze.md`](software/docs/isa_generation_freeze.md)
-  — normative ISA contract (+ dated §6 revisions).
-- [`docs/porta_bus_split.md`](docs/porta_bus_split.md) — the Port-A/Port-S
-  memory architecture and why it exists (the corruption fix).
-- [`docs/t0_sfu_fmax_audit.md`](docs/t0_sfu_fmax_audit.md) — what actually
-  binds fmax (exp/EXPSUM), the 34.41 MHz contingency, T3 step-0 status.
-- [`rtl/TESTBENCHES.md`](rtl/TESTBENCHES.md) — RTL bench ownership.
-
-### Landed-lever reports (dated records, each with measured gates)
-
-- [`docs/t1_overlap_items.md`](docs/t1_overlap_items.md) — T1 items 1+2
-  (KV V-prefetch, FC2 weight prefetch).
-- [`docs/lever_d_dma_transpose.md`](docs/lever_d_dma_transpose.md),
-  [`docs/lever_e_fmax_cluster.md`](docs/lever_e_fmax_cluster.md),
-  [`docs/lever_h_b32.md`](docs/lever_h_b32.md),
-  [`docs/lever_i_serving.md`](docs/lever_i_serving.md),
-  [`docs/lever_b3_specdec.md`](docs/lever_b3_specdec.md) — DMA
-  transpose-load, the fmax cluster, B=32 (negative result), serving
-  (logits×N + chunked prefill), speculative decoding.
-- [`docs/phase0_measurement.md`](docs/phase0_measurement.md) — the overlap
-  corruption discovery and its bounds.
-- [`docs/t1_measured_redirect.md`](docs/t1_measured_redirect.md) — the T1
-  re-scope (read its outcome banner: two conclusions were later overturned).
-
-### Historical (preserved as record, superseded for planning)
-
-- [`docs/perf_roadmap_2026-07-10.md`](docs/perf_roadmap_2026-07-10.md)
-  (levers A/C/B/D/E era), [`docs/perf_roadmap_2026-07-08.md`](docs/perf_roadmap_2026-07-08.md)
-  (single-stream era) — pre-re-base numbers; see their banners.
-- [`docs/accelerator_completion_review.md`](docs/accelerator_completion_review.md)
-  — the 2026-05-19 gap analysis (its gaps have since closed; see banner).
-- [`docs/llm_isa_plan.md`](docs/llm_isa_plan.md), `docs/rtl_plan.md`,
-  `docs/rtl_debug_plan.md`, `docs/rtl_debugging_plan.md`,
-  `docs/stage5_readiness_2026-04-22.md` — ISA/RTL bring-up planning.
-- `rtl/synth/BASELINE.md`, `PHASE2_INTEGRATION.md`, `PHASE3_CLOSEOUT.md` —
-  the synthesizability campaign (2026-05); cell counts predate the July RTL.
-- [`software/CODEBASE.md`](software/CODEBASE.md) — ViT-era architecture
-  overview; ISA mechanics and assembler/compiler internals remain accurate.
-
----
-
-## Known open items
-
-- **T3 step 0 integration**: `fp32_exp_p18` is verified but the SFU still
-  elaborates combinational `fp32_exp` at three sites; until integrated, the
-  34.41 MHz peg is contingent (cycle counts unaffected).
-- **Full-chip/full-SFU PNR** is blocked on this class of machine (OOMs at
-  15 GB; needs ≥24 GB). fmax evidence is per-block PNR + standalone
-  primitive STA, calibrated (see `docs/t0_sfu_fmax_audit.md`).
-- **Pre-existing test failures** (pinned set — fixture/environment debt, not
-  product regressions): fixture SHA drift, `test_stage5_ptq_presets`
-  `n_embd` KeyErrors, W4 `tile_config` tuple cases, fp16-embedding-era
-  synthetic tests. Gate new work against a clean-HEAD baseline, not zero.
-  (The golden-simulator SHA pin itself is green at the §6 m_exact revision.)
-- **W4 on RTL** not implemented (golden/ISA only).
-- **FPGA path** is a smoke-tested skeleton; no part chosen. The measured
-  track is ASIC/sky130.
-
----
-
-## Layout invariants worth knowing
-
-- **The golden model is the conformance arbiter** on the tiny fixture; don't
-  edit `taccel/golden_model/simulator.py` casually (SHA-pinned). At 124M the
-  arbiter is RTL-vs-RTL SHA + argmax/PPL (golden saturates fp16).
-- **The freeze cosim gate is the bright line**: commits touching
-  `rtl/common/src/`, `taccel/isa/`, `taccel/golden_model/`, or the codegen
-  path must keep it byte-identical.
-- **Overlap/concurrency changes** carry the extra gate: co-busy + Port-A
-  audit + RTL-vs-RTL SHA (see the doctrine section — this is not optional;
-  the repo has the scar).
-- **Byte-pinned defaults**: productized PPL presets and the spec-dec
-  inertness pin are byte-identity gates; drift of 1e-4 PPL or one schedule
-  byte is a real signal, and re-pins are deliberate events.
-- **Box limits**: never two yosys jobs, or a yosys job + a 124M sim, or two
-  124M sims, concurrently on a 15 GB machine.
-
----
+- [Documentation index](docs/README.md)
+- [Current project status](docs/project_status.md)
+- [ISA specification](software/docs/isa_spec.md)
+- [ISA freeze and amendment record](software/docs/isa_generation_freeze.md)
+- [Software architecture](software/CODEBASE.md)
+- [RTL testbench guide](rtl/TESTBENCHES.md)
+- [ASIC flow](rtl/asic/README.md)
+- [FPGA flow](rtl/fpga/README.md)
+- [Generic RTL elaboration gate](rtl/synth/BASELINE.md)
 
 ## License
 
-No license file is present in the tree; the code is © the repository owner.
-Contact before depending on or redistributing.
+No license file is present. Contact the repository owner before depending on
+or redistributing the project.

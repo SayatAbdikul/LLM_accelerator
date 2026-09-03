@@ -1,10 +1,9 @@
 // Placeholder ASIC pad ring.
 //
-// Provides clock/reset synchronization between off-chip pads and the
-// on-chip core domain. Step E (2026-05-26 RTL restructure): stub-only,
-// no real IO cells or ESD protection. Replace with the PDK's IO library
-// (sky130_fd_io_*, etc.) when OpenLane is wired up. For Caravel
-// integration the pad ring lives inside the harness, not here.
+// Passes the clock pad through and samples reset through two flops. This is
+// elaboration-only: it has no real IO cells, ESD protection, vendor attributes,
+// or explicit power-on initialization. Replace it with the integration
+// target's characterized IO/reset solution.
 
 `ifndef PAD_RING_STUB_SV
 `define PAD_RING_STUB_SV
@@ -18,8 +17,8 @@ module pad_ring_stub (
 
   assign clk_core = clk_pad;
 
-  // 2-FF reset synchronizer (asynchronous reset assertion, synchronous
-  // deassertion on the core clock).
+  // Two-flop sampling on the core clock. Both assertion and deassertion are
+  // synchronous in this placeholder implementation.
   logic [1:0] rst_sync_q;
   always_ff @(posedge clk_core) rst_sync_q <= {rst_sync_q[0], rst_n_pad};
   assign rst_n_core = rst_sync_q[1];

@@ -1,10 +1,9 @@
 // FPGA top wrapper around the verified `taccel_top` core.
 //
-// Step D (2026-05-26 RTL restructure): exposes board-level pins
-// (clk, rst, start/done/fault) and routes the core's AXI master to a
-// placeholder DDR controller stub. The compute core itself is unchanged
-// and continues to be verified by the freeze cosim gate
-// (software/tests/test_compare_rtl_golden.py 5/5 byte-match).
+// Research integration wrapper exposing board-level clock/reset/control pins
+// and routing the core's AXI master to a placeholder DDR controller. There is
+// no selected device, board constraint set, real memory controller, or
+// bitstream flow. See rtl/TESTBENCHES.md for current conformance coverage.
 //
 // When a target FPGA part is picked, replace pll_stub / iobuf_stub /
 // ddr_axi_stub with vendor IP (MMCM/MIG/etc.) — the core instantiation

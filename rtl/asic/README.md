@@ -1,98 +1,157 @@
 # ASIC build path
 
-Step E (2026-05-26 RTL restructure) created this skeleton; it has since grown
-into the project's **primary measured target**. **Default PDK is SKY130**
-(sky130A standard cells, installed locally via ciel); IHP130 can be added
-later by dropping a sibling `src/sram_dp_ihp130.sv` and extending the
-Makefile's `PDK_SRAM_FILE_<pdk>` mapping.
+**Audited:** 2026-09-03
+**Research PDK:** SKY130A / `sky130_fd_sc_hd`
+**Status:** wrapper elaboration and per-block research flows exist; full-chip
+physical closure does not
 
-**What actually runs today** (this is where every fmax number comes from):
+The ASIC directory is the project's measured physical-design path. It is not
+a tape-out-ready project.
 
-- `build/synth_blocks/` — sky130 yosys synthesis suite: `synth_full.sh <top>`
-  (full-design, `abc -D 5000` — the calibrated mapper every STA number uses),
-  `synth_block.sh` (per-block, iterative delay tightening), `synth_sky130.sh`
-  (macro-tuned flow), plus per-block OpenSTA drivers (`run_block_sta.sh`,
-  `sta_one.sh`, `*_sta.tcl`, `*_sweep.tcl`).
-- `build/openroad/` — **OpenROAD per-block PNR + STA** on sky130_fd_sc_hd:
-  `block_pnr.tcl` (generic: netlist + top + period), plus tuned per-block
-  scripts (`dma_pnr.tcl`, `helper_pnr.tcl`, `sfu_pnr*.tcl`). The post-PNR
-  34.41 MHz figure comes from this flow.
-- Memory limits: the **full-SFU flatten (and full-chip PNR) OOMs below
-  ~24 GB RAM** — per-block and standalone-primitive flows are the supported
-  path on smaller boxes; never run two yosys jobs concurrently on 15 GB.
-  yosys's SHARE pass hangs on the SFU fp32 cones — the scripts use
-  `-noshare` where needed.
+## What is implemented
 
-## Layout
+- `src/taccel_top_asic.sv`: ASIC-facing wrapper around the shared
+  `taccel_top` core and AXI master.
+- `src/pad_ring_stub.sv`: placeholder clock/reset pad boundary.
+- `src/sram_dp_sky130.sv`: behavioral `sram_dp_macro` boundary matching the
+  shared two-port memory contract.
+- `Makefile`: `sv2v + yosys` wrapper elaboration smoke gate.
+- `build/synth_blocks/`: SKY130 Yosys/ABC and OpenSTA research scripts.
+- `build/openroad/`: direct per-block OpenROAD placement/timing scripts.
 
-| Path | Role |
-|---|---|
-| `src/taccel_top_asic.sv` | wraps the verified `taccel_top` core with off-chip pads (clk, rst, start/done/fault, AXI master) and routes through pad ring stub |
-| `src/pad_ring_stub.sv` | placeholder for SKY130 IO library (sky130_fd_io_*); 2-FF reset synchronizer for now |
-| `src/sram_dp_sky130.sv` | declares `module sram_dp_macro` with a BEHAVIORAL stub body; lands real `sky130_sram_*` instantiations when the macro composition is chosen |
-| `build/synth_blocks/`, `build/openroad/` | the working synth/STA/PNR flows (above) + their netlists and logs |
-| `openlane/` | OpenLane-2 config exists for `fetch_unit` (`config.yaml` + `pin_order.cfg`); other blocks TBD — the de-facto PNR flow is OpenROAD direct |
-| `libs/` | reserved for PDK liberty/lef pointers (env-var driven; the flows currently point straight at the ciel sky130A install) |
-| `Makefile` | `yosys-asic` smoke gate; stub `openlane` target |
+The `openlane/` and `libs/` directories are placeholders. The Makefile
+`openlane` target intentionally exits nonzero.
 
-## Target-axis defines (set by `Makefile`)
+## Wrapper smoke gate
 
-```
--DTARGET_ASIC          # selects sram_dp_macro binding in the common
-                       # SRAM dispatch wrapper
--DSFU_SYNTH_NO_DPI     # elides DPI-C imports (required for synthesis)
--DSFU_SYNTH_MODE=1     # routes SFU through synthesizable fp32 primitives
--DHELPER_SYNTH_MODE=1  # routes helper engine through synthesizable chain
+From the repository root:
+
+```sh
+make -C rtl/asic yosys-asic
 ```
 
-## Wrapper `\`error` guards
+This command:
 
-`taccel_top_asic.sv` carries two compile-time guards that refuse to
-elaborate under misconfigured builds:
+1. reads `rtl/common/filelists/core.f`;
+2. adds the ASIC wrapper, pad stub, and SKY130 SRAM boundary;
+3. converts with `sv2v` using:
 
-```systemverilog
-`ifndef SFU_SYNTH_NO_DPI
-  `error "TARGET_ASIC requires SFU_SYNTH_NO_DPI; ..."
-`endif
+   - `TARGET_ASIC`;
+   - `SFU_SYNTH_NO_DPI`;
+   - `SFU_SYNTH_MODE=1`;
+   - `HELPER_SYNTH_MODE=1`;
 
-`ifndef TARGET_ASIC
-  `error "taccel_top_asic requires -DTARGET_ASIC; ..."
-`endif
+4. runs Yosys `hierarchy -check`, `check`, and `stat` on
+   `taccel_top_asic`.
+
+This is an elaboration check, not mapped synthesis or timing closure.
+
+The wrapper contains compile-time guards for `TARGET_ASIC` and
+`SFU_SYNTH_NO_DPI` so a misconfigured synthesis command fails early.
+
+## Memory boundary
+
+The core requests three logical memories:
+
+| Buffer | Width × depth | Capacity |
+|---|---:|---:|
+| ABUF | 128 × 8,192 | 128 KiB |
+| WBUF | 128 × 16,384 | 256 KiB |
+| ACCUM | 128 × 4,096 | 64 KiB |
+
+`sram_dp_sky130.sv` currently models these with registers. It does not
+instantiate a real SKY130 SRAM macro.
+
+The macro replacement must preserve:
+
+- Port A read/write behavior;
+- Port B read-only behavior;
+- write-first Port A semantics;
+- the latency assumed by `sram_subsystem.sv`;
+- the independent logical channels used for systolic Port S routing.
+
+The complete 448 KiB logical capacity is much larger than a small
+Caravel-style SRAM budget. Banking, capacity reduction, or a different
+integration substrate must be decided before physical closure.
+
+## Technology-mapped research scripts
+
+The scripts under `build/synth_blocks/` are separate from the Makefile smoke
+gate. Examples:
+
+```sh
+rtl/asic/build/synth_blocks/synth_full.sh taccel_top
+rtl/asic/build/synth_blocks/synth_block.sh fp32_div_p6
+rtl/asic/build/synth_blocks/run_block_sta.sh fp32_div_p6
 ```
 
-These compose with the gen-2 ISA freeze: the design synthesizes with zero
-behavioral/DPI dependency, byte-exactly equivalent to the verified golden
-model under `software/tests/test_compare_rtl_golden.py`.
+Important portability constraint: these scripts currently hard-code a Linux
+Ciel SKY130 path under `/home/user/.ciel/...`, and one OpenSTA driver uses
+`/tmp/gcc-shim/sta`. Update those variables/paths for the local installation
+before running them. They are reproducibility artifacts, not portable build
+automation.
 
-## SRAM macro composition (still deferred)
+`synth_full.sh` performs:
 
-The behavioral stub in `src/sram_dp_sky130.sv` will become a bank of
-`sky130_sram_*` macros when the tape-out scope is set. Bank-target sizes:
+- `sv2v` conversion with ASIC/synth defines;
+- Yosys `synth -flatten`;
+- `dfflibmap`;
+- ABC mapping against `sky130_fd_sc_hd__tt_025C_1v80.lib`;
+- cell/area statistics.
 
-| Buffer | DATA_W × DEPTH | Bytes | Macro composition |
-|---|---|---|---|
-| ABUF | 128 × 8192 | 128 KB | TBD |
-| WBUF | 128 × 16384 | 256 KB | TBD |
-| ACCUM | 128 × 4096 | 64 KB | TBD |
+Per-block scripts are preferred on memory-limited machines.
 
-Note: at ~1 mm² per 2 KB on sky130A, the full 448 KB of on-chip SRAM
-exceeds the eFabless Caravel user-area budget (~10 mm²) by ~20×. No
-tape-out strategy is decided; the SRAM bank sizes here will likely shrink
-when the final chip-scope is set. (The macro's port contract — 1rw1r,
-write-first Port A, read-only Port B — is load-bearing: the whole
-DMA-prefetch-under-MATMUL overlap scheme and the Port-S drain channel
-assume it. See `docs/porta_bus_split.md` before changing it.)
+## OpenROAD block flow
 
-## Remaining full-chip closure steps
+`build/openroad/block_pnr.tcl` accepts:
 
-1. Choose the SRAM macro composition and replace the behavioral stub in
-   `src/sram_dp_sky130.sv` with banked `sky130_sram_*` instances.
-2. Full-chip (or at least full-SFU) PNR on a ≥24 GB machine — per-block
-   PNR + calibrated standalone-primitive STA is the current evidence basis
-   (`docs/t0_sfu_fmax_audit.md`, `docs/lever_e_fmax_cluster.md`).
-3. Either extend the OpenLane-2 configs (`openlane/<block>/config.yaml`)
-   block by block, or stay on OpenROAD direct; add SDC per block.
-4. Run DRC/LVS/STA closure; commit GDS as tape-out-ready artifact.
+```text
+<netlist.v> <top> <period_ns> [utilization_percent]
+```
 
-The shared filelist `rtl/common/filelists/core.f` remains the source of
-truth for the core RTL across all closure steps — no churn there.
+Example shape:
+
+```sh
+openroad -no_init -exit -threads 4 \
+  rtl/asic/build/openroad/block_pnr.tcl \
+  <netlist.v> <top> <period_ns> <utilization>
+```
+
+Specialized `dma_pnr.tcl`, `helper_pnr.tcl`, and `sfu_pnr*.tcl` scripts
+capture prior experiments. Inspect their hard-coded PDK paths and assumptions
+before reuse.
+
+## Timing status
+
+The historical 34.41 MHz post-PNR value was obtained from an earlier
+per-block/primitive configuration. Later commits integrated previously
+unmeasured long exponential, GELU, dequant, LayerNorm, and scale-generation
+paths. It must not be quoted as current complete-SFU or full-chip sign-off.
+
+The latest pipeline campaign reduced known long paths to approximately one FP
+primitive per stage, generally mapping in the 27–32 ns range depending on
+context. The post-`451e7df` whole-lane run exceeded 15 GB and was killed, so a
+current end-to-end fmax is still open. See
+[the current status](../../docs/project_status.md).
+
+## Resource constraints
+
+- Full-SFU/full-chip flattening and PNR can exceed 15 GB.
+- Yosys mapping varies materially with synthesis context; a standalone
+  primitive result is a proxy, not an exact full-SFU frequency.
+- Do not run multiple heavy Yosys/OpenROAD jobs concurrently on a small host.
+- Some flows avoid Yosys sharing because the FP cones make it slow or
+  unstable.
+
+## Work required for physical closure
+
+1. Parameterize PDK/tool paths instead of hard-coding the original machine.
+2. Choose an SRAM macro strategy and implement `sram_dp_macro`.
+3. Choose the integration target and replace the pad stub with real IO.
+4. Create maintained timing constraints and power intent.
+5. Run full-SFU and then full-chip mapping, placement, CTS, routing, and STA.
+6. Close DRC/LVS and validate memory timing/behavior.
+7. Re-measure performance using the achieved clock and a named memory model.
+
+The shared core source list remains
+`rtl/common/filelists/core.f` throughout these steps.

@@ -1,11 +1,11 @@
-// IO buffer + 2-FF reset synchronizer.
+// Two-flop reset-pin synchronizer placeholder; this is not an IO buffer.
 //
 // Replace with vendor IBUF + ASYNC_REG / dont_touch synchronizer FFs when
 // the target FPGA is picked. This stub provides minimal metastability
 // hardening for an asynchronous reset pin.
 //
-// Step D (2026-05-26 RTL restructure): stub-only so the FPGA wrapper
-// elaborates without vendor IBUF cells.
+// Stub-only so the FPGA wrapper elaborates without vendor IBUF cells. It has
+// no vendor synchronizer attributes and no explicit power-on initialization.
 
 `ifndef IOBUF_STUB_SV
 `define IOBUF_STUB_SV

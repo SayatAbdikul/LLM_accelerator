@@ -1,11 +1,11 @@
 # Lever I — serving completeness: logits×N (I-a) and chunked multi-token prefill (I-b)
 
-> **Status note (2026-07-16):** the I-b headline (TTFT **12.38×**, 128-token
-> prompt 69.9 s → 5.6 s, byte-exact at any prompt length) is current. The decode
-> rates quoted below (9.779/9.729) are pre-Port-A-fix; honest current b16 is
-> 11.055. And "the only lever left that moves decode is F (multi-clock)" was
-> overtaken twice: F was rejected in favor of single-domain T3, and T1 items 1+2
-> moved decode 10.145 → 11.055 with zero RTL (`docs/perf_roadmap_2026-07-16.md`).
+> **Historical landing report, reconciled 2026-09-03.** Multi-row logits and
+> chunked prefill remain implemented. The 12.38× TTFT comparison and decode
+> token rates below are results from the July campaign; the absolute times/rates
+> use the old 34.41 MHz peg and are not current hardware sign-off. See
+> [current project status](project_status.md) and the
+> [documentation index](README.md).
 
 Two compiler-only, byte-exact levers. **Neither improves decode tok/s** — I-a makes
 batched decode a real N-way serving path, and I-b attacks **TTFT** (time to first

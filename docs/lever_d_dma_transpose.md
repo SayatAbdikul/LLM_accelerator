@@ -1,10 +1,11 @@
 # Lever D — DMA transpose-load (de-serialize the K^T helper pass)
 
-> **Status note (2026-07-16):** the mechanism and the −9,407,232-cycle step cut
-> below are current (cycle counts are data-independent). The **absolute tok/s
-> (8.379 → 9.779) predate the Port-A correctness fix** (`daef072`,
-> `docs/porta_bus_split.md`) and carry its hidden subsidy; the honest current
-> b16 number is 11.055 (`docs/perf_roadmap_2026-07-16.md`).
+> **Historical landing report, reconciled 2026-09-03.** The transpose-load
+> mechanism remains implemented. The cycle delta below belongs to its original
+> measurement campaign; all absolute token rates use the old 34.41 MHz peg and
+> are not current full-chip sign-off. The latest b16 measurement is 49,998,042
+> cycles per 16-token step. See [current project status](project_status.md) and
+> the [documentation index](README.md).
 
 **Goal:** delete the ~9.4M-cycle/step *serial* helper K^T-transpose pass by folding
 the transpose into the DMA **load** (a legal systolic-overlap partner). Byte-exact.

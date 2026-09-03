@@ -1,58 +1,71 @@
-# FPGA build path
+# FPGA integration status
 
-Step D (2026-05-26 RTL restructure) created this skeleton. **No FPGA part
-is picked yet**, so only the `yosys-fpga` elaboration smoke gate is wired
-today. Full Vivado / Quartus / nextpnr integration is deferred until a
-target board is chosen.
+Updated: 2026-09-03
 
-## Layout
+This directory is a target-integration skeleton, not a deployable board
+project. No FPGA family or board is selected, and there are no vendor project
+files, pin constraints, generated clocks, timing constraints, or real external
+memory controller. The current `yosys-fpga` target verifies only that the
+complete FPGA wrapper hierarchy elaborates without unresolved modules.
 
-| Path | Role |
+For the project-wide implementation and verification status, see
+[`../../docs/project_status.md`](../../docs/project_status.md).
+
+## Current files
+
+| Path | Current role |
 |---|---|
-| `src/taccel_top_fpga.sv` | wraps the verified `taccel_top` core with board-level pins (clk, rst, start/done/fault) and routes the AXI master to the DDR stub |
-| `src/pll_stub.sv` | clock pass-through; replace with vendor MMCM/PLL |
-| `src/iobuf_stub.sv` | 2-FF reset synchronizer; replace with vendor IBUF + ASYNC_REG |
-| `src/ddr_axi_stub.sv` | AXI4 slave stub that always-acks but never returns data; replace with vendor DDR controller IP (Xilinx MIG, Intel UniPHY, LiteDRAM, etc.) |
-| `src/sram_dp_fpga.sv` | reserved placeholder for explicit BRAM/URAM bindings; FPGA target currently uses the inferred BRAM body from `rtl/common/src/memory/sram_dp_inferred.sv` |
-| `constraints/` | reserved for XDC (Vivado) / SDC files |
-| `Makefile` | `yosys-fpga` smoke gate via `sv2v + yosys` |
+| `src/taccel_top_fpga.sv` | Wraps `taccel_top` with placeholder board pins and connects its AXI master to the DDR stub. |
+| `src/pll_stub.sv` | Clock pass-through; not a PLL or generated-clock implementation. |
+| `src/iobuf_stub.sv` | Reset synchronizer placeholder; not a complete board I/O binding. |
+| `src/ddr_axi_stub.sv` | AXI slave placeholder that accepts request/data handshakes but never returns read or write responses; real transactions stall. |
+| `src/sram_dp_fpga.sv` | Reserved for explicit BRAM/URAM bindings; it is not included in the current target file list. |
+| `constraints/` | Placeholder for future XDC or SDC constraints. |
+| `Makefile` | Builds the wrapper with `sv2v` and runs a Yosys hierarchy/check/stat gate. |
 
-## Target-axis defines (set by `Makefile`)
+The common compute RTL comes from `rtl/common/filelists/core.f`; the FPGA
+directory adds only target wrappers and stubs.
 
-```
--DTARGET_FPGA          # selects FPGA bindings in the common RTL
--DSFU_SYNTH_NO_DPI     # elides DPI-C imports (required for synthesis)
--DSFU_SYNTH_MODE=1     # routes SFU through synthesizable fp32 primitives
--DHELPER_SYNTH_MODE=1  # routes helper engine through synthesizable chain
-```
+## Current elaboration gate
 
-These compose with the gen-2 ISA freeze: the design synthesizes with
-zero behavioral/DPI dependency, equivalent to the verified golden model
-under the byte-exact freeze cosim gate (`test_compare_rtl_golden.py`).
+Run from the repository root:
 
-## Wrapper `\`error` guard
-
-`taccel_top_fpga.sv` guards against misconfigured builds:
-
-```systemverilog
-`ifndef SFU_SYNTH_NO_DPI
-  `error "TARGET_FPGA requires SFU_SYNTH_NO_DPI; ..."
-`endif
+```bash
+make -C rtl/fpga yosys-fpga
 ```
 
-If a future build flow forgets to define `SFU_SYNTH_NO_DPI`, the FPGA
-wrapper refuses to elaborate.
+The target defines:
 
-## Picking a part — what changes
+```text
+TARGET_FPGA
+SFU_SYNTH_NO_DPI
+SFU_SYNTH_MODE=1
+HELPER_SYNTH_MODE=1
+```
 
-When a target FPGA is chosen:
+It then converts SystemVerilog with `sv2v` and runs:
 
-1. Replace `pll_stub.sv` with vendor PLL (Vivado MMCM, Intel IOPLL).
-2. Replace `iobuf_stub.sv` with vendor IBUF + ASYNC_REG synchronizer.
-3. Replace `ddr_axi_stub.sv` with vendor DDR controller IP (or LiteDRAM).
-4. Add `constraints/<board>.xdc` (or `.sdc`) with pin assignments.
-5. Add a `vivado` / `quartus` / `nextpnr` target to `Makefile`.
-6. Optionally add explicit BRAM/URAM bindings in `src/sram_dp_fpga.sv`.
+```text
+hierarchy -check -top taccel_top_fpga
+check
+stat
+```
 
-The shared filelist `rtl/common/filelists/core.f` remains the source of
-truth for the core RTL — no churn there.
+This proves source resolution and structural elaboration only. It does not run
+device mapping, place-and-route, timing analysis, power analysis, or bitstream
+generation, and it is not evidence of FPGA resource fit or clock frequency.
+
+The wrapper deliberately rejects synthesis configurations that retain DPI-C.
+Functional equivalence is established by the separate software/RTL conformance
+tests described in [`../TESTBENCHES.md`](../TESTBENCHES.md), not by this target.
+
+## Work required for a real board
+
+1. Select the FPGA part, board, clock, reset, and external-memory topology.
+2. Replace the PLL, I/O, and DDR placeholders with vendor or open-source IP.
+3. Add pin, clock, false-path, and I/O timing constraints.
+4. Decide whether inferred SRAMs are acceptable or add explicit BRAM/URAM
+   bindings and validate read-during-write behavior.
+5. Add a Vivado, Quartus, or nextpnr build with utilization and timing gates.
+6. Add board-level reset, memory, program-loading, and end-to-end inference
+   tests before describing the target as deployable.

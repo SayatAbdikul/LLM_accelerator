@@ -1,17 +1,11 @@
 # T1 — the compiler overlap campaign, measured and re-scoped (2026-07-15)
 
-> **OUTCOME (2026-07-16) — two conclusions below were overturned by later
-> measurement; see `docs/t1_overlap_items.md` for the landing report.**
-> (1) Item 1 landed (`dde6f19`) at **+5.8% b16**, not the ~+20% ceiling
-> confirmed below — the KV **capacity wall** (working set 12.3 MB/layer vs
-> 384 KB SRAM) confines KV overlap to attention's own systolic (~5.5M), so the
-> realistic ceiling was +8–11% and increment 1 (V-only) took +5.8% of it.
-> (2) **"b1 is done for T1" was REFUTED**: measured systolic slack (6.96M)
-> exceeds exposed DMA (5.89M), and item 2 (FC2 weight prefetch, `9a82e34`)
-> delivered **b1 +8.17%** (and b16 +3.0%) — the fc2 streaming path was
-> un-scheduled, not un-hideable; the `pipeline_full_k` "already implemented"
-> claim below never applied to it. Everything else (item 3 net-negative at b1,
-> item 4 deprioritized, the port probe, the gate doctrine) stands.
+> **Historical measurement redirect, reconciled 2026-09-03.** Its initial “b1
+> is done” conclusion was overturned by the item 2 FC2 prefetch result, while
+> item 1 landed with a smaller capacity-limited gain. The absolute rates and
+> baselines below are no longer current. See the historical
+> [landing report](t1_overlap_items.md), then [current project status](project_status.md)
+> for latest cycles and timing limitations.
 
 **Bottom line: the T1 plan's four items were sized off beat counts and
 schedule assumptions that the measured baselines contradict. Three of the

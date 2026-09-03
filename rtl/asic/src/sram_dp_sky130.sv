@@ -1,19 +1,18 @@
 // SKY130 PDK SRAM macro binding for the `sram_dp_macro` slot.
 //
-// Step E (2026-05-26 RTL restructure): declares `module sram_dp_macro`
-// with a BEHAVIORAL stub body (equivalent to sram_dp_inferred) so the
-// ASIC wrapper elaborates cleanly. The real macro instantiations land
-// when OpenLane is wired up — at that point this body becomes a bank of
-// `sky130_sram_1rw1r_*` macros composed to match {DATA_W, DEPTH}.
+// Declares `module sram_dp_macro` with a BEHAVIORAL register-array body so the
+// ASIC wrapper elaborates cleanly. Despite the filename, this file does not
+// instantiate a SKY130 SRAM macro. A physical implementation must replace it
+// with characterized banks matching {DATA_W, DEPTH} and the required port
+// behavior.
 //
 // Bank-target sizes:
 //   ABUF  : DATA_W=128, DEPTH=8192  → 128 KB
 //   WBUF  : DATA_W=128, DEPTH=16384 → 256 KB
 //   ACCUM : DATA_W=128, DEPTH=4096  → 64  KB
 //
-// At ~1 mm²/2 KB on sky130A this is way more SRAM than fits in a Caravel
-// user-area slot; see top-level README's tape-out strategy section for
-// the substrate-IP vs full-model trade-off.
+// These logical capacities have not been floorplanned or proven to fit a
+// particular open-PDK shuttle or die.
 
 `ifndef SRAM_DP_SKY130_SV
 `define SRAM_DP_SKY130_SV
@@ -37,10 +36,8 @@ module sram_dp_macro #(
   output logic [DATA_W-1:0]             b_rdata
 );
 
-  // Behavioral stub — to be replaced with banked sky130_sram_* macro
-  // instantiations once OpenLane is set up. Behavior matches the inferred
-  // body (sram_dp_inferred) so the dispatch wrapper's two branches are
-  // logically equivalent for the elaboration smoke gate.
+  // Behavioral stub — replace with characterized macro banks before physical
+  // implementation. Behavior matches the inferred body for elaboration.
   logic [DATA_W-1:0] mem [0:DEPTH-1];
 
   always_ff @(posedge clk) begin

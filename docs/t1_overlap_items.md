@@ -1,5 +1,12 @@
 # T1 items 1+2 LANDED — KV V-prefetch (b16) + FC2 weight prefetch (b1+b16), byte-exact (2026-07-16)
 
+> **Historical landing report, reconciled 2026-09-03.** Both compiler overlap
+> mechanisms remain implemented, but later pipeline work changed the latest
+> measurements to 18,318,261 cycles for b1 and 49,998,042 cycles per b16 step.
+> The token rates below use the old 34.41 MHz partial-design timing peg and are
+> not current full-chip sign-off. See [current project status](project_status.md)
+> and the [documentation index](README.md).
+
 **Bottom line: two compiler-only overlap levers, zero RTL. Combined: b16
 54,269,714 → 49,803,314 cyc/step = 10.145 → 11.055 tok/s (+8.96%); b1
 19,794,743 → 18,300,503 = 1.738 → 1.880 tok/s (+8.17%). Both byte-exact

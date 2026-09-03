@@ -1,5 +1,12 @@
 # W8A8 Phase 0 — PPL gate result
 
+> **Historical experiment, reconciled 2026-09-03.** This result rejected the
+> proposed W8A8 inter-op path; the maintained hardware target remains W8A16.
+> Fixture paths, exact perplexities, and tool behavior below are the record of
+> the 2026-05-23 run and have not been revalidated as current release gates.
+> See the current [project status](../../docs/project_status.md) and
+> [software map](../CODEBASE.md).
+
 **Date:** 2026-05-23
 **Verdict:** **RED** — abort the W8A8 plan as written, pivot to mitigations
 or to W4A8 weight-only.

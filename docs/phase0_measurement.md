@@ -1,15 +1,11 @@
 # Phase 0 — measure + audit
 
-> **OUTCOME (2026-07-16): the fix this doc demanded has LANDED** (`daef072`,
-> `docs/porta_bus_split.md`) — Port A fanned out per buffer + a dedicated
-> systolic Port S; logits byte-identical, lost writes → 0, concurrency kept.
-> Two reading corrections: (1) "honest = 9.06 tok/s" was honest only for the
-> pre-fix serialized fallback; the post-fix honest chain is **10.145 →
-> (T1 items) → 11.055 b16 / 1.880 b1**. (2) The cycle counts labeled
-> *"shipped (corrupt — do not quote)"* below (54,269,714 / 19,794,743) are
-> now the HONEST post-fix step counts — the fix kept the schedule and made
-> the results correct, so quote them freely *post-daef072*. The diagnosis,
-> method, and the blind-gate lesson below are permanent.
+> **Historical diagnosis, reconciled 2026-09-03.** The required Port-A fan-out
+> and dedicated systolic Port S landed in `daef072`; the silent corruption
+> described below is fixed. Its diagnosis and verification lesson remain
+> relevant, but its cycle and token-rate baselines have been superseded. See
+> [current project status](project_status.md) for latest measurements and
+> [the documentation index](README.md) for authority.
 
 Cheap, zero-risk, and it **re-ranks the whole plan**. Two results:
 

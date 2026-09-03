@@ -1,28 +1,25 @@
-# Synthesizability gate for the TACCEL design — generic synth, NO FPGA part.
+# Synthesizability gate for the complete TACCEL core — no target wrapper.
 #
-# File reads are supplied by the Makefile (single source of truth = CONTROL_SV,
-# the taccel_top design set with tb/ excluded) via:
-#   yosys -p "read_verilog -sv -I... <CONTROL_SV>" rtl/synth/synth_check.ys
+# The Verilator Makefile converts the sources from
+# rtl/common/filelists/core.f with sv2v -DSFU_SYNTH_NO_DPI, then supplies the
+# generated Verilog to Yosys before running this script.
 #
-# Definition of done (FPGA-demo roadmap Phase 2): this elaborates taccel_top to
-# a synthesizable netlist with ZERO behavioral constructs (no `real`, no DPI-C).
-# It is EXPECTED to fail today on sfu_engine.sv + blocking_helper_engine.sv
-# (real storage + import "DPI-C"). That red IS the precise work list and the
-# regression detector for the synthesizable-RTL effort.
+# Definition of green: the full taccel_top hierarchy resolves, contains no
+# reachable DPI/real dependency in the synthesis configuration, passes the
+# structural check, and reports statistics. This is an elaboration/
+# synthesizability gate, not technology mapping or timing analysis.
 
 # Resolve the module hierarchy from the real top; loud early error on any
 # missing/unresolved module.
 hierarchy -check -top taccel_top
 
-# Phase-3 GREEN whole-design pipeline (2026-05-21). Skips proc/flatten —
+# Whole-design gate. It intentionally skips proc/flatten —
 # sv2v emits ~17k auto-generated cast helper functions (one per
 # `integer'(...)` widening in the 1024-element loops) that make proc
-# multi-minute; the synth-check definition of done is "yosys elaborates
-# every module with zero `real`/DPI/system-tasks/unbounded-loops," which
-# the read_verilog + hierarchy step already proves.
+# multi-minute. Technology-mapped synthesis and timing live under rtl/asic/.
 
-# Structural check (non-fatal).
+# Structural check.
 check
 
-# First area/cell estimate at the elaborated level.
+# Elaboration-level statistics; not a physical area estimate.
 stat

@@ -3,6 +3,13 @@
 **Date: 2026-07-15. Standalone sky130 (tt_025C_1v80) synth + OpenSTA, reg-to-reg
 delay of flop-in/flop-out shells around the un-pipelined SFU clouds.**
 
+> **Historical timing audit, reconciled 2026-09-03.** The audit correctly
+> motivated pipelining; `fp32_exp_p18` and `fp32_gelu_p33` are now integrated.
+> Its standalone 29–490 ns measurements and the earlier 34.41 MHz peg do not
+> constitute current full-chip sign-off. A later full-lane physical run exceeded
+> the available 15 GB memory. See [current project status](project_status.md)
+> and the [documentation index](README.md).
+
 ## Why this audit exists
 
 The chip's fmax is quoted at **34.41 MHz (29.06 ns)**, and the lever-E "29.64 ns

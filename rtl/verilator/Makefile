@@ -258,11 +258,9 @@ test_sfu: $(BUILD_DIR)/test_sfu/Vtaccel_top
 	$(BUILD_DIR)/test_sfu/Vtaccel_top
 
 # -----------------------------------------------------------------------
-# test_sfu_synth: same SFU regressions with SFU_SYNTH_MODE=1. Migrated ops
-# (currently: 0x19 VADD_FP32) take the synthesizable path through the
-# fp32_add + fp32_to_fp16 primitives; unmigrated ops fall back to DPI.
-# Used to gate each Phase-2 op migration; the canonical gate is the
-# vadd_fp32 fixture under this build.
+# test_sfu_synth: run the generation-2 SFU regressions with SFU_SYNTH_MODE=1.
+# All active W8A16 SFU opcodes use the synthesizable pipeline in this build;
+# there is no DPI fallback for those operations.
 # -----------------------------------------------------------------------
 $(BUILD_DIR)/test_sfu_synth/Vtaccel_top: $(CONTROL_DEPS) test_sfu.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_sfu_synth
@@ -278,12 +276,13 @@ $(BUILD_DIR)/test_sfu_synth/Vtaccel_top: $(CONTROL_DEPS) test_sfu.cpp $(TB_HEADE
 	$(MAKE) -C $(BUILD_DIR)/test_sfu_synth -f Vtaccel_top.mk
 
 test_sfu_synth: $(BUILD_DIR)/test_sfu_synth/Vtaccel_top
-	@echo "--- Running SFU tests with SFU_SYNTH_MODE=1 (Phase-2 synth path) ---"
+	@echo "--- Running SFU tests with SFU_SYNTH_MODE=1 (current mode-1 path) ---"
 	$(BUILD_DIR)/test_sfu_synth/Vtaccel_top
 
 # -----------------------------------------------------------------------
-# test_helpers_synth: helper regressions with HELPER_SYNTH_MODE=1. Currently
-# migrates the dequant_add_pack op via 16-lane parallel fp32 primitive chain.
+# test_helpers_synth: helper regressions with HELPER_SYNTH_MODE=1. This selects
+# the synthesizable helper implementation, including the retained dequant-add
+# primitive chain.
 # -----------------------------------------------------------------------
 $(BUILD_DIR)/test_helpers_synth/Vtaccel_top: $(CONTROL_DEPS) test_helpers.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_helpers_synth
@@ -299,13 +298,12 @@ $(BUILD_DIR)/test_helpers_synth/Vtaccel_top: $(CONTROL_DEPS) test_helpers.cpp $(
 	$(MAKE) -C $(BUILD_DIR)/test_helpers_synth -f Vtaccel_top.mk
 
 test_helpers_synth: $(BUILD_DIR)/test_helpers_synth/Vtaccel_top
-	@echo "--- Running helper tests with HELPER_SYNTH_MODE=1 (Phase-2 synth path) ---"
+	@echo "--- Running helper tests with HELPER_SYNTH_MODE=1 (current mode-1 path) ---"
 	$(BUILD_DIR)/test_helpers_synth/Vtaccel_top
 
 # -----------------------------------------------------------------------
 # test_sfu_helper_synth: BOTH SFU and HELPER on synth paths simultaneously.
-# Catches cross-mode interactions; this is the Phase-2 "full synth path"
-# gate for ops/state-machines that have been migrated.
+# Catches cross-mode interactions when both mode-1 datapaths are selected.
 # -----------------------------------------------------------------------
 $(BUILD_DIR)/test_sfu_helper_synth/Vtaccel_top: $(CONTROL_DEPS) test_sfu.cpp $(TB_HEADERS)
 	mkdir -p $(BUILD_DIR)/test_sfu_helper_synth
@@ -733,9 +731,9 @@ test_addr_raw_hazard: $(BUILD_DIR)/test_addr_raw_hazard/Vtaccel_top
 	$(BUILD_DIR)/test_addr_raw_hazard/Vtaccel_top
 
 # -----------------------------------------------------------------------
-# synth-check: yosys generic-synthesis gate (no FPGA part). The full design,
-# including the synthesizable SFU and helper datapaths, must elaborate through
-# the shared core.f source list.
+# synth-check: complete-core sv2v + Yosys elaboration/synthesizability gate.
+# It resolves the real SFU/helper hierarchy but does not technology-map it.
+# Technology-mapped SKY130 synthesis and timing live under rtl/asic/.
 # -----------------------------------------------------------------------
 SYNTH_DIR    := ../synth
 SYNTH_SCRIPT := $(SYNTH_DIR)/synth_check.ys
@@ -743,8 +741,8 @@ SYNTH_BUILD  := $(BUILD_DIR)/synth
 SV2V_OUT     := $(SYNTH_BUILD)/design_full.v
 
 # sv2v adapts SystemVerilog (packages, enums, ANSI ports, import pkg::*) to
-# Verilog-2005 that yosys's built-in frontend parses. yosys then runs the
-# synth-check script (hierarchy -> synth -> check -> stat).
+# Verilog-2005 that Yosys's built-in frontend parses. Yosys then runs the
+# synth-check script (hierarchy -> check -> stat).
 $(SV2V_OUT): $(CONTROL_SV)
 	mkdir -p $(SYNTH_BUILD)
 	sv2v -DSFU_SYNTH_NO_DPI -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) $(CONTROL_SV) -w $(SV2V_OUT)

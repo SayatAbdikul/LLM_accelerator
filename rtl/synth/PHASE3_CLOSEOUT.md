@@ -2,18 +2,19 @@
 
 Status as of 2026-05-21. Supersedes `PHASE2_INTEGRATION.md`.
 
-> **Dated record.** The definition-of-done and the ULP-band ledger remain the
-> contract; the cell counts are as-of 2026-05-21 (the RTL has since grown:
-> Port-S bus split, lever-D transpose DMA, `m_exact`, K-split RMW drain,
-> pipelined `fp32_div_p6`/`fp32_sqrt_p6` in the SFU, standalone
-> `fp32_exp_p18`). For what happened after synthesizability — sky130
-> STA/PNR and the performance campaign — see `rtl/asic/README.md` and
-> `docs/perf_roadmap_2026-07-16.md`.
+> **Historical close-out, reconciled 2026-09-03.** The RTL later gained the
+> Port-S split, transpose DMA, `m_exact`, K-split RMW drain, and integrated
+> pipelined div/sqrt/exp/GELU paths; six legacy gen-1 SFU opcodes were then
+> removed. Some commands and file lists below were deleted during cleanup.
+> The live hierarchy/check/stat procedure and current metrics are in
+> [`BASELINE.md`](BASELINE.md); physical-flow limitations are in
+> [`../asic/README.md`](../asic/README.md).
 
 ## Definition of done (FPGA-demo roadmap Phase-2)
 
-`make synth-check` returns **0** on the **whole design** (no FPGA part).
-Every module in `$(CONTROL_SV)` elaborates through sv2v + yosys to a
+At this historical milestone, `make synth-check` returned **0** on the selected
+design (no FPGA part). Every module in the then-current file list elaborated
+through sv2v + yosys to a
 synthesizable construct set: zero `real`-typed storage, zero
 `import "DPI-C"`, zero system-tasks, zero unbounded loops.
 

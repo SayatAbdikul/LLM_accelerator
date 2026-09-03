@@ -1,9 +1,9 @@
 // ASIC top wrapper around the verified `taccel_top` core.
 //
-// Step E (2026-05-26 RTL restructure): exposes off-chip pads (clk, rst,
-// start/done/fault) and the AXI master to external memory, routed
-// through the pad ring stub. Targeted at open-PDK tape-out-ready flow
-// on SKY130 (default) via OpenLane.
+// Research integration wrapper exposing clock/reset/control pins and the AXI
+// master through placeholder pad logic. This is sufficient for structural
+// elaboration, but it is not a tape-out-ready top: the pad ring, SRAM macros,
+// physical configuration, and sign-off flow remain unimplemented.
 //
 // When integrated into eFabless Caravel, this wrapper's external AXI is
 // re-routed through Caravel's Wishbone bridge instead of off-chip pads,
@@ -36,7 +36,7 @@ module taccel_top_asic
   parameter int HELPER_SYNTH_MODE  = 1
 )(
   // Off-chip pads — placeholder pin list, real pin order set by
-  // OpenLane's pin_order.cfg once the floorplan is defined.
+  // a physical-flow pin-order file once a floorplan is defined.
   input  logic        clk_pad,
   input  logic        rst_n_pad,
   input  logic        start,

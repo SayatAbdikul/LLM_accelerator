@@ -75,13 +75,13 @@ class Stage5PTQPreset:
     # the model (40,306 PPL on GPT-2 124M); keeping lm_head at W8 brings
     # the W4 PPL into the feasible range (73-75 with no rotation; <65
     # with QuaRot per the rerun on 2026-05-23). Set explicitly to 4 only
-    # for ablation / research; production W4 paths leave this None.
+    # for ablation; the maintained W4 research presets leave this None.
     lm_head_bitwidth: Optional[int] = None
-    # W4A16 production pipeline (plan Phase 1.8, 2026-05-24). When
+    # W4A16 research pipeline (plan Phase 1.8, 2026-05-24). When
     # `apply_awq_gptq=True`, `_turboquant_eval.prepare()` runs
     # `software/taccel/runtime/w4_quant.py::apply_w4_awq_gptq` to mutate
     # the state_dict (AWQ — using the existing `awq_alpha` field at line 46
-    # for the AWQ blend exponent; production W4 sets it to 0.40 instead
+    # for the AWQ blend exponent; the selected W4 preset sets it to 0.40 instead
     # of the canonical 0.5) and build a `weight_overrides` map (GPTQ-inject)
     # that bypasses the simulator's internal RTN. The W4 AWQ path is
     # SEPARATE from the W8A8 AWQ at line 45 (`awq_enabled`) — they share
@@ -577,7 +577,7 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
     # block selection as fc2 (0,1,2,4,8,9,10,11). Motivated by the weight-
     # only QDQ diagnostic which showed per-channel dequant is essentially
     # free in pure FP32 (53.42 vs 53.69 PPL ceiling); the codebase's mean-
-    # scale approximation is what introduces the production gap. Per-channel
+    # scale approximation is what introduces the maintained W8A16 quality gap. Per-channel
     # dequant on more layers should reduce that approximation error.
     # ----------------------------------------------------------------------
     "default_plus_fc1_pc_8": _preset(
@@ -610,7 +610,7 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
     ),
     # QuaRot Phase 1 presets. Diagnostic experiments showed that residual-
     # stream rotation by an orthogonal matrix recovers a substantial fraction
-    # of the FP32→INT8 PPL gap. Production uses a 1-PRESERVING rotation
+    # of the FP32→INT8 PPL gap. The promoted offline W8 preset uses a 1-PRESERVING rotation
     # (R · 1 = 1), which is mathematically required for LayerNorm's mean-
     # subtraction to commute with rotation in the offline-only pipeline.
     #
@@ -618,7 +618,7 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
     #   * quarot_baseline (rotation only):                       8,694 PPL
     #   * quarot_with_bc (rotation + BC, NO output-aware search): 2,828 PPL
     #   * Diagnostic reference (general Haar + runtime un-rotate-LN):
-    #     2,543 PPL — production within ~10% despite offline-only.
+    #     2,543 PPL — promoted preset within ~10% despite offline-only.
     #
     # IMPORTANT: output-aware MLP/lm_head searches DO NOT compose with
     # rotation. Empirically, adding them on top of `quarot_with_bc` blew up
@@ -679,7 +679,7 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
     # calibration, no golden bundle path. The diagnostic at
     # `software/tools/diagnose_weight_only_qdq_ceiling.py` proved this
     # achieves 53.42 PPL on `gpt2_converted_nanogpt.pt` at 257-tok /
-    # 256-ctx vs the 53.69 FP32 ceiling and the 6,174 W8A8 production
+    # 256-ctx vs the 53.69 FP32 ceiling and the historical 6,174 W8A8
     # baseline. The Phase A campaign
     # (`software/docs/ptq_phase_a_findings.md`) established that the W8A8
     # baseline cannot be improved by pure-offline transforms; W8A32 is the
@@ -727,7 +727,7 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
     #   weight_only_int4_calibrated — +real QKT/attn_v calibration scales.
     #   weight_only_int4_quarot     — +data-free residual-stream rotation
     #                                  (random_orthogonal) on top. This is
-    #                                  the production W4A16 target.
+    #                                  a measured W4A16 research target.
     # All three keep `weight_only_int8=True` so the eval pipeline reuses
     # the W8A16 branch logic verbatim; only the per-tensor `bitwidth=4`
     # changes. The 2× weight DRAM saving comes from this single switch.
@@ -752,12 +752,13 @@ STAGE5_PTQ_PRESETS: Dict[str, Stage5PTQPreset] = {
         weight_bitwidth=4,
     ),
     # ----------------------------------------------------------------------
-    # W4A16 PRODUCTION preset (plan Phase 1.8, 2026-05-24). The empirical
+    # W4A16 RESEARCH preset (plan Phase 1.8, 2026-05-24). The empirical
     # winner of the W4 quality ladder on GPT-2 124M: AWQ(α=0.40, c_attn +
     # c_fc + lm_head) + GPTQ-inject (block weights only; lm_head stays at
     # W8 via lm_head_bitwidth default) + Stage5 QKT/attn_v static calib.
     # No QuaRot (intrinsically hurts W4 per [[w4a16-phase1-quality]]).
-    # End-to-end 257-tok PPL = 63.04 (gate ≤ 65). See [[w4a16-phase1-quality]].
+    # Historical 257-tok PPL = 63.04 (gate ≤ 65). RTL does not decode the
+    # weight_int4 tile bit, so this preset is not hardware-deployable.
     # ----------------------------------------------------------------------
     "weight_only_int4_awq_gptq": _preset(
         "weight_only_int4_awq_gptq",

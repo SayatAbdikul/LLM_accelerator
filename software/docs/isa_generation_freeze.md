@@ -1,591 +1,271 @@
-# ISA Generation Freeze — gen-2 (W8A32 Phase 3 (c.1))
+# ISA generation freeze — generation 2
 
-**Status: FREEZE DECISION LOCKED (2026-05-15). Becomes the effective repo
-baseline on commit of the §5 dependencies** — the generation decision is
-fixed and final; the repo is not yet the frozen baseline only because the
-spec files in §5 are still uncommitted.
+**Decision locked:** 2026-05-15
+**Contract status:** effective and implemented for the causal W8A16 target
+**Last documentation reconciliation:** 2026-09-03
 
-Frozen generation: **gen-2** — the FP32 sub-layer / dynamic-per-matmul-scale
-generation introduced by W8A32 Phase 3 **(c.1)**, **including the in-flight
-M2.5-A additions** (0x1E DEQUANT_ACCUM_FP32_SCALED, 0x1F MAX_ABS_REDUCE_FP32)
-currently uncommitted in the §5 files.
+This record freezes the maintained hardware-target ISA generation and records later compatible
+amendments. The exact current field layout and support matrix live in
+[`isa_spec.md`](isa_spec.md).
 
-This document is the normative ISA contract the RTL must implement. Until a
-superseding freeze revision is published, the opcode set below is fixed; any
-ISA change requires a new dated revision of this file.
+## Frozen decision
 
-## 1. Decision record
+The maintained hardware-target architecture is generation 2:
 
-- **What:** lock the ISA to gen-2 (FP32 sub-layer ops 0x17–0x1F + the
-  still-emitted gen-1 infrastructure ops). Do **not** revert to gen-1.
-- **Basis:** `w8a32_deployment_scope.md` recommended option **(c.1)**;
-  commits `47141fb` (Phase 3 (c.1) M1: ISA extension + simulator dispatch)
-  and `5babbaa` (M2: codegen lowering for sub-layer ops) implement it; the
-  toolchain and golden model already emit/dispatch gen-2. User confirmed
-  "Lock gen-2 (c.1)" on 2026-05-15.
-- **Why not gen-1:** reverting would undo committed Phase 3 (c.1) work and
-  risk the activation-range accuracy the FP32 sub-layer path was added for
-  (dynamic per-matmul scaling, `MAX_ABS_REDUCE_FP32`).
+- INT8 weights and INT8 systolic inputs;
+- INT32 systolic accumulation;
+- FP16 inter-layer activation storage;
+- FP32 internal dequantization, residual, LayerNorm, GELU, softmax, and scale
+  arithmetic;
+- dynamic per-matmul activation scaling;
+- causal attention configured by `CONFIG_ATTN`.
 
-## 2. Normative opcode set (RTL MUST implement exactly these)
+Generation 2 replaced the old generation-1 INT8-I/O SFU path. Reverting to
+generation 1 would invalidate the maintained W8A16 compiler, dynamic scaling,
+and the validated quality path.
 
-Ground truth = empirical histogram of a compiled GPT-2 124M bundle
-(prefill + decode), **both** `weight_only_int8` and
-`weight_only_int8_quarot` presets — **byte-identical** (QuaRot is data-free
-weight prep, zero ISA surface). 19 opcodes are emitted:
+## Normative hardware opcode set
 
-| Opcode | Name | Gen | RTL today |
-|---|---|---|---|
-| 0x01 | HALT | infra | implemented |
-| 0x02 | SYNC | infra | implemented |
-| 0x03 | CONFIG_TILE | infra | implemented |
-| 0x04 | SET_SCALE | infra | implemented |
-| 0x05 | SET_ADDR_LO | infra | implemented |
-| 0x06 | SET_ADDR_HI | infra | implemented |
-| 0x07 | LOAD | infra | implemented |
-| 0x08 | STORE | infra | implemented |
-| 0x09 | BUF_COPY | infra | implemented |
-| 0x0A | MATMUL | infra | implemented |
-| 0x14 | CONFIG_ATTN | infra | implemented |
-| 0x17 | DEQUANT_ACCUM_FP32 | **gen-2** | **MISSING — reserved/illegal** |
-| 0x18 | QUANT_FP32_INT8 | **gen-2** | **MISSING — reserved/illegal** |
-| 0x19 | VADD_FP32 | **gen-2** | **MISSING — reserved/illegal** |
-| 0x1A | LAYERNORM_FP32 | **gen-2** | **MISSING — reserved/illegal** |
-| 0x1B | GELU_FP32 | **gen-2** | **MISSING — reserved/illegal** |
-| 0x1D | MASKED_SOFTMAX_FP32 | **gen-2** | **MISSING — reserved/illegal** |
-| 0x1E | DEQUANT_ACCUM_FP32_SCALED | **gen-2** | **MISSING — reserved/illegal** |
-| 0x1F | MAX_ABS_REDUCE_FP32 | **gen-2** | **MISSING — reserved/illegal** |
+The frozen GPT-2 causal target requires:
 
-Per-bundle emission counts (prefill, GPT-2 124M, indicative of hotness):
-SYNC 11765, SET_ADDR_LO/HI 11061, BUF_COPY 8977, LOAD 6656, STORE 4405,
-CONFIG_TILE 3000, MATMUL 1254, QUANT_FP32_INT8 1177, DEQUANT_ACCUM_FP32_SCALED
-771, MAX_ABS_REDUCE_FP32 601, SET_SCALE 576, DEQUANT_ACCUM_FP32 288,
-CONFIG_ATTN 144, MASKED_SOFTMAX_FP32 144, VADD_FP32 145, GELU_FP32 36,
-LAYERNORM_FP32 25, HALT 1.
+### Infrastructure
 
-## 3. Non-normative for the gen-2 RTL target
+- `HALT`, `SYNC`;
+- `CONFIG_TILE`, `CONFIG_ATTN`, `SET_SCALE`;
+- `SET_ADDR_LO`, `SET_ADDR_HI`;
+- `LOAD`, `STORE`, `BUF_COPY`;
+- `MATMUL`.
 
-These 13 opcodes are **not emitted** by the gen-2 toolchain. The opcode enum,
-assemblers (`isa/instructions.py`), and golden model keep them for
-back-compat / non-causal models, but **the gen-2 RTL is NOT required to
-implement them** and MAY treat them as illegal. **REVISION 2026-05-23
-(Phase B):** the MAY-clause has been partially exercised — the 6 gen-1 SFU
-ops (and pre-existing 0x1C) are now stripped from RTL silicon and trap as
-`FAULT_ILLEGAL_OP` at decode; the 5 gen-1 helper-engine ops remain RTL-legal
-(`blocking_helper_engine.sv` still implements them). Detail:
+`NOP` remains a legal conventional no-op although compiler bundles do not
+normally need it.
 
-- **STRIPPED from RTL silicon — Phase B 2026-05-23.** `decode_unit.sv` traps
-  these as `FAULT_ILLEGAL_OP`; `sfu_engine.sv` no longer implements their
-  state machines; `sfu_g1_compute.svh` + `sfu_attn.svh` deleted. Software ISA
-  retains them for historical bundle replay (the Python `isa/`, assembler,
-  and golden model still encode/decode/execute them):
-  - 0x0E SOFTMAX, 0x0F LAYERNORM (→0x1A), 0x10 GELU (→0x1B),
-    0x12 SOFTMAX_ATTNV, 0x15 MASKED_SOFTMAX (→0x1D),
-    0x16 MASKED_SOFTMAX_ATTNV (no FP32 fused analogue).
-  - 0x1C SOFTMAX_FP32 — pre-existing reserved (non-causal, no causal-LM
-    consumer); was already illegal pre-Phase-B.
-- **Still legal in RTL** (helper-engine handled, non-normative per gen-2
-  toolchain emission). The 2026-05-23 plan initially listed these in the
-  strip set; on execution they were correctly identified as helper-engine
-  ops (not SFU), and rolled back — `blocking_helper_engine.sv` retains
-  their case arms:
-  - 0x0B REQUANT, 0x0C SCALE_MUL, 0x0D VADD (→0x19),
-    0x11 REQUANT_PC, 0x13 DEQUANT_ADD.
-- **Retained no-op:** 0x00 NOP — keep as a defined decode-to-no-op
-  (conventional, zero RTL cost); not emitted but not deprecated.
+### Generation-2 operations
 
-Note 0x1C SOFTMAX_FP32 is gen-2-numbered but **non-normative** (no causal-LM
-consumer) — RTL need not implement it; the normative gen-2 additions are
-0x17–0x1B and 0x1D–0x1F (**8 opcodes**, not 9).
+| Opcode | Name | Hardware contract |
+|---:|---|---|
+| `0x17` | DEQUANT_ACCUM_FP32 | INT32 ACCUM to FP16 activation storage |
+| `0x18` | QUANT_FP32_INT8 | FP16 activation storage to INT8 |
+| `0x19` | VADD_FP32 | FP32-internal residual add, FP16 storage |
+| `0x1A` | LAYERNORM_FP32 | FP32-internal LayerNorm, FP16 storage |
+| `0x1B` | GELU_FP32 | FP32-internal GELU, FP16 storage |
+| `0x1D` | MASKED_SOFTMAX_FP32 | Causal softmax using `CONFIG_ATTN` |
+| `0x1E` | DEQUANT_ACCUM_FP32_SCALED | Per-channel dequant × dynamic activation scale + folded bias |
+| `0x1F` | MAX_ABS_REDUCE_FP32 | Produce quant/dequant scale pair |
 
-## 4. RTL reconciliation requirement (the blocking work item)
+All eight operations require R-type `flags[0]=1` in RTL. The older
+FP32-storage form (`flags[0]=0`) remains modeled in Python for research but is
+not part of the hardware target.
 
-The RTL implements gen-1 (0x00–0x16); `taccel_pkg.sv:45` and
-`decode_unit.sv:32` declare **0x17–0x1F = "reserved — illegal instruction
-fault"**. A current bundle therefore illegal-faults on the first gen-2 op.
-To make golden-vs-RTL cosim possible on the production path:
+`SOFTMAX_FP32` (`0x1C`) is not normative. Python retains the class and golden
+implementation for noncausal experimentation, but RTL treats it as
+`FAULT_ILLEGAL_OP`. Supported GPT-2 graphs emit `MASKED_SOFTMAX_FP32`.
 
-1. **Implement the 8 normative gen-2 opcodes in RTL:** 0x17, 0x18, 0x19,
-   0x1A, 0x1B, 0x1D, 0x1E, 0x1F. Remove them from the reserved/illegal
-   range in `taccel_pkg.sv` / `decode_unit.sv`. (0x1C stays reserved.)
-2. **Validate the 11 already-implemented normative ops** (§2 "implemented")
-   in cosim — no new RTL, but they must pass against the gen-2 golden model.
-3. The SFU "all internal ops FP32" contract (`sfu_engine.sv:18-19`) is
-   consistent with gen-2; the gen-2 ops are FP32-I/O, so the change is the
-   instruction-level decode/datapath, not the internal precision model.
-4. Area note (unmeasured): the gen-2 FP32 sub-layer datapath is expected to
-   cost more SFU area than the gen-1 ops it supersedes. No synthesis number
-   exists. This is acknowledged, not blocking the freeze, but should be
-   measured before RTL sign-off.
-5. **Conformance / definition of done.** Gen-2 RTL is conformant when
-   `software/tests/test_compare_rtl_golden.py` passes an **end-to-end**
-   (not block-level) byte-match within FP16 ULP on the GPT-2 W8A16
-   teacher-forced reference bundle (`weight_only_int8_quarot`, 257-tok)
-   against the pinned golden model below. Block-level cosim greens are
-   necessary but **not** sufficient — the freeze is not satisfied until the
-   end-to-end bundle byte-matches.
-   **Status (2026-05-16, P6b) — substantive property GREEN; literal §5 bar
-   NOT yet met (two explicit gaps, named below).** The end-to-end
-   RTL-vs-golden gate is built and green:
-   `test_compare_rtl_golden.py::test_rtl_cosim_gen2_byte_match[0,5]` runs
-   the *real* compiled bundle on Verilator `run_program` and byte-matches
-   the pinned golden across all 71 captured gen-1+gen-2 nodes (LayerNorm/
-   GELU/residual/dequant/quant/masked-softmax/max-abs-reduce/attn) at
-   **0 fp16 ULP on every op-class incl. `gelu_new`** — strictly stronger
-   than the §7 ≤3 gelu band (e2e fp16 rounding collapses the sub-ULP tanh
-   delta, same mechanism §7 noted for masked-softmax); RTL run clean
-   (`status=halted`, `fault=False`, `forbidden_overlap=False`).
-   **Model & scope actually exercised (do not over-read):** the *tiny
-   2-layer nanoGPT shakespeare-char fixture* (`tools/train_tiny_fixture.py`
-   `DEFAULT_FIXTURE`, d128/l2; ~3114-insn prefill, ~5 s/run) compiled with
-   the `weight_only_int8_quarot` **preset**, **single-token PREFILL only**.
-   This is meaningful evidence — it is the *same gen-2 ISA* the GPT-2 W8A16
-   bundle emits, exercised through the real compiler/codegen/SYNC path — so
-   the gen-2 **datapath** is conformant. But the **literal §5 bar is not
-   met on two axes**: (1) **model size** — tiny d128/l2 fixture, *not*
-   GPT-2 124M (12-layer); (2) **sequence** — single-token prefill, *not*
-   257-tok prefill+decode (the decode stream needs PC-rebased trace
-   manifests + per-step kv/attn runtime patching; prefill_pc=0 made prefill
-   rebase-free). Closing both is tracked as **P6c / task #106**; the freeze
-   §5 definition-of-done remains formally open until the GPT-2 124M 257-tok
-   bundle byte-matches.
-   **Status (2026-05-17, P6c — GPT-2 124M single-tok prefill:
-   byte-EXACT to golden up to the first fp16 overflow; one isolated bug;
-   §5 still open).** Headline: on the real **GPT-2 124M**
-   `weight_only_int8_quarot` bundle (single-token prefill), **RTL is
-   byte-EXACT (0 fp16 ULP) to the pinned golden across the entire prefill
-   for every captured node before golden's first fp16 overflow** — the
-   only exception being **one localized bug (`block0_head0_query`,
-   propagating to its direct child `block0_head0_qkt`)**. RTL runs clean
-   (`status=halted`, `fault=False`, `forbidden_overlap=False`;
-   `run_program` rebuilt with `DRAM_SIZE≥1<<30` — the 16 MB default
-   `FAULT_DRAM_OOB`s on the 392 MB image). Findings (advisor-reviewed,
-   primary-source): **(a) well-posed boundary** — golden first overflows
-   fp16 at `block0_out_proj` (pc 2298, 48/768 → ±65504/NaN; the W8A16
-   storage format genuinely saturates at 124M MLP dynamic range, model
-   still 55.76 PPL). The `block0_out_proj` *trace snapshot* matches
-   byte-identically at its capture point, but that snapshot is a
-   non-functional tile: it is requantized → stored → reloaded (int8)
-   before the residual path consumes it, and the **functional** out_proj
-   is that reloaded int8 representation — which is exactly where BUG2
-   enters (P6d ground truth, #107). The full pre-boundary prefill is
-   0 ULP modulo the one bug above. **(b) BUG1** —
-   `block0_head0_query` (first Q-projection, head-0 only; heads 1–11 all
-   0 ULP) miscomputes; architecturally inert at seq=1 (`softmax(1,1)`).
-   **P6e (2026-05-17) CONFIRMED the root cause** via a chain of 8
-   fidelity-gated / control-validated refutations (input/path,
-   int8/scale_regs[0], bias/0x1E-src2, scalar scale_regs[1],
-   wrong-weight-swap) culminating in Step3c: a non-perturbing
-   `cg._record_trace_event` probe of the *loaded* weight in WBUF under
-   the canonical cosim — ALL controls 0-ULP including `head0_key__wprobe`
-   byte-exact (validates the WBUF-snapshot instrument), while
-   **`head0_query__wprobe` is 48569/49152 bytes WRONG golden-vs-RTL**.
-   ⇒ **BUG1 = the FIRST matmul-weight DMA-load into WBUF is wrong in
-   RTL** (golden loads the same staged Wq correctly — same instruction
-   stream; golden reproduces head0_query at fid 1.9e-4 with the correct
-   Wq). The systolic array then computes correct_int8 @ WRONG_Wq →
-   the observed head0_query divergence. Scope: specifically the first
-   matmul-weight WBUF load — NOT generic first-WBUF (ln1 γ/β WBUF loads
-   ran earlier, 0-ULP), NOT large-load (head0_key Wk: same 49152 B /
-   same SET_ADDR+LOAD+SYNC1 structure, byte-EXACT). **Root mechanism
-   CONFIRMED BIT-EXACT (Step4/5, direct observation):** RTL's wrong
-   head0_query Wq == golden DRAM[`0x14c12ca0`] at 93.76% vs 1.19% at the
-   intended `0x4c12ca0`; addr-reg trace shows golden's `pc=51 LOAD` reads
-   `0x4c12ca0` (post-`SET_ADDR_HI`=0) while RTL reads `0x14c12ca0`
-   (pre-HI, stale HI=1). ⇒ **BUG1 = a `SET_ADDR_HI`(pc=50)→`LOAD`(pc=51)
-   address-register read-after-write hazard** — the consuming LOAD
-   samples the addr reg before the immediately-preceding `SET_ADDR_HI`
-   write is visible → stale HI=1 → wrong DRAM source → wrong Wq → wrong
-   matmul. (The earlier "port-A mux steal" fix-class was **refuted**: a
-   DMA back-pressure fix was a provable no-op — head0_query unchanged,
-   controls 0-ULP, no port-A contention; reverted, run_program rebuilt
-   clean. Lesson: never patch on inference — confirm the mechanism
-   directly.) seq=1-inert ⇒ decode/#109 item, NOT a §5 prefill-byte-match
-   blocker (freeze gate stays 4/4). FIX (scoped, HIGH-RISK shared
-   control-unit/addr-regfile): the LOAD/STORE consuming an addr reg must
-   see the preceding `SET_ADDR` write — control-unit dispatch stall until
-   commit / addr-regfile bypass / registered-after-commit base_addr.
-   MUST first build a bit-exact predicted-buggy unit repro
-   (`SET_ADDR_LO;SET_ADDR_HI;LOAD` ⇒ stale-HI; 2nd LOAD = known-good
-   control) to pin the exact race + confirm BEFORE patching, then
-   canonical 124M cosim + freeze gate 4/4 + suites. Task **#108 (P6e)**.
-   **P6l (2026-05-18, #108 DONE). BUG1 FIXED — corrected mechanism.**
-   The freeze doc's earlier "register-file RAW hazard" framing (stale HI=1
-   from `SET_ADDR_HI`→`LOAD`) was an incorrect mechanism attribution:
-   `SET_ADDR_HI`'s NBA register write commits at the posedge that ends its
-   S_ISSUE cycle; the S_FETCH stage plus AXI fetch latency before the next
-   `LOAD` reaches S_ISSUE spans ≥2 posedges — the write is fully visible. The "RTL reads 0x14c12ca0 (stale HI=1)" was a correct WBUF
-   content observation (the stale data *in WBUF* matched that address) but
-   a wrong mechanism attribution (no AXI read was issued to 0x14c12ca0
-   from pc=51; the DMA read was silently dropped, explained below). The
-   simple `SET_ADDR_HI`→`LOAD` unit reproducers never triggered the bug
-   because they had no concurrent DMA. **Confirmed root cause:**
-   `dma_dispatch = !sfu_busy` in `control_unit.sv` lacked a `!dma_busy`
-   guard. When a STORE DMA is active, the AXI write channel is independent
-   of `rd_inflight_q`, so instruction fetches proceed freely. A subsequent
-   LOAD reaches S_ISSUE with `dma_busy=1`, fires `dma_dispatch=1`, but the
-   DMA engine (in D_STORE_W, not D_IDLE) silently ignores the pulse. The
-   control unit advances; the Wq WBUF load never executes; WBUF retains the
-   stale Wk from the prior LOAD (which had used addr=0x14c12ca0, HI=1).
-   **Fix (`control_unit.sv`):** (i) combinational: `OP_LOAD, OP_STORE:
-   dma_dispatch = !sfu_busy && !dma_busy`; (ii) sequential S_ISSUE stall:
-   `if (sfu_busy || dma_busy) state <= S_ISSUE`. **ISA-contract change:**
-   LOAD/STORE now serialize through DMA idle. Previously they were
-   fire-and-forget (SYNC was the sole ordering point); a program issuing
-   LOAD while a prior STORE-DMA was still in-flight silently dropped the
-   LOAD. Programs that correctly bracket every LOAD/STORE with SYNC are
-   unaffected; this fix makes the ISA contract explicit and enforced in HW.
-   **Reproducer (bit-exact):** `rtl/verilator/test_addr_raw_hazard.cpp`
-   `test_dispatch_drop_via_store` — pre-fix: ABUF=0xBB (stale, second LOAD
-   dropped), FAIL; post-fix: ABUF=0xAA (correct), PASS. Full suite 6/6.
-   **Verified:** 124M cosim post-fix → `block0_head0_query` 0 fp16 ULP
-   (was 490 ULP); all controls 0-ULP; freeze gate 4/4
-   (`test_compare_rtl_golden.py`). #108 DONE. The decode path + logits
-   metric are tracked as **#109 (P6f)**.
-   **(c) BUG2** — past the overflow boundary,
-   non-finite-operand handling in the requant path diverges (golden
-   `np.clip`/cast-NaN vs RTL); a localized op-semantics edge for
-   non-finite inputs, *not* a finite-path datapath error. Task **#107
-   (P6d)**. **No freeze edit is shipped:** per §7 discipline, a
-   logits-level / characterized 124M conformance metric (per-tensor
-   byte-match is well-posed only up to the overflow boundary) must be
-   *proposed with its supporting measurement* before §5/§7 are amended —
-   tracked as **#109 (P6f)**, which also carries the 257-tok decode
-   integration. §5 definition-of-done remains formally open.
-6. **Pinned reference golden.** RTL conformance is measured against
-   `software/taccel/golden_model/simulator.py` **at the commit created by
-   the §5 commit**: `frozen_golden_sha = aa9a9c0fa389d77598acfe68f4ac1347bd9fc9ef`
-   (recorded 2026-05-16; §5 spec files committed/clean). Golden fixtures
-   under `rtl/verilator/fixtures/gen2/` are pinned to this SHA via
-   `software/tools/gen_gen2_fixtures.py`. Any later `simulator.py` change
-   requires a new freeze revision + fixture regen — otherwise "cosim vs the
-   gen-2 golden" is a moving target, the exact failure this freeze closes.
-   **Content-level pin (enforced, not just documented).** The commit SHA
-   above does not detect a `simulator.py` edit made *after* `aa9a9c0`
-   within the same or a later commit, so the pin is enforced at the
-   content level: the SHA-1 git-blob hash of
-   `software/taccel/golden_model/simulator.py` is
-   `cc1bc64f34bf7b5a53a5760bcd500dca10cb8080` (**freeze §6 REVISION
-   2026-09-02, retired gen-1 SFU cleanup**: the simulator and assembler no
-   longer execute or emit the six gen-1 SFU opcodes that RTL has rejected
-   since 2026-05-23. Regenerating all ten gen-2 cases changed zero `.raw`
-   payloads; only the `meta.json` source stamps changed. Supported gen-2
-   semantics are therefore byte-identical). Prior pin
-   `029605f58c56002c06848fa5a18e42ec69513409` (**freeze §6 REVISION
-   2026-07-10, m_exact CONFIG_TILE extension**: CONFIG_TILE bits [27:16]
-   now carry `m_exact`, an exact SFU row count (0 = full tiles, the
-   legacy behaviour every pre-extension bundle encodes — decode of old
-   words is bit-identical). The simulator `tile_config` grows to a
-   5-tuple with `m_exact` at [4]; the 14 SFU `_exec_*` row bounds in
-   `simulator.py` and the 6 legacy INT8-path ops in `golden_model/sfu.py`
-   honor it via partial read/write of the leading M rows. Systolic
-   `execute_matmul` and the helper engine keep the tile-quantized
-   `(M+1)*16` — the field is SFU-only, mirroring the RTL
-   (`sfu_engine.dispatch_m_rows_w` mux; `decode_unit`/`register_file`
-   plumbing added the same day). Gen-2 W8 semantics untouched: all gen-2
-   `.raw` fixtures regenerate byte-identical. Prior pin
-   `8fd46a159169696e306fb8f601a1857452bd1fcb` (**freeze §6 REVISION
-   2026-07-08, W4 tile_config extension**: commit `2ae4535` ("Add INT4
-   weight packing and W4 support") extended the simulator `tile_config`
-   with a `weight_int4` flag + packed-INT4 read paths in
-   `golden_model/memory.py`/`systolic.py`. Gen-2 W8 semantics are
-   untouched (the flag defaults off for every existing bundle): all
-   gen-2 `.raw` fixtures regenerated **byte-identical** (0 of 44 payload
-   files drifted), only the 10 `meta.json` sha-stamps changed. The commit
-   message declared the SHA impact at the time; the pin update was
-   deferred until now. Prior pin `131d3ef1a6009519976cf99baf9157a434e67f6f`
-   (**freeze §6 REVISION 2026-05-17, P6g / Option B, task #110**: the 0x18
-   `QUANT_FP32_INT8` non-finite requant contract was made explicit per §7
-   item 8 Option B — NaN→0, ±inf→±127/−128, finite-overflow→saturate.
-   Numerically identical to the prior `np.clip(...).astype(np.int8)` on
-   the pinned numpy: all gen-2 `.raw` fixtures regenerated byte-identical,
-   only the `meta.json` sha-stamp changed. Prior pin
-   `7746e65598961ac8430f8eeece45d7ec976584cd`, pre-P6g, blob at `aa9a9c0`).
-   New commit SHA is set by the user on external commit; this blob hash is
-   the authoritative enforced pin and is what the test recomputes).
-   `software/tests/test_compare_rtl_golden.py::test_frozen_golden_sha_pin`
-   recomputes this blob hash and **fails loud** on any drift — the gen-2
-   conformance gate refuses to run a comparison against an unpinned
-   golden, closing the moving-target hole even inside an unchanged commit.
-7. **Conformance tolerance — per op-class (REVISION 2026-05-16).** The
-   original "byte-match within FP16 ULP" (item 5) left the band a single
-   guessed number (≤1). Measurement on the P2 ops replaces the guess:
-   - **Non-transcendental ops → exactly 0 fp16 ULP (bit-exact).** Verified:
-     `VADD_FP32` (0x19) and `LAYERNORM_FP32` (0x1A, eps=1e-5, γβ, mean/var)
-     are byte-identical to the golden fixtures. This is mandatory; any
-     drift is a real bug. Applies to 0x17/0x18/0x19/0x1A/0x1E.
-   - **Transcendental-heavy ops → small empirically-characterized band.**
-     `GELU_FP32` (0x1B `gelu_new`) is byte-identical to a libm-`tanhf`
-     implementation of the exact golden formula; it differs from the
-     golden's `np.tanh` (numpy vectorized float32 tanh) by **≤3 fp16 ULP
-     on 53/1024 elements** (measured; `/tmp/verify_gelu.py` reproduces it:
-     RTL ≡ libm-gelu exactly, libm-vs-golden ≡ RTL-vs-golden = (53, 3)).
-     The datapath is correct — the residual is purely a float32-tanh
-     library difference. Conformance band for `gelu_new`: **|ulp| ≤ 3**.
-   - `MASKED_SOFTMAX_FP32` (0x1D, `exp`) — **measured P4: BIT-EXACT
-     (0 ULP)** on the characterized fixture (uniform(-8,8), qrb=0,
-     valid_kv_len=64). Unlike `gelu_new`, the `row_max` subtraction +
-     softmax normalization + final FP16 round collapse the numpy-vs-libm
-     `expf` differences. Conformance band for `masked_softmax_fp32`:
-     **0 ULP** on the fixture. Caveat: this is one input distribution;
-     the end-to-end bundle (P6) over real activations is the final
-     arbiter — if real-data `exp` drift appears there it gets its own
-     characterized band, same discipline. Band is fixture-asserted, not
-     a universal claim.
-   - `LAYERNORM_FP32` (0x1A, `1/sqrt(var+eps)`) — fixture-measured BIT-EXACT
-     (0 ULP, see above) but **REVISION 2026-05-19 (P6f / #109): a measured
-     real-data band of ≤1 fp16 ULP applies on GPT-2 124M**. The #109
-     first-measurement (logits-level metric, `run_cosim_sequence_logits`;
-     `test_rtl_cosim_gpt2_124m_logits_metric`, opt-in PYTEST_124M) found the
-     first per-tensor divergence at a layernorm output — `block0_ln1` for
-     token `[464,3290,318]`, `block1_ln1` for token 0 — at **exactly 1 fp16
-     ULP** in BOTH independent token sets (golden 0.0265503 vs rtl 0.0265656;
-     numpy var/rsqrt vs the RTL/DPI libm path, same numpy-vs-libm class as
-     `gelu_new`). The boundary node is token-position-dependent; the ≤1-ULP
-     LayerNorm signature is consistent. This is the §7 "real-data drift gets
-     its OWN characterized band" clause exercised (same discipline as
-     `gelu_new` ≤3 ULP); it does NOT change `simulator.py` (golden SHA
-     untouched). Logits-level conformance past the W8A16 fp16-overflow
-     boundary (per-tensor byte-match is ill-posed there, §4.x / P6c) is the
-     `logits_metric` (argmax-agreement / finite-masked cosine / per-token
-     NLL→ppl); first 124M measurement: argmax-agree 1.0, min-cosine
-     0.99999, 0 non-finite (the PPL Δ is illustrative on the N=2 feasibility
-     probe, not a population estimate — pin the band on argmax/cosine). This
-     closes the #109 well-posedness gap in the §5 definition-of-done.
-   - Bit-replicating numpy's tanh is rejected: numpy-version-fragile and
-     the freeze already pins a golden SHA. Characterizing the band per
-     op-class is the disciplined resolution the §6 revision mechanism is
-     for. `expect_fp16_ulp` enforces these bands per op in `test_sfu.cpp`.
-8. **Non-finite requant contract — Option B CHOSEN & IMPLEMENTED
-   (2026-05-17, user pick; P6g / #110).** At
-   GPT-2 124M the W8A16 fp16 storage genuinely overflows in the MLP/attn
-   path (golden too). The requant op (`QUANT_FP32_INT8` 0x18 / the
-   `DEQUANT_ACCUM_*` int8-clamp paths — same idiom
-   `np.clip(np.round(x·s),-128,127).astype(np.int8)`) then has to map a
-   **non-finite** fp32 to int8. **Golden, measured (numpy 1.26.4):** the
-   `np.clip(…,-128,127)` saturates finite-overflow and ±inf → ±127/−128;
-   **NaN passes the clip and `NaN.astype(int8)` → 0**. RTL's 0x18
-   datapath does *not* reproduce this (hardware clip comparisons are
-   all-false for NaN → garbage int8, not 0). This is BUG2. Pick one
-   (each is mechanical; A and B converge on identical code/RTL, differ
-   only in how §7 reads; C changes the rule instead of the RTL):
-   - **Option A — pin the (current) golden semantics.** Make golden
-     explicit: `np.where(np.isfinite(x), np.clip(np.round(x·s),-128,127),
-     0).astype(np.int8)` (NaN→0, ±inf/overflow→saturate), numpy-version
-     independent; specify it in this §; RTL implements NaN→0 / saturate.
-   - **Option B — choose a hw-sane contract from scratch.** §7 specifies
-     NaN→0, ±inf→±127, overflow→saturate; golden enforced explicitly
-     (same patch as A); RTL implements it. Identical end state to A; only
-     this paragraph's framing differs (B = "designed", A = "pins numpy").
-   - **Option C — don't fix in RTL; characterize at logits.** Declare the
-     §5 well-posed region = "up to the first golden non-finite tensor";
-     past it, conformance is the logits-level metric (#109 / P6f). RTL's
-     non-finite handling is allowed to differ. The gelu-band move applied
-     to overflow; no RTL/golden code change, the metric moves instead.
-   Same §6 revision discipline as the §7 bands: this is a *characterized
-   contract decision*, not a silent relax.
-   **Decision & implementation (P6g / #110).** User chose **Option B**
-   (FPGA-deployment rationale: deterministic, explicitly-specified,
-   version-independent — A's "pin numpy `NaN.astype`" is the same
-   fragility the freeze rejected for gelu; C alone leaves silicon
-   behavior unspecified in a reachable regime). Implemented & staged:
-   golden `_exec_quant_fp32_int8` (:856) made explicit
-   `np.where(np.isnan(scaled), 0, np.clip(scaled,-128,127)).astype(int8)`
-   (NaN→0, ±inf/overflow→saturate); the synthesizable SV
-   `quantize_to_i8` (`sfu_engine.sv`) gets NaN→0 / ±inf→±127 guards;
-   the DPI `sfu_fp32_quantize_i8` kept consistent. **Behavior-preserving
-   on the pinned numpy** — all gen-2 `.raw` fixtures regenerated
-   byte-identical (only the `meta.json` sha-stamp changed); content pin
-   re-pinned (§6 revision, blob `131d3ef1…`). The contract is correct
-   and FPGA-deployable on its own merits.
-   **Empirical caveat (do not over-read):** implementing B did **not**
-   move the GPT-2 124M cosim boundary (`block0_residual1` 18188 ULP,
-   gNaN=rNaN=0 finite-vs-finite). **B is not BUG2's cause** (P6g:
-   provably 0 non-finite over 1177 functional 0x18 calls). **BUG2's
-   root is still OPEN — two roots refuted, each caught pre-fix by
-   instrument discipline:** (i) P6d "0x18 non-finite" → refuted by P6g
-   (zero cosim change); (ii) P6h "systolic MATMUL deep-K" → refuted by
-   P6i: the bisect relied on an **ACCUM-via-snapshot read that is
-   unreliable in RTL** (RTL ACCUM snapshots all-zeros / garbage at every
-   phase & pc, while the *same* matmul's downstream fp16 is P6c-proven
-   0-ULP exact ⇒ the real-datapath ACCUM is correct; only the snapshot
-   read is wrong; golden snapshot is self-consistent). No unit test
-   validates ACCUM *readback* (P5 gen-2 ACCUM tests preload ACCUM + read
-   ABUF; only `test_systolic_chained` validates post-MATMUL ACCUM). So
-   the MATMUL is **not** proven buggy. **(iii) "deep-K" also refuted; BUG2
-   LOCALIZED (P6j/#113)** via a clean control-validated `run_program
-   --dram-dump-*` probe to the **functional `out_proj`** chain
-   (`concat[768]@Wo[768×768]` → MATMUL@2131 → 0x1E@2141 → DMA-store):
-   diverges; downstream innocent. **(iv) BUG2 ROOT CAUSE LOCKED &amp; FIXED
-   — P6k / #115 (2026-05-17).** The "wide-N" framing (iii) was a proxy:
-   wide N merely makes the weight exceed WBUF, routing out_proj/fc1/
-   lm_head to the **tiled lowering** `emit_matmul_w8a16_large_weight_tiled`
-   (a *different* path from the byte-exact-proven simple `emit_matmul_w8a16`
-   that head Q/K/V use). `_large_weight_tile_plan(768,768)` = 2 N-tiles ×
-   2 K-tiles ⇒ the 2nd MatmulInsn is **flags=1** (K-split accumulate).
-   Real root: `systolic_controller.sv:344`
-   `clear_acc=(ST_INIT_TILE)&&!flags_accumulate_q` suppresses the
-   per-output-tile PE-accumulator clear for the **entire** multi-(m,n)-tile
-   walk when flags=1; `systolic_array` `pe_acc` has no per-tile preload and
-   DRAIN_WR overwrites (no RMW) ⇒ flags=1 is correct **only for a single
-   16×16 output tile**. **Proven** by
-   `rtl/verilator/test_systolic_chained.cpp::test_ksplit_accumulate_diagnostic`
-   (chained = 124M cosim mode): K-split flags0/flags1 on the same data as
-   the passing single-shot `test_matmul_multitile_2x2x2` (V1 known-exact
-   contrast) ⇒ **1014/1024 ≠ correct, 0/1024 == the predicted cross-tile-
-   leak model** (byte-exact the broken mechanism, all cells — not merely
-   "diverges"). Pre-existing `test_matmul_accumulate_flag` only covered the
-   single-tile degenerate-correct case (false confidence). **Fix S
-   shipped (#115):** `_large_weight_tile_plan` now prefers a full-K weight
-   tile (single MatmulInsn flags=0 per N-tile) whenever a full-K
-   activation strip fits ABUF — the frozen GPT-2 124M bundle now emits
-   **2340 MATMULs, 0 with flags=1** (out_proj/fc1/lm_head → full-K
-   flags=0; fc2 K=3072 → large-input *streaming* path, flags=0-only by
-   construction). K-tiling is integer-exact tiling-invariant ⇒ the golden
-   is **numerically identical** (frozen `.raw` fixtures byte-unchanged,
-   §6 simulator.py blob untouched). **VERIFIED — canonical 124M cosim
-   after S (controls `head1_query`/`concat` 0-ULP — instrument valid):
-   the canonical `block0_out_proj` *manifest node* is now 0-ULP
-   byte-exact to golden across all 768 cols / all 3 S N-tiles, including
-   the 48 NaN/overflow cols matched golden↔RTL.** Fix S fully resolved
-   the out_proj tiled-path miscompute (BUG2). The remaining
-   `block0_residual1` ~18139 ULP (finite, 0 NaN) is the FIRST node *past*
-   out_proj — which is precisely the W8A16 fp16 overflow boundary (§4.x /
-   P6c, pre-existing: golden itself saturates ±65504/NaN at out_proj
-   @124M). Per-tensor byte-match past the first golden overflow is
-   already documented ill-posed → **logits-level metric, task #109 /
-   P6f**; it is **not** BUG2 and not a regression. This run also proves
-   the entire pre-overflow datapath *through out_proj* is now byte-exact
-   (a major de-risking for #109). **BUG2 root-caused, fixed (S),
-   verified — #115 DONE.** The latent RTL flags=1-multi-tile HW
-   bug (FPGA generality) is tracked as **R-min / task #116** (controller
-   clear_acc-per-tile + DRAIN read-modify-write); the DIAGNOSTIC test is
-   its permanent regression evidence (flips to a hard assertion when #116
-   lands). Four bespoke-probe instrument failures across this saga, all
-   caught by the `block0_head1_query`/`multitile_2x2x2`=exact control;
-   only canonical `rc.*` + existing manifest + `--dram-dump-*` + the
-   unit-level `test_systolic_chained` ACCUM readback are trustworthy
-   (ACCUM-snapshot debt **#114 — RESOLVED 2026-05-19**). **#114 DONE:**
-   reproducer (`rtl/verilator/test_accum_snapshot_readback.cpp`,
-   known-exact `read_accum_32x32` contrast) pinned the mechanism as
-   **capture TIMING, not the `accum_read_logical_i32` layout**:
-   `accum_read_logical_i32` is byte-exact on a settled ACCUM (post-halt
-   and at the systolic-draining SYNC retire) but reads all-zeros at the
-   MATMUL retire — `run_program` captured ACCUM at an anchor PC that
-   retires before the asynchronous `ST_DRAIN_WR` settles it (±1 cycle
-   cannot help — why P6h's `retire_cycle`/`retire_plus_1` both failed).
-   **Fix:** `taccel_top.sv` exposes `sys_busy` (`public_flat_rd`, pure
-   Verilator pragma); `run_program.cpp` defers a `buf_id==BUF_ACCUM`
-   capture until `sys_busy==0` (ACCUM-scoped — fp16/int8 capture timing
-   untouched; freeze gate 6/6 byte-identical, the safety net). The
-   reproducer is now a permanent hard regression (the freeze-named "no
-   unit test validates ACCUM readback" gap, closed). The Option B
-   non-finite contract stands independently as the correct, FPGA-deployable
-   behavior.
-9. **Phase B SFU silicon strip — DONE 2026-05-23 (companion item to §3
-   REVISION 2026-05-23).** With the gen-2 conformance work (items 5–8) and
-   the §5 definition-of-done met, the 6 gen-1 SFU opcodes (§3) were stripped
-   from RTL silicon — exercising the §3 MAY-clause for the SFU-handled
-   subset. Specifically:
-   - `decode_unit.sv:38` traps `0x0E/0x0F/0x10/0x12/0x15/0x16` (plus
-     pre-existing `0x1C`) as `FAULT_ILLEGAL_OP` before SFU dispatch.
-   - `sfu_engine.sv` deleted: ~280 LOC of gen-1 state bodies (`F_LN_PARAM_*`,
-     `F_ROW_I8_*`, `F_ROW_I32_*`, `F_GELU_I8_*`, `F_GELU_I32_*`,
-     `F_GELU_SYNTH_I8/I32_ITER`, `F_ATTN_QKT_REQ`, `F_ATTN_V_REQ`,
-     `F_ATTN_WRITE`); F_IDLE gen-1 dispatch arms; gen-1 dispatch flags
-     (`dispatch_softmax_*`/`dispatch_gelu_*`/`dispatch_layernorm_w`/
-     `dispatch_*softmax_attnv*`); gen-1 SRAM-arbiter arms; gen-1
-     `dispatch_unsupported_w` case arms.
-   - **DELETED files**: `rtl/src/sfu_g1_compute.svh` (130 LOC),
-     `rtl/src/sfu_attn.svh` (135 LOC).
-   - `taccel_pkg.sv` `FAULT_ILLEGAL_OP` comment + `// STRIPPED` markings on
-     the 6 ops.
-   - `rtl/verilator/test_sfu.cpp`: 9 gen-1 test functions deleted (lines
-     441–1134); test count **21 → 11**; `G2_*` constants + `expect_fp16_ulp`
-     helper recovered from the deleted block. `test_sfu_synth.cpp` shares
-     the same TU; same delta.
-   - **KEPT (shared with gen-2)**: `F_ROW_PACK` / `F_ROW_WRITE` (gen-2 0x18
-     `QUANT_FP32_INT8` reaches them via `sfu_g2_compute.svh:84`/`:241`); the
-     `F_G2_LN_*` / `F_G2_SM_*` shared sub-FSMs (their gen-1-aware writeback
-     branches remain as dead-but-elaborated code — deferred to a future
-     cosim-gated cleanup pass); `attn_accum_q[]` (used by gen-2 VADD);
-     `row_i32_addr_w` (used by gen-2 0x17/0x1E).
-   - **Historical synth-check hashes:** whole-design **97873ef4a2 →
-     4006339cfc** (cell drop from removed FSM logic); the then-existing
-     lightweight control-plane check moved **18e3144b40 → d13c694b63**.
-     That partial blackbox gate was retired after the full-design gate
-     superseded it.
-   - **Freeze gate preserved.** `pytest test_compare_rtl_golden.py` =
-     **6 passed + 1 skipped byte-identical** pre/post Phase B (the gen-2
-     frozen bundle never emits the stripped opcodes; the safety-net empirical
-     behavior-neutrality predicted by §5 holds). Full gate matrix:
-     pytest 125+1, `test_sfu`/`test_sfu_synth` 11/11 each (down from 21/21),
-     `test_helpers`/`test_helpers_synth` 19/19 each (helper opcodes stayed
-     legal).
-   - **Scope correction vs the original plan.** The 2026-05-23 plan listed
-     11 gen-1 ops for the strip; on execution, 5 of those
-     (`0x0B`/`0x0C`/`0x0D`/`0x11`/`0x13`) are handled by
-     `blocking_helper_engine.sv`, not `sfu_engine.sv` — making them illegal
-     at decode broke `test_helpers::vadd_int8_saturating`. The 5 helper-engine
-     ops were rolled back to legal (§3 lists them as "Still legal in RTL"
-     above). A future Phase B' could symmetrically strip the helper-engine
-     gen-1 paths (~50–100 LOC helper case-arm cleanup + ~9 `test_helpers.cpp`
-     test functions); not blocking the freeze.
-   - **Software ISA unchanged.** `software/taccel/isa/`, `assembler/`, and
-     `golden_model/simulator.py` all still implement the 6 stripped ops;
-     historical bundles parse and replay in software (only `run_program`
-     rejects them now). `test_isa_encoding.py` / `test_assembler.py` round
-     trips green unchanged.
+## Retired and compatibility opcodes
 
-   The §5 definition-of-done remains MET — Phase B exercised the §3 MAY
-   clause without changing the §5 substantive conformance property.
+### Retired generation-1 SFU
 
-## 5. Actions required to *complete* the freeze (owner: user — I do not commit)
+These six opcodes are permanently retired:
 
-The freeze is not real until the in-flight spec is committed. As of the
-session-start snapshot these are uncommitted-modified and MUST be committed
-as the frozen baseline:
+- `0x0E SOFTMAX`;
+- `0x0F LAYERNORM`;
+- `0x10 GELU`;
+- `0x12 SOFTMAX_ATTNV`;
+- `0x15 MASKED_SOFTMAX`;
+- `0x16 MASKED_SOFTMAX_ATTNV`.
 
-- `software/taccel/isa/opcodes.py`
-- `software/taccel/isa/instructions.py`
-- `software/taccel/isa/encoding.py`
-- `software/taccel/golden_model/simulator.py`
-- `software/tests/test_compare_rtl_golden.py`
+RTL has rejected them since 2026-05-23. As of `3486c01`, Python instruction
+classes, assembler syntax, compiler emission, golden execution, and legacy
+tests are also removed. Their enum names remain only to preserve numeric
+allocation and diagnose old binaries.
 
-After commit, any opcode change requires a new dated revision of this file
-and re-opens the gen-2 RTL contract.
+### Retained helper compatibility
 
-**Status (2026-05-19) — §5 definition-of-done MET; spec committed.** The §5
-spec files above were committed by the user (frozen baseline set). The three
-items that kept the definition-of-done formally open are resolved:
-- **#109 (P6f) DONE** — logits-level conformance metric delivered
-  (`rtl_cosim.run_cosim_sequence_logits` / `logits_metric`;
-  `test_rtl_cosim_gen2_logits_metric_tiny` CI-green metric self-validation;
-  `test_rtl_cosim_gpt2_124m_logits_metric` opt-in first measurement). The
-  per-tensor-ill-posed-past-overflow gap is closed by the §4-item-7
-  `LAYERNORM_FP32` ≤1-ULP real-data band + the logits metric (argmax/cosine).
-- **#116 (R-min) DONE** — RTL `flags=1` K-split multitile fixed
-  (`systolic_controller.sv` per-output-tile `clear_acc` + `ST_DRAIN_RD`
-  read-modify-write); `test_systolic_chained::matmul_chained_ksplit_accumulate`
-  flipped from DIAGNOSTIC to a hard assertion (0/1024 vs correct).
-- **#114 DONE** — ACCUM-snapshot readback fixed & permanently regressed
-  (see §4 item 8).
-The freeze gate (`test_compare_rtl_golden.py`) is **6/6 + 1 skipped**
-(124M opt-in) and byte-identical pre/post #116/#114 (frozen bundle emits 0
-`flags=1`, no ACCUM snapshots — the empirical behavior-neutrality safety net)
-**and pre/post Phase B 2026-05-23** (gen-2 frozen bundle never emits any of
-the 6 stripped gen-1 SFU opcodes; same safety-net mechanism — see §4 item 9).
-Remaining open items are FPGA-realization (synthesizable SFU, part/perf
-target — `docs/accelerator_completion_review.md`), NOT freeze-contract items.
+The following generation-1 helper opcodes remain legal in RTL:
 
-## 6. Cross-references
+- `0x0B REQUANT`;
+- `0x0C SCALE_MUL`;
+- `0x0D VADD`;
+- `0x11 REQUANT_PC`;
+- `0x13 DEQUANT_ADD`.
 
-- Decision basis: `software/docs/w8a32_deployment_scope.md` (§"Decision
-  required", recommends (c.1)).
-- ISA opcode definitions: `software/taccel/isa/opcodes.py:86` (`Opcode`).
-- RTL opcode table: `rtl/src/include/taccel_pkg.sv:22-45`.
-- Cosim harness / debug state: `docs/rtl_debug_plan.md` (current first
-  divergence ~`pos_embed_add`, gen-1 — predates this freeze).
-- Empirical probe: `software/tools/isa_coverage_probe.py` (re-runnable;
-  compiles GPT-2 via `build_stage3_tiny_decoder_bundle`, histograms
-  `codegen.instructions`; basis for §2).
+They are non-normative for the primary W8A16 bundle but remain implemented by
+`blocking_helper_engine.sv` for compatibility and selected diagnostics.
+
+## Frozen numeric and layout contracts
+
+### Instruction and addressing
+
+- Instructions are fixed at 64 bits and serialized big-endian.
+- The opcode is bits `[63:59]`.
+- SRAM offsets and lengths use 16-byte units.
+- Four address registers hold 56-bit DRAM byte addresses.
+- ABUF/WBUF/ACCUM are 128/256/64 KiB respectively.
+
+### W8A16 flag
+
+For generation-2 R-type operations:
+
+- `flags=1`: FP16 activation storage, FP32 internal arithmetic; normative RTL.
+- `flags=0`: FP32 activation storage; Python research path only.
+
+For `DEQUANT_ACCUM_FP32_SCALED` with `flags=1`, `src2` contains `2N` FP16
+values: `N` per-channel scales followed by `N` biases. The epilogue computes
+
+```text
+int32_accum * per_channel_scale * activation_scale + bias
+```
+
+before one FP16 cast. This avoids an intermediate FP16 rounding step.
+
+### Dynamic scale pair
+
+`MAX_ABS_REDUCE_FP32` writes:
+
+```text
+S[sreg]   = 127 / max(max_abs, epsilon)
+S[sreg+1] = max(max_abs, epsilon) / 127
+```
+
+The first scale feeds quantization; the second restores real units after the
+next matmul.
+
+### Causal mask
+
+`CONFIG_ATTN` stores `query_row_base`, `valid_kv_len`, and two mode bits.
+`MASKED_SOFTMAX_FP32` applies the selected causal and valid-length predicates.
+This context is mandatory and persistent until replaced or reset.
+
+### Exact SFU row count
+
+The 2026-07-10 `m_exact` amendment assigns `CONFIG_TILE[27:16]`:
+
+- zero preserves the original padded `(M+1)×16` row count;
+- nonzero gives the exact SFU row count.
+
+MATMUL and helper engines continue to use padded tile geometry. The default
+zero encoding preserves old words byte-for-byte.
+
+### Transposed LOAD
+
+The DMA transpose amendment assigns M-type `cols_log2[6:3]` and
+`transpose[0]`. A transposed LOAD reads contiguous INT8 `(R,C)` data and writes
+`(C,R)` to SRAM, with `C = 16 << cols_log2`. Existing plain transfers encode
+both fields as zero.
+
+### INT4 research extension
+
+Python assigns `CONFIG_TILE[28]` to `weight_int4` and implements packing plus
+golden execution. This is not frozen hardware functionality: RTL does not
+decode bit 28. Hardware-target bundles must leave it zero until a separate
+hardware revision is approved.
+
+## Conformance policy
+
+### Golden-model pin
+
+The authoritative content hash of
+`software/taccel/golden_model/simulator.py` is:
+
+```text
+cc1bc64f34bf7b5a53a5760bcd500dca10cb8080
+```
+
+`software/tests/test_compare_rtl_golden.py::test_frozen_golden_sha_pin`
+recomputes the Git blob hash and fails on drift. A simulator edit requires:
+
+1. a dated amendment to this record;
+2. an intentional pin update;
+3. generation-2 fixture regeneration;
+4. a report of whether raw fixture payloads changed.
+
+The 2026-09 retired-op cleanup changed the simulator blob but regenerated all
+ten generation-2 cases with zero raw payload drift.
+
+### Tiny-model conformance
+
+The tiny frozen decoder is the byte-exact RTL-versus-golden gate. The active
+tests are:
+
+- `software/tests/test_compare_rtl_golden.py`;
+- `software/tests/test_batched_decode.py`;
+- generation-2 vectors under `rtl/verilator/fixtures/gen2/`.
+
+### GPT-2 124M conformance
+
+Whole-program byte matching is not meaningful after the first FP16 non-finite
+boundary in the large model. Large-model sign-off therefore uses:
+
+- deterministic RTL-versus-RTL logits hashes for schedule/overlap changes;
+- argmax and logits metrics;
+- perplexity against the named preset and dataset window.
+
+A report must name the checkpoint, preset, token window, context, RTL mode,
+clock assumption, and DRAM model.
+
+### Approximation bands
+
+The synthesizable SFU uses deterministic FP32 primitives and FP16 storage.
+Primitive and end-to-end gates establish operation-specific tolerances rather
+than requiring every internal FP32 intermediate to match a host math library
+bit-for-bit. Pipelined variants must be bit-identical to their combinational
+parent where their test states that contract.
+
+Current primitive gates cover divide, square root, `fp32_exp_p18`, and
+`fp32_gelu_p33`. The active generation-2 fixture cases cover dequant,
+dequant-scaled, VADD, LayerNorm, GELU, masked softmax, quantization, and
+MAX_ABS reduction.
+
+## Implementation status
+
+The original RTL reconciliation work is complete:
+
+- all eight normative generation-2 opcodes decode and execute in W8A16 mode;
+- mode-1 SFU/helper paths are synthesizable without DPI imports;
+- full shared-core `sv2v + yosys` elaboration is green;
+- the long exponential, GELU, scale divide, dequant, and LayerNorm chains have
+  been pipelined;
+- tiny RTL-versus-golden conformance and batched decode gates are active.
+
+Remaining work is not a generation-freeze blocker:
+
+- full-chip physical timing and SRAM/IO integration;
+- the `0x1C` software/RTL scope decision;
+- the INT4 hardware-scope decision;
+- optional large-model and board/tape-out closure.
+
+## Revision log
+
+| Date | Revision |
+|---|---|
+| 2026-05-15 | Generation-2 decision locked, including dynamic-scale opcodes `0x1E` and `0x1F` |
+| 2026-05-16 | Operation-specific conformance/ULP policy recorded |
+| 2026-05-17 | Non-finite QUANT behavior made explicit |
+| 2026-05-19 | Logits-level large-model metric accepted; freeze dependencies committed |
+| 2026-05-23 | Six generation-1 SFU opcodes made illegal in RTL; helper opcodes retained |
+| 2026-05-24 | INT4 software/golden extension added outside the normative RTL target |
+| 2026-07-08 | INT4 tile metadata reflected in the golden simulator pin |
+| 2026-07-10 | `m_exact` and transposed-LOAD amendments landed |
+| 2026-07-21..25 | Long SFU/helper paths pipelined without changing numerical outputs |
+| 2026-09-03 | Retired generation-1 Python execution and obsolete verification paths removed; golden pin updated with zero generation-2 payload drift |
+
+## Change procedure
+
+Any future opcode or field change must:
+
+1. update this record and [`isa_spec.md`](isa_spec.md);
+2. update Python opcode, instruction, and codec definitions;
+3. update RTL package, decode, control, and implementing engine;
+4. add positive, boundary, reserved-field, and fault tests;
+5. regenerate frozen fixtures;
+6. review the golden hash;
+7. run software, Verilator, co-simulation, and synthesis gates.
+
+## References
+
+- Current field and support matrix: [`isa_spec.md`](isa_spec.md)
+- Current project status: [`../../docs/project_status.md`](../../docs/project_status.md)
+- Python ISA: `software/taccel/isa/`
+- RTL ISA constants: `rtl/common/src/include/taccel_pkg.sv`
+- RTL legality: `rtl/common/src/decode_unit.sv`
+- Golden pin test: `software/tests/test_compare_rtl_golden.py`
+- Fixture generator: `software/tools/gen_gen2_fixtures.py`

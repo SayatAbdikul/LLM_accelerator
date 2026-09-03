@@ -119,11 +119,11 @@ class CodeGenerator:
             calibration_scales: tensor_name → per-tensor activation scale
             prescaled_biases: name → INT32 pre-scaled bias array
             use_fp16_activations: DEPRECATED — kept for signature back-compat.
-                Always treated as True. The W8A16 path is the only deployment
-                surface; W8A8 INT8-round-trip optimizations (dequant_add residual,
-                requant_pc, gelu_from_accum, fused_softmax_attnv) were retired
-                with the DeiT tooling and stripped from RTL silicon 2026-05-23
-                (see software/docs/isa_generation_freeze.md §3/§4).
+                Always treated as True. W8A16 is the only maintained compiler
+                lowering. The old W8A8 compiler fallbacks and gen-1 SFU path
+                were removed; retained integer helper opcodes such as
+                DEQUANT_ADD and REQUANT_PC remain legal in RTL for compatibility
+                (see software/docs/isa_generation_freeze.md).
             biases: Optional map of bias_name → FP32 1-D vector. The codegen
                 stages each FP32 bias folded into the
                 `__w8a16_pc_scale_and_bias` combined 2N FP16 blob
@@ -133,9 +133,9 @@ class CodeGenerator:
                 dtype is "int4", `_layout_weights` packs the np.int8 storage
                 via `decoder_bundle.pack_int4` before staging into the DRAM
                 blob (2 nibbles per byte; layout per the `pack_int4`
-                docstring — the RTL `weight_unpack.sv` and golden
-                `memory.read_int4_tile` mirror this exact format).
-                W4A16 plan Phase 2 (2026-05-24).
+                docstring; golden `memory.read_int4_tile` mirrors this exact
+                format). RTL does not currently decode the INT4 tile bit, so
+                this is a research/golden path rather than hardware lowering.
 
         Element size is FP16 (2 bytes/element) throughout the W8A16
         datapath; `self.elem_bytes = 2` and `self.fp_precision_flag = 1`

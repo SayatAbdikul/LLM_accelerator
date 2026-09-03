@@ -1,7 +1,7 @@
 """W4A16 weight quantization — AWQ → GPTQ-inject → AdaRound → bias-correct.
 
-This is the production W4 stack identified by the W4A16 Phase 1 quality
-work (2026-05-23 / 24, see [[w4a16-phase1-quality]] memory) plus the
+This is the best measured W4 research stack from the W4A16 Phase 1 quality
+work (2026-05-23 / 24) plus the
 Tier-1 refinements landed 2026-05-24:
 
   1. **AWQ** (Lin et al. MLSys 2024) applied in place to `payload["state_dict"]`:
@@ -67,9 +67,12 @@ PPL (212-238 vs 63-65), because the AWQ fold into ln_f changes the
 lm_head INPUT activation distribution and improves the dynamic INT8
 act quant on that input.
 
-End-to-end gate (GPT-2 124M, 257-tok WikiText):
-  Production = AWQ(α=0.40) + GPTQ(act_order) + AdaRound + bias-correct +
+Historical end-to-end gate (GPT-2 124M, 257-tok WikiText):
+  Research preset = AWQ(α=0.40) + GPTQ(act_order) + AdaRound + bias-correct +
   Stage5 QKT/attn_v calib + lm_head_bitwidth=8.
+
+RTL does not currently decode CONFIG_TILE.weight_int4, so this stack is not a
+hardware deployment path.
 """
 from __future__ import annotations
 
@@ -90,7 +93,7 @@ WeightOverrides = Dict[str, Tuple[np.ndarray, np.ndarray]]
 # ---------------------------------------------------------------------------
 # Default calibration shape (Tier-1 2026-05-24 bump).
 #
-# The W4 production stack used to default to `n_seqs=32, seq_len=64` =
+# The W4 research stack used to default to `n_seqs=32, seq_len=64` =
 # 2048 tokens — about 128× SMALLER than GPTQ paper's `128 × 2048 = 262K`
 # tokens. The Hessian `H = X^T X` over a 768- or 3072-wide input dimension
 # is rank-deficient on that small a corpus and the GPTQ paper's `dead`
@@ -121,7 +124,7 @@ def apply_w4_awq_gptq(
     apply_bias_correction: bool = True,
     hg_cache_path: Optional[Path] = None,
 ) -> Tuple[WeightOverrides, dict]:
-    """Apply the W4 production stack to ``payload``: AWQ in place, then
+    """Apply the W4 research stack to ``payload``: AWQ in place, then
     GPTQ + AdaRound + bias correction to produce per-weight overrides.
 
     The state_dict in ``payload`` is mutated by the AWQ step (per-channel
@@ -144,9 +147,9 @@ def apply_w4_awq_gptq(
             (and effectively repeat) the tokens.
         alpha: AWQ blend exponent. ``0.40`` is the empirical sweet spot on
             GPT-2 124M (2026-05-24 sweep); canonical AWQ uses ``0.50``.
-        bitwidth: Weight bitwidth for the block matmuls. ``4`` is the W4A16
-            production target; ``3`` works but is below the quality gate
-            on this model.
+        bitwidth: Weight bitwidth for the block matmuls. ``4`` is the measured
+            W4A16 research target; ``3`` works but was below the quality gate
+            on this model. Neither is currently an RTL deployment mode.
         n_seqs, seq_len: Calibration corpus shape (default 128 × 512 =
             65,536 tokens, GPTQ-paper-regime). Older runs used 32 × 64 =
             2048 tokens; the Tier-1 bump lifts Hessian quality without

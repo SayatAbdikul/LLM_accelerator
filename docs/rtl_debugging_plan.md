@@ -1,19 +1,12 @@
 # TACCEL RTL Debugging Plan
 
-> **Status (2026-05-25):** historical debugging plan. The ISA has since grown
-> to gen-2 (19 emitted opcodes) and frozen 2026-05-19; the bottom-up debug
-> workflow this plan describes was the scaffold that ultimately closed the
-> freeze cosim gate (6+1 byte-identical). Current state-of-truth:
-> [top-level README](../README.md) and
-> [`software/docs/isa_generation_freeze.md`](../software/docs/isa_generation_freeze.md).
->
-> *(2026-07-16: two hardware facts herein are additionally OBSOLETE — the
-> shared-Port-A fixed-priority mux ("Helper > SFU > DMA > Systolic") was
-> replaced by a per-buffer fan-out + dedicated systolic Port S
-> (`porta_bus_split.md`); and `obs_forbidden_overlap_violation_q == 0` does
-> NOT imply arbitration-clean: that checker's blind spot — no DMA∧systolic
-> term — is how a silent-corruption bug lived for months
-> (`phase0_measurement.md`).)*
+> **Historical debug plan, reconciled 2026-09-03.** It describes the gen-1/ViT
+> bring-up period, not the current ISA or test suite. The shared Port-A mux was
+> replaced with per-buffer fan-out and a dedicated systolic Port S, and the
+> retired gen-1 SFU opcodes were removed from execution. Use the current
+> [RTL testbench guide](../rtl/TESTBENCHES.md),
+> [ISA specification](../software/docs/isa_spec.md), and
+> [project status](project_status.md).
 
 ## Context
 

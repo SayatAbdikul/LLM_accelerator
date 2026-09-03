@@ -35,7 +35,7 @@ class Prepared:
     # ablation in [[w4a16-phase1-quality]] shows W4 lm_head is the entire
     # PPL killer (548× difference); keep it at W8 under W4 block weights.
     lm_head_bitwidth: Optional[int] = None
-    # W4A16 production AWQ+GPTQ override map (2026-05-24 plan Phase 1.8).
+    # W4A16 research AWQ+GPTQ override map (2026-05-24 plan Phase 1.8).
     # When the preset has `apply_awq_gptq=True`, `prepare()` populates this
     # with the per-weight (int8_tensor, fp16_scales) tuples produced by
     # `w4_quant.apply_w4_awq_gptq`, and `ppl_for()` passes them to the
@@ -115,11 +115,11 @@ def prepare(
         )
     # W4A16 AWQ+GPTQ pipeline (plan Phase 1.8). Run AFTER QuaRot (so QuaRot's
     # state_dict mutations are in play for the AWQ activation capture; in
-    # practice the production W4 preset doesn't combine the two — QuaRot
+    # practice the selected W4 research preset doesn't combine the two — QuaRot
     # hurts W4 per [[w4a16-phase1-quality]] — but this ordering preserves
     # composability if someone wants to try) and BEFORE calibration (so
     # the calibration FP32 forward sees the AWQ-folded LN gamma/bias and
-    # the resulting calibration scales match the deployed activation
+    # the resulting calibration scales match the modeled activation
     # distribution).
     weight_overrides = None
     if getattr(preset, "apply_awq_gptq", False):

@@ -1,13 +1,12 @@
 # Lever E — fmax cluster (break the 3-way SFU primitive floor)
 
-> **Status note (2026-07-16):** the floor drop (32.10 → 29.64 ns), bit-exactness,
-> and cycle-neutrality below are current. Two caveats discovered later:
-> (1) the tok/s peg (9.779 → ~10.59) is on the pre-Port-A-fix machine — honest
-> current b16 is 11.055 (`docs/perf_roadmap_2026-07-16.md`); (2) "the whole-chip
-> fmax floor" is the **div/sqrt-primitive** floor — the un-pipelined `fp32_exp`
-> clouds (~490 ns single-cycle) were never in a timing report and bind first
-> until T3 step 0 integrates `fp32_exp_p18` (`docs/t0_sfu_fmax_audit.md`).
-> This lever remains exactly right — it is the step *after* exp.
+> **Historical timing experiment, reconciled 2026-09-03.** The pipelined
+> div/sqrt work described below remains in the design, and the later
+> `fp32_exp_p18` and `fp32_gelu_p33` pipelines are also integrated. The reported
+> 29–32 ns paths and 34.41 MHz peg came from standalone/partial physical runs;
+> they are not a current full-chip clock limit. A later full-lane run exceeded
+> the available 15 GB host memory. See [current project status](project_status.md)
+> for the sign-off boundary and [documentation index](README.md) for authority.
 
 **Goal:** lower the post-PNR SFU critical path (the div/sqrt-primitive fmax floor,
 29.06 ns = 34.41 MHz) by recutting the two primitives that co-bind it. Multiplicative

@@ -268,11 +268,9 @@ class ConfigTileInsn(Instruction):
     M: int = 0  # tile count (0-based encoded: value V means V+1 tiles)
     N: int = 0
     K: int = 0
-    # W4A16 plan Phase 2 (2026-05-24). False (default) → INT8 weights
-    # (current behaviour, byte-identical). True → INT4-packed weights
-    # in WBUF, unpacked to INT8 at read time via `weight_unpack.sv`
-    # (Phase 3 RTL) / `golden_model/memory.read_int4_tile` (Phase 2 golden).
-    # Encoded at bit [28] (see `C_WEIGHT_INT4_SHIFT` in opcodes.py).
+    # Python research extension. False (default) selects INT8 weights. True
+    # selects packed INT4 in bundle/golden execution. RTL does not decode bit
+    # [28], so hardware-target programs must leave this false.
     weight_int4: bool = False
     # m_exact (freeze §6 rev 2026-07-10): exact SFU row count at bits
     # [27:16] (see `C_M_EXACT_SHIFT`). 0 = full tiles ((M+1)*16 rows,

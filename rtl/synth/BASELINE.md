@@ -1,145 +1,123 @@
-# Phase-3 synth-check baseline (2026-05-21, GREEN)
+# Generic RTL synthesizability gate
 
-> **Dated baseline (2026-05).** The gate definition and the RED→GREEN story
-> are current; the **pinned cell counts and module inventory are of that
-> date** — the design has since gained the Port-S bus split, the K-split
-> RMW drain, the lever-D transpose DMA path, `m_exact`, and the pipelined
-> fp32 div/sqrt now instantiated in the SFU, so re-run `make -C
-> rtl/verilator synth-check` for current numbers rather than quoting the
-> counts below. sky130 synthesis/STA/PNR (with real timing numbers) lives
-> separately in `rtl/asic/build/` — see `rtl/asic/README.md`.
+**Current result:** green on 2026-09-02/03 after `3486c01`
+**Command:** `make -C rtl/verilator synth-check`
+**Top:** `taccel_top`
 
-Empirical baseline from `make synth-check` (yosys generic synth, no FPGA
-part). The gate now **PASSES on the FULL design** (script:
-`rtl/synth/synth_check.ys`; Makefile target: `rtl/verilator/Makefile`
-`synth-check`; tooling: yosys 0.65 + sv2v 0.0.13 via Homebrew). It was
-RED through Phases 0–2; this revision documents the GREEN landing.
+This is the current shared-core `sv2v + yosys` elaboration gate. It proves that
+the complete target-neutral RTL hierarchy parses without DPI/`real`
+dependencies and has no unresolved modules. It is deliberately not a mapped
+area/timing flow.
 
-## Current pinned hashes (post-Step-B, 2026-05-26)
+## Latest observed result
 
-After the RTL restructure (`rtl/src/` → `rtl/common/src/`, `sram_dp` →
-target-dispatch wrapper around `sram_dp_inferred`, single-source-of-truth
-filelist at `rtl/common/filelists/core.f`):
+| Metric | Value |
+|---|---:|
+| Exit code | 0 |
+| Yosys | 0.65 |
+| Wall-reported Yosys time | 83.24 s |
+| Peak memory | 1.93 GB |
+| Hierarchy cells | 54,998 |
+| Wires | 221,956 |
+| Wire bits | 4,906,697 |
+| Memories | 3 |
+| Memory bits | 3,670,016 |
+| Logfile hash | `c7b93d94cb` |
 
-| Gate | Cells | Logfile hash | Pinned |
-|---|---|---|---|
-| `synth-check` (whole design) | **38,031** | **2650883be9** | 2026-05-26 |
+The run emits many known messages from generated casts, FP constant
+conversion, and memory lowering. Exit status, hierarchy resolution, and the
+structural check are the gate. Do not treat warning count as a stable metric
+across Yosys versions.
 
-Hash history (whole-design):
+## What runs
 
-| Date | Hash | Trigger |
-|---|---|---|
-| 2026-05-21 | `97873ef4a2` | Phase-3 closeout GREEN landing |
-| 2026-05-23 | `4006339cfc` | ISA Reduction Phase B+C (gen-1 SFU opcodes stripped; commit `e7b3314`) |
-| 2026-05-26 | **`2650883be9`** | RTL restructure Step B (sram_dp wrapper adds `u_impl` hierarchy level) |
+The Verilator Makefile:
 
-The Step B hash shift is purely AST-trace lines (yosys emits one extra
-`Generating RTLIL representation for module ...` per parametrized
-instantiation of `sram_dp_inferred`). Cell count is **unchanged**:
-yosys flattens the wrapper, the dispatch is preprocessor-level
-(`\`ifdef TARGET_ASIC`), and behaviorally `sram_dp` → `sram_dp_inferred`
-is identity. Freeze cosim moneyshot 5/5 byte-identical confirms zero
-logical drift.
+1. reads `rtl/common/filelists/core.f`;
+2. expands paths relative to `rtl/common/src/`;
+3. invokes `sv2v` with `SFU_SYNTH_NO_DPI`;
+4. writes `rtl/verilator/build/synth/design_full.v`;
+5. asks Yosys to read that Verilog and run
+   `rtl/synth/synth_check.ys`.
 
-## How the gate runs
+Equivalent outline:
 
 ```sh
 sv2v -DSFU_SYNTH_NO_DPI \
-     -I rtl/common/src/include -I rtl/common/src/systolic -I rtl/common/src \
-     <CORE_SV> -w build/synth/design_full.v
-yosys -p "read_verilog build/synth/design_full.v" rtl/synth/synth_check.ys
+  -Irtl/common/src/include \
+  -Irtl/common/src/systolic \
+  <sources from rtl/common/filelists/core.f> \
+  -w rtl/verilator/build/synth/design_full.v
+
+yosys -p "read_verilog rtl/verilator/build/synth/design_full.v; \
+  script rtl/synth/synth_check.ys"
 ```
 
-`<CORE_SV>` is now derived from `rtl/common/filelists/core.f` via the
-shared `read_filelist`+`addprefix` Make pattern used by every per-target
-Makefile (Verilator, FPGA, ASIC). Adding a new core source means one line
-in `core.f`; all three build paths pick it up.
+The Yosys script currently performs:
 
-`sv2v` adapts SystemVerilog (packages, enums, `logic`, `always_ff/comb`,
-generate, `import pkg::*`) to Verilog-2005 that yosys's built-in frontend
-parses. `-DSFU_SYNTH_NO_DPI` strips the DPI imports + real-using helper
-functions + DPI call-site fallbacks from `sfu_engine.sv` and
-`blocking_helper_engine.sv`, leaving only the synth-mode datapaths.
+```text
+hierarchy -check -top taccel_top
+check
+stat
+```
 
-yosys then runs `hierarchy -check -top taccel_top; proc; opt -fast;
-check -assert; stat`.
+It does not run `proc`, `flatten`, technology mapping, ABC, placement, routing,
+or timing analysis. Earlier documentation called this “full synthesis”; the
+accurate description is full-design elaboration/synthesizability checking.
 
-## How it went from RED → GREEN
+## Definition of green
 
-Phase-3 close-out (2026-05-21, this session) eliminated the two remaining
-gaps from the original RED list:
+The target is green when:
 
-1. **DPI-C imports + `real`-typed storage** — **CLOSED** via:
-   - Phase 3.D: storage cascade `real` → `logic [31:0]` (fp32 bit-pattern)
-     for `row_data_q`, `attn_accum_q`, `gamma_q`, `beta_q`, scales,
-     `g2_maxabs_q`, `attn_row_max_q`, `attn_exp_sum_q`, `ln_debug_*_q`.
-     DPI mode wraps writes with `real_to_fp32_bits(...)` and reads with
-     `fp32_bits_to_real(...)`; synth mode reads/writes bits directly.
-   - Phase 3.E: `\`ifndef SFU_SYNTH_NO_DPI` wrap around all DPI imports
-     (13 in sfu_engine, 4 in helper), all real-using helper functions
-     (pow2_int, fp16_to_real, quantize_to_i8, gelu_real, g2_clamp_eps,
-     fp32_bits_to_real, real_to_fp32_bits, dequant_add_pack), and all DPI
-     call-site else branches (14 sites across the two modules).
-   - `g2_clamp_eps` replaced in synth path with bit-level magnitude
-     compare (positive fp32 numbers compare as unsigned int per IEEE-754
-     monotonicity).
-   - `ln_n_fp32 = real_to_fp32_bits(real'(n_elems_q))` replaced with
-     `i32_to_fp32` primitive instance.
+- every source in `core.f` converts through `sv2v`;
+- Yosys resolves the entire `taccel_top` hierarchy;
+- the synth configuration contains no reachable DPI imports or `real` state;
+- `check` completes without a fatal structural error;
+- the command exits zero.
 
-2. **2D unpacked array declarations in `systolic_*`** — **CLOSED earlier
-   Phase 3** (2026-05-21, prior milestone in same session). All 7
-   declarations across `systolic_array.sv` and `systolic_controller.sv`
-   packed as `logic [SYS_DIM-1:0][...][7:0] arr`.
+`SFU_SYNTH_NO_DPI` removes reference-only DPI code. The top-level synthesis
+configuration selects the synthesizable SFU and helper datapaths.
 
-## Gate definitions (current)
+## Source-of-truth rule
 
-- **`synth-check`** (full design, **34.76 s, rc=0**): full RTL through
-  sv2v (`-DSFU_SYNTH_NO_DPI`) + yosys `hierarchy; check; stat`. Returns 0
-  iff every module elaborates with zero `real`/DPI/system-tasks/unbounded-
-  loops. Skips `proc`/`flatten`/`opt` because sv2v emits ~17k auto-cast
-  helper functions (one per `integer'(...)` widening in the 1024-element
-  loops) that make those passes multi-minute; the synth-check definition
-  of done is "yosys elaborates," which `hierarchy` already proves.
-  Captured whole-design stat:
-  **38,174 cells**, 565,527 public wire bits, 3 memories (3,670,016
-  memory bits), 9 submodules. Cell breakdown: 2,437 $add, 2,292 $sub,
-  698 $mul, 2,294 $mux, 14,730 $lt, 4,335 $eq, etc.
+`rtl/common/filelists/core.f` is shared by Verilator, FPGA, and ASIC builds.
+Adding a compilation unit requires one filelist update. Included `.svh` files
+are tracked separately as Make prerequisites so editing them rebuilds the
+generated Verilog and test binaries.
 
-## Per-module verdict (full design, post-close-out)
+## Removed partial gate
 
-| Module | yosys+sv2v | Note |
-|---|---|---|
-| `taccel_pkg.sv` | ✅ synth-clean | package + enums + structs |
-| `decode_unit.sv` | ✅ synth-clean | |
-| `fetch_unit.sv` | ✅ synth-clean | |
-| `control_unit.sv` | ✅ synth-clean | |
-| `register_file.sv` | ✅ synth-clean | yosys "Replacing memory \\addr_regs/\\scale_regs with list of registers" — expected per-buffer inference |
-| `sram_dp.sv` | ✅ synth-clean | Step B (2026-05-26): target-dispatch wrapper. Default branch (`TARGET_SIM`/`TARGET_FPGA`) binds to `sram_dp_inferred` (`(* ram_style = "block" *)` BRAM-inferable); `TARGET_ASIC` binds to `sram_dp_macro` (defined in `rtl/asic/src/sram_dp_<pdk>.sv`) |
-| `sram_dp_inferred.sv` | ✅ synth-clean | Step B (2026-05-26): the inferred BRAM body, factored out of `sram_dp.sv`. Used by Verilator + synth-check + FPGA targets |
-| `sram_subsystem.sv` | ✅ synth-clean | |
-| `systolic_pe.sv` | ✅ synth-clean | |
-| `systolic_array.sv` | ✅ synth-clean | packed 2D array (Phase-3 refactor) |
-| `systolic_controller.sv` | ✅ synth-clean | packed 2D array (Phase-3 refactor) |
-| `dma_engine.sv` | ✅ synth-clean | |
-| `taccel_top.sv` | ✅ synth-clean | |
-| `sfu_engine.sv` | ✅ synth-clean | Phase-3.D + 3.E close-out (this session) |
-| `blocking_helper_engine.sv` | ✅ synth-clean | Phase-3.D + 3.E close-out (this session) |
-| `fp32_*.sv` (11 primitives then; 20 today — pipelined div_p2..p6 / sqrt_p2..p6 / exp_p18 added since) | ✅ synth-clean | Phase-1 library |
+The old `synth-check-ctrl` target excluded the SFU/helper and supplied
+black-box stubs. Once the complete hierarchy became green, that partial gate
+stopped proving anything stronger and drifted from the real interface. It,
+`core_ctrl.f`, `blackbox_stubs.v`, and `synth_check_ctrl.ys` were removed in
+`3486c01`.
 
-## Gate exit definition (post-close-out)
+## Relationship to ASIC and FPGA flows
 
-`make synth-check` returns **0** when:
-- yosys completes `hierarchy -top taccel_top; proc; opt -fast; check -assert; stat`
-- All modules in `$(CONTROL_SV)` parse and elaborate
-- Zero `import "DPI-C"` and zero `real`-typed signals remain reachable in
-  the synth-check build (sv2v removes them via `-DSFU_SYNTH_NO_DPI`).
+- `make -C rtl/asic yosys-asic` elaborates `taccel_top_asic` with the SKY130
+  wrapper and SRAM macro boundary.
+- `make -C rtl/fpga yosys-fpga` elaborates `taccel_top_fpga` with inferred
+  memory and platform stubs.
+- `rtl/asic/build/synth_blocks/` contains technology-mapped SKY130 synthesis
+  and OpenSTA scripts.
+- `rtl/asic/build/openroad/` contains direct per-block placement/routing
+  scripts.
 
-Per the plan, this is the FPGA-demo roadmap **Phase-2 definition of done — MET**.
+Use the ASIC scripts for cell mapping or timing conclusions. The generic gate
+does not establish fmax or physical area.
 
-## What's still informational (not gating)
+## Historical context
 
-- `flatten` skipped from `synth-check.ys` because of compile-time on the 4MB
-  SRAM arrays — area accuracy is a Phase-3 follow-on under a real FPGA part.
-- Cosim default (no `-DSFU_SYNTH_NO_DPI`) keeps DPI active for `test_sfu`
-  byte-exact regression — proves the synth and DPI paths agree byte-for-byte
-  on the gen-2 frozen bundle.
+The gate became green during the May 2026 SFU/helper migration:
+
+- FP state moved from host `real` values to 32-bit IEEE-754 bit patterns.
+- Synthesizable add/multiply/divide/sqrt/exp/GELU/conversion primitives were
+  introduced.
+- DPI imports and host-only helpers were excluded from synthesis builds.
+- unpacked array constructs were rewritten for `sv2v/Yosys` compatibility.
+
+The detailed migration ledger is preserved in
+[`PHASE2_INTEGRATION.md`](PHASE2_INTEGRATION.md) and
+[`PHASE3_CLOSEOUT.md`](PHASE3_CLOSEOUT.md). Their old cell counts and removed
+partial-gate commands are historical only.

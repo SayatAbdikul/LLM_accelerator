@@ -1,13 +1,12 @@
 # GPT-2 INT8 PTQ — Phase A Diagnostic Findings
 
-> **Status (2026-07-16): historical diagnostic; its conclusion came true.**
-> The "codegen/ISA extensions" this doc said were required are exactly what
-> shipped as the gen-2 FP32 sub-layer (dynamic per-tile `MAX_ABS_REDUCE_FP32`
-> + `DEQUANT_ACCUM_FP32_SCALED`), and the production W8A16+QuaRot preset now
-> sits at 56.23 PPL vs the 6,174 measured here. Note: the three "committed
-> and ready" diagnostic tools it cites (`diagnose_per_layer_error.py`,
-> `diagnose_activation_outliers.py`, `tabulate_ablation_results.py`) no
-> longer exist in `tools/`.
+> **Historical PTQ diagnostic, reconciled 2026-09-03.** Its conclusion led to
+> the gen-2 FP32 sub-layer, including dynamic per-tile max-abs scaling and
+> scaled dequantization. The W8A16+QuaRot result cited later in this report is a
+> dated experiment, not a currently rerun quality gate. The three diagnostic
+> scripts named below were removed. For the maintained software path, see
+> [`../CODEBASE.md`](../CODEBASE.md) and the project
+> [status](../../docs/project_status.md).
 
 Status: **Phase A complete (2026-05-12).** The 115× FP32 gap on the production
 preset `output_aware_mlp_lm_head_0_11_pc_full_bc` (6,174 PPL at 257-tok /

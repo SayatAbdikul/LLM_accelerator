@@ -1,16 +1,13 @@
 # The Port-A bus split — fixing the silent matmul corruption
 
 **Status: LANDED.** This is the correctness fix Phase 0 called for
-(`docs/phase0_measurement.md`). It is not primarily a performance lever, though it
-does legitimately recover the 7.33% that the DMA‖Systolic overlap was "buying" by
-throwing away results.
+([`phase0_measurement.md`](phase0_measurement.md)).
 
-*(2026-07-16 note: the 10.145 tok/s below was the honest number **at this fix**;
-T1 items 1+2 have since taken b16 to **11.055** and b1 to **1.880** —
-`docs/t1_overlap_items.md`. Separately, the "29.64 ns SFU floor" used as the
-fmax yardstick here is contingent on exp pipelining — `docs/t0_sfu_fmax_audit.md`;
-this doc's own conclusion, that the Port-A path is ~10× under any plausible floor,
-is unaffected.)*
+> **Historical landing report, reconciled 2026-09-03.** The bus split remains
+> implemented. The 10.145/11.055/1.880 token rates and 29.64 ns comparison
+> below are campaign-era values based on the old partial timing peg, not current
+> sign-off. See [current project status](project_status.md) and
+> [the documentation index](README.md).
 
 ---
 

@@ -1,10 +1,8 @@
 # FPGA build entry.
 #
-# Step D (2026-05-26 RTL restructure): provides a `yosys-fpga` elaboration
-# smoke gate. NO target FPGA part is picked yet, so full Vivado/Quartus/
-# nextpnr integration is deferred. When a part is picked, add a `vivado`
-# (or `quartus`/`nextpnr`) target here, point at the shared filelist below,
-# and add a constraints file under constraints/.
+# Provides a `yosys-fpga` structural elaboration gate. No target FPGA part or
+# board is selected; there is no Vivado/Quartus/nextpnr project, constraint
+# set, real clock block, or functional memory controller.
 #
 # Usage:
 #   make yosys-fpga   — elaboration smoke gate; must elaborate cleanly

@@ -1,14 +1,14 @@
 # Lever H — B=32 batching (and the weight-corruption bug it exposed)
 
-**Result: +3.45% (9.729 → 10.065 tok/s), not the roadmap's +15–20%.**
-**Batching is MINED OUT.** The commit is still worth having: it fixed a
-pre-existing, silent weight-corruption bug and proved the RTL correct at
+**Historical result: +3.45% (9.729 → 10.065 tok/s), not the roadmap's
++15–20%.** The landing also fixed a weight-corruption bug and exercised
 `M_pad > SYSTOLIC_DIM`.
 
-> **Status note (2026-07-16):** the conclusion (mined out; do not pursue B=64;
-> sys scales exactly 2×) is current and structural. The absolute tok/s are on
-> the pre-Port-A-fix machine (`daef072`); honest current b16 is 11.055
-> (`docs/perf_roadmap_2026-07-16.md`). B=32 has not been re-measured post-fix.
+> **Reconciled 2026-09-03.** The B=32 conclusion and measurements below remain
+> historical; B=32 has not been re-measured on the latest code. Absolute token
+> rates use the old 34.41 MHz peg and predate the Port-A correction. The latest
+> maintained reference is b16: 49,998,042 cycles per 16-token step. See
+> [current project status](project_status.md) and [documentation index](README.md).
 
 ## Measured — 124M, pos-510 (ctx-511), mode-1 honest-BW, 34.41 MHz
 

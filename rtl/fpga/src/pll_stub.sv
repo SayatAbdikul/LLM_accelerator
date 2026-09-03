@@ -5,9 +5,9 @@
 //   - Intel/Altera Quartus: ALTPLL / IOPLL
 //   - Lattice nextpnr / Yosys: EHXPLLL (ECP5) etc.
 //
-// Step D (2026-05-26 RTL restructure): stub-only so the FPGA wrapper
-// elaborates without a vendor IP environment. Does not provide clock
-// multiplication, phase shift, or jitter cleanup.
+// Stub-only so the FPGA wrapper elaborates without a vendor IP environment.
+// Does not provide clock multiplication, phase shift, locking, or jitter
+// cleanup.
 
 `ifndef PLL_STUB_SV
 `define PLL_STUB_SV

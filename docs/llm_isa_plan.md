@@ -1,16 +1,12 @@
 # Plan: Extend TACCEL ISA to Run nanoGPT (ISA v1.1)
 
-> **Status (2026-05-25):** historical planning document. The ISA spec it
-> describes (v1.1) has since been superseded by the gen-2 freeze — see
-> [`software/docs/isa_generation_freeze.md`](../software/docs/isa_generation_freeze.md)
-> for the current normative contract. Kept for context on how the decoder
-> ops grew on top of the ViT base.
->
-> *(2026-07-16 additions: two of its calls were later overtaken — speculative
-> decoding, a stated non-goal, landed as an opt-in host track
-> (`lever_b3_specdec.md`); and chunked prefill shipped WITHOUT the
-> `key_col_base` field this plan deemed necessary — per-row global-position
-> masking sufficed (`lever_i_serving.md`).)*
+> **Historical plan, reconciled 2026-09-03.** The v1.1 proposal below was
+> superseded by the implemented gen-2 W8A16 contract. Speculative decoding
+> later landed as an optional host/compiler path, and chunked prefill shipped
+> without the proposed `key_col_base` field. Use the current
+> [ISA specification](../software/docs/isa_spec.md),
+> [freeze record](../software/docs/isa_generation_freeze.md), and
+> [project status](project_status.md); retain this file only as design history.
 
 Status: refined implementation plan, incorporating Rev 0-2 critiques plus the
 Rev 3-6 correctness, runtime-contract, striping, and verification-gate reviews.

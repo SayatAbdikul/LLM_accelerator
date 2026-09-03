@@ -1,10 +1,9 @@
 # ASIC build entry.
 #
-# Step E (2026-05-26 RTL restructure): provides a `yosys-asic` elaboration
-# smoke gate. OpenLane integration is deferred — `make openlane` prints a
-# pointer message and exits non-zero. Default PDK = sky130A; IHP130 path
-# can be added by dropping a sibling `sram_dp_ihp130.sv` and switching
-# PDK_SRAM_FILE.
+# Provides a `yosys-asic` wrapper-elaboration gate. `make openlane` is an
+# intentionally failing placeholder: no production OpenLane configuration,
+# macro set, or portable PDK binding has been integrated. `sky130A` currently
+# selects only the behavioral SRAM compatibility module below.
 #
 # Usage:
 #   make yosys-asic              — elaboration smoke gate
@@ -67,19 +66,17 @@ $(SV2V_OUT): $(CORE_SV) $(ASIC_SV)
 
 # Elaboration smoke gate. Yosys must resolve the full taccel_top_asic
 # hierarchy with zero unresolved modules. ABC/synth passes are NOT run
-# — full physical closure happens in OpenLane once a PDK is installed.
+# — full physical closure requires a separately integrated physical flow.
 yosys-asic: $(SV2V_OUT)
 	@echo "--- yosys ASIC elaboration smoke gate (taccel_top_asic; PDK=$(PDK)) ---"
 	yosys -p "read_verilog $(SV2V_OUT); hierarchy -check -top taccel_top_asic; check; stat"
 
-# OpenLane integration is deferred until a PDK is installed locally
-# (sky130A via volare, or IHP130 via OpenIHP). Stub prints a pointer
-# message and exits non-zero so this target is not mistakenly green.
+# OpenLane integration is not implemented. The stub exits non-zero so this
+# target cannot be mistaken for a successful physical-design run.
 openlane:
-	@echo "OpenLane integration is not implemented yet — pending PDK install."
+	@echo "OpenLane integration is not implemented."
 	@echo "  Selected PDK: $(PDK)"
-	@echo "  When ready, populate openlane/config.tcl and libs/<pdk>/ pointers,"
-	@echo "  then replace this target with a real OpenLane runscript."
+	@echo "  Add a portable PDK/macro configuration and a real run script first."
 	@exit 1
 
 clean:

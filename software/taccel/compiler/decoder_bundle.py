@@ -18,8 +18,8 @@ from .tiler import pad_dim
 #
 # Used by `_layout_weights` to serialize per-channel INT4 weight tensors as
 # packed bytes (2 nibbles per byte) into the bundle DRAM blob, and by the
-# golden model `read_int4_tile` to unpack at consumption time. The RTL
-# `weight_unpack.sv` module (Phase 3) MUST mirror this layout exactly.
+# golden model `read_int4_tile` to unpack at consumption time. RTL does not
+# currently consume CONFIG_TILE.weight_int4 or unpack this layout.
 #
 # Canonical layout (the spec; do not change without updating golden + RTL):
 #   * Input: signed INT4 values in [-8, +7], stored as `np.int8` (the values

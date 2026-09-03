@@ -7,7 +7,8 @@
 //   - Intel: UniPHY / DDR4-EMIF
 //   - Open source: LiteDRAM
 //
-// Step D (2026-05-26 RTL restructure): elaboration-only placeholder.
+// Elaboration-only placeholder. It accepts requests but never asserts RVALID
+// or BVALID, so any real read or write transaction stalls permanently.
 
 `ifndef DDR_AXI_STUB_SV
 `define DDR_AXI_STUB_SV
