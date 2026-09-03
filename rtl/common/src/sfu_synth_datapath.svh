@@ -581,53 +581,21 @@
   // chains of FALSE critical path in any full-SFU STA. `synth_scale1_bits`
   // went with them (its last consumer was the deleted ATTN V cone below).
 
-  // Opcode-aware SOFTMAX visibility predicate. The F_G2_SM_* sub-FSM tests
-  // sm_visible_w in every state, replacing the inline kt-comparison so the
-  // same sub-FSM handles all softmax-family opcodes (gen-1 + gen-2 + ATTN).
-  //   OP_SOFTMAX:               all iters visible (gen-1, unmasked)
-  //   OP_MASKED_SOFTMAX:        attn_visible(row, iter) (gen-1, gen-1 mask)
-  //   OP_MASKED_SOFTMAX_FP32:   iter_s <= sm_keep_through_q (gen-2 causal)
-  //   OP_SOFTMAX_ATTNV:         all iters visible (gen-1 ATTN unmasked)
-  //   OP_MASKED_SOFTMAX_ATTNV:  attn_visible(row, iter) (gen-1 ATTN mask)
+  // Only gen-2 MASKED_SOFTMAX_FP32 reaches this sub-FSM. Visibility is the
+  // causal prefix selected by CONFIG_ATTN.
   logic sm_visible_w;
-  always_comb begin
-    case (opcode_q)
-      OP_SOFTMAX:                sm_visible_w = 1'b1;
-      OP_MASKED_SOFTMAX:         sm_visible_w = attn_visible(row_idx_q, integer'(iter_idx_q));
-      OP_MASKED_SOFTMAX_FP32:    sm_visible_w =
-          ($signed({6'b0, iter_idx_q}) <= $signed({1'b0, sm_keep_through_q[15:0]}));
-      OP_SOFTMAX_ATTNV:          sm_visible_w = 1'b1;
-      OP_MASKED_SOFTMAX_ATTNV:   sm_visible_w = attn_visible(row_idx_q, integer'(iter_idx_q));
-      default:                   sm_visible_w = 1'b0;
-    endcase
-  end
+  assign sm_visible_w =
+      ($signed({6'b0, iter_idx_q}) <= $signed({1'b0, sm_keep_through_q[15:0]}));
   // Collect-indexed visibility for the software-pipelined F_G2_SM_OUT_NORM: the
   // element whose quotient emerges on sm_norm_w is sm_coll_q (= iter_idx_q-7),
   // NOT the feed element iter_idx_q, so its output mask must be evaluated at
-  // sm_coll_q. Mirrors sm_visible_w exactly with sm_coll_q. Only gen-2
-  // OP_MASKED_SOFTMAX_FP32 reaches mode-1 here; the gen-1 arms are decode-illegal
-  // (dead) but kept for elaboration parity with sm_visible_w.
+  // sm_coll_q, using the same causal prefix predicate.
   logic sm_visible_coll_w;
-  always_comb begin
-    case (opcode_q)
-      OP_SOFTMAX:                sm_visible_coll_w = 1'b1;
-      OP_MASKED_SOFTMAX:         sm_visible_coll_w = attn_visible(row_idx_q, integer'(sm_coll_q));
-      OP_MASKED_SOFTMAX_FP32:    sm_visible_coll_w =
-          ($signed({6'b0, sm_coll_q}) <= $signed({1'b0, sm_keep_through_q[15:0]}));
-      OP_SOFTMAX_ATTNV:          sm_visible_coll_w = 1'b1;
-      OP_MASKED_SOFTMAX_ATTNV:   sm_visible_coll_w = attn_visible(row_idx_q, integer'(sm_coll_q));
-      default:                   sm_visible_coll_w = 1'b0;
-    endcase
-  end
-  // Phase-3.B ATTN: bound is k_elems_q (column count) instead of n_elems_q.
-  // Bound mux keeps the F_G2_SM_* sub-FSM iteration logic single-source.
+  assign sm_visible_coll_w =
+      ($signed({6'b0, sm_coll_q}) <= $signed({1'b0, sm_keep_through_q[15:0]}));
+
   logic [15:0] sm_iter_bound_w;
-  always_comb begin
-    case (opcode_q)
-      OP_SOFTMAX_ATTNV, OP_MASKED_SOFTMAX_ATTNV: sm_iter_bound_w = k_elems_q;
-      default:                                   sm_iter_bound_w = n_elems_q;
-    endcase
-  end
+  assign sm_iter_bound_w = n_elems_q;
 
   // Runtime-bounded MAX/EXPSUM walk for gen-2 causal masked softmax. For
   // OP_MASKED_SOFTMAX_FP32 the visible set is EXACTLY the contiguous prefix

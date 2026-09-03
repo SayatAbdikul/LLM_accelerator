@@ -1,7 +1,7 @@
 """Encode instructions to bytes and decode bytes to instructions."""
 import struct
 from .opcodes import (
-    Opcode, InsnFormat, OPCODE_FORMAT,
+    Opcode, InsnFormat, OPCODE_FORMAT, RETIRED_OPCODES,
     OPCODE_SHIFT, OPCODE_MASK,
     R_SRC1_BUF_SHIFT, R_SRC1_OFF_SHIFT, R_SRC2_BUF_SHIFT, R_SRC2_OFF_SHIFT,
     R_DST_BUF_SHIFT, R_DST_OFF_SHIFT, R_SREG_SHIFT, R_FLAGS_SHIFT,
@@ -19,8 +19,7 @@ from .opcodes import (
 from .instructions import (
     Instruction, RTypeInsn, MTypeInsn, BufCopyInsn, ATypeInsn, ConfigTileInsn,
     ConfigAttnInsn, SetScaleInsn, SyncInsn, NopInsn, HaltInsn,
-    MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn, SoftmaxInsn, LayernormInsn, GeluInsn,
-    SoftmaxAttnVInsn, MaskedSoftmaxInsn, MaskedSoftmaxAttnVInsn, DequantAddInsn,
+    MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn, DequantAddInsn,
     LoadInsn, StoreInsn, SetAddrLoInsn, SetAddrHiInsn,
     # W8A32 R-type extension (M1)
     DequantAccumFp32Insn, QuantFp32Int8Insn, VaddFp32Insn,
@@ -36,12 +35,6 @@ _R_TYPE_CLASSES = {
     Opcode.REQUANT_PC: RequantPcInsn,
     Opcode.SCALE_MUL: ScaleMulInsn,
     Opcode.VADD: VaddInsn,
-    Opcode.SOFTMAX: SoftmaxInsn,
-    Opcode.LAYERNORM: LayernormInsn,
-    Opcode.GELU: GeluInsn,
-    Opcode.SOFTMAX_ATTNV: SoftmaxAttnVInsn,
-    Opcode.MASKED_SOFTMAX: MaskedSoftmaxInsn,
-    Opcode.MASKED_SOFTMAX_ATTNV: MaskedSoftmaxAttnVInsn,
     Opcode.DEQUANT_ADD: DequantAddInsn,
     # W8A32 R-type extension (M1)
     Opcode.DEQUANT_ACCUM_FP32: DequantAccumFp32Insn,
@@ -141,6 +134,8 @@ def decode(data: bytes) -> Instruction:
     word = struct.unpack(">Q", data)[0]
     opcode_val = (word >> OPCODE_SHIFT) & OPCODE_MASK
     opcode = Opcode(opcode_val)
+    if opcode in RETIRED_OPCODES:
+        raise ValueError(f"Opcode {opcode.name} (0x{opcode_val:02x}) is retired")
     fmt = OPCODE_FORMAT[opcode]
 
     if fmt == InsnFormat.R_TYPE:

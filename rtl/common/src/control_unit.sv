@@ -165,13 +165,8 @@ module control_unit
   logic        masked_attn_valid_now;
   logic        is_masked_sfu_op_w;
 
-  assign is_masked_sfu_op_w = (insn.opcode == OP_MASKED_SOFTMAX) ||
-                              (insn.opcode == OP_MASKED_SOFTMAX_ATTNV) ||
-                              (insn.opcode == OP_MASKED_SOFTMAX_FP32);
-  assign attn_softmax_key_cols_w =
-      (insn.opcode == OP_MASKED_SOFTMAX_ATTNV) ?
-      (({5'h0, tile_k} + 15'd1) << 4) :
-      (({5'h0, tile_n} + 15'd1) << 4);
+  assign is_masked_sfu_op_w = (insn.opcode == OP_MASKED_SOFTMAX_FP32);
+  assign attn_softmax_key_cols_w = (({5'h0, tile_n} + 15'd1) << 4);
   assign attn_valid_kv_len_ext_w = {3'h0, attn_valid_kv_len};
 
   assign config_attn_valid_now = tile_valid &&
@@ -477,12 +472,6 @@ module control_unit
               // Stage D SFU ops are architecturally asynchronous. Dispatch once
               // the serialized Stage D resource slot is clear, then advance PC
               // immediately and rely on SYNC(100) for ordering.
-              OP_SOFTMAX,
-              OP_MASKED_SOFTMAX,
-              OP_SOFTMAX_ATTNV,
-              OP_MASKED_SOFTMAX_ATTNV,
-              OP_LAYERNORM,
-              OP_GELU,
               OP_VADD_FP32,
               OP_LAYERNORM_FP32,
               OP_GELU_FP32,
@@ -649,13 +638,12 @@ module control_unit
             OP_REQUANT, OP_REQUANT_PC, OP_SCALE_MUL, OP_VADD, OP_DEQUANT_ADD:
               helper_dispatch = tile_valid && helper_ready_now;
 
-            OP_SOFTMAX, OP_SOFTMAX_ATTNV, OP_LAYERNORM, OP_GELU,
             OP_VADD_FP32, OP_LAYERNORM_FP32, OP_GELU_FP32,
             OP_DEQUANT_ACCUM_FP32, OP_QUANT_FP32_INT8,
             OP_DEQUANT_ACCUM_FP32_SCALED, OP_MAX_ABS_REDUCE_FP32:
               sfu_dispatch = tile_valid && sfu_ready_now;
 
-            OP_MASKED_SOFTMAX, OP_MASKED_SOFTMAX_ATTNV, OP_MASKED_SOFTMAX_FP32:
+            OP_MASKED_SOFTMAX_FP32:
               sfu_dispatch = masked_attn_valid_now && sfu_ready_now;
 
             default: ;

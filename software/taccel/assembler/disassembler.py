@@ -86,8 +86,7 @@ class Disassembler:
             dst = _buf_ref(insn.dst_buf, insn.dst_off)
             parts = [src1, src2, dst]
             if insn.sreg > 0 or op in (Opcode.REQUANT, Opcode.SCALE_MUL,
-                                        Opcode.SOFTMAX, Opcode.LAYERNORM, Opcode.GELU,
-                                        Opcode.SOFTMAX_ATTNV, Opcode.DEQUANT_ADD):
+                                        Opcode.DEQUANT_ADD):
                 parts.append(f"S{insn.sreg}")
             if insn.flags:
                 parts.append(f"acc={insn.flags}")

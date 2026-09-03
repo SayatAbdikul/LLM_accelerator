@@ -1,6 +1,5 @@
 """IR → ISA instruction sequence code generator."""
 import re
-import struct
 import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
 from ..assembler.assembler import RelocationSite, RuntimeConfigAttnSite, RuntimePatchSite
@@ -8,22 +7,16 @@ from ..isa.opcodes import (
     ABUF_SIZE,
     ACCUM_SIZE,
     BUF_ABUF,
-    BUF_WBUF,
-    BUF_ACCUM,
     WBUF_SIZE,
 )
 from ..isa.instructions import (
-    MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn, SoftmaxInsn, LayernormInsn, GeluInsn,
-    DequantAddInsn,
-    SoftmaxAttnVInsn, ConfigAttnInsn, MaskedSoftmaxInsn, MaskedSoftmaxAttnVInsn,
-    LoadInsn, StoreInsn, BufCopyInsn, SetAddrLoInsn, SetAddrHiInsn,
-    ConfigTileInsn, SetScaleInsn, SyncInsn, NopInsn, HaltInsn, Instruction,
+    BufCopyInsn, SetAddrLoInsn, SetAddrHiInsn, SyncInsn, HaltInsn, Instruction,
 )
 from .ir import IRNode, IRGraph
-from .tiler import tile_matmul, tile_qkt, tile_strip_mine, pad_dim, TILE
+from .tiler import pad_dim, TILE
 from .memory_alloc import MemoryAllocator, Allocation
-from .model_config import ModelConfig, deit_tiny_config
-from .kv_cache import KVCacheLayout, normalize_kv_kind
+from .model_config import ModelConfig
+from .kv_cache import KVCacheLayout
 
 UNIT = 16
 STAGE4_M_TILE = TILE
@@ -1013,10 +1006,6 @@ class CodeGenerator:
     def _emit_gelu(self, node: IRNode):
         from .emit.sfu import emit_gelu
         emit_gelu(self, node)
-
-    def _emit_gelu_from_dram_temp(self, node: IRNode):
-        from .emit.sfu import emit_gelu_from_dram_temp
-        emit_gelu_from_dram_temp(self, node)
 
     def _emit_layernorm(self, node: IRNode):
         from .emit.sfu import emit_layernorm

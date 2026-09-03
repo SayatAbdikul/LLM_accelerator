@@ -1,7 +1,7 @@
 # TACCEL design source list — single source of truth.
 #
 # Paths in this file are relative to rtl/common/src/. Each per-target
-# Makefile (Verilator, cocotb, future FPGA/ASIC) prepends its own SRC_DIR
+# Makefile (Verilator, FPGA, and ASIC) prepends its own SRC_DIR
 # before passing the list to its tool. Lines starting with `#` and blank
 # lines are stripped.
 #

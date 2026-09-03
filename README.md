@@ -52,7 +52,7 @@ LLM_accelerator/
 │   │   ├── golden_model/           # Bit-accurate Python simulator (content-pinned)
 │   │   └── runtime/                # HostRunner (decode loop, chunked prefill, spec-dec),
 │   │                               #   PPL eval, calibration, W4 path, disk caches
-│   ├── tests/                      # 58 pytest files: freeze cosim, batched decode,
+│   ├── tests/                      # 56 pytest files: freeze cosim, batched decode,
 │   │                               #   spec-dec inertness pin, ISA/codegen byte-identity, PPL
 │   ├── tools/                      # CLIs: bench_decode_cycles, fast_gate_b16,
 │   │                               #   profile_decode_step, rtl_cosim, evaluate_gpt2_perplexity,
@@ -72,8 +72,6 @@ LLM_accelerator/
 │   │   └── filelists/              # core.f — the single source-of-truth filelist
 │   ├── verilator/                  # Native C++ benches + run_program harness (primary sim);
 │   │                               #   run_program_synth = the perf-measurement build
-│   ├── cocotb/                     # Python-driven ISA benches — DORMANT since
-│   │                               #   2026-05-26, superseded by rtl/verilator
 │   ├── asic/                       # ASIC wrappers, sky130 SRAM macro stub, synth + STA +
 │   │                               #   OpenROAD per-block PNR flows (build/synth_blocks,
 │   │                               #   build/openroad), OpenLane config
@@ -158,9 +156,6 @@ make -C rtl/verilator all             # decode/control/dma/helpers/sfu/systolic 
 make -C rtl/verilator test_sfu_synth  # mode-1 SFU datapath gate (11 cases)
 make -C rtl/verilator test_fp32_div_p6 test_fp32_sqrt_p6 test_fp32_exp_p18
                                       # pipelined-primitive bit-exactness gates
-# NOTE: `make -C rtl/cocotb test_all SIM=verilator` is NOT runnable — cocotb is
-# not a declared dependency, and the tier has been dormant since 2026-05-26
-# (superseded by the Verilator benches above). See rtl/TESTBENCHES.md.
 ```
 
 Bench guide: [`rtl/TESTBENCHES.md`](rtl/TESTBENCHES.md).

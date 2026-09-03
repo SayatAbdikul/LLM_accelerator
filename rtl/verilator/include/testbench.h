@@ -388,30 +388,6 @@ inline uint64_t VADD(int src1_buf, int src1_off, int src2_buf, int src2_off,
                      int dst_buf, int dst_off, int sreg, int flags = 0) {
     return R_TYPE(0x0D, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags);
 }
-inline uint64_t SOFTMAX(int src1_buf, int src1_off, int dst_buf, int dst_off,
-                        int sreg, int flags = 0) {
-    return R_TYPE(0x0E, src1_buf, src1_off, 0, 0, dst_buf, dst_off, sreg, flags);
-}
-inline uint64_t MASKED_SOFTMAX(int src1_buf, int src1_off, int dst_buf, int dst_off,
-                               int sreg, int flags = 0) {
-    return R_TYPE(0x15, src1_buf, src1_off, 0, 0, dst_buf, dst_off, sreg, flags);
-}
-inline uint64_t LAYERNORM(int src1_buf, int src1_off, int src2_buf, int src2_off,
-                          int dst_buf, int dst_off, int sreg, int flags = 0) {
-    return R_TYPE(0x0F, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags);
-}
-inline uint64_t GELU(int src1_buf, int src1_off, int dst_buf, int dst_off,
-                     int sreg, int flags = 0) {
-    return R_TYPE(0x10, src1_buf, src1_off, 0, 0, dst_buf, dst_off, sreg, flags);
-}
-inline uint64_t SOFTMAX_ATTNV(int src1_buf, int src1_off, int src2_buf, int src2_off,
-                              int dst_buf, int dst_off, int sreg, int flags = 0) {
-    return R_TYPE(0x12, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags);
-}
-inline uint64_t MASKED_SOFTMAX_ATTNV(int src1_buf, int src1_off, int src2_buf, int src2_off,
-                                     int dst_buf, int dst_off, int sreg, int flags = 0) {
-    return R_TYPE(0x16, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags);
-}
 inline uint64_t DEQUANT_ADD(int src1_buf, int src1_off, int src2_buf, int src2_off,
                             int dst_buf, int dst_off, int sreg, int flags = 0) {
     return R_TYPE(0x13, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags);

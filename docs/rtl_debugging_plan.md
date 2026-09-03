@@ -39,10 +39,10 @@ make -C rtl/verilator test_systolic_array_chained
 make -C rtl/verilator test_systolic_chained
 ```
 
-### 1b. cocotb integration tests (top-level ISA-visible behavior)
+### 1b. Program-level integration tests
 ```
-make -C rtl/cocotb test_all SIM=verilator
-make -C rtl/cocotb test_systolic_chained SIM=verilator
+make -C rtl/verilator run_program
+python -m pytest software/tests/test_compare_rtl_golden.py -v
 ```
 
 ### 1c. Software golden model tests
@@ -264,10 +264,10 @@ Scale registers read combinationally. Helper/SFU latches scale on dispatch cycle
    ```
    make -C rtl/verilator test_decode test_control test_dma test_helpers test_sfu test_systolic test_systolic_array_chained test_systolic_chained
    ```
-2. All cocotb tests pass:
+2. Program-level RTL/golden integration passes:
    ```
-   make -C rtl/cocotb test_all SIM=verilator
-   make -C rtl/cocotb test_systolic_chained SIM=verilator
+   make -C rtl/verilator run_program
+   python -m pytest software/tests/test_compare_rtl_golden.py -v
    ```
 3. `obs_forbidden_overlap_violation_q == 0` in every test run
 4. Golden model comparison passes:

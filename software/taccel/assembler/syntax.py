@@ -3,8 +3,7 @@ import re
 from typing import Optional, Tuple, List
 from ..isa.opcodes import Opcode, BUF_ABUF, BUF_WBUF, BUF_ACCUM
 from ..isa.instructions import (
-    MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn, SoftmaxInsn, LayernormInsn, GeluInsn,
-    SoftmaxAttnVInsn, MaskedSoftmaxInsn, MaskedSoftmaxAttnVInsn, DequantAddInsn,
+    MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn, DequantAddInsn,
     LoadInsn, StoreInsn, BufCopyInsn, SetAddrLoInsn, SetAddrHiInsn,
     ConfigTileInsn, ConfigAttnInsn, SetScaleInsn, SyncInsn, NopInsn, HaltInsn, Instruction,
 )
@@ -31,14 +30,8 @@ MNEMONIC_MAP = {
     "REQUANT_PC": Opcode.REQUANT_PC,
     "SCALE_MUL": Opcode.SCALE_MUL,
     "VADD": Opcode.VADD,
-    "SOFTMAX": Opcode.SOFTMAX,
-    "LAYERNORM": Opcode.LAYERNORM,
-    "GELU": Opcode.GELU,
-    "SOFTMAX_ATTNV": Opcode.SOFTMAX_ATTNV,
     "DEQUANT_ADD": Opcode.DEQUANT_ADD,
     "CONFIG_ATTN": Opcode.CONFIG_ATTN,
-    "MASKED_SOFTMAX": Opcode.MASKED_SOFTMAX,
-    "MASKED_SOFTMAX_ATTNV": Opcode.MASKED_SOFTMAX_ATTNV,
 }
 
 
@@ -175,9 +168,8 @@ def parse_line(line: str) -> Tuple[Optional[str], Optional[Instruction]]:
         params = _parse_kv_or_positional_bufcopy(args_str)
         return label, BufCopyInsn(**params)
 
-    elif opcode in (Opcode.MATMUL, Opcode.REQUANT, Opcode.REQUANT_PC, Opcode.SCALE_MUL, Opcode.VADD,
-                    Opcode.SOFTMAX, Opcode.LAYERNORM, Opcode.GELU, Opcode.SOFTMAX_ATTNV,
-                    Opcode.MASKED_SOFTMAX, Opcode.MASKED_SOFTMAX_ATTNV, Opcode.DEQUANT_ADD):
+    elif opcode in (Opcode.MATMUL, Opcode.REQUANT, Opcode.REQUANT_PC,
+                    Opcode.SCALE_MUL, Opcode.VADD, Opcode.DEQUANT_ADD):
         return label, _parse_r_type(opcode, args_str)
 
     raise SyntaxError(f"Unhandled mnemonic: {mnemonic}")
@@ -218,10 +210,6 @@ def _parse_r_type(opcode: Opcode, args_str: str) -> Instruction:
         Opcode.MATMUL: MatmulInsn, Opcode.REQUANT: RequantInsn,
         Opcode.REQUANT_PC: RequantPcInsn,
         Opcode.SCALE_MUL: ScaleMulInsn, Opcode.VADD: VaddInsn,
-        Opcode.SOFTMAX: SoftmaxInsn, Opcode.LAYERNORM: LayernormInsn,
-        Opcode.GELU: GeluInsn, Opcode.SOFTMAX_ATTNV: SoftmaxAttnVInsn,
-        Opcode.MASKED_SOFTMAX: MaskedSoftmaxInsn,
-        Opcode.MASKED_SOFTMAX_ATTNV: MaskedSoftmaxAttnVInsn,
         Opcode.DEQUANT_ADD: DequantAddInsn,
     }
 

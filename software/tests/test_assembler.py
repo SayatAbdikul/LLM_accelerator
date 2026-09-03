@@ -215,15 +215,13 @@ class TestDisassembler:
         assert "REQUANT_PC" in text
         assert "WBUF[0x0004]" in text
 
-    def test_softmax_attnv_roundtrip(self):
-        prog = Assembler().assemble(
-            "SOFTMAX_ATTNV src1=ACCUM[0], src2=ABUF[4], dst=WBUF[8], sreg=4, flags=0"
-        )
-        insn = decode(prog.get_instruction_bytes(0))
-        assert insn.opcode.name == "SOFTMAX_ATTNV"
-        text = Disassembler().disassemble(prog)
-        assert "SOFTMAX_ATTNV" in text
-        assert "ABUF[0x0004]" in text
+    @pytest.mark.parametrize("mnemonic", [
+        "SOFTMAX", "LAYERNORM", "GELU", "SOFTMAX_ATTNV",
+        "MASKED_SOFTMAX", "MASKED_SOFTMAX_ATTNV",
+    ])
+    def test_retired_sfu_mnemonics_are_rejected(self, mnemonic):
+        with pytest.raises(SyntaxError, match=f"Unknown mnemonic: {mnemonic}"):
+            Assembler().assemble(mnemonic)
 
     def test_config_attn_roundtrip(self):
         prog = Assembler().assemble(
@@ -239,20 +237,6 @@ class TestDisassembler:
         assert "query_row_base=16" in text
         assert "valid_kv_len=31" in text
         assert "mode=0b11" in text
-
-    def test_masked_softmax_assembly_roundtrip(self):
-        source = "\n".join([
-            "CONFIG_ATTN query_row_base=0, valid_kv_len=16, mode=0b10",
-            "MASKED_SOFTMAX src1=ACCUM[0], src2=ABUF[0], dst=WBUF[16], sreg=2, flags=0",
-            "MASKED_SOFTMAX_ATTNV src1=ACCUM[0], src2=ABUF[4], dst=WBUF[8], sreg=4, flags=0",
-        ])
-        prog1 = Assembler().assemble(source)
-        text = Disassembler().disassemble(prog1)
-        lines = [line.split('] ', 1)[1] for line in text.split('\n')]
-        prog2 = Assembler().assemble('\n'.join(lines))
-        assert prog1.instructions == prog2.instructions
-        assert "MASKED_SOFTMAX" in text
-        assert "MASKED_SOFTMAX_ATTNV" in text
 
     def test_dequant_add_roundtrip(self):
         prog = Assembler().assemble(

@@ -7,7 +7,7 @@ Architecture overview
 Three execution units operate behind an in-order issue stage:
   - DMA   : LOAD / STORE (DRAM ↔ SRAM)
   - Systolic : MATMUL (INT8×INT8 → INT32, 16×16 tiled)
-  - SFU   : SOFTMAX / LAYERNORM / GELU (FP32 datapath, INT8 I/O *and* FP32 I/O)
+  - SFU   : generation-2 FP32/FP16 LayerNorm, GELU, and masked softmax
 
 The programmer inserts SYNC instructions with a 3-bit resource mask to
 enforce ordering between units.  Without SYNC, the hardware may overlap
@@ -71,10 +71,9 @@ second N entries of the src2 blob.
 
 Reserved fields / opcodes
 -------------------------
-- After M2.5-A, the entire 5-bit opcode space (0x00–0x1F) is in use.
-  No opcodes are reserved. Future ISA extensions must reuse a slot
-  via a CONFIG-style prefix, expand the opcode field, or relocate an
-  existing rarely-used encoding.
+- Retired generation-1 SFU slots 0x0E, 0x0F, 0x10, 0x12, 0x15, and 0x16
+  remain named so old binaries can be diagnosed, but cannot be assembled,
+  decoded into executable instructions, or run by the golden model.
 - CONFIG_ATTN reserved bits [32:0] must be zero.
 - M-TYPE stride_log2 [6:3] is reserved and must be zero.
 - M-TYPE flags [2:0] are reserved and must be zero.
@@ -123,6 +122,16 @@ class Opcode(IntEnum):
     MAX_ABS_REDUCE_FP32 = 0x1F
 
 
+RETIRED_OPCODES = frozenset({
+    Opcode.SOFTMAX,
+    Opcode.LAYERNORM,
+    Opcode.GELU,
+    Opcode.SOFTMAX_ATTNV,
+    Opcode.MASKED_SOFTMAX,
+    Opcode.MASKED_SOFTMAX_ATTNV,
+})
+
+
 class InsnFormat(IntEnum):
     R_TYPE = 0
     M_TYPE = 1
@@ -148,15 +157,9 @@ OPCODE_FORMAT = {
     Opcode.REQUANT: InsnFormat.R_TYPE,
     Opcode.SCALE_MUL: InsnFormat.R_TYPE,
     Opcode.VADD: InsnFormat.R_TYPE,
-    Opcode.SOFTMAX: InsnFormat.R_TYPE,
-    Opcode.LAYERNORM: InsnFormat.R_TYPE,
-    Opcode.GELU: InsnFormat.R_TYPE,
     Opcode.REQUANT_PC: InsnFormat.R_TYPE,
-    Opcode.SOFTMAX_ATTNV: InsnFormat.R_TYPE,
     Opcode.DEQUANT_ADD: InsnFormat.R_TYPE,
     Opcode.CONFIG_ATTN: InsnFormat.ATTN_TYPE,
-    Opcode.MASKED_SOFTMAX: InsnFormat.R_TYPE,
-    Opcode.MASKED_SOFTMAX_ATTNV: InsnFormat.R_TYPE,
     # W8A32 R-type extension (M1)
     Opcode.DEQUANT_ACCUM_FP32: InsnFormat.R_TYPE,
     Opcode.QUANT_FP32_INT8: InsnFormat.R_TYPE,

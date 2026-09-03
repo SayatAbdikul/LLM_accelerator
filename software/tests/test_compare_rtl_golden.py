@@ -55,18 +55,12 @@ from taccel.runtime.tiny_fixture import (
 # --------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GOLDEN_MODEL_PATH = REPO_ROOT / "software" / "taccel" / "golden_model" / "simulator.py"
-# git-blob SHA-1 of simulator.py. Freeze §6 REVISION 2026-07-08 (W4
-# tile_config extension): commit 2ae4535 added the weight_int4 flag to
-# the simulator tile_config + packed-INT4 read paths. Gen-2 W8 semantics
-# untouched (flag defaults off): all gen-2 .raw fixtures regenerated
-# byte-identical, only the meta.json sha-stamps changed — a source
-# change, so the content pin is re-pinned per freeze §6.
-# Prior: 131d3ef1a6009519976cf99baf9157a434e67f6f (§6 REVISION 2026-05-17,
-# P6g / Option B, task #110: explicit 0x18 non-finite contract, also
-# byte-stable). Earlier: 7746e65598961ac8430f8eeece45d7ec976584cd
-# (pre-P6g; freeze commit aa9a9c0). New commit SHA is set by the user on
-# external commit; this blob hash is the authoritative enforced pin.
-FROZEN_GOLDEN_BLOB_SHA = "029605f58c56002c06848fa5a18e42ec69513409"
+# git-blob SHA-1 of simulator.py. Freeze §6 REVISION 2026-09-02 removes
+# execution paths for six gen-1 SFU opcodes that RTL has rejected since
+# 2026-05-23. Supported gen-2 semantics are unchanged: regeneration changed
+# zero raw payloads (only meta.json source stamps). The blob hash remains the
+# authoritative enforced pin; the commit SHA is filled by the external commit.
+FROZEN_GOLDEN_BLOB_SHA = "cc1bc64f34bf7b5a53a5760bcd500dca10cb8080"
 
 # freeze §4.5: the conformance bundle is the GPT-2 W8A16 weight_only_int8_quarot
 # generation. Its FP32 sub-layer ops are the gen-2 ISA this freeze covers.
@@ -131,7 +125,7 @@ def test_frozen_golden_sha_pin():
     actual = _git_blob_sha1(GOLDEN_MODEL_PATH)
     assert actual == FROZEN_GOLDEN_BLOB_SHA, (
         "FROZEN GOLDEN DRIFT — gen-2 conformance is undefined.\n"
-        f"  expected blob {FROZEN_GOLDEN_BLOB_SHA} (freeze §6 rev 2026-07-10, m_exact)\n"
+        f"  expected blob {FROZEN_GOLDEN_BLOB_SHA} (freeze §6 rev 2026-09-02)\n"
         f"  actual   blob {actual}\n"
         f"  file: {GOLDEN_MODEL_PATH}\n"
         "simulator.py changed since the freeze. Per freeze §6 this REQUIRES "

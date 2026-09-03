@@ -1,46 +1,25 @@
 # RTL Testbench Guide
 
-RTL verification is standardized on **native Verilator C++ benches** — fast,
-deterministic unit and subsystem checks. This is the live layer; everything in
-"Running Tests" below that starts `make -C rtl/verilator` is expected to pass.
-
-> **The cocotb tier is DORMANT (assessed 2026-07-17) — do not treat it as a gate.**
-> `cocotb` is not declared in `software/requirements.txt` and is not installed, so
-> `make -C rtl/cocotb ...` cannot run here. It has not been touched since
-> 2026-05-26 (`e150095`) and therefore predates ~20 RTL-changing commits — the
-> `m_exact` CONFIG_TILE extension, the Port-A/Port-S split, the lever-D transpose
-> LOAD, the ACCUM preclear deletion and `div_p6`/`sqrt_p6`. Whether these benches
-> still pass is UNKNOWN, because nothing runs them.
->
-> It is also fully superseded: every cocotb module has a live Verilator
-> counterpart (`test_dma`, `test_decode`+`test_control`, `test_helpers`,
-> `test_sfu`, `test_systolic`, `test_systolic_chained`), and the Verilator tier is
-> far richer (32 targets incl. `test_fp32_exp_p18` and `test_systolic_qkt_*`).
-> The cocotb references below are retained as a map of what it once covered.
-> Either declare + refresh the tier, or retire it — but do not read it as coverage.
+RTL verification is standardized on **native Verilator C++ benches**: fast,
+deterministic unit, subsystem, and program-level checks. Everything in
+"Running Tests" below is expected to pass.
 
 ## Bench Ownership
 
 - Front-end / control:
   - `rtl/verilator/test_decode.cpp`
   - `rtl/verilator/test_control.cpp`
-  - `rtl/cocotb/test_fetch_decode.py`
 - Data movement:
   - `rtl/verilator/test_dma.cpp`
-  - `rtl/cocotb/test_dma.py`
 - Local compute:
   - `rtl/verilator/test_helpers.cpp`
   - `rtl/verilator/test_sfu.cpp`
-  - `rtl/cocotb/test_helpers.py`
-  - `rtl/cocotb/test_sfu.py`
 - Matrix compute:
   - `rtl/verilator/test_systolic.cpp`
   - `rtl/verilator/test_systolic_array_chained.cpp`
   - `rtl/verilator/test_systolic_chained.cpp`
   - `rtl/verilator/test_accum_snapshot_readback.cpp`
-  - `rtl/verilator/test_systolic_qkt*.cpp` (attention-shape replay/padded/history)
-  - `rtl/cocotb/test_systolic.py`
-  - `rtl/cocotb/test_systolic_chained.py`
+  - `rtl/verilator/test_systolic_qkt*.cpp` (attention-shape basic/replay/padded)
 - Synthesizable-datapath (mode-1) gates — the chip's real datapath, vs the DPI reference:
   - `make -C rtl/verilator test_sfu_synth` (SFU fp32 datapath, 11 cases)
   - `make -C rtl/verilator test_helpers_synth`, `test_sfu_helper_synth`
@@ -62,11 +41,6 @@ deterministic unit and subsystem checks. This is the live layer; everything in
   - Use `tbutil::SimHarness` for reset/start/run flow.
   - Use `tbutil::sram_*` helpers for direct SRAM inspection and preload.
   - Use `AXI4SlaveModel` fault injection for read/write error cases.
-- cocotb benches should build on `rtl/cocotb/utils/testbench.py`.
-  - Use `setup_test()` and `wait_halt()` for the standard reset/start flow.
-  - Use `pattern()` and `set_addr()` for common program/data setup.
-  - Use `read_accum_16x16()` / `read_accum_32x32()` for top-level MATMUL scoreboarding.
-
 ## Required Shape For New Benches
 
 Each new RTL feature should add:
@@ -89,11 +63,6 @@ When a bug is fixed, prefer the smallest regression at the lowest useful layer f
   - `make -C rtl/verilator test_systolic_array_chained`
   - `make -C rtl/verilator test_systolic_chained`
   - `make -C rtl/verilator run_program`
-- cocotb:
-  - `make -C rtl/cocotb test_all SIM=verilator`
-  - `make -C rtl/cocotb test_dma SIM=verilator`
-  - `make -C rtl/cocotb test_sfu SIM=verilator`
-  - `make -C rtl/cocotb test_systolic_chained SIM=verilator`
 
 ## Program Sign-Off
 

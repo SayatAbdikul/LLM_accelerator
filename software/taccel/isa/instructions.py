@@ -74,36 +74,6 @@ class VaddInsn(RTypeInsn):
 
 
 @dataclass
-class SoftmaxInsn(RTypeInsn):
-    opcode: Opcode = field(default=Opcode.SOFTMAX, init=False)
-
-
-@dataclass
-class MaskedSoftmaxInsn(RTypeInsn):
-    opcode: Opcode = field(default=Opcode.MASKED_SOFTMAX, init=False)
-
-
-@dataclass
-class LayernormInsn(RTypeInsn):
-    opcode: Opcode = field(default=Opcode.LAYERNORM, init=False)
-
-
-@dataclass
-class GeluInsn(RTypeInsn):
-    opcode: Opcode = field(default=Opcode.GELU, init=False)
-
-
-@dataclass
-class SoftmaxAttnVInsn(RTypeInsn):
-    opcode: Opcode = field(default=Opcode.SOFTMAX_ATTNV, init=False)
-
-
-@dataclass
-class MaskedSoftmaxAttnVInsn(RTypeInsn):
-    opcode: Opcode = field(default=Opcode.MASKED_SOFTMAX_ATTNV, init=False)
-
-
-@dataclass
 class DequantAddInsn(RTypeInsn):
     opcode: Opcode = field(default=Opcode.DEQUANT_ADD, init=False)
 

@@ -9,7 +9,7 @@ uses SYNC with a 3-bit resource mask to enforce ordering:
 
     SYNC 0b001   — wait for DMA   (LOAD / STORE)
     SYNC 0b010   — wait for Systolic (MATMUL)
-    SYNC 0b100   — wait for SFU   (SOFTMAX / LAYERNORM / GELU)
+    SYNC 0b100   — wait for SFU
     SYNC 0b111   — wait for all
 
 In the golden model SYNC is a no-op since everything is already sequential.
@@ -18,9 +18,8 @@ units drain.
 
 Illegal opcodes
 ---------------
-Decoding a reserved opcode (0x14–0x1F) or malformed instruction raises
-IllegalOpcodeError.  RTL behaviour: the processor halts (equivalent to
-executing HALT) and sets a fault status register.
+Decoding a retired or malformed instruction raises an error. RTL halts and
+sets a fault status register for the same instruction.
 """
 import numpy as np
 from typing import Any, Dict, Optional, Set
@@ -31,8 +30,7 @@ from ..isa.instructions import (
     NopInsn, HaltInsn, SyncInsn, ConfigTileInsn, SetScaleInsn,
     SetAddrLoInsn, SetAddrHiInsn, LoadInsn, StoreInsn, BufCopyInsn,
     MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn,
-    SoftmaxInsn, LayernormInsn, GeluInsn, SoftmaxAttnVInsn,
-    ConfigAttnInsn, MaskedSoftmaxInsn, MaskedSoftmaxAttnVInsn, DequantAddInsn,
+    ConfigAttnInsn, DequantAddInsn,
     # W8A32 extension (M1)
     DequantAccumFp32Insn, QuantFp32Int8Insn, VaddFp32Insn,
     LayernormFp32Insn, GeluFp32Insn, SoftmaxFp32Insn, MaskedSoftmaxFp32Insn,
@@ -42,10 +40,6 @@ from ..isa.instructions import (
 from .state import MachineState
 from . import memory as mem
 from .systolic import execute_matmul
-from .sfu import (
-    execute_layernorm, execute_softmax, execute_gelu, execute_softmax_attnv,
-    execute_masked_softmax, execute_masked_softmax_attnv,
-)
 from .dma import execute_load, execute_store, execute_buf_copy
 from ..utils.int8_ops import clip_int8, clip_int32
 
@@ -71,7 +65,6 @@ class Simulator:
     def __init__(self, state: MachineState = None):
         self.state = state or MachineState()
         self.trace_manifest: Dict[int, list] = {}
-        self.runtime_twin_specs: Dict[int, Dict[str, object]] = {}
         self.trace_enabled = False
         self.trace_node_names: Optional[Set[str]] = None
         self.trace_tensors: Dict[str, np.ndarray] = {}
@@ -89,15 +82,6 @@ class Simulator:
         self.state.pc = program.entry_point
         self.state.halted = False
         self.trace_manifest = getattr(program, "trace_manifest", {}) or {}
-        self.runtime_twin_specs = {}
-        compiler_manifest = getattr(program, "compiler_manifest", {}) or {}
-        runtime_twin = compiler_manifest.get("runtime_twin_uniform", {}) or {}
-        for kind in ("softmax", "gelu"):
-            for pc_key, spec in (runtime_twin.get(kind, {}) or {}).items():
-                spec_dict = dict(spec or {})
-                spec_dict["kind"] = kind
-                self.runtime_twin_specs[int(pc_key)] = spec_dict
-        self.state.runtime_twin_specs = dict(self.runtime_twin_specs)
         self.trace_tensors = {}
         self.trace_raw_tensors = {}
         self.trace_saturation = {}
@@ -173,8 +157,6 @@ class Simulator:
         self.bundle = bundle
         self.program = bundle
         self.trace_manifest = {}
-        self.runtime_twin_specs = {}
-        self.state.runtime_twin_specs = {}
         self._reset_trace_state()
         self._reset_volatile_execution_state(bundle.prefill_pc)
 
@@ -533,32 +515,6 @@ class Simulator:
             self._exec_vadd(insn)
         elif op == Opcode.DEQUANT_ADD:
             self._exec_dequant_add(insn)
-        elif op == Opcode.SOFTMAX:
-            execute_softmax(self.state, insn)
-        elif op == Opcode.MASKED_SOFTMAX:
-            if self.state.tile_config is None:
-                raise ConfigError("CONFIG_TILE not set")
-            self._validate_attn_context_for_key_cols((self.state.tile_config[1] + 1) * 16)
-            execute_masked_softmax(self.state, insn)
-        elif op == Opcode.SOFTMAX_ATTNV:
-            virtual_payloads = execute_softmax_attnv(self.state, insn)
-            self._virtual_trace_payloads = {
-                node_name: dict(payload)
-                for node_name, payload in (virtual_payloads or {}).items()
-            }
-        elif op == Opcode.MASKED_SOFTMAX_ATTNV:
-            if self.state.tile_config is None:
-                raise ConfigError("CONFIG_TILE not set")
-            self._validate_attn_context_for_key_cols((self.state.tile_config[2] + 1) * 16)
-            virtual_payloads = execute_masked_softmax_attnv(self.state, insn)
-            self._virtual_trace_payloads = {
-                node_name: dict(payload)
-                for node_name, payload in (virtual_payloads or {}).items()
-            }
-        elif op == Opcode.LAYERNORM:
-            execute_layernorm(self.state, insn)
-        elif op == Opcode.GELU:
-            execute_gelu(self.state, insn)
         # ----- W8A32 extension (Phase 3 (c.1), M1) -----
         elif op == Opcode.DEQUANT_ACCUM_FP32:
             self._exec_dequant_accum_fp32(insn)

@@ -25,8 +25,8 @@ SYSTOLIC_DIR := $(SRC_DIR)/systolic
 ASIC_DIR     := src
 BUILD_DIR    := build
 
-# Shared filelist — single source of truth for the core RTL. Same one
-# Verilator, cocotb, and the FPGA Makefile all consume.
+# Shared filelist — single source of truth for the core RTL. The same one
+# Verilator and the FPGA Makefile consume.
 CORE_F        := ../common/filelists/core.f
 read_filelist  = $(shell grep -E -v '^[[:space:]]*(\#|$$)' $(1))
 CORE_SV       := $(addprefix $(SRC_DIR)/, $(call read_filelist,$(CORE_F)))

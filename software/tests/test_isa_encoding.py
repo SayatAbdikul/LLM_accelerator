@@ -3,13 +3,12 @@ import pytest
 import struct
 import numpy as np
 from taccel.isa import encode, decode
-from taccel.isa.opcodes import Opcode, BUF_ABUF, BUF_WBUF, BUF_ACCUM
+from taccel.isa.opcodes import Opcode, RETIRED_OPCODES, BUF_ABUF, BUF_WBUF, BUF_ACCUM
 from taccel.isa.instructions import (
     NopInsn, HaltInsn, SyncInsn, ConfigTileInsn, SetScaleInsn,
     SetAddrLoInsn, SetAddrHiInsn, LoadInsn, StoreInsn, BufCopyInsn,
     MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn,
-    SoftmaxInsn, LayernormInsn, GeluInsn, SoftmaxAttnVInsn,
-    ConfigAttnInsn, MaskedSoftmaxInsn, MaskedSoftmaxAttnVInsn, DequantAddInsn,
+    ConfigAttnInsn, DequantAddInsn,
 )
 
 
@@ -243,51 +242,6 @@ class TestRTypeInstructions:
                                    dst_buf=BUF_ACCUM, dst_off=0))
         assert dec.src1_buf == BUF_ACCUM
 
-    def test_softmax(self):
-        dec = round_trip(SoftmaxInsn(src1_buf=BUF_ABUF, src1_off=0,
-                                      dst_buf=BUF_ABUF, dst_off=0, sreg=6))
-        assert dec.sreg == 6
-
-    def test_masked_softmax(self):
-        dec = round_trip(MaskedSoftmaxInsn(src1_buf=BUF_ACCUM, src1_off=0,
-                                           dst_buf=BUF_WBUF, dst_off=64, sreg=6))
-        assert dec.src1_buf == BUF_ACCUM
-        assert dec.dst_buf == BUF_WBUF
-        assert dec.sreg == 6
-
-    def test_layernorm(self):
-        dec = round_trip(LayernormInsn(src1_buf=BUF_ABUF, src1_off=0,
-                                        src2_buf=BUF_WBUF, src2_off=0,
-                                        dst_buf=BUF_ABUF, dst_off=0, sreg=4))
-        assert dec.src2_buf == BUF_WBUF
-
-    def test_gelu(self):
-        dec = round_trip(GeluInsn(src1_buf=BUF_ABUF, src1_off=0,
-                                   dst_buf=BUF_ABUF, dst_off=0, sreg=2))
-        assert dec.sreg == 2
-
-    def test_softmax_attnv(self):
-        dec = round_trip(SoftmaxAttnVInsn(
-            src1_buf=BUF_ACCUM, src1_off=0,
-            src2_buf=BUF_ABUF, src2_off=64,
-            dst_buf=BUF_WBUF, dst_off=128, sreg=4,
-        ))
-        assert dec.src1_buf == BUF_ACCUM
-        assert dec.src2_buf == BUF_ABUF
-        assert dec.dst_buf == BUF_WBUF
-        assert dec.sreg == 4
-
-    def test_masked_softmax_attnv(self):
-        dec = round_trip(MaskedSoftmaxAttnVInsn(
-            src1_buf=BUF_ACCUM, src1_off=0,
-            src2_buf=BUF_ABUF, src2_off=64,
-            dst_buf=BUF_WBUF, dst_off=128, sreg=4,
-        ))
-        assert dec.src1_buf == BUF_ACCUM
-        assert dec.src2_buf == BUF_ABUF
-        assert dec.dst_buf == BUF_WBUF
-        assert dec.sreg == 4
-
     def test_dequant_add(self):
         dec = round_trip(DequantAddInsn(
             src1_buf=BUF_ACCUM, src1_off=0,
@@ -313,8 +267,8 @@ class TestRTypeInstructions:
                                      dst_buf=BUF_ACCUM, dst_off=0))
         assert dec.src2_off == 16383
 
-    def test_all_20_instruction_types(self):
-        """Ensure all 20 instruction types can be round-tripped."""
+    def test_all_generation2_instruction_types(self):
+        """Ensure every supported base instruction type can be round-tripped."""
         insns = [
             NopInsn(), HaltInsn(), SyncInsn(resource_mask=7),
             ConfigTileInsn(M=0, N=0, K=0),
@@ -329,15 +283,17 @@ class TestRTypeInstructions:
             RequantPcInsn(src1_buf=2, src1_off=0, src2_buf=1, src2_off=0, dst_buf=0, dst_off=0, sreg=0),
             ScaleMulInsn(src1_buf=2, src1_off=0, dst_buf=2, dst_off=0, sreg=0),
             VaddInsn(src1_buf=0, src1_off=0, src2_buf=0, src2_off=0, dst_buf=0, dst_off=0),
-            SoftmaxInsn(src1_buf=0, src1_off=0, dst_buf=0, dst_off=0, sreg=0),
-            SoftmaxAttnVInsn(src1_buf=2, src1_off=0, src2_buf=0, src2_off=0, dst_buf=1, dst_off=0, sreg=0),
             DequantAddInsn(src1_buf=2, src1_off=0, src2_buf=0, src2_off=0, dst_buf=0, dst_off=0, sreg=0),
-            LayernormInsn(src1_buf=0, src1_off=0, src2_buf=1, src2_off=0, dst_buf=0, dst_off=0, sreg=0),
-            GeluInsn(src1_buf=0, src1_off=0, dst_buf=0, dst_off=0, sreg=0),
         ]
-        assert len(insns) == 20, f"Expected 20 instructions, got {len(insns)}"
+        assert len(insns) == 16
         for insn in insns:
             round_trip(insn)
+
+    @pytest.mark.parametrize("opcode", sorted(RETIRED_OPCODES, key=int))
+    def test_retired_sfu_opcodes_are_not_decodable(self, opcode):
+        raw = struct.pack(">Q", int(opcode) << 59)
+        with pytest.raises(ValueError, match="is retired"):
+            decode(raw)
 
 
 class TestValidation:

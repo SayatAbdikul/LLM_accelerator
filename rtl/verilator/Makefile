@@ -44,14 +44,10 @@ VFLAGS += -I$(SRC_DIR)
 PKG           := $(INCLUDE_DIR)/taccel_pkg.sv
 DECODE_SV     := $(PKG) $(SRC_DIR)/decode_unit.sv $(TB_DIR)/tb_decode_unit.sv
 
-# Step C (2026-05-26 RTL restructure): single source of truth for the
-# design source list lives at rtl/common/filelists/core.f (full design)
-# and rtl/common/filelists/core_ctrl.f (control-plane subset, used by
-# synth-check-ctrl). Each entry is a path relative to rtl/common/src/;
-# the read_filelist function strips comments + blanks and the addprefix
-# call prepends $(SRC_DIR) to produce a CWD-correct Make list.
+# Single source of truth for the design source list. Each entry is relative to
+# rtl/common/src/; read_filelist strips comments and blanks before addprefix
+# produces a CWD-correct Make list.
 CORE_F        := ../common/filelists/core.f
-CORE_CTRL_F   := ../common/filelists/core_ctrl.f
 read_filelist  = $(shell grep -E -v '^[[:space:]]*(\#|$$)' $(1))
 
 # The `include-d .svh siblings are NOT in core.f (they are not compilation
@@ -65,21 +61,19 @@ read_filelist  = $(shell grep -E -v '^[[:space:]]*(\#|$$)' $(1))
 # thing it claimed to check.
 SVH_SRCS      := $(wildcard $(SRC_DIR)/*.svh)
 CONTROL_SV    := $(addprefix $(SRC_DIR)/, $(call read_filelist,$(CORE_F)))
-CTRL_SV       := $(addprefix $(SRC_DIR)/, $(call read_filelist,$(CORE_CTRL_F)))
-# Use these in PREREQUISITE position; CONTROL_SV/CTRL_SV stay the verilator
-# SOURCE lists (passing a .svh to verilator as a compilation unit fails).
+# Use this in prerequisite position; CONTROL_SV stays the Verilator source
+# list (passing a .svh to Verilator as a compilation unit fails).
 CONTROL_DEPS  := $(CONTROL_SV) $(SVH_SRCS)
-CTRL_DEPS     := $(CTRL_SV) $(SVH_SRCS)
 
 .PHONY: all run_program run_program_synth run_program_noovl test_decode test_control test_dma test_helpers test_sfu \
         test_systolic test_systolic_array_chained test_systolic_chained \
         test_systolic_query test_systolic_qkt \
         test_systolic_qkt_basic test_systolic_qkt_replay \
-        test_systolic_qkt_padded test_systolic_qkt_history \
+        test_systolic_qkt_padded \
         test_addr_raw_hazard \
         test_accum_snapshot_readback test_fp32_add test_fp32_div test_fp32_div_p3 test_fp32_div_p4 test_fp32_div_p5 test_fp32_div_p6 test_fp32_sqrt test_fp32_sqrt_p3 test_fp32_sqrt_p4 test_fp32_sqrt_p6 test_fp32_exp_p18 test_fp32_gelu_p33 \
         test_sfu_synth test_helpers_synth \
-        test_sfu_helper_synth synth-check synth-check-ctrl clean
+        test_sfu_helper_synth synth-check clean
 # R7 (2026-05-23): test_fp32_*_pipe targets removed. The 12 fp32_*_pipe.sv
 # wrappers and their 12 _pipe.cpp standalone gates were dead code from the
 # abandoned "pipelined-first" direction. The combinational cores (fp32_add.sv,
@@ -353,7 +347,7 @@ test_systolic: $(BUILD_DIR)/test_systolic/Vtaccel_top
 # -----------------------------------------------------------------------
 # test_systolic_array_chained: unit-test the chained mesh directly
 # -----------------------------------------------------------------------
-$(BUILD_DIR)/test_systolic_array_chained/Vsystolic_array: \ $(TB_HEADERS)
+$(BUILD_DIR)/test_systolic_array_chained/Vsystolic_array: $(TB_HEADERS) \
 		$(PKG) $(SRC_DIR)/systolic/systolic_pe.sv $(SRC_DIR)/systolic/systolic_array.sv \
 		test_systolic_array_chained.cpp
 	mkdir -p $(BUILD_DIR)/test_systolic_array_chained
@@ -682,12 +676,12 @@ test_systolic_query: $(BUILD_DIR)/test_systolic_query/Vtaccel_top
 	$(BUILD_DIR)/test_systolic_query/Vtaccel_top
 
 # -----------------------------------------------------------------------
-# test_systolic_qkt_{basic,replay,padded,history}: R4-split QK^T regressions.
+# test_systolic_qkt_{basic,replay,padded}: R4-split QK^T regressions.
 # The pre-split monolithic test_systolic_qkt.cpp (3,672 LOC, 31 tests) was
-# divided 2026-05-22 into four topic-based translation units. Shared helpers
+# divided into topic-based translation units. Shared helpers
 # live in include/systolic_qkt_utils.h. Each split file builds its own
 # Verilator-wrapped binary; the aggregate `test_systolic_qkt` target runs
-# all four for backward-compat with scripts that invoked the old name.
+# all current splits for backward compatibility with the old target name.
 # -----------------------------------------------------------------------
 define QKT_SPLIT_RULES
 $$(BUILD_DIR)/test_systolic_qkt_$(1)/Vtaccel_top: $$(CONTROL_SV) test_systolic_qkt_$(1).cpp include/systolic_qkt_utils.h
@@ -710,11 +704,10 @@ endef
 $(eval $(call QKT_SPLIT_RULES,basic))
 $(eval $(call QKT_SPLIT_RULES,replay))
 $(eval $(call QKT_SPLIT_RULES,padded))
-$(eval $(call QKT_SPLIT_RULES,history))
 
-# Aggregate target — runs all four split binaries.
+# Aggregate target — runs all current split binaries.
 test_systolic_qkt: test_systolic_qkt_basic test_systolic_qkt_replay \
-                   test_systolic_qkt_padded test_systolic_qkt_history
+                   test_systolic_qkt_padded
 
 # -----------------------------------------------------------------------
 # test_addr_raw_hazard: BUG1 reproducer — SET_ADDR_HI → LOAD RAW hazard.
@@ -740,13 +733,9 @@ test_addr_raw_hazard: $(BUILD_DIR)/test_addr_raw_hazard/Vtaccel_top
 	$(BUILD_DIR)/test_addr_raw_hazard/Vtaccel_top
 
 # -----------------------------------------------------------------------
-# synth-check: yosys generic-synthesis gate (no FPGA part). Proves the
-# design elaborates to synthesizable logic with zero behavioral (real/DPI)
-# constructs — the FPGA-demo roadmap Phase-2 definition of done. Single
-# source of truth for the file list is CONTROL_SV (the taccel_top design
-# set, tb/ excluded). Currently EXPECTED to fail on sfu_engine.sv +
-# blocking_helper_engine.sv (real storage + DPI-C); that red is the work
-# list. Goes green when the synthesizable-RTL effort is complete.
+# synth-check: yosys generic-synthesis gate (no FPGA part). The full design,
+# including the synthesizable SFU and helper datapaths, must elaborate through
+# the shared core.f source list.
 # -----------------------------------------------------------------------
 SYNTH_DIR    := ../synth
 SYNTH_SCRIPT := $(SYNTH_DIR)/synth_check.ys
@@ -763,26 +752,6 @@ $(SV2V_OUT): $(CONTROL_SV)
 synth-check: $(SV2V_OUT)
 	@echo "--- yosys generic synthesizability gate (taccel_top) ---"
 	yosys -p "read_verilog $(SV2V_OUT); script $(SYNTH_SCRIPT)"
-
-# -----------------------------------------------------------------------
-# synth-check-ctrl: control-plane synthesizability gate (Phase-3).
-# Reads CONTROL_SV MINUS sfu_engine.sv + blocking_helper_engine.sv, with
-# those stubbed via rtl/synth/blackbox_stubs.v. Proves the entire control
-# plane (decode/fetch/control/regfile/sram/systolic/dma/top) elaborates
-# and structurally synthesizes through yosys. Lightweight pipeline
-# (proc/flatten/opt-fast/check/stat) — skips ABC tech-mapping for speed.
-# -----------------------------------------------------------------------
-SV2V_CTRL := $(SYNTH_BUILD)/design_ctrl.v
-# CTRL_SV is defined alongside CONTROL_SV at the top of this Makefile, both
-# derived from rtl/common/filelists/ via read_filelist (Step C, 2026-05-26).
-
-$(SV2V_CTRL): $(CTRL_SV)
-	mkdir -p $(SYNTH_BUILD)
-	sv2v -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) $(CTRL_SV) -w $(SV2V_CTRL)
-
-synth-check-ctrl: $(SV2V_CTRL)
-	@echo "--- yosys control-plane synth-check (SFU/helper blackboxed) ---"
-	yosys -p "read_verilog -lib $(SYNTH_DIR)/blackbox_stubs.v; read_verilog $(SV2V_CTRL); script $(SYNTH_DIR)/synth_check_ctrl.ys"
 
 # -----------------------------------------------------------------------
 clean:

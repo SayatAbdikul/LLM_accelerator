@@ -36,7 +36,6 @@ from .kv import (
 from .matmul import emit_attn_v, emit_concat_heads, emit_qkt
 from .sfu import (
     emit_gelu,
-    emit_gelu_from_dram_temp,
     emit_layernorm,
     emit_scale_mul,
     emit_softmax,
@@ -54,7 +53,6 @@ __all__ = [
     "emit_dma_store",
     "emit_embedding_lookup",
     "emit_gelu",
-    "emit_gelu_from_dram_temp",
     "emit_kv_load",
     "emit_kv_store",
     "emit_layernorm",

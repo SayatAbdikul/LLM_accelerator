@@ -24,7 +24,6 @@ filelist at `rtl/common/filelists/core.f`):
 | Gate | Cells | Logfile hash | Pinned |
 |---|---|---|---|
 | `synth-check` (whole design) | **38,031** | **2650883be9** | 2026-05-26 |
-| `synth-check-ctrl` (ctrl plane) | **5,120** | **cd84afa9a9** | 2026-05-26 |
 
 Hash history (whole-design):
 
@@ -53,8 +52,8 @@ yosys -p "read_verilog build/synth/design_full.v" rtl/synth/synth_check.ys
 
 `<CORE_SV>` is now derived from `rtl/common/filelists/core.f` via the
 shared `read_filelist`+`addprefix` Make pattern used by every per-target
-Makefile (Verilator, cocotb, FPGA, ASIC). Adding a new core source means
-one line in `core.f`; all four build paths pick it up.
+Makefile (Verilator, FPGA, ASIC). Adding a new core source means one line
+in `core.f`; all three build paths pick it up.
 
 `sv2v` adapts SystemVerilog (packages, enums, `logic`, `always_ff/comb`,
 generate, `import pkg::*`) to Verilog-2005 that yosys's built-in frontend
@@ -90,9 +89,7 @@ gaps from the original RED list:
 2. **2D unpacked array declarations in `systolic_*`** — **CLOSED earlier
    Phase 3** (2026-05-21, prior milestone in same session). All 7
    declarations across `systolic_array.sv` and `systolic_controller.sv`
-   packed as `logic [SYS_DIM-1:0][...][7:0] arr`. `rtl/synth/blackbox_stubs.v`
-   updated to parameterize the SFU/helper stubs (`SFU_SYNTH_MODE` /
-   `HELPER_SYNTH_MODE`) for the lightweight control-plane variant.
+   packed as `logic [SYS_DIM-1:0][...][7:0] arr`.
 
 ## Gate definitions (current)
 
@@ -103,17 +100,10 @@ gaps from the original RED list:
   helper functions (one per `integer'(...)` widening in the 1024-element
   loops) that make those passes multi-minute; the synth-check definition
   of done is "yosys elaborates," which `hierarchy` already proves.
-  Procedural decode is exercised by `synth-check-ctrl` on the control
-  plane (5 s with SFU/helper blackboxed). Captured whole-design stat:
+  Captured whole-design stat:
   **38,174 cells**, 565,527 public wire bits, 3 memories (3,670,016
   memory bits), 9 submodules. Cell breakdown: 2,437 $add, 2,292 $sub,
   698 $mul, 2,294 $mux, 14,730 $lt, 4,335 $eq, etc.
-- **`synth-check-ctrl`** (control plane lightweight, 5.03 s): sfu_engine
-  and blocking_helper_engine **blackboxed** via `rtl/synth/blackbox_stubs.v`.
-  Proves the surrounding control plane elaborates cleanly in isolation;
-  uses `proc; flatten; opt -fast; check -assert; stat`. Captured stat:
-  5,111 cells / 6,799 wires (290,408 wire bits) / 3 memories (3,670,016
-  memory bits — DRAM-backed SRAM models) for the control plane.
 
 ## Per-module verdict (full design, post-close-out)
 

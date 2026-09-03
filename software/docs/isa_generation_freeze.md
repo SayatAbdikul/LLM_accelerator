@@ -265,6 +265,12 @@ To make golden-vs-RTL cosim possible on the production path:
    within the same or a later commit, so the pin is enforced at the
    content level: the SHA-1 git-blob hash of
    `software/taccel/golden_model/simulator.py` is
+   `cc1bc64f34bf7b5a53a5760bcd500dca10cb8080` (**freeze §6 REVISION
+   2026-09-02, retired gen-1 SFU cleanup**: the simulator and assembler no
+   longer execute or emit the six gen-1 SFU opcodes that RTL has rejected
+   since 2026-05-23. Regenerating all ten gen-2 cases changed zero `.raw`
+   payloads; only the `meta.json` source stamps changed. Supported gen-2
+   semantics are therefore byte-identical). Prior pin
    `029605f58c56002c06848fa5a18e42ec69513409` (**freeze §6 REVISION
    2026-07-10, m_exact CONFIG_TILE extension**: CONFIG_TILE bits [27:16]
    now carry `m_exact`, an exact SFU row count (0 = full tiles, the
@@ -504,11 +510,11 @@ To make golden-vs-RTL cosim possible on the production path:
      branches remain as dead-but-elaborated code — deferred to a future
      cosim-gated cleanup pass); `attn_accum_q[]` (used by gen-2 VADD);
      `row_i32_addr_w` (used by gen-2 0x17/0x1E).
-   - **Synth-check hashes (`make synth-check` / `synth-check-ctrl`):**
-     whole-design **97873ef4a2 → 4006339cfc** (cell drop from removed FSM
-     logic); control-plane **18e3144b40 → d13c694b63** (decode_unit
-     illegal-opcode extension; SFU is blackboxed in this build via
-     `rtl/synth/blackbox_stubs.v`).
+   - **Historical synth-check hashes:** whole-design **97873ef4a2 →
+     4006339cfc** (cell drop from removed FSM logic); the then-existing
+     lightweight control-plane check moved **18e3144b40 → d13c694b63**.
+     That partial blackbox gate was retired after the full-design gate
+     superseded it.
    - **Freeze gate preserved.** `pytest test_compare_rtl_golden.py` =
      **6 passed + 1 skipped byte-identical** pre/post Phase B (the gen-2
      frozen bundle never emits the stripped opcodes; the safety-net empirical

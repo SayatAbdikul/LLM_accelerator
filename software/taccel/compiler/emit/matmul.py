@@ -6,32 +6,21 @@ linear matmul (`_emit_matmul`) is already a 2-line dispatcher to
 `compiler/w8a16_emit/matmul.emit_matmul_w8a16` and stays in
 `codegen.py`.
 
-In W8A16 mode each entry point early-dispatches to its matching
-`compiler/w8a16_emit/` helper. The legacy INT8 paths preserved below
-are kept for source parity with the original method bodies; they are
-unreachable under the current `use_fp16_activations = True` hardcode.
+Q@K^T and attention·V dispatch to their active W8A16 helpers. Head
+concatenation stays here because it is shared by those lowerings.
 """
 from __future__ import annotations
 
-import re
 from typing import TYPE_CHECKING
 
 from ...isa.instructions import (
     BufCopyInsn,
-    ConfigTileInsn,
-    MaskedSoftmaxAttnVInsn,
-    MaskedSoftmaxInsn,
-    MatmulInsn,
-    RequantInsn,
-    SetScaleInsn,
-    SoftmaxAttnVInsn,
-    SoftmaxInsn,
     SyncInsn,
 )
-from ...isa.opcodes import BUF_ABUF, BUF_ACCUM, BUF_WBUF
+from ...isa.opcodes import BUF_ABUF
 from ..ir import IRNode
-from ..tiler import TILE, pad_dim
-from ._common import UNIT, _fp16_to_uint16
+from ..tiler import pad_dim
+from ._common import UNIT
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..codegen import CodeGenerator

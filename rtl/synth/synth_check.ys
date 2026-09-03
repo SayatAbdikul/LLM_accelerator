@@ -19,12 +19,9 @@ hierarchy -check -top taccel_top
 # `integer'(...)` widening in the 1024-element loops) that make proc
 # multi-minute; the synth-check definition of done is "yosys elaborates
 # every module with zero `real`/DPI/system-tasks/unbounded-loops," which
-# the read_verilog + hierarchy step already proves. Procedural decode is
-# exercised by `synth_check_ctrl.ys` on the control plane (5 s with the
-# SFU/helper blackboxed).
+# the read_verilog + hierarchy step already proves.
 
-# Structural check (non-fatal); the `-assert` form is used by the
-# control-plane variant which has the auxiliary opt -fast cleanup.
+# Structural check (non-fatal).
 check
 
 # First area/cell estimate at the elaborated level.

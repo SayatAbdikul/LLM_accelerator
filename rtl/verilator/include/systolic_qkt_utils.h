@@ -1,14 +1,7 @@
-// Shared helpers for R4-split test_systolic_qkt_{basic,replay,padded,history}.cpp.
+// Shared helpers for test_systolic_qkt_{basic,replay,padded}.cpp.
 //
-// R4 (2026-05-22): the 3,672-LOC test_systolic_qkt.cpp was split into 4 topic-
-// based translation units. Helpers that the original file shared across its
-// 31 tests live here. The header opens an anonymous namespace at file scope —
-// each TU including it gets an internal-linkage copy (one per binary, since
-// the four split files build into four separate Verilator-wrapped binaries).
-//
-// Layout below matches the original file's L1-L817 verbatim (prelude +
-// helpers), with the trailing `}  // namespace` from L3633 inserted here so
-// the anonymous namespace is closed within the header.
+// Each split includes this header and receives an internal-linkage copy of
+// the helpers it uses.
 
 #ifndef RTL_VERILATOR_SYSTOLIC_QKT_UTILS_H
 #define RTL_VERILATOR_SYSTOLIC_QKT_UTILS_H
@@ -18,16 +11,14 @@
 #include "Vtaccel_top.h"
 #include "Vtaccel_top___024root.h"
 #include "verilated.h"
-#include "systolic_debug_artifacts.h"
-#include "systolic_window_trace.h"
 #include "testbench.h"
 
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -213,256 +204,6 @@ void expect_int8_matrix_prefix(
   }
 }
 
-bool microtrace_mode_enabled(const char* mode_name) {
-  const char* out_path = std::getenv("RTL_QKT_MICROTRACE_OUT");
-  const char* mode = std::getenv("RTL_QKT_MICROTRACE_MODE");
-  if (out_path == nullptr || out_path[0] == '\0')
-    return false;
-  if (mode == nullptr || mode[0] == '\0')
-    return false;
-  return std::string(mode) == mode_name;
-}
-
-bool artifact_mode_allowed(const char* mode_name) {
-  const char* mode = std::getenv("RTL_QKT_MICROTRACE_MODE");
-  if (mode == nullptr || mode[0] == '\0')
-    return true;
-  return std::string(mode) == mode_name;
-}
-
-void maybe_write_microtrace(const char* mode_name, const tbutil::SystolicWindowTrace& trace) {
-  if (!microtrace_mode_enabled(mode_name))
-    return;
-  const char* out_path = std::getenv("RTL_QKT_MICROTRACE_OUT");
-  std::ofstream stream(out_path, std::ios::binary);
-  if (!stream)
-    TEST_FAIL(mode_name, ("could not open microtrace output " + std::string(out_path)).c_str());
-  stream << tbutil::systolic_window_trace_to_json(trace);
-}
-
-void maybe_write_accum_write_log(const char* mode_name, const tbutil::AccumWriteLog& log) {
-  const char* out_path = std::getenv("RTL_QKT_ACCUM_WRITE_LOG_OUT");
-  if (out_path == nullptr || out_path[0] == '\0')
-    return;
-  if (!artifact_mode_allowed(mode_name))
-    return;
-  std::ofstream stream(out_path, std::ios::binary);
-  if (!stream)
-    TEST_FAIL(mode_name,
-              ("could not open accum write log output " + std::string(out_path)).c_str());
-  stream << tbutil::accum_write_log_to_json(log);
-}
-
-void maybe_write_sram_write_log(const char* mode_name, const tbutil::SramWriteLog& log) {
-  const char* out_path = std::getenv("RTL_QKT_SRAM_WRITE_LOG_OUT");
-  if (out_path == nullptr || out_path[0] == '\0')
-    return;
-  const char* mode = std::getenv("RTL_QKT_MICROTRACE_MODE");
-  if (mode != nullptr && mode[0] != '\0' && std::string(mode) != mode_name)
-    return;
-  std::ofstream stream(out_path, std::ios::binary);
-  if (!stream)
-    TEST_FAIL(mode_name,
-              ("could not open SRAM write log output " + std::string(out_path)).c_str());
-  stream << tbutil::sram_write_log_to_json(log);
-}
-
-void maybe_write_hidden_snapshot(const char* mode_name, const tbutil::SystolicHiddenSnapshot& snapshot) {
-  const char* out_path = std::getenv("RTL_QKT_HIDDEN_SNAPSHOT_OUT");
-  if (out_path == nullptr || out_path[0] == '\0')
-    return;
-  if (!artifact_mode_allowed(mode_name))
-    return;
-  std::ofstream stream(out_path, std::ios::binary);
-  if (!stream)
-    TEST_FAIL(mode_name,
-              ("could not open hidden snapshot output " + std::string(out_path)).c_str());
-  stream << tbutil::hidden_snapshot_to_json(snapshot);
-}
-
-template <typename NegedgeObserver, typename CycleObserver>
-void replay_start_with_debug(
-    SimHarness& sim,
-    NegedgeObserver&& observe_negedge,
-    CycleObserver&& observe_cycle) {
-  sim.dut->start = 1;
-  tick_with_negedge_observer(
-      sim.dut.get(),
-      sim.dram,
-      std::forward<NegedgeObserver>(observe_negedge));
-  sim.dut->start = 0;
-  observe_cycle();
-}
-
-template <typename NegedgeObserver, typename CycleObserver>
-void replay_step_with_debug(
-    SimHarness& sim,
-    NegedgeObserver&& observe_negedge,
-    CycleObserver&& observe_cycle) {
-  tick_with_negedge_observer(
-      sim.dut.get(),
-      sim.dram,
-      std::forward<NegedgeObserver>(observe_negedge));
-  observe_cycle();
-}
-
-bool sram_log_contains_row(
-    const tbutil::SramWriteLog& log,
-    const char* writer_source,
-    uint64_t issue_pc,
-    const char* buf_name,
-    uint32_t row) {
-  for (const auto& rec : log.records) {
-    if (rec.writer_source == writer_source &&
-        rec.issue_pc == issue_pc &&
-        rec.buf_name == buf_name &&
-        rec.row == row) {
-      return true;
-    }
-  }
-  return false;
-}
-
-std::vector<int32_t> capture_accum_strip_i32(
-    Vtaccel_top* dut,
-    int dst_off_units,
-    int rows,
-    int cols,
-    int mem_cols) {
-  std::vector<int32_t> values(size_t(rows) * size_t(cols), 0);
-  for (int row = 0; row < rows; ++row) {
-    for (int col = 0; col < cols; ++col)
-      values[size_t(row) * size_t(cols) + size_t(col)] =
-          read_accum_wide(dut, dst_off_units, row, col, mem_cols);
-  }
-  return values;
-}
-
-std::vector<int64_t> capture_buffer_strip_i8(
-    Vtaccel_top* dut,
-    int buf_id,
-    int offset_units,
-    int rows,
-    int cols) {
-  auto observed = sram_read_bytes(
-      dut,
-      buf_id,
-      size_t(offset_units) * 16u,
-      size_t(rows) * size_t(cols));
-  std::vector<int64_t> values(size_t(rows) * size_t(cols), 0);
-  for (size_t idx = 0; idx < observed.size(); ++idx)
-    values[idx] = int64_t(int8_t(observed[idx]));
-  return values;
-}
-
-std::vector<int64_t> capture_abuf_strip_i8(
-    Vtaccel_top* dut,
-    int offset_units,
-    int rows,
-    int cols) {
-  return capture_buffer_strip_i8(dut, BUF_ABUF_ID, offset_units, rows, cols);
-}
-
-std::vector<int64_t> widen_i32_values(const std::vector<int32_t>& values) {
-  std::vector<int64_t> widened(values.size(), 0);
-  for (size_t idx = 0; idx < values.size(); ++idx)
-    widened[idx] = int64_t(values[idx]);
-  return widened;
-}
-
-struct MatrixCheckpoint {
-  std::string key;
-  std::string dtype;
-  int rows = 0;
-  int cols = 0;
-  int row_start = 0;
-  std::vector<int64_t> values;
-};
-
-void maybe_write_matrix_checkpoints(
-    const char* mode_name,
-    const std::string& node_prefix,
-    int strip_row_start,
-    const std::vector<MatrixCheckpoint>& checkpoints) {
-  const char* out_path = std::getenv("RTL_QKT_CHECKPOINTS_OUT");
-  if (out_path == nullptr || out_path[0] == '\0')
-    return;
-  if (!artifact_mode_allowed(mode_name))
-    return;
-  if (checkpoints.empty())
-    return;
-
-  auto write_matrix = [&](std::ofstream& stream,
-                          const MatrixCheckpoint& checkpoint) {
-    stream << "  \"" << checkpoint.key << "\": {\n";
-    stream << "    \"dtype\": \"" << checkpoint.dtype << "\",\n";
-    stream << "    \"shape\": [" << checkpoint.rows << ", " << checkpoint.cols << "],\n";
-    stream << "    \"row_start\": " << checkpoint.row_start << ",\n";
-    stream << "    \"values\": [\n";
-    for (int row = 0; row < checkpoint.rows; ++row) {
-      stream << "      [";
-      for (int col = 0; col < checkpoint.cols; ++col) {
-        if (col != 0)
-          stream << ", ";
-        stream << checkpoint.values[size_t(row) * size_t(checkpoint.cols) + size_t(col)];
-      }
-      stream << "]";
-      if (row + 1 != checkpoint.rows)
-        stream << ",";
-      stream << "\n";
-    }
-    stream << "    ]\n";
-    stream << "  }";
-  };
-
-  std::ofstream stream(out_path, std::ios::binary);
-  if (!stream)
-    TEST_FAIL(mode_name,
-              ("could not open QK^T checkpoints output " + std::string(out_path)).c_str());
-  stream << "{\n";
-  stream << "  \"mode\": \"" << mode_name << "\",\n";
-  stream << "  \"node_prefix\": \"" << node_prefix << "\",\n";
-  stream << "  \"strip_row_start\": " << strip_row_start << ",\n";
-  for (size_t idx = 0; idx < checkpoints.size(); ++idx) {
-    write_matrix(stream, checkpoints[idx]);
-    if (idx + 1 != checkpoints.size())
-      stream << ",";
-    stream << "\n";
-  }
-  stream << "\n}\n";
-}
-
-void maybe_write_qkt_checkpoints(
-    const char* mode_name,
-    const std::string& node_prefix,
-    int strip_row_start,
-    int cols,
-    const std::vector<int32_t>& accum_pre_matmul,
-    const std::vector<int32_t>& qkt_output) {
-  maybe_write_matrix_checkpoints(
-      mode_name,
-      node_prefix,
-      strip_row_start,
-      {
-          MatrixCheckpoint{
-              "accum_pre_matmul",
-              "int32",
-              int(accum_pre_matmul.size() / size_t(cols)),
-              cols,
-              strip_row_start,
-              widen_i32_values(accum_pre_matmul),
-          },
-          MatrixCheckpoint{
-              "qkt_output",
-              "int32",
-              int(qkt_output.size() / size_t(cols)),
-              cols,
-              strip_row_start,
-              widen_i32_values(qkt_output),
-          },
-      });
-}
-
 struct ProjectionReplayResult {
   bool exact_valid = false;
   bool exact_match = false;
@@ -523,76 +264,6 @@ void record_projection_replay_result(const char* proj_name, bool clean_mode, boo
     g_projection_replay_results[idx].exact_match = match;
   }
   maybe_write_projection_replay_results();
-}
-
-struct Ln1ReplayFixture {
-  std::string base;
-  std::string metadata_text;
-  std::vector<uint8_t> input_bytes;
-  std::vector<uint8_t> output_bytes;
-  std::vector<uint8_t> gamma_bytes;
-  std::vector<uint8_t> beta_bytes;
-  std::vector<uint8_t> gamma_beta_bytes;
-  int input_off_units = 0;
-  int output_off_units = 0;
-  int gamma_beta_off_units = 0;
-  int sreg_base = 0;
-  int in_scale_fp16 = 0;
-  int out_scale_fp16 = 0;
-  int gamma_dram_offset = 0;
-  int beta_dram_offset = 0;
-  int rows = 0;
-  int cols = 0;
-  int m_tiles = 0;
-  int n_tiles = 0;
-};
-
-Ln1ReplayFixture load_ln1_replay_fixture(const char* name) {
-  const char* replay_dir = std::getenv("RTL_QKT_REPLAY_DIR");
-  if (replay_dir == nullptr || replay_dir[0] == '\0') {
-    std::printf("SKIP: %s (set RTL_QKT_REPLAY_DIR to enable)\n", name);
-    return {};
-  }
-
-  Ln1ReplayFixture fixture;
-  fixture.base = std::string(replay_dir);
-  fixture.metadata_text = read_text_file(fixture.base + "/replay_metadata.json");
-  fixture.input_bytes = read_binary_file(fixture.base + "/ln1_input_padded.raw");
-  fixture.output_bytes = read_binary_file(fixture.base + "/ln1_output_padded.raw");
-  fixture.gamma_bytes = read_binary_file(fixture.base + "/ln1_gamma.raw");
-  fixture.beta_bytes = read_binary_file(fixture.base + "/ln1_beta.raw");
-  fixture.gamma_beta_bytes = fixture.gamma_bytes;
-  fixture.gamma_beta_bytes.insert(
-      fixture.gamma_beta_bytes.end(),
-      fixture.beta_bytes.begin(),
-      fixture.beta_bytes.end());
-
-  fixture.input_off_units = extract_json_int(fixture.metadata_text, "ln1_input_padded_offset_units");
-  fixture.output_off_units = extract_json_int(fixture.metadata_text, "ln1_output_padded_offset_units");
-  fixture.gamma_beta_off_units = extract_json_int(fixture.metadata_text, "ln1_gamma_beta_wbuf_offset_units");
-  fixture.sreg_base = extract_json_int(fixture.metadata_text, "ln1_sreg_base");
-  fixture.in_scale_fp16 = extract_json_int(fixture.metadata_text, "ln1_in_scale_fp16");
-  fixture.out_scale_fp16 = extract_json_int(fixture.metadata_text, "ln1_out_scale_fp16");
-  fixture.gamma_dram_offset = extract_json_int(fixture.metadata_text, "ln1_gamma_dram_offset");
-  fixture.beta_dram_offset = extract_json_int(fixture.metadata_text, "ln1_beta_dram_offset");
-  fixture.rows = extract_json_int(fixture.metadata_text, "ln1_input_padded_rows");
-  fixture.cols = extract_json_int(fixture.metadata_text, "ln1_input_padded_cols");
-  fixture.m_tiles = fixture.rows / 16;
-  fixture.n_tiles = fixture.cols / 16;
-
-  if (fixture.rows != 208 || fixture.cols != 192)
-    TEST_FAIL(name, "unexpected LayerNorm replay shape");
-  if (fixture.input_bytes.size() != size_t(fixture.rows * fixture.cols))
-    TEST_FAIL(name, "unexpected ln1_input_padded.raw size");
-  if (fixture.output_bytes.size() != size_t(fixture.rows * fixture.cols))
-    TEST_FAIL(name, "unexpected ln1_output_padded.raw size");
-  if (fixture.gamma_bytes.size() != size_t(fixture.cols * 2) ||
-      fixture.beta_bytes.size() != size_t(fixture.cols * 2))
-    TEST_FAIL(name, "unexpected LayerNorm gamma/beta payload size");
-  if (fixture.gamma_beta_bytes.size() % 16u != 0u)
-    TEST_FAIL(name, "unexpected packed LayerNorm gamma/beta alignment");
-
-  return fixture;
 }
 
 int32_t read_accum_wide(Vtaccel_top* dut, int dst_off, int row_idx, int col_idx, int cols) {

@@ -4,17 +4,3 @@ numpy
 scipy
 pytest
 pytest-xdist>=3.0
-
-# Removed 2026-07-17 (zero import sites anywhere under software/):
-#   Pillow   — existed only for tests/test_download_imagenet_class.py, an
-#              ImageNet fossil in a GPT-2 project which imported a module
-#              (`images.download_imagenet_class`) that no longer exists, so it
-#              could never even be collected. Test deleted; dep with it.
-#   requests — no references at all.
-#   datasets — no references at all.
-# Added: pytest, which 46 files import but which was only ever pulled in
-# transitively by pytest-xdist.
-#
-# NOT declared here on purpose: `cocotb`. The rtl/cocotb tier is dormant and
-# superseded by the Verilator benches — see rtl/TESTBENCHES.md. Declaring it
-# would imply the tier is a live gate, which it is not.

@@ -1,32 +1,9 @@
-"""SFU op emit helpers: scale_mul rename + layernorm/softmax/gelu/vadd.
-
-Free-function migrations of the original `_emit_scale_mul`,
-`_emit_softmax`, `_emit_gelu`, `_emit_gelu_from_dram_temp`,
-`_emit_layernorm`, and `_emit_vadd` methods on `CodeGenerator`.
-
-In W8A16 mode each entry point (other than `_emit_scale_mul`, which is
-a metadata-only rename) early-dispatches to the matching helper in
-`compiler/w8a16_emit/`. The legacy INT8 paths preserved below are kept
-for source parity with the original method bodies; they are unreachable
-under the current `use_fp16_activations = True` hardcode.
-"""
+"""SFU emit helpers for the active W8A16 lowering path."""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ...isa.instructions import (
-    ConfigTileInsn,
-    DequantAddInsn,
-    GeluInsn,
-    LayernormInsn,
-    SetScaleInsn,
-    SyncInsn,
-    VaddInsn,
-)
-from ...isa.opcodes import BUF_ABUF, BUF_ACCUM, BUF_WBUF
 from ..ir import IRNode
-from ..tiler import TILE, pad_dim
-from ._common import UNIT, _fp16_to_uint16
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..codegen import CodeGenerator
@@ -79,74 +56,6 @@ def emit_gelu(cg: "CodeGenerator", node: IRNode) -> None:
     """
     from ..w8a16_emit import emit_gelu_fp32
     emit_gelu_fp32(cg, node)
-
-
-def emit_gelu_from_dram_temp(cg: "CodeGenerator", node: IRNode) -> None:
-    """Apply GELU strip-by-strip to a DRAM-temp-resident tensor."""
-    input_name = node.inputs[0]
-    input_dram = cg.dram_temp_outputs[input_name]
-    M = int(node.output_shape[0])
-    N = int(node.output_shape[1])
-    M_pad = pad_dim(M)
-    N_pad = pad_dim(N)
-    strip_rows = TILE
-    out_dram = cg.dram_temp_start + cg.mem.alloc_dram_temp(
-        f"{node.name}_temp", M_pad * N_pad
-    )
-    in_scale = cg.calibration_scales.get(input_name, 1.0 / 127.0)
-    out_scale = cg.calibration_scales.get(node.name, 1.0 / 127.0)
-    cg.mem.abuf.free(input_name)
-
-    for row_start in range(0, M_pad, strip_rows):
-        logical_rows = max(0, min(strip_rows, M - row_start))
-        strip_alloc = cg.mem.abuf.alloc(f"{node.name}_strip{row_start}", strip_rows * N_pad)
-        cg._emit_dma_load(
-            BUF_ABUF,
-            strip_alloc.offset_units,
-            strip_rows * N_pad,
-            1,
-            input_dram + row_start * N_pad,
-        )
-        cg._emit(SyncInsn(resource_mask=0b001))
-        cg._emit(ConfigTileInsn(M=0, N=N_pad // TILE - 1, K=0))
-        sreg = cg._alloc_sreg_pair()
-        cg._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(in_scale)))
-        cg._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0, imm16=_fp16_to_uint16(out_scale)))
-        cg._emit(GeluInsn(
-            src1_buf=BUF_ABUF,
-            src1_off=strip_alloc.offset_units,
-            dst_buf=BUF_ABUF,
-            dst_off=strip_alloc.offset_units,
-            sreg=sreg,
-        ))
-        cg._emit(SyncInsn(resource_mask=0b100))
-        cg._record_trace_event(
-            node.name,
-            BUF_ABUF,
-            strip_alloc.offset_units,
-            strip_rows,
-            N_pad,
-            logical_rows,
-            N,
-            "int8",
-            out_scale,
-            row_start=row_start,
-            full_rows=M,
-            full_cols=N,
-        )
-        cg._emit_dma_store(
-            BUF_ABUF,
-            strip_alloc.offset_units,
-            strip_rows * N_pad,
-            2,
-            out_dram + row_start * N_pad,
-        )
-        cg._emit(SyncInsn(resource_mask=0b001))
-        cg.mem.abuf.free(strip_alloc.name)
-
-    cg.dram_temp_outputs[node.name] = out_dram
-    placeholder = cg.mem.abuf.alloc(node.name, strip_rows * N_pad)
-    placeholder.size_bytes = M_pad * N_pad
 
 
 def emit_layernorm(cg: "CodeGenerator", node: IRNode) -> None:

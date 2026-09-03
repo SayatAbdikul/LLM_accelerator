@@ -60,7 +60,6 @@ class MachineState:
         self.current_pc = 0
         self.halted = False
         self.cycle_count = 0
-        self.runtime_twin_specs = {}
 
     def get_buffer(self, buf_id: int) -> bytearray:
         """Get SRAM buffer by ID."""
@@ -105,4 +104,3 @@ class MachineState:
         self.current_pc = 0
         self.halted = False
         self.cycle_count = 0
-        self.runtime_twin_specs = {}
