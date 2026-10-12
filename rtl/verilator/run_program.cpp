@@ -112,15 +112,30 @@ struct Summary {
     bool timeout = false;
     std::string parse_error;
     uint64_t cycles = 0;
+    int sfu_synth_mode = 0;
+    int helper_synth_mode = 0;
+    bool fetch_buffer_enabled = false;
+    uint64_t instruction_read_count = 0;
     uint64_t retired_instructions = 0;
     uint64_t sync_wait_dma_cycles = 0;
     uint64_t sync_wait_sys_cycles = 0;
     uint64_t sync_wait_sfu_cycles = 0;
     uint64_t dma_burst_count = 0;
     uint64_t dma_beat_count = 0;
+    uint64_t dma_read_burst_count = 0;
+    uint64_t dma_write_burst_count = 0;
+    uint64_t dma_read_beat_count = 0;
+    uint64_t dma_write_beat_count = 0;
     uint64_t helper_busy_cycles = 0;
     uint64_t sfu_busy_cycles = 0;
     uint64_t systolic_busy_cycles = 0;
+    uint64_t systolic_load_cycles = 0;
+    uint64_t systolic_data_cycles = 0;
+    uint64_t systolic_k_boundary_cycles = 0;
+    uint64_t systolic_flush_cycles = 0;
+    uint64_t systolic_drain_cycles = 0;
+    uint64_t systolic_other_cycles = 0;
+    uint64_t systolic_compute_steps = 0;
     // T0.2: cycles the fetch unit stalled on the shared AXI read port (fetch/DMA
     // contention). Lets the overlap campaign separate real exposed DMA from
     // instruction-fetch starvation.
@@ -554,15 +569,30 @@ Summary build_summary(Vtaccel_top* dut, int num_classes) {
     summary.fault = dut->fault;
     summary.fault_code = dut->fault_code;
     summary.cycles = root->taccel_top__DOT__obs_cycle_count_q;
+    summary.sfu_synth_mode = root->taccel_top__DOT__obs_sfu_synth_mode_w;
+    summary.helper_synth_mode = root->taccel_top__DOT__obs_helper_synth_mode_w;
+    summary.fetch_buffer_enabled = root->taccel_top__DOT__obs_fetch_buffer_enable_w;
+    summary.instruction_read_count = root->taccel_top__DOT__obs_fetch_read_count_q;
     summary.retired_instructions = root->taccel_top__DOT__obs_retired_insn_count_q;
     summary.sync_wait_dma_cycles = root->taccel_top__DOT__obs_sync_wait_dma_cycles_q;
     summary.sync_wait_sys_cycles = root->taccel_top__DOT__obs_sync_wait_sys_cycles_q;
     summary.sync_wait_sfu_cycles = root->taccel_top__DOT__obs_sync_wait_sfu_cycles_q;
     summary.dma_burst_count = root->taccel_top__DOT__obs_dma_burst_count_q;
     summary.dma_beat_count = root->taccel_top__DOT__obs_dma_beat_count_q;
+    summary.dma_read_burst_count = root->taccel_top__DOT__obs_dma_read_burst_count_q;
+    summary.dma_write_burst_count = root->taccel_top__DOT__obs_dma_write_burst_count_q;
+    summary.dma_read_beat_count = root->taccel_top__DOT__obs_dma_read_beat_count_q;
+    summary.dma_write_beat_count = root->taccel_top__DOT__obs_dma_write_beat_count_q;
     summary.helper_busy_cycles = root->taccel_top__DOT__obs_helper_busy_cycles_q;
     summary.sfu_busy_cycles = root->taccel_top__DOT__obs_sfu_busy_cycles_q;
     summary.systolic_busy_cycles = root->taccel_top__DOT__obs_sys_busy_cycles_q;
+    summary.systolic_load_cycles = root->taccel_top__DOT__obs_sys_load_cycles_q;
+    summary.systolic_data_cycles = root->taccel_top__DOT__obs_sys_data_cycles_q;
+    summary.systolic_k_boundary_cycles = root->taccel_top__DOT__obs_sys_k_boundary_cycles_q;
+    summary.systolic_flush_cycles = root->taccel_top__DOT__obs_sys_flush_cycles_q;
+    summary.systolic_drain_cycles = root->taccel_top__DOT__obs_sys_drain_cycles_q;
+    summary.systolic_other_cycles = root->taccel_top__DOT__obs_sys_other_cycles_q;
+    summary.systolic_compute_steps = root->taccel_top__DOT__obs_sys_compute_steps_q;
     summary.dma_sys_cobusy_cycles = root->taccel_top__DOT__obs_dma_sys_cobusy_cycles_q;
     summary.fetch_ar_stall_cycles = root->taccel_top__DOT__obs_fetch_ar_stall_cycles_q;
     summary.sys_porta_lost = root->taccel_top__DOT__obs_sys_porta_lost_q;
@@ -604,6 +634,16 @@ Summary build_summary(Vtaccel_top* dut, int num_classes) {
     if (summary.forbidden_overlap_violation) {
         summary.violations.push_back("forbidden_async_engine_overlap");
     }
+    const uint64_t phase_total = summary.systolic_load_cycles + summary.systolic_data_cycles +
+        summary.systolic_k_boundary_cycles + summary.systolic_flush_cycles +
+        summary.systolic_drain_cycles + summary.systolic_other_cycles;
+    if (phase_total != summary.systolic_busy_cycles)
+        summary.violations.push_back("systolic_phase_count_mismatch");
+    if (summary.systolic_compute_steps != summary.systolic_data_cycles + summary.systolic_flush_cycles)
+        summary.violations.push_back("systolic_compute_step_count_mismatch");
+    if (summary.dma_beat_count != summary.dma_read_beat_count + summary.dma_write_beat_count ||
+        summary.dma_burst_count != summary.dma_read_burst_count + summary.dma_write_burst_count)
+        summary.violations.push_back("dma_direction_count_mismatch");
 
     return summary;
 }
@@ -622,6 +662,13 @@ std::string summary_to_json(const Summary& summary) {
         oss << "  \"parse_error\": null,\n";
     }
     oss << "  \"cycles\": " << summary.cycles << ",\n";
+    oss << "  \"configuration\": {\n";
+    oss << "    \"sfu_synth_mode\": " << summary.sfu_synth_mode << ",\n";
+    oss << "    \"helper_synth_mode\": " << summary.helper_synth_mode << ",\n";
+    oss << "    \"fetch_buffer_enabled\": "
+        << (summary.fetch_buffer_enabled ? "true" : "false") << "\n";
+    oss << "  },\n";
+    oss << "  \"instruction_read_count\": " << summary.instruction_read_count << ",\n";
     oss << "  \"retired_instructions\": " << summary.retired_instructions << ",\n";
     oss << "  \"sync_wait_cycles\": {\n";
     oss << "    \"dma\": " << summary.sync_wait_dma_cycles << ",\n";
@@ -630,7 +677,14 @@ std::string summary_to_json(const Summary& summary) {
     oss << "  },\n";
     oss << "  \"dma\": {\n";
     oss << "    \"burst_count\": " << summary.dma_burst_count << ",\n";
-    oss << "    \"beat_count\": " << summary.dma_beat_count << "\n";
+    oss << "    \"beat_count\": " << summary.dma_beat_count << ",\n";
+    oss << "    \"accepted_bytes\": " << summary.dma_beat_count * 16 << ",\n";
+    oss << "    \"read_burst_count\": " << summary.dma_read_burst_count << ",\n";
+    oss << "    \"write_burst_count\": " << summary.dma_write_burst_count << ",\n";
+    oss << "    \"read_beat_count\": " << summary.dma_read_beat_count << ",\n";
+    oss << "    \"write_beat_count\": " << summary.dma_write_beat_count << ",\n";
+    oss << "    \"read_bytes\": " << summary.dma_read_beat_count * 16 << ",\n";
+    oss << "    \"write_bytes\": " << summary.dma_write_beat_count * 16 << "\n";
     oss << "  },\n";
     oss << "  \"busy_cycles\": {\n";
     oss << "    \"helper\": " << summary.helper_busy_cycles << ",\n";
@@ -638,6 +692,15 @@ std::string summary_to_json(const Summary& summary) {
     oss << "    \"systolic\": " << summary.systolic_busy_cycles << "\n";
     oss << "  },\n";
     oss << "  \"fetch_ar_stall_cycles\": " << summary.fetch_ar_stall_cycles << ",\n";
+    oss << "  \"systolic_phases\": {\n";
+    oss << "    \"load_cycles\": " << summary.systolic_load_cycles << ",\n";
+    oss << "    \"data_cycles\": " << summary.systolic_data_cycles << ",\n";
+    oss << "    \"k_boundary_cycles\": " << summary.systolic_k_boundary_cycles << ",\n";
+    oss << "    \"flush_cycles\": " << summary.systolic_flush_cycles << ",\n";
+    oss << "    \"drain_cycles\": " << summary.systolic_drain_cycles << ",\n";
+    oss << "    \"other_cycles\": " << summary.systolic_other_cycles << ",\n";
+    oss << "    \"compute_steps\": " << summary.systolic_compute_steps << "\n";
+    oss << "  },\n";
     // Shared-Port-A arbitration. `dma_sys_cobusy` is the denominator; any
     // nonzero `sys_lost` is a silently dropped systolic access.
     oss << "  \"port_a\": {\n";

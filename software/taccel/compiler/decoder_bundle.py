@@ -376,21 +376,35 @@ def build_decoder_program_bundle(
     dequant_add_residual1_blocks: Optional[set[int]] = None,
     dequant_add_residual2_blocks: Optional[set[int]] = None,
     gelu_from_accum_blocks: Optional[set[int]] = None,
-    use_fp16_activations: bool = False,
+    use_fp16_activations: bool = True,
     biases: Optional[Dict[str, np.ndarray]] = None,
     n_streams: int = 1,
+    target: str = "rtl-gen2",
+    compiler_options=None,
 ) -> DecoderBundleBuild:
     """Build a ProgramBundle from already-formed decoder IR graphs.
 
     All FP tiles are FP16 (2 bytes/element) — the INT8-activation (W8A8)
-    path was retired with the DeiT/RTL tooling. `use_fp16_activations`
-    is kept for signature compatibility but is always True.
+    path was retired with the DeiT/RTL tooling. Explicit requests for other
+    activation storage or retired compiler fusions are rejected. `target`
+    defaults to current RTL capabilities; research-golden must be selected
+    explicitly for software-only instruction support. `compiler_options`
+    selects independent, initially opt-in optimization candidates.
 
     `n_streams` (Phase 2 lockstep batched decode) sizes the KV cache to hold
     that many independent per-stream caches per head entry. `n_streams=1`
     (default) is byte-identical to the single-stream cache.
     """
     elem_bytes = 2
+    for name, value in {
+        "requant_pc_weight_names": requant_pc_weight_names,
+        "requant_pc_scale_tables": requant_pc_scale_tables,
+        "dequant_add_residual1_blocks": dequant_add_residual1_blocks,
+        "dequant_add_residual2_blocks": dequant_add_residual2_blocks,
+        "gelu_from_accum_blocks": gelu_from_accum_blocks,
+    }.items():
+        if value:
+            raise ValueError(f"{name} is unsupported by the maintained W8A16 compiler")
     # Lever A (int8 KV cache): K/V rows are quantized to INT8 at store time
     # (`kv_quant` nodes) with the decode-side static calibration scales, so
     # the cache stores 1 byte/elem — half the KV DRAM + DMA of the FP16
@@ -406,25 +420,6 @@ def build_decoder_program_bundle(
     decode_graph = _copy_graph_with_logits_store(decode_graph, stream_name="decode")
     if logits_size == 0:
         logits_size = _infer_logits_size(prefill_graph, decode_graph)
-    requant_pc_weight_names, requant_pc_scale_tables = _decoder_requant_pc_tables(
-        weight_data,
-        calibration_scales,
-        model_config,
-        prefill_graph=prefill_graph,
-        decode_graph=decode_graph,
-        explicit_names=requant_pc_weight_names,
-        explicit_tables=requant_pc_scale_tables,
-    )
-    residual1_dequant_blocks = (
-        set(range(int(model_config.n_layer)))
-        if dequant_add_residual1_blocks is None
-        else set(int(v) for v in dequant_add_residual1_blocks)
-    )
-    residual2_dequant_blocks = (
-        set(range(int(model_config.n_layer)))
-        if dequant_add_residual2_blocks is None
-        else set(int(v) for v in dequant_add_residual2_blocks)
-    )
     # Lever I-b: the two streams must stage the SAME stage-4 weight tiles, or
     # their data blobs diverge and the shared-blob check below rejects them. The
     # emitter's tiling decision depends on M_pad (a CONSUMER property), so a
@@ -455,12 +450,8 @@ def build_decoder_program_bundle(
         kv_layout=kv_layout,
         extra_stage4_weights=shared_stage4,
         stage4_m_pad=stage4_m_pad,
-        dequant_add_residual1_blocks=residual1_dequant_blocks,
-        dequant_add_residual2_blocks=residual2_dequant_blocks,
-        gelu_from_accum=gelu_from_accum_blocks is not None,
-        gelu_from_accum_blocks=gelu_from_accum_blocks,
-        requant_pc_weight_names=requant_pc_weight_names,
-        requant_pc_scale_tables=requant_pc_scale_tables,
+        target=target,
+        options=compiler_options,
         use_fp16_activations=use_fp16_activations,
         biases=biases,
     )
@@ -473,17 +464,17 @@ def build_decoder_program_bundle(
         kv_layout=kv_layout,
         extra_stage4_weights=shared_stage4,
         stage4_m_pad=stage4_m_pad,
-        dequant_add_residual1_blocks=residual1_dequant_blocks,
-        dequant_add_residual2_blocks=residual2_dequant_blocks,
-        gelu_from_accum=gelu_from_accum_blocks is not None,
-        gelu_from_accum_blocks=gelu_from_accum_blocks,
-        requant_pc_weight_names=requant_pc_weight_names,
-        requant_pc_scale_tables=requant_pc_scale_tables,
+        target=target,
+        options=compiler_options,
         use_fp16_activations=use_fp16_activations,
         biases=biases,
     )
+    prefill_codegen.layout_graphs = decode_codegen.layout_graphs = (prefill_graph, decode_graph)
     prefill_instructions, prefill_data = prefill_codegen.generate(prefill_graph)
-    decode_instructions, decode_data = decode_codegen.generate(decode_graph)
+    decode_instructions, decode_data = decode_codegen.generate(
+        decode_graph,
+        shared_layout=prefill_codegen if prefill_codegen.options.shared_data_layout else None,
+    )
     if prefill_data != decode_data:
         raise ValueError("prefill and decode graphs produced different shared data layouts")
     if temp_size == 0:
@@ -529,54 +520,3 @@ def build_decoder_program_bundle(
         prefill_codegen=prefill_codegen,
         decode_codegen=decode_codegen,
     )
-
-
-def _decoder_requant_pc_tables(
-    weight_data: Dict[str, Tuple[np.ndarray, Optional[np.ndarray]]],
-    calibration_scales: Dict[str, float],
-    model_config: ModelConfig,
-    *,
-    prefill_graph: IRGraph,
-    decode_graph: IRGraph,
-    explicit_names: Optional[set[str]],
-    explicit_tables: Optional[Dict[str, np.ndarray]],
-) -> Tuple[set[str], Dict[str, np.ndarray]]:
-    """Enable per-channel requant tables for selected decoder linear weights."""
-    names = set(explicit_names or set())
-    tables = dict(explicit_tables or {})
-
-    weight_name = "lm_head.weight"
-    if weight_name in weight_data:
-        q_weight, weight_scales = weight_data[weight_name]
-        if (
-            isinstance(q_weight, np.ndarray)
-            and q_weight.ndim == 2
-            and q_weight.size > 256 * 1024
-            and int(model_config.vocab_size) > 4096
-        ):
-            names.add(weight_name)
-
-    for selected_name in sorted(names):
-        if selected_name in tables:
-            continue
-        if selected_name not in weight_data:
-            raise KeyError(f"missing weight data for REQUANT_PC weight {selected_name!r}")
-        _q_weight, weight_scales = weight_data[selected_name]
-        if weight_scales is None:
-            raise KeyError(f"missing per-channel scales for REQUANT_PC weight {selected_name!r}")
-        input_name, output_name = _matmul_binding_for_weight((prefill_graph, decode_graph), selected_name)
-        scales = np.asarray(weight_scales, dtype=np.float32)
-        tables[selected_name] = (
-            np.float32(calibration_scales.get(input_name, 6.0 / 127.0))
-            * scales
-            / max(float(calibration_scales.get(output_name, 6.0 / 127.0)), 1e-12)
-        ).astype(np.float16)
-    return names, tables
-
-
-def _matmul_binding_for_weight(graphs, weight_name: str) -> tuple[str, str]:
-    for graph in graphs:
-        for node in graph.nodes:
-            if node.op == "matmul" and len(node.inputs) > 1 and node.inputs[1] == weight_name:
-                return str(node.inputs[0]), str(node.name)
-    return "ln_f", "lm_head"

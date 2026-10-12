@@ -6,19 +6,27 @@ set -e
 
 TOP="$1"; shift
 OUTDIR=rtl/asic/build/synth_blocks
-LIB=/home/user/.ciel/ciel/sky130/versions/61a056e180dac7dcc6d4eb7529e2231f95105746/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+LIB=${LIB:?Set LIB to the selected characterized Liberty file}
+mkdir -p "$OUTDIR"
+PARAMS=""
+case "$TOP" in
+  sfu_engine) PARAMS="chparam -set SFU_SYNTH_MODE 1 sfu_engine;" ;;
+  blocking_helper_engine) PARAMS="chparam -set HELPER_SYNTH_MODE 1 blocking_helper_engine;" ;;
+  taccel_top) PARAMS="chparam -set SFU_SYNTH_MODE 1 -set HELPER_SYNTH_MODE 1 taccel_top;" ;;
+esac
 
 # Materialize core filelist as absolute paths.
 CORE=$(grep -vE '^[[:space:]]*(#|$)' rtl/common/filelists/core.f | sed 's|^|rtl/common/src/|')
 
 # sv2v: all core RTL + any extras (e.g. ASIC wrappers).
-sv2v -DTARGET_ASIC -DSFU_SYNTH_NO_DPI -DSFU_SYNTH_MODE=1 -DHELPER_SYNTH_MODE=1 \
+sv2v -DTARGET_ASIC -DSFU_SYNTH_NO_DPI \
      -I rtl/common/src/include -I rtl/common/src/systolic -I rtl/common/src \
      $CORE "$@" -w "$OUTDIR/${TOP}.v"
 
 # Single yosys pass: synth + ABC + report. No tightening sweep (slow on big designs).
 yosys -p "
   read_verilog -sv $OUTDIR/${TOP}.v;
+  $PARAMS
   hierarchy -check -top $TOP;
   synth -top $TOP -flatten;
   dfflibmap -liberty $LIB;
@@ -31,4 +39,5 @@ CELLS=$(grep "Number of cells:" "$OUTDIR/${TOP}.full.log" | tail -1 | awk '{prin
 AREA=$(grep "Chip area" "$OUTDIR/${TOP}.full.log" | tail -1 | awk '{print $NF}')
 WIRES=$(grep "Number of wires:" "$OUTDIR/${TOP}.full.log" | tail -1 | awk '{print $NF}')
 SEQ_PCT=$(grep "used for sequential" "$OUTDIR/${TOP}.full.log" | tail -1 | grep -oE '\([0-9.]+%\)')
-echo "$TOP  cells=$CELLS  wires=$WIRES  area=${AREA} um^2  seq=${SEQ_PCT}"
+# Physical um^2 requires matching LEF verification in tools/block_flow.py.
+echo "$TOP  cells=$CELLS  wires=$WIRES  area=${AREA} unverified_Liberty_units  seq=${SEQ_PCT}"

@@ -9,7 +9,6 @@ from typing import Dict, Iterable, List, Sequence
 import numpy as np
 import torch
 
-from taccel.compiler.tiler import pad_dim
 from taccel.runtime.calibration import (
     apply_fc2_aware_gelu_scale_search_from_token_ids,
     apply_output_aware_attn_scale_search_from_token_ids,
@@ -46,15 +45,8 @@ CHAT_CALIBRATION_MAX_TOKENS = 512
 CHAT_DEFAULT_PTQ_PRESET = "fc2_8_to_11_raw_vadd"
 
 
-def _active_logits(logits: np.ndarray, vocab_size: int) -> np.ndarray:
-    return np.asarray(logits, dtype=np.float32)[: int(vocab_size)]
-
-
 def _greedy_token(logits: np.ndarray, vocab_size: int) -> int:
-    active = _active_logits(logits, vocab_size)
-    if active.size == 0:
-        raise ValueError("empty logits")
-    return int(np.argmax(active))
+    return HostRunner._greedy_token(logits, vocab_size=vocab_size)
 
 
 def _truncate_context(token_ids: Sequence[int], max_context_tokens: int) -> List[int]:
@@ -176,6 +168,8 @@ def _golden_generate(
     prompt = [int(tok) for tok in prompt_ids]
     if not prompt:
         raise ValueError("prompt_ids must be non-empty")
+    if max_new_tokens < 0:
+        raise ValueError("max_new_tokens must be non-negative")
     max_decode_position = max(0, len(prompt) + int(max_new_tokens) - 1)
     tiny = build_stage3_tiny_decoder_bundle(
         payload,
@@ -183,24 +177,23 @@ def _golden_generate(
         calibration_scales=calibration_scales,
         ptq_preset=ptq_preset,
     )
-    # Infer logits dtype from the bundle's logits_size byte budget.
-    #   pad_dim(vocab) * 1 = INT8  (W8A8 path)
-    #   pad_dim(vocab) * 2 = FP16  (W8A16 path; weight_only_int8 preset)
-    elem_bytes = max(1, int(tiny.logits_size) // pad_dim(int(vocab_size)))
-    logits_dtype = {1: np.int8, 2: np.float16}.get(elem_bytes, np.int8)
-    runner = HostRunner(tiny.build.bundle, logits_dtype=logits_dtype)
+    # The maintained decoder bundle stores FP16 logits for every preset.
+    runner = HostRunner(tiny.build.bundle, logits_dtype=np.float16,
+                        vocab_size=vocab_size)
 
     generated = list(prompt)
     logits = runner.run_prefill([prompt[0]])
     for position, token in enumerate(prompt[1:], start=1):
         logits = runner.run_decode_step(int(token), position)
 
-    next_token = _greedy_token(logits, vocab_size)
-    for _ in range(max_new_tokens):
-        generated.append(next_token)
-        position = len(generated) - 1
-        logits = runner.run_decode_step(next_token, position)
+    for step in range(max_new_tokens):
         next_token = _greedy_token(logits, vocab_size)
+        generated.append(next_token)
+        # This local runner is discarded and only IDs are returned. The
+        # final token therefore needs no KV commit or next-token logits.
+        if step + 1 < max_new_tokens:
+            position = len(generated) - 1
+            logits = runner.run_decode_step(next_token, position)
     return generated
 
 
@@ -324,15 +317,9 @@ def main(argv=None) -> int:
     if args.mode in {"golden", "both"}:
         if not args.calibration_text.exists():
             raise FileNotFoundError(args.calibration_text)
-        # Label the actual deployment path. weight_only_int8 presets use
-        # the W8A16 codepath (FP16 activations); other presets use W8A8.
-        if bool(getattr(ptq_preset, "weight_only_int8", False)):
-            deployment_label = "W8A16"
-            deployment_detail = "INT8 weights + FP16 activations (bias-fold DEQUANT)"
-        else:
-            deployment_label = "W8A8"
-            deployment_detail = "INT8 weights + INT8 activations"
-        print(f"golden deployment path: {deployment_label} ({deployment_detail})")
+        # All presets use the maintained decoder builder's W8A16 storage.
+        print("golden deployment path: W8A16 "
+              "(INT8 weights + FP16 activations, bias-fold DEQUANT)")
         print(
             "Preparing golden model calibration "
             f"({ptq_preset.name}, {calibration_n_seqs}x{calibration_seq_len})..."

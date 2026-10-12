@@ -1,4 +1,4 @@
-# Generic per-block PNR + STA flow on sky130_fd_sc_hd.
+# SKY130 per-block placement/CTS + estimated-parasitic STA (NOT routed PNR).
 # Usage: openroad -no_init -exit -threads 4 \
 #          -tag block_pnr block_pnr.tcl <netlist> <top> <clock_period>
 if {[llength $argv] < 3} {
@@ -10,10 +10,12 @@ set TOP     [lindex $argv 1]
 set PERIOD  [lindex $argv 2]
 set UTIL    [expr {[llength $argv] >= 4 ? [lindex $argv 3] : 20}]
 
-set PDK_ROOT /home/user/.ciel/ciel/sky130/versions/61a056e180dac7dcc6d4eb7529e2231f95105746/sky130A/libs.ref/sky130_fd_sc_hd
-set TECH_LEF $PDK_ROOT/techlef/sky130_fd_sc_hd__nom.tlef
-set CELL_LEF $PDK_ROOT/lef/sky130_fd_sc_hd.lef
-set LIB      $PDK_ROOT/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+foreach name {TECH_LEF CELL_LEF LIB} {
+  if {![info exists ::env($name)] || ![file exists $::env($name)]} {
+    error "Set $name to an existing SKY130 HD view; no machine-specific PDK fallback"
+  }
+  set $name $::env($name)
+}
 
 read_liberty $LIB
 read_lef $TECH_LEF
@@ -58,7 +60,7 @@ clock_tree_synthesis -buf_list sky130_fd_sc_hd__clkbuf_4 -root_buf sky130_fd_sc_
 detailed_placement
 estimate_parasitics -placement
 
-puts "===== POST-PNR STA ($TOP, util=$UTIL%) ====="
+puts "===== PLACED + CTS STA; estimated parasitics, NOT routed ($TOP, util=$UTIL%) ====="
 report_clock_min_period
 puts "\n===== summary ====="
 report_wns

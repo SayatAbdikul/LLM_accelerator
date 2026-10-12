@@ -110,7 +110,7 @@ def test_embedding_lookup_codegen_smoke():
     codegen = CodeGenerator(
         weight_data={
             "transformer.wte.weight": (
-                np.arange(4 * 128, dtype=np.int16).astype(np.int8).reshape(4, 128),
+                np.arange(4 * 128, dtype=np.float16).reshape(4, 128),
                 None,
             )
         },

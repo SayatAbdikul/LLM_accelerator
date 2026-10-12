@@ -25,8 +25,8 @@ def _config(vocab_size=8):
 
 
 def _weights(vocab_size=8):
-    token = (np.arange(vocab_size * 16, dtype=np.int16).reshape(vocab_size, 16) - 32).astype(np.int8)
-    pos = (np.arange(16 * 16, dtype=np.int16).reshape(16, 16) + 17).astype(np.int8)
+    token = (np.arange(vocab_size * 16, dtype=np.float16).reshape(vocab_size, 16) - 32).astype(np.float16)
+    pos = (np.arange(16 * 16, dtype=np.float16).reshape(16, 16) + 17).astype(np.float16)
     return {
         "transformer.wte.weight": (token, None),
         "transformer.wpe.weight": (pos, None),
@@ -41,7 +41,7 @@ def _fixed_logits_graph(token_id):
         name="store_logits",
         inputs=["manual_logits"],
         output_shape=(1, 16),
-        attrs={"src_buf": BUF_ABUF, "src_off_units": 0},
+        attrs={"src_buf": BUF_ABUF, "src_off_units": 0, "dtype": "fp16"},
     ))
     return graph
 
@@ -71,7 +71,7 @@ def test_codegen_logits_store_writes_prefill_and_decode_regions():
         calibration_scales={},
         prescaled_biases={},
         model_config=_config(),
-        logits_size=16,
+        logits_size=32,
     )
     bundle = build.bundle
     sim = Simulator()
@@ -80,15 +80,15 @@ def test_codegen_logits_store_writes_prefill_and_decode_regions():
     shared_before = bytes(sim.state.dram[bundle.data_base:bundle.temp_base])
     kv_before = bytes(sim.state.dram[bundle.kv_cache_base:bundle.required_dram_bytes])
 
-    sim.state.abuf[:16] = token_table[2].tobytes()
+    sim.state.abuf[:32] = token_table[2].tobytes()
     sim.run_program(bundle, "prefill")
-    assert bytes(sim.state.dram[bundle.prefill_logits_offset:bundle.prefill_logits_offset + 16]) == (
+    assert bytes(sim.state.dram[bundle.prefill_logits_offset:bundle.prefill_logits_offset + 32]) == (
         token_table[2].tobytes()
     )
 
-    sim.state.abuf[:16] = token_table[5].tobytes()
+    sim.state.abuf[:32] = token_table[5].tobytes()
     sim.run_program(bundle, "decode")
-    assert bytes(sim.state.dram[bundle.decode_logits_offset:bundle.decode_logits_offset + 16]) == (
+    assert bytes(sim.state.dram[bundle.decode_logits_offset:bundle.decode_logits_offset + 32]) == (
         token_table[5].tobytes()
     )
     assert bytes(sim.state.dram[bundle.data_base:bundle.temp_base]) == shared_before
@@ -104,9 +104,9 @@ def test_host_runner_reads_codegen_logits_from_dynamic_embedding_sites():
         calibration_scales={},
         prescaled_biases={},
         model_config=config,
-        logits_size=16,
+        logits_size=32,
     )
-    runner = HostRunner(build.bundle, logits_dtype=np.int8)
+    runner = HostRunner(build.bundle, logits_dtype=np.float16)
     token_table = _weights()["transformer.wte.weight"][0]
 
     prefill_logits = runner.run_prefill([3])

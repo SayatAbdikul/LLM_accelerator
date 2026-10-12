@@ -10,7 +10,8 @@ engine, synthesizable SFU, three on-chip SRAMs, and an in-order issue unit. The
 software provides the ISA, assembler, model frontends, quantization, compiler,
 golden simulator, host runtime, fixtures, and RTL co-simulation tools.
 
-> **Documentation state:** audited against commit `3486c01` on 2026-09-03.
+> **Documentation state:** October 11 implementation based on `978f126`;
+> validation is tracked in [the milestone report](docs/optimization_results.md).
 > Start with [the current project status](docs/project_status.md) and
 > [documentation index](docs/README.md). Dated plans and measurement reports
 > are retained as historical evidence and are labeled accordingly.
@@ -23,8 +24,8 @@ golden simulator, host runtime, fixtures, and RTL co-simulation tools.
 | Numeric path | W8A16: INT8 weights, FP16 activation storage, INT32 accumulators, FP32 SFU internals. The KV cache is stored as INT8. |
 | RTL | The full shared-core hierarchy passes the `sv2v + yosys` hierarchy/check/stat gate. FPGA and ASIC wrapper elaboration targets are also provided. These are not mapped synthesis or physical sign-off. |
 | ISA | Fixed 64-bit, big-endian instructions. Six generation-1 SFU opcodes are retired. The RTL implements the causal generation-2 path; `SOFTMAX_FP32` (`0x1C`) remains software/golden-only and is illegal in RTL. |
-| Verification | 462 Python tests collect. The cleanup validation passed 214 focused Python tests, 94 native RTL checks, the full-design generic elaboration gate, and fixture/hash checks. Optional large-model and replay-data tests remain environment-gated. |
-| Performance | Latest measured cycles are 18,318,261 for B=1 at position 511 and 49,998,042 per B=16 step at position 510. A current full-chip post-layout fmax has not been established after the July SFU/helper pipeline work. |
+| Verification | A mandatory no-skip profile, pinned executable reference dependencies, native protocol/primitive tests, and opt-in large-model tests distinguish conformance from numerical quality. Latest counts and scope are in the milestone report. |
+| Performance | Corrected mode-1 baselines and opt-in compiler/fetch A/B reports replace ambiguous historical runner provenance. No current full-chip post-layout fmax, power, or achieved tokens/second is established. |
 | Physical target | SKY130 is the measured ASIC research path. The FPGA directory is an elaboration-ready wrapper skeleton; no board or vendor flow is selected. |
 
 ## Repository layout
@@ -39,7 +40,7 @@ LLM_accelerator/
 │   │   ├── quantizer/           # W8/W4 research quantizers and calibration helpers
 │   │   ├── golden_model/        # Sequential ISA simulator
 │   │   └── runtime/             # HostRunner, PPL evaluation, fixtures, spec decode
-│   ├── tests/                   # 56 pytest modules
+│   ├── tests/                   # Mandatory core plus optional fixture/quality tests
 │   ├── tools/                   # Co-sim, profiling, conversion, evaluation CLIs
 │   └── docs/                    # ISA contract and historical quantization records
 ├── rtl/
@@ -73,20 +74,36 @@ OpenROAD, depending on the selected flow.
 
 ### Run the software tests
 
+The required profile needs the deterministic tiny fixture and a freshly built
+mode-1 runner. Generate a missing fixture, validate it, and build the runner:
+
 ```sh
-.venv/bin/python -m pytest -q software/tests
+test -f software/tests/fixtures/generated/nanogpt_shakespeare_char_d128_l2.pt || \
+  PYTHONPATH=software .venv/bin/python software/tools/train_tiny_fixture.py
+PYTHONPATH=software .venv/bin/python software/tools/train_tiny_fixture.py --validate-only
+make -C rtl/verilator run_program_synth
+```
+
+The conditional generation command writes the ignored tiny checkpoint and
+its metadata only when the checkpoint is absent. A metadata mismatch fails
+validation; investigate it instead of replacing an existing payload.
+
+```sh
+PYTHONPATH=software .venv/bin/python -m pytest -q software/tests
+PYTHONPATH=software .venv/bin/python -m pytest -q software/tests --verification-profile required
 ```
 
 Useful optional gates:
 
 ```sh
-PYTEST_SLOW=1 .venv/bin/python -m pytest -q software/tests
-PYTEST_124M=1 .venv/bin/python -m pytest -q \
+PYTHONPATH=software PYTEST_SLOW=1 .venv/bin/python -m pytest -q software/tests
+PYTHONPATH=software PYTEST_124M=1 .venv/bin/python -m pytest -q \
   software/tests/test_compare_rtl_golden.py
 ```
 
-The full suite contains fixture- and environment-dependent tests. Use a clean
-checkout on the same machine as the comparison baseline when evaluating an
+The required profile selects the release core and fails skipped mandatory
+gates. The full developer suite also contains fixture- and environment-dependent
+tests. Use a clean checkout on the same machine as the comparison baseline when evaluating an
 unrelated change; see [project status](docs/project_status.md) for the most
 recent verified scope.
 
@@ -95,6 +112,7 @@ recent verified scope.
 ```sh
 make -C rtl/verilator all
 make -C rtl/verilator test_sfu_synth test_helpers_synth
+make -C rtl/verilator test_dma_buffer test_fetch_buffer test_fetch_no_buffer
 make -C rtl/verilator test_systolic_array_chained test_systolic_qkt
 make -C rtl/verilator test_fp32_div_p6 test_fp32_sqrt_p6
 make -C rtl/verilator test_fp32_exp_p18 test_fp32_gelu_p33
@@ -109,15 +127,16 @@ directory is unavailable. See [the RTL testbench guide](rtl/TESTBENCHES.md).
 
 ```sh
 make -C rtl/verilator run_program run_program_synth
-.venv/bin/python -m pytest -q \
+PYTHONPATH=software .venv/bin/python -m pytest -q \
   software/tests/test_compare_rtl_golden.py \
   software/tests/test_batched_decode.py
 ```
 
-The tiny decoder fixture is the byte-exact conformance target. GPT-2 124M
-crosses an FP16 non-finite boundary, so large-model validation uses the
-documented logits/argmax/perplexity metrics instead of claiming whole-program
-byte equality.
+The tiny decoder fixture is the conformance target with frozen per-op FP16
+ULP bands. Scheduling A/B changes require identical logical RTL outputs and KV
+bytes. Historical GPT-2 124M captures reached FP16 non-finite values; the optional
+quality gate requires finite logits and cannot pass merely because non-finite
+hashes match. Shape-only cycle measurements are not an accuracy claim.
 
 ### Run RTL elaboration gates
 
@@ -204,19 +223,21 @@ See [the software codebase guide](software/CODEBASE.md) and
 
 ## Performance
 
-The latest checked-in cycle measurements are:
+Historical cycle measurements are retained for context:
 
 | Shape | Position | Step cycles | Cycles/token |
 |---|---:|---:|---:|
 | B=1 decode | 511 | 18,318,261 | 18,318,261 |
 | B=16 decode | 510 | 49,998,042 | 3,124,878 |
 
-These measurements use `run_program_synth --fast-beats`. They include the
-July pipeline changes through `451e7df` and preserve the known logits hashes.
+These measurements use the historical `run_program_synth --fast-beats` build
+through `451e7df`; helper-mode provenance is not verified. Their historical
+"logits hashes" actually label an INT32 ACCUM diagnostic, not FP16 decoder
+logits. Use [the October report](docs/optimization_results.md) for corrected
+configuration, actual DRAM-output hashes, and matched candidates.
 The formerly quoted 34.41 MHz post-PNR number excluded several later-integrated
-long paths and must not be presented as current full-chip closure. At 34.41 MHz
-only as an illustrative conversion, the table corresponds to approximately
-1.879 tok/s for B=1 and 11.012 aggregate tok/s for B=16.
+long paths and must not be presented as current full-chip closure or used as
+an achieved-throughput conversion.
 
 For fresh measurement:
 
@@ -229,8 +250,9 @@ PYTHONPATH=software .venv/bin/python software/tools/fast_gate_b16.py \
 ```
 
 Do not report tokens/second from a cycle result without naming the clock and
-DRAM model. The pinned `--fast-beats` model supplies one 128-bit beat per core
-cycle; fixed-bandwidth sensitivity is a different experiment.
+DRAM model. `--fast-beats --beat-interval N` supplies one 128-bit read beat
+every N core cycles; writes are independently unthrottled. It is not a shared
+fixed-total GB/s memory controller.
 
 ## Known gaps
 
@@ -243,17 +265,19 @@ cycle; fixed-bandwidth sensitivity is a different experiment.
   rejected by RTL. Supported causal decoder graphs use
   `MASKED_SOFTMAX_FP32`; the noncausal contract still needs a product decision.
 - Python supports packed INT4 metadata and golden-model execution, but RTL
-  does not consume `CONFIG_TILE.weight_int4`. W4 is therefore not an RTL
-  deployment mode.
-- The broad Python suite still includes optional large fixtures, long
-  perplexity tests, and known baseline issues, including four stale Stage-5
-  preset monkeypatch tests. Current status is recorded in
+  does not consume `CONFIG_TILE.weight_int4`. Hardware-target compilation
+  rejects W4 and noncausal `SOFTMAX_FP32`; research-golden stays explicit.
+- The broad Python suite still includes optional large fixtures and long
+  perplexity tests. Stale Stage-5, embedding, provenance, and trained-reference
+  regressions were repaired without weakening numerical tolerances. Current status is recorded in
   [docs/project_status.md](docs/project_status.md).
 
 ## Documentation
 
 - [Documentation index](docs/README.md)
 - [Current project status](docs/project_status.md)
+- [Optimization implementation and results](docs/optimization_results.md)
+- [Code exploration roadmap](docs/code_exploration_roadmap.md)
 - [ISA specification](software/docs/isa_spec.md)
 - [ISA freeze and amendment record](software/docs/isa_generation_freeze.md)
 - [Software architecture](software/CODEBASE.md)

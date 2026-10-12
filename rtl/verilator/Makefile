@@ -63,7 +63,7 @@ SVH_SRCS      := $(wildcard $(SRC_DIR)/*.svh)
 CONTROL_SV    := $(addprefix $(SRC_DIR)/, $(call read_filelist,$(CORE_F)))
 # Use this in prerequisite position; CONTROL_SV stays the Verilator source
 # list (passing a .svh to Verilator as a compilation unit fails).
-CONTROL_DEPS  := $(CONTROL_SV) $(SVH_SRCS)
+CONTROL_DEPS  := $(CONTROL_SV) $(SVH_SRCS) $(CORE_F) Makefile
 
 .PHONY: all run_program run_program_synth run_program_noovl test_decode test_control test_dma test_helpers test_sfu \
         test_systolic test_systolic_array_chained test_systolic_chained \
@@ -73,7 +73,8 @@ CONTROL_DEPS  := $(CONTROL_SV) $(SVH_SRCS)
         test_addr_raw_hazard \
         test_accum_snapshot_readback test_fp32_add test_fp32_div test_fp32_div_p3 test_fp32_div_p4 test_fp32_div_p5 test_fp32_div_p6 test_fp32_sqrt test_fp32_sqrt_p3 test_fp32_sqrt_p4 test_fp32_sqrt_p6 test_fp32_exp_p18 test_fp32_gelu_p33 \
         test_sfu_synth test_helpers_synth \
-        test_sfu_helper_synth synth-check clean
+        test_sfu_helper_synth test_fetch_buffer test_fetch_no_buffer \
+        run_program_synth_nofetch test_dma_buffer synth-check clean
 # R7 (2026-05-23): test_fp32_*_pipe targets removed. The 12 fp32_*_pipe.sv
 # wrappers and their 12 _pipe.cpp standalone gates were dead code from the
 # abandoned "pipelined-first" direction. The combinational cores (fp32_add.sv,
@@ -110,6 +111,7 @@ run_program: $(BUILD_DIR)/run_program/Vtaccel_top
 # hand-typed verilator line:
 #   -GSFU_SYNTH_MODE=1   the real synthesizable SFU datapath, not the DPI
 #                        reference model (mode-1 == the chip)
+#   -GHELPER_SYNTH_MODE=1 the synthesizable retained helper datapath
 #   -GDRAM_SIZE=1 GiB    the 16 MB default faults GPT-2 124M with DRAM_OOB
 # Always pass --fast-beats when running it: that is the honest-BW memory
 # model (1 beat/cycle). The testbench default (~2.66 cyc/beat) is an artifact.
@@ -121,6 +123,8 @@ $(BUILD_DIR)/run_program_synth/Vtaccel_top: $(CONTROL_DEPS) run_program.cpp $(TB
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
 	  -GSFU_SYNTH_MODE=1 \
+	  -GHELPER_SYNTH_MODE=1 \
+	  -GFETCH_BUFFER_ENABLE=1 \
 	  -GDRAM_SIZE=$(DRAM_SIZE_124M) \
 	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
 	  --top-module taccel_top \
@@ -131,6 +135,23 @@ $(BUILD_DIR)/run_program_synth/Vtaccel_top: $(CONTROL_DEPS) run_program.cpp $(TB
 	$(MAKE) -C $(BUILD_DIR)/run_program_synth -f Vtaccel_top.mk
 
 run_program_synth: $(BUILD_DIR)/run_program_synth/Vtaccel_top
+
+# Corrected hardware baseline: identical compute modes, instruction buffer off.
+# Keep a separate output directory so A/B runs never reuse the wrong binary.
+$(BUILD_DIR)/run_program_synth_nofetch/Vtaccel_top: $(CONTROL_DEPS) run_program.cpp $(TB_HEADERS)
+	mkdir -p $(BUILD_DIR)/run_program_synth_nofetch
+	$(VERILATOR) $(VFLAGS) \
+	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
+	  -GSFU_SYNTH_MODE=1 -GHELPER_SYNTH_MODE=1 -GFETCH_BUFFER_ENABLE=0 \
+	  -GDRAM_SIZE=$(DRAM_SIZE_124M) \
+	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
+	  --top-module taccel_top \
+	  --Mdir $(BUILD_DIR)/run_program_synth_nofetch \
+	  $(CONTROL_SV) run_program.cpp \
+	  -CFLAGS "-I$(CURDIR)/include $(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/run_program_synth_nofetch -f Vtaccel_top.mk
+
+run_program_synth_nofetch: $(BUILD_DIR)/run_program_synth_nofetch/Vtaccel_top
 
 # -----------------------------------------------------------------------
 # run_program_noovl: run_program_synth with SYS_DMA_OVERLAP=0.
@@ -151,6 +172,8 @@ $(BUILD_DIR)/run_program_noovl/Vtaccel_top: $(CONTROL_DEPS) run_program.cpp $(TB
 	$(VERILATOR) $(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
 	  -GSFU_SYNTH_MODE=1 \
+	  -GHELPER_SYNTH_MODE=1 \
+	  -GFETCH_BUFFER_ENABLE=1 \
 	  -GDRAM_SIZE=$(DRAM_SIZE_124M) \
 	  -GSYS_DMA_OVERLAP=0 \
 	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
@@ -218,6 +241,17 @@ $(BUILD_DIR)/test_dma/Vtaccel_top: $(CONTROL_DEPS) test_dma.cpp $(TB_HEADERS)
 test_dma: $(BUILD_DIR)/test_dma/Vtaccel_top
 	@echo "--- Running DMA tests ---"
 	$(BUILD_DIR)/test_dma/Vtaccel_top
+
+$(BUILD_DIR)/test_dma_buffer/Vtaccel_top: $(CONTROL_DEPS) test_dma.cpp $(TB_HEADERS)
+	mkdir -p $(BUILD_DIR)/test_dma_buffer
+	$(VERILATOR) $(VFLAGS) -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
+	  -GFETCH_BUFFER_ENABLE=1 -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
+	  --top-module taccel_top --Mdir $(BUILD_DIR)/test_dma_buffer \
+	  $(CONTROL_SV) test_dma.cpp -CFLAGS "-I$(CURDIR)/include $(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_dma_buffer -f Vtaccel_top.mk
+
+test_dma_buffer: $(BUILD_DIR)/test_dma_buffer/Vtaccel_top
+	$(BUILD_DIR)/test_dma_buffer/Vtaccel_top
 
 # -----------------------------------------------------------------------
 # test_helpers: verilate taccel_top (with helper engine) + compile + run
@@ -682,7 +716,7 @@ test_systolic_query: $(BUILD_DIR)/test_systolic_query/Vtaccel_top
 # all current splits for backward compatibility with the old target name.
 # -----------------------------------------------------------------------
 define QKT_SPLIT_RULES
-$$(BUILD_DIR)/test_systolic_qkt_$(1)/Vtaccel_top: $$(CONTROL_SV) test_systolic_qkt_$(1).cpp include/systolic_qkt_utils.h
+$$(BUILD_DIR)/test_systolic_qkt_$(1)/Vtaccel_top: $$(CONTROL_DEPS) test_systolic_qkt_$(1).cpp $$(TB_HEADERS)
 	mkdir -p $$(BUILD_DIR)/test_systolic_qkt_$(1)
 	$$(VERILATOR) $$(VFLAGS) \
 	  -GSYSTOLIC_ARCH_MODE=1 \
@@ -743,13 +777,35 @@ SV2V_OUT     := $(SYNTH_BUILD)/design_full.v
 # sv2v adapts SystemVerilog (packages, enums, ANSI ports, import pkg::*) to
 # Verilog-2005 that Yosys's built-in frontend parses. Yosys then runs the
 # synth-check script (hierarchy -> check -> stat).
-$(SV2V_OUT): $(CONTROL_SV)
+$(SV2V_OUT): $(CONTROL_DEPS)
 	mkdir -p $(SYNTH_BUILD)
 	sv2v -DSFU_SYNTH_NO_DPI -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) $(CONTROL_SV) -w $(SV2V_OUT)
 
 synth-check: $(SV2V_OUT)
 	@echo "--- yosys generic synthesizability gate (taccel_top) ---"
 	yosys -p "read_verilog $(SV2V_OUT); script $(SYNTH_SCRIPT)"
+
+# Focused fetch tests compile only the fetch unit; both cache configurations
+# exercise the same protocol, coherence, and architectural fault contract.
+$(BUILD_DIR)/test_fetch_buffer/Vfetch_unit: $(PKG) $(SRC_DIR)/fetch_unit.sv test_fetch.cpp Makefile
+	mkdir -p $(BUILD_DIR)/test_fetch_buffer
+	$(VERILATOR) $(VFLAGS) -I$(INCLUDE_DIR) --top-module fetch_unit \
+	  -GFETCH_BUFFER_ENABLE=1 --Mdir $(BUILD_DIR)/test_fetch_buffer \
+	  $(PKG) $(SRC_DIR)/fetch_unit.sv test_fetch.cpp \
+	  -CFLAGS "$(CXXFLAGS) -DTEST_FETCH_BUFFER_ENABLE=1"
+
+test_fetch_buffer: $(BUILD_DIR)/test_fetch_buffer/Vfetch_unit
+	$(BUILD_DIR)/test_fetch_buffer/Vfetch_unit
+
+$(BUILD_DIR)/test_fetch_no_buffer/Vfetch_unit: $(PKG) $(SRC_DIR)/fetch_unit.sv test_fetch.cpp Makefile
+	mkdir -p $(BUILD_DIR)/test_fetch_no_buffer
+	$(VERILATOR) $(VFLAGS) -I$(INCLUDE_DIR) --top-module fetch_unit \
+	  -GFETCH_BUFFER_ENABLE=0 --Mdir $(BUILD_DIR)/test_fetch_no_buffer \
+	  $(PKG) $(SRC_DIR)/fetch_unit.sv test_fetch.cpp \
+	  -CFLAGS "$(CXXFLAGS) -DTEST_FETCH_BUFFER_ENABLE=0"
+
+test_fetch_no_buffer: $(BUILD_DIR)/test_fetch_no_buffer/Vfetch_unit
+	$(BUILD_DIR)/test_fetch_no_buffer/Vfetch_unit
 
 # -----------------------------------------------------------------------
 clean:

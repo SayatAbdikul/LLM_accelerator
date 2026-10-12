@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from taccel.runtime import calibration as calibration_mod
+from taccel.runtime.calibration import output_aware as output_aware_mod
 from taccel.runtime.stage5_ptq import (
     STAGE5_PTQ_PRESETS,
     Stage5PTQPreset,
@@ -317,7 +318,7 @@ def test_output_aware_attn_blockwide_uses_one_multiplier_for_all_heads(monkeypat
     def fake_mean(payload, seqs, scales, *, ptq_preset):
         return float(scales["block0_head0_attn_v"] + scales["block0_head1_attn_v"])
 
-    monkeypatch.setattr(calibration_mod, "_mean_fake_quant_target_nll", fake_mean)
+    monkeypatch.setattr(output_aware_mod, "_mean_fake_quant_target_nll", fake_mean)
     updated, diagnostics = calibration_mod.apply_output_aware_attn_scale_search_from_token_ids(
         payload,
         [0, 1, 2],
@@ -343,7 +344,7 @@ def test_output_aware_attn_value_search_keeps_kv_load_scale_synced(monkeypatch):
     def fake_mean(payload, seqs, scales, *, ptq_preset):
         return float(scales["block0_head0_value"] + scales["block0_head0_value_kv_load"])
 
-    monkeypatch.setattr(calibration_mod, "_mean_fake_quant_target_nll", fake_mean)
+    monkeypatch.setattr(output_aware_mod, "_mean_fake_quant_target_nll", fake_mean)
     updated, diagnostics = calibration_mod.apply_output_aware_attn_scale_search_from_token_ids(
         payload,
         [0, 1, 2],
@@ -368,7 +369,7 @@ def test_output_aware_lm_head_scale_search_updates_lm_head_scale(monkeypatch):
     def fake_mean(payload, seqs, scales, *, ptq_preset):
         return float(scales.get("lm_head", 1.0))
 
-    monkeypatch.setattr(calibration_mod, "_mean_fake_quant_target_nll", fake_mean)
+    monkeypatch.setattr(output_aware_mod, "_mean_fake_quant_target_nll", fake_mean)
     updated, diagnostics = calibration_mod.apply_output_aware_lm_head_scale_search_from_token_ids(
         payload,
         [0, 1, 2],
@@ -393,7 +394,7 @@ def test_output_aware_gelu_scale_search_accepts_search_caps(monkeypatch):
         seen_lengths.append((len(seqs), len(seqs[0]) if seqs else 0))
         return float(scales["block0_gelu"])
 
-    monkeypatch.setattr(calibration_mod, "_mean_fake_quant_target_nll", fake_mean)
+    monkeypatch.setattr(output_aware_mod, "_mean_fake_quant_target_nll", fake_mean)
     updated, diagnostics = calibration_mod.apply_output_aware_gelu_scale_search_from_token_ids(
         payload,
         list(range(20)),

@@ -140,7 +140,38 @@ def _load_hf_model(source: str):
     return GPT2LMHeadModel.from_pretrained(source)
 
 
-def write_payload(payload: dict, output: Path, *, source: str) -> dict:
+def load_local_safetensors(source: Path, config_path: Path) -> tuple[dict, dict]:
+    """Convert local HF tensors with an explicit, recorded configuration.
+
+    Both GPT2Model keys (``h.0...``) and GPT2LMHeadModel keys
+    (``transformer.h.0...``) are accepted. A previous converted metadata file
+    can supply model_args when the original config.json is unavailable.
+    """
+    from safetensors.torch import load_file
+
+    raw_config = json.loads(config_path.read_text())
+    config = dict(raw_config.get("model_args", raw_config))
+    if "block_size" in config and "n_positions" not in config:
+        config["n_positions"] = config["block_size"]
+    state = load_file(str(source), device="cpu")
+    if "transformer.wte.weight" not in state:
+        state = {("transformer." + key if key.startswith(("wte.", "wpe.", "h.", "ln_f.")) else key): value
+                 for key, value in state.items()}
+    payload = convert_hf_state_dict_to_nanogpt(state, config)
+    args = payload["model_args"]
+    if tuple(payload["state_dict"]["transformer.wte.weight"].shape) != (args["vocab_size"], args["n_embd"]):
+        raise ValueError("token embedding shape does not match explicit configuration")
+    if tuple(payload["state_dict"]["transformer.wpe.weight"].shape) != (args["block_size"], args["n_embd"]):
+        raise ValueError("position embedding shape does not match explicit configuration")
+    provenance = {"source_sha256": _sha256(source),
+                  "configuration_sha256": hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(),
+                  "configuration": config, "configuration_source": str(config_path),
+                  "converter_sha256": _sha256(Path(__file__)),
+                  "torch_version": str(torch.__version__), "conversion_kind": "offline_safetensors"}
+    return payload, provenance
+
+
+def write_payload(payload: dict, output: Path, *, source: str, provenance: dict | None = None) -> dict:
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, output)
     metadata = {
@@ -152,6 +183,8 @@ def write_payload(payload: dict, output: Path, *, source: str) -> dict:
         "weight_tying": "lm_head.weight aliases transformer.wte.weight in payload",
         "format": "nanogpt_split_qkv",
     }
+    if provenance is not None:
+        metadata["provenance"] = provenance
     output.with_suffix(output.suffix + ".json").write_text(json.dumps(metadata, indent=2, sort_keys=True))
     return metadata
 
@@ -160,11 +193,19 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", help="HF model name such as 'gpt2' or a local HF checkpoint directory")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--config", type=Path,
+                        help="explicit JSON configuration for offline .safetensors conversion")
     args = parser.parse_args(argv)
 
-    model = _load_hf_model(args.source)
-    payload = convert_hf_state_dict_to_nanogpt(model.state_dict(), model.config)
-    metadata = write_payload(payload, args.output, source=args.source)
+    provenance = None
+    if Path(args.source).suffix == ".safetensors":
+        if args.config is None:
+            parser.error("offline .safetensors conversion requires --config")
+        payload, provenance = load_local_safetensors(Path(args.source), args.config)
+    else:
+        model = _load_hf_model(args.source)
+        payload = convert_hf_state_dict_to_nanogpt(model.state_dict(), model.config)
+    metadata = write_payload(payload, args.output, source=args.source, provenance=provenance)
     print(json.dumps(metadata, indent=2, sort_keys=True))
     return 0
 

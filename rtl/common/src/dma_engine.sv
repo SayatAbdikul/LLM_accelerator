@@ -1,6 +1,7 @@
 // DMA Engine -- LOAD (DRAM->SRAM) and STORE (SRAM->DRAM) via AXI4 master.
 //
-// LOAD:  Issues sequential AXI4 read bursts of up to 256 beats each.
+// LOAD:  Issues sequential AXI4 read bursts of up to 256 beats each, split
+//        at 4-KiB boundaries as required by AXI (including transposed LOAD).
 //        Each accepted 16-byte beat is written to SRAM port A at consecutive rows.
 //
 // STORE: Issues sequential AXI4 write bursts of up to 256 beats each.
@@ -124,7 +125,12 @@ module dma_engine
   logic [15:0] burst_beats_q;
   logic [15:0] burst_beat_idx_q;
   logic [55:0] curr_dram_addr_q;
+  logic        dispatch_addr_overflow_q;
   logic [3:0]  fault_code_r;
+  // A different SRAM Port-A-class owner may change sram_rdata while W is
+  // stalled. Preserve the first offered payload without delaying ready W beats.
+  logic [127:0] store_w_hold_data_q;
+  logic         store_w_hold_valid_q;
 
   // ---- Lever D transposed-load state ----
   // A transposed LOAD walks `t_rows_tiles` stripes. Each stripe reads
@@ -146,7 +152,6 @@ module dma_engine
   logic [15:0] t_cols_beats_w;   // C/16 = 1 << cols_log2
   logic [15:0] t_row_in_w;       // input row of current beat = beat >> cols_log2
   logic [15:0] t_colgrp_w;       // input beat's 16-col group = beat & (C/16-1)
-  logic [15:0] t_stripe_bytes_w; // bytes per stripe = C*16
   logic        t_read_last_w;    // last beat of the stripe read
   logic        t_write_last_w;   // last column of the stripe write
   logic        t_stripe_last_w;  // last stripe of the transfer
@@ -157,7 +162,6 @@ module dma_engine
   assign t_row_in_w      = t_beat_idx_q >> cols_log2_q;
   assign t_colgrp_w      = t_beat_idx_q & (t_cols_beats_w - 16'h1);
   assign t_wr_col_base_w = t_colgrp_w[2:0] << 4;   // 0,16,32,48 (C≤64)
-  assign t_stripe_bytes_w= {t_csize_q[11:0], 4'b0};   // C beats × 16 bytes
   assign t_read_last_w   = (t_beat_idx_q == (t_csize_q - 16'h1));
   assign t_write_last_w  = (t_col_idx_q == (t_csize_q - 16'h1));
   assign t_stripe_last_w = (t_stripe_idx_q == (t_rows_tiles_q - 16'h1));
@@ -208,18 +212,23 @@ module dma_engine
     end
   endfunction
 
-  function automatic logic [15:0] burst_beats(input logic [15:0] remaining);
+  function automatic logic [15:0] burst_beats(
+    input logic [15:0] remaining,
+    input logic [55:0] address
+  );
+    logic [15:0] page_beats;
     begin
-      if (remaining > 16'd256)
-        burst_beats = 16'd256;
-      else
-        burst_beats = remaining;
+      // 128-bit beats: a page holds 256 beats. This bound simultaneously
+      // enforces AXI's maximum burst length and prevents crossing 4 KiB.
+      page_beats = 16'd256 - {8'h0, address[11:4]};
+      burst_beats = (remaining > page_beats) ? page_beats : remaining;
     end
   endfunction
 
   assign burst_bytes_w           = {36'h0, burst_beats_q, 4'b0};
   assign remaining_after_burst_w = beats_remaining_q - burst_beats_q;
-  assign next_burst_beats_w      = burst_beats(remaining_after_burst_w);
+  assign next_burst_beats_w      = burst_beats(remaining_after_burst_w,
+                                              dram_addr_after_burst_w);
   assign dram_addr_after_burst_w = curr_dram_addr_q + burst_bytes_w;
   assign sram_row_after_burst_w  = curr_sram_row_q + burst_beats_q;
   assign burst_last_beat_w       = (burst_beat_idx_q == (burst_beats_q - 16'h1));
@@ -248,7 +257,8 @@ module dma_engine
   // is short.
   assign latched_dram_end_w  = {1'b0, curr_dram_addr_q}
                              + {37'h0, beats_remaining_q, 4'b0};
-  assign latched_dram_oob_w  = (latched_dram_end_w > 57'(DRAM_SIZE));
+  assign latched_dram_oob_w  = dispatch_addr_overflow_q |
+                               (latched_dram_end_w > 57'(DRAM_SIZE));
   assign latched_buf_rows_w  = buf_rows(buf_id_q);
   assign latched_sram_end_w  = {1'b0, curr_sram_row_q} + {1'b0, beats_remaining_q};
   assign latched_sram_oob_w  =
@@ -271,7 +281,10 @@ module dma_engine
       burst_beats_q          <= 16'h0;
       burst_beat_idx_q       <= 16'h0;
       curr_dram_addr_q       <= 56'h0;
+      dispatch_addr_overflow_q <= 1'b0;
       fault_code_r           <= 4'h0;
+      store_w_hold_data_q    <= 128'h0;
+      store_w_hold_valid_q   <= 1'b0;
       next_dram_addr_q       <= 56'h0;
       next_sram_row_q        <= 16'h0;
       next_beats_remaining_q <= 16'h0;
@@ -301,9 +314,10 @@ module dma_engine
             buf_id_q          <= buf_id;
             curr_sram_row_q   <= sram_off;
             beats_remaining_q <= xfer_len;
-            burst_beats_q     <= burst_beats(xfer_len);
+            burst_beats_q     <= 16'h0;
             burst_beat_idx_q  <= 16'h0;
             curr_dram_addr_q  <= dispatch_dram_byte_addr_w[55:0];
+            dispatch_addr_overflow_q <= dispatch_dram_byte_addr_w[56];
             // Lever D: latch transpose mode + geometry. Only honored for LOAD.
             is_transpose_q    <= is_transpose && !is_store;
             cols_log2_q       <= cols_log2;
@@ -315,6 +329,9 @@ module dma_engine
         end
 
         D_DISPATCH_CHECK: begin
+          // Compute the first burst from the registered effective address,
+          // keeping page-boundary selection out of the dispatch adder path.
+          burst_beats_q <= burst_beats(beats_remaining_q, curr_dram_addr_q);
           if (latched_dram_oob_w) begin
             fault_code_r <= 4'(FAULT_DRAM_OOB);
             state        <= D_FAULT;
@@ -332,6 +349,7 @@ module dma_engine
             t_rows_tiles_q <= beats_remaining_q >> (5'(cols_log2_q) + 5'd4);
             t_stripe_idx_q <= 16'h0;
             t_beat_idx_q   <= 16'h0;
+            burst_beats_q  <= burst_beats(16'h10 << cols_log2_q, curr_dram_addr_q);
             state          <= D_T_AR;
           end else begin
             state <= is_store_q ? D_STORE_AW : D_LOAD_AR;
@@ -381,6 +399,7 @@ module dma_engine
         end
 
         D_STORE_SRAM_PRE: begin
+          store_w_hold_valid_q <= 1'b0;
           if (sram_fault) begin
             fault_code_r <= 4'(FAULT_SRAM_OOB);
             state        <= D_FAULT;
@@ -397,6 +416,11 @@ module dma_engine
               burst_beat_idx_q <= burst_beat_idx_q + 16'h1;
               state            <= D_STORE_SRAM_PRE;
             end
+          end else if (!store_w_hold_valid_q) begin
+            // Capture before another owner's synchronous SRAM access updates
+            // its output at this edge. All later stalled cycles use this copy.
+            store_w_hold_data_q  <= sram_rdata;
+            store_w_hold_valid_q <= 1'b1;
           end
         end
 
@@ -421,7 +445,9 @@ module dma_engine
         // ---- Lever D transposed-load stripe loop ----
         D_T_AR: begin
           if (dma_ar_ready) begin
-            t_beat_idx_q <= 16'h0;
+            // The logical stripe may span two AXI bursts. Preserve its
+            // gather index; only the AXI-local beat counter starts over.
+            burst_beat_idx_q <= 16'h0;
             state        <= D_T_R;
           end
         end
@@ -431,7 +457,7 @@ module dma_engine
             if (dma_r_resp != 2'b00) begin
               fault_code_r <= 4'(FAULT_DRAM_OOB);
               state        <= D_FAULT;
-            end else if (dma_r_last != t_read_last_w) begin
+            end else if (dma_r_last != burst_last_beat_w) begin
               fault_code_r <= 4'(FAULT_DRAM_OOB);
               state        <= D_FAULT;
             end else begin
@@ -440,11 +466,21 @@ module dma_engine
               for (int j = 0; j < 16; j++)
                 tbuf[t_row_in_w[3:0]][t_wr_col_base_w[5:0] + 6'(j)] <= dma_r_data[j*8 +: 8];
               if (t_read_last_w) begin
+                // Keep the address at the first byte of the next stripe.
+                curr_dram_addr_q <= next_dram_addr_q;
                 t_col_idx_q <= 16'h0;
                 t_out_row_q <= t_base_row_q + t_stripe_idx_q;  // col 0 row
                 state       <= D_T_WRITE;
               end else begin
                 t_beat_idx_q <= t_beat_idx_q + 16'h1;
+                if (burst_last_beat_w) begin
+                  curr_dram_addr_q <= next_dram_addr_q;
+                  burst_beats_q <= burst_beats(t_csize_q - t_beat_idx_q - 16'd1,
+                                               next_dram_addr_q);
+                  state <= D_T_AR;
+                end else begin
+                  burst_beat_idx_q <= burst_beat_idx_q + 16'h1;
+                end
               end
             end
           end
@@ -456,7 +492,7 @@ module dma_engine
             if (t_stripe_last_w) begin
               state <= D_IDLE;
             end else begin
-              curr_dram_addr_q <= curr_dram_addr_q + {40'h0, t_stripe_bytes_w};
+              burst_beats_q   <= burst_beats(t_csize_q, curr_dram_addr_q);
               t_stripe_idx_q   <= t_stripe_idx_q + 16'h1;
               t_beat_idx_q     <= 16'h0;
               state            <= D_T_AR;
@@ -536,7 +572,7 @@ module dma_engine
 
       D_STORE_W: begin
         dma_w_valid = 1'b1;
-        dma_w_data  = sram_rdata;
+        dma_w_data  = store_w_hold_valid_q ? store_w_hold_data_q : sram_rdata;
         dma_w_last  = burst_last_beat_w;
       end
 
@@ -547,7 +583,7 @@ module dma_engine
       // ---- Lever D transposed-load ----
       D_T_AR: begin
         dma_ar_addr  = curr_dram_addr_q;
-        dma_ar_len   = 8'(t_csize_q - 16'h1);   // C beats (≤64) per stripe
+        dma_ar_len   = 8'(burst_beats_q - 16'h1);
         dma_ar_valid = 1'b1;
       end
 

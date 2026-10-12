@@ -1,6 +1,6 @@
 {
-  "checkpoint_path": "/home/user/LLM_accelerator/software/tests/fixtures/generated/nanogpt_shakespeare_char_d384_l6.pt",
-  "checkpoint_sha256": "accd8037ae104adaac54b1a257ab818198fec5e77054b1381aaa4b340b89dc96",
+  "checkpoint_path": "/Users/sayat/Documents/GitHub/LLM_accelerator/software/tests/fixtures/generated/nanogpt_shakespeare_char_d384_l6.pt",
+  "checkpoint_sha256": "6800d6ff0a8112aed3a7ae72bfaf60ca30bf965429f1fa354c3e2ec233ccf144",
   "dataset": "embedded_shakespeare_char_excerpt",
   "hyperparameters": {
     "bias": true,
@@ -9,6 +9,11 @@
     "d_model": 384,
     "n_head": 6,
     "n_layer": 6
+  },
+  "provenance": {
+    "generator_sha256": "ce8de88ce5faea2abec20d621a7354cb5306026cc0a97b45a26b769555e2cf9d",
+    "payload_sha256": "85ae9371384200a6ceb02239e16cd7ebb53a96ea6a85de7a8b55fc1edcf5e70e",
+    "torch_version": "2.11.0"
   },
   "ranges": {
     "calibration_bytes": {

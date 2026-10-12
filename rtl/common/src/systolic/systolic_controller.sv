@@ -67,7 +67,12 @@ module systolic_controller
   // write from a CORRUPTING one when the DMA outranks us on the shared bus: the
   // preclear only writes zeros that ST_DRAIN_WR later overwrites unconditionally,
   // but a dropped drain write loses a real accumulator result forever.
-  output logic                 obs_a_preclear
+  output logic                 obs_a_preclear,
+  // Mutually exclusive busy-phase classification; observation only.
+  // 0 idle, 1 initial load/prime, 2 data feed, 3 K-boundary pause,
+  // 4 final skew flush, 5 drain (including read-modify-write), 6 other.
+  output logic [2:0]           obs_phase,
+  output logic                 obs_step_enable
 );
 
   assign obs_a_preclear = (state == ST_DST_CLEAR_WR);
@@ -181,6 +186,18 @@ module systolic_controller
   // src2_logical_row is built from rd_lane_w so both the prime and the
   // in-loop read-ahead address the correct B row.
   logic [5:0]  rd_lane_w;
+  assign obs_step_enable = step_en;
+  always_comb begin
+    case (state)
+      ST_IDLE: obs_phase = 3'd0;
+      ST_INIT_TILE, ST_A_LOAD_REQ, ST_A_LOAD_LATCH, ST_READ_REQ:
+        obs_phase = 3'd1;
+      ST_READ_USE: obs_phase = (lane_q < 6'(SYS_DIM)) ? 3'd2 : 3'd4;
+      ST_PF_FINISH: obs_phase = 3'd3;
+      ST_DRAIN_PREP, ST_DRAIN_RD, ST_DRAIN_WR: obs_phase = 3'd5;
+      default: obs_phase = 3'd6;
+    endcase
+  end
   // A-load read-ahead: in ST_A_LOAD_LATCH the port-B read issued is for the
   // NEXT scratch row (a_load_row_q + 1) while the current row is being
   // latched. ST_A_LOAD_REQ is a one-shot prime reading row 0 itself.

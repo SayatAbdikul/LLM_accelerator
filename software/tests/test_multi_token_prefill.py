@@ -25,7 +25,7 @@ import numpy as np
 import pytest
 
 from taccel.assembler.assembler import ProgramBinary
-from taccel.runtime.host_runner import HostRunner
+from taccel.runtime.host_runner import BundlePatcher, HostRunner
 from taccel.runtime.tiny_fixture import build_stage3_tiny_decoder_bundle
 
 RTL_SYNTH_BINARY = (
@@ -125,14 +125,15 @@ def test_chunked_prefill_is_byte_identical_to_sequential(tmp_path, L, P):
 
 
 def test_multi_token_prefill_rtl_matches_golden_bytes(tmp_path):
-    """Bit-exact contract: mode-1 synth RTL == mode-0 golden on the DENSE PREFILL
+    """Bit-exact contract: mode-1 synth RTL == Python golden on DENSE PREFILL
     program (byte-identical logits region).
 
-    Tiny model on purpose — RTL-vs-golden byte-match is only well-posed below
-    GPT-2 124M's first fp16 overflow (see rtl_cosim.py #109).
+    This tiny finite conformance workload does not establish full-model quality.
     """
     if not RTL_SYNTH_BINARY.exists():
         pytest.skip(f"synth RTL binary not built: {RTL_SYNTH_BINARY}")
+    from tools.benchmark_support import check_runner_freshness, decoder_logits_metrics, validate_runner_summary
+    check_runner_freshness(Path(__file__).resolve().parents[2], RTL_SYNTH_BINARY)
     P = 16
     payload = _build_payload(tmp_path)
     tiny = build_stage3_tiny_decoder_bundle(
@@ -140,13 +141,15 @@ def test_multi_token_prefill_rtl_matches_golden_bytes(tmp_path):
     bundle = tiny.build.bundle
     prompt = _prompt(P)
 
-    # Golden (mode-0 DPI): run ONE prefill chunk on a fresh bundle.
-    runner = HostRunner(bundle, logits_dtype=np.int8)
-    golden = runner.run_prefill_chunk(prompt, 0)
+    # Python golden: compare the full byte view of the FP16 logits region.
+    runner = HostRunner(bundle, logits_dtype=np.float16)
+    golden_fp16 = runner.run_prefill_chunk(prompt, 0)
+    assert np.isfinite(golden_fp16.reshape(P, -1)[:, :tiny.config.vocab_size]).all()
+    golden = golden_fp16.view(np.uint8)
 
     # RTL: patch the same sites, extract the standalone PREFILL program, run it
     # on a fresh image and dump the logits region. Symmetric with the golden run.
-    patcher = HostRunner(bundle, simulator=None)
+    patcher = BundlePatcher(bundle)
     patcher._patch_embeddings("prefill", prompt, list(range(P)))
     patcher._patch_kv_bases(0, stream="prefill")
     patcher._patch_attention_context("prefill", 0, P)
@@ -167,10 +170,16 @@ def test_multi_token_prefill_rtl_matches_golden_bytes(tmp_path):
             "--dram-dump-offset", str(off), "--dram-dump-size", str(size),
             "--dram-dump-out", str(td / "dram.bin")]
     cp = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
+    assert cp.returncode == 0, cp.stderr[-800:]
     assert (td / "s.json").exists(), f"RTL run failed: {cp.stderr[-800:]}"
     summ = json.loads((td / "s.json").read_text())
-    assert summ.get("status") == "halted" and not summ.get("fault"), summ
-    rtl = np.frombuffer((td / "dram.bin").read_bytes(), dtype=np.int8)[:golden.shape[0]]
+    validate_runner_summary(summ)
+    raw = (td / "dram.bin").read_bytes()
+    assert len(raw) == golden.size == size
+    metrics = decoder_logits_metrics(raw, rows=P, vocab_size=int(tiny.config.vocab_size),
+                                     row_bytes=int(bundle.logits_row_bytes))
+    assert metrics["all_finite"], metrics
+    rtl = np.frombuffer(raw, dtype=np.uint8)
 
     assert np.array_equal(golden, rtl), (
         f"RTL != golden on the chunked prefill: "

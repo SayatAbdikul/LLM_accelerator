@@ -2,22 +2,14 @@
 import importlib.util
 import os
 import subprocess
+import sys
 from pathlib import Path
-
-import pytest
-
 
 TOOL_PATH = Path(__file__).resolve().parents[1] / "tools" / "train_tiny_fixture.py"
 RUNNER = Path(__file__).resolve().parents[1] / "run_nanogpt.py"
 
-# The runner is invoked via a separate venv to dodge OMP-fork issues that
-# show up when subprocess'ing back into the parent's Python. Tests that
-# exercise the full CLI need this venv pre-built locally; skip otherwise.
-_RUNNER_PYTHON = Path("/tmp/llm_accelerator_stage3_venv/bin/python")
-_NEEDS_RUNNER_VENV = pytest.mark.skipif(
-    not _RUNNER_PYTHON.exists(),
-    reason=f"runner venv {_RUNNER_PYTHON} not present",
-)
+# An alternate interpreter is optional, not a machine-specific prerequisite.
+_RUNNER_PYTHON = os.environ.get("TACCEL_TEST_RUNNER_PYTHON", sys.executable)
 
 
 def _fixture_tool():
@@ -27,7 +19,6 @@ def _fixture_tool():
     return module
 
 
-@_NEEDS_RUNNER_VENV
 def test_run_nanogpt_stage4_fixture_smoke(tmp_path):
     tool = _fixture_tool()
     checkpoint = tmp_path / "nanogpt_shakespeare_char_d384_l6.pt"
@@ -36,9 +27,13 @@ def test_run_nanogpt_stage4_fixture_smoke(tmp_path):
 
     env = os.environ.copy()
     env["PYTHONPATH"] = "software"
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                 "VECLIB_MAXIMUM_THREADS"):
+        env.setdefault(name, "1")
+    env.setdefault("TOKENIZERS_PARALLELISM", "false")
     result = subprocess.run(
         [
-            "/tmp/llm_accelerator_stage3_venv/bin/python",
+            _RUNNER_PYTHON,
             str(RUNNER),
             str(checkpoint),
             "--prompt-ids",

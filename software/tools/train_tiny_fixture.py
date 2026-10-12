@@ -68,6 +68,25 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def payload_sha256(payload: dict) -> str:
+    """Content identity independent of torch.save ZIP metadata and filenames."""
+    h = hashlib.sha256()
+    h.update(json.dumps({k: v for k, v in payload.items() if k != "state_dict"},
+                        sort_keys=True).encode())
+    for key, tensor in sorted(payload["state_dict"].items()):
+        array = tensor.detach().cpu().numpy()
+        h.update(json.dumps([key, str(array.dtype), list(array.shape)]).encode())
+        h.update(array.tobytes())
+    return h.hexdigest()
+
+
+def _fixture_provenance(payload: dict) -> dict:
+    import torch
+    return {"payload_sha256": payload_sha256(payload),
+            "generator_sha256": sha256_file(Path(__file__)),
+            "torch_version": str(torch.__version__)}
+
+
 def split_ranges(text: str, *, calibration_limit: int = 256) -> Dict[str, Tuple[int, int]]:
     n = len(text.encode("utf-8"))
     train_end = int(n * 0.90)
@@ -659,8 +678,10 @@ def write_fixture(checkpoint_path: Path = DEFAULT_FIXTURE,
     import torch
 
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(_make_checkpoint_payload(), checkpoint_path)
+    payload = _make_checkpoint_payload()
+    torch.save(payload, checkpoint_path)
     metadata = build_metadata(checkpoint_path, sha256_file(checkpoint_path))
+    metadata["provenance"] = _fixture_provenance(payload)
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return metadata
 
@@ -688,6 +709,7 @@ def write_stage4_fixture(checkpoint_path: Path = DEFAULT_STAGE4_FIXTURE,
         block_size=256,
         stage4_ready=True,
     )
+    metadata["provenance"] = _fixture_provenance(payload)
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return metadata
 
@@ -726,6 +748,7 @@ def write_trained_d128_fixture(
         training=training,
         validation_loss=float(training["validation_loss"]),
     )
+    metadata["provenance"] = _fixture_provenance(payload)
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return metadata
 

@@ -24,6 +24,8 @@ class IRGraph:
         self.node_map: Dict[str, IRNode] = {}
 
     def add_node(self, node: IRNode) -> IRNode:
+        if node.name in self.node_map:
+            raise ValueError(f"Duplicate IR node name {node.name!r}")
         self.nodes.append(node)
         self.node_map[node.name] = node
         return node

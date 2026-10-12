@@ -198,7 +198,7 @@ def test_debug_gpt2_perplexity_compare_search_windows_report_sections(monkeypatc
         return {"lm_head": scale, "block0_gelu": scale}, {"window": f"{search_n_seqs}x{search_seq_len}"}
 
     def fake_golden(*args, **kwargs):
-        return [np.asarray([2, 1, 0, -1], dtype=np.int8)]
+        return [np.asarray([2, 1, 0, -1], dtype=np.float32)]
 
     def fake_fake(*args, **kwargs):
         return [np.asarray([2, 0, 1, -1], dtype=np.int8)]
@@ -233,9 +233,9 @@ def test_calibration_sweep_forwards_mlp_search_caps(monkeypatch):
     dbg = _debug_module()
     captured = []
 
-    monkeypatch.setattr(dbg, "build_calibration_scales_from_token_ids", lambda *args, **kwargs: {"lm_head": 1.0})
+    monkeypatch.setattr(dbg, "build_calibration_scales_from_token_ids", lambda *args, **kwargs: {"lm_head": 0.25})
     monkeypatch.setattr(dbg, "apply_stage5_ptq_scale_policy", lambda scales, *args, **kwargs: dict(scales))
-    monkeypatch.setattr(dbg, "run_golden_teacher_forced_logits", lambda *args, **kwargs: [np.asarray([2, 1, 0, -1], dtype=np.int8)])
+    monkeypatch.setattr(dbg, "run_golden_teacher_forced_logits", lambda *args, **kwargs: [np.asarray([0.5, 0.25, 0, -0.25], dtype=np.float32)])
     monkeypatch.setattr(dbg, "run_fake_quant_teacher_forced_logits", lambda *args, **kwargs: [np.asarray([2, 1, 0, -1], dtype=np.int8)])
 
     def fake_mlp_search(*args, **kwargs):
@@ -256,6 +256,14 @@ def test_calibration_sweep_forwards_mlp_search_caps(monkeypatch):
 
     assert len(rows) == len(dbg.SWEEP_CONFIGS)
     assert captured == [(4, 64)] * len(dbg.SWEEP_CONFIGS)
+    for row in rows:
+        assert row["relative_delta"] == 0.0
+        assert row["golden_storage"] == {
+            "dtype": "float16", "widened_to": "float32", "finite_count": 4,
+            "element_count": 4, "min_unique_count": 4,
+        }
+        assert row["fake_quant_int8"]["mean_saturation_rate"] == 0.0
+        assert "mean_saturation_rate" not in row
 
 
 def test_calibration_sweep_gelu_search_uses_supported_kwargs(monkeypatch):
@@ -264,7 +272,7 @@ def test_calibration_sweep_gelu_search_uses_supported_kwargs(monkeypatch):
 
     monkeypatch.setattr(dbg, "build_calibration_scales_from_token_ids", lambda *args, **kwargs: {"lm_head": 1.0})
     monkeypatch.setattr(dbg, "apply_stage5_ptq_scale_policy", lambda scales, *args, **kwargs: dict(scales))
-    monkeypatch.setattr(dbg, "run_golden_teacher_forced_logits", lambda *args, **kwargs: [np.asarray([2, 1, 0, -1], dtype=np.int8)])
+    monkeypatch.setattr(dbg, "run_golden_teacher_forced_logits", lambda *args, **kwargs: [np.asarray([2, 1, 0, -1], dtype=np.float32)])
     monkeypatch.setattr(dbg, "run_fake_quant_teacher_forced_logits", lambda *args, **kwargs: [np.asarray([2, 1, 0, -1], dtype=np.int8)])
 
     def fake_gelu_search(*args, **kwargs):

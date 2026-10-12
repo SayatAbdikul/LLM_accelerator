@@ -19,19 +19,14 @@ from ..quantizer.quantize import quantize_tensor
 from ..quantizer.scales import ScalePropagator
 from .calibration import build_calibration_scales
 from .fake_quant import cosine_similarity
-from .fake_quant_reference import NanoGPTFQReference
+from .w8a16_simulator_reference import NanoGPTW8A16SimulatorReference
 from .fp32_reference import NanoGPTFP32Reference
 from .host_runner import HostRunner
 from .stage5_ptq import (
     Stage5PTQPreset,
     apply_stage5_ptq_scale_policy,
     resolve_stage5_ptq_preset,
-    stage5_dequant_add_residual1_blocks,
-    stage5_dequant_add_residual2_blocks,
     stage5_gelu_from_accum_blocks,
-    stage5_raw_residual1_blocks,
-    stage5_raw_residual2_blocks,
-    stage5_requant_pc_weight_names,
     validate_stage5_ptq_preset_for_model,
 )
 
@@ -420,13 +415,16 @@ def build_stage3_tiny_decoder_bundle(
     ptq_preset: str | Stage5PTQPreset | None = None,
     batch: int = 1,
     prefill_tokens: int = 1,
+    compiler_options=None,
+    target: str = "rtl-gen2",
 ) -> TinyFixtureBundle:
     """Build the full 1-token tiny decoder ProgramBundle used by Stage 3 tests.
 
     ``batch`` selects the decode-stream shape. ``batch=1`` (default) keeps the
     single-token decoder byte-identical to before. ``batch=16``/``batch=32``
     build the lockstep batched decode stream (N query rows through the shared
-    non-attention path); the prefill stream stays single-token regardless.
+    non-attention path). Their prefill slot uses that same batched graph to
+    prime one token per stream. Chunked multi-token prefill is batch=1 only.
 
     Lever H (batch=32): the shared work (LN / Q,K,V+out projections / FFN /
     lm_head — all M-shaped, weights DMA'd once) amortizes over 2x the tokens,
@@ -582,10 +580,10 @@ def build_stage3_tiny_decoder_bundle(
         logits_size=logits_size,
         logits_rows=logits_rows,
         prefill_store_rows=int(prefill_tokens),
-        requant_pc_weight_names=stage5_requant_pc_weight_names(config, resolved_preset),
-        dequant_add_residual1_blocks=stage5_dequant_add_residual1_blocks(config, resolved_preset),
-        dequant_add_residual2_blocks=stage5_dequant_add_residual2_blocks(config, resolved_preset),
-        gelu_from_accum_blocks=gelu_from_accum_blocks or None,
+        # Legacy INT8 fusion/requant lowering does not apply to the FP16 path.
+        # Preset calibration remains above; pass only supported lowering options.
+        compiler_options=compiler_options,
+        target=target,
         use_fp16_activations=True,
         biases=biases,
         n_streams=batch,
@@ -661,23 +659,23 @@ def _topk_set(logits: np.ndarray, *, vocab_size: int, k: int = 5) -> set[int]:
 
 
 def _run_reference_trace(
-    ref: NanoGPTFQReference,
+    ref: NanoGPTW8A16SimulatorReference,
     prompt_ids: Sequence[int],
     *,
     max_new_tokens: int,
     vocab_size: int,
 ) -> TinyDecodeTrace:
-    """Greedy decode using the PyTorch fake-quant numpy reference."""
+    """Greedy decode using the independent W8A16 numerical reference."""
     generated = [int(tok) for tok in prompt_ids]
     logits_trace: List[np.ndarray] = []
 
-    logits = ref.forward_incremental(generated)
+    logits = ref.run_prefill(generated)
     logits_trace.append(logits)
     next_token = _greedy_token(logits, vocab_size)
 
     for _ in range(max_new_tokens):
         generated.append(next_token)
-        logits = ref.forward_incremental(generated)
+        logits = ref.run_decode_step(generated[-1], len(generated) - 1)
         logits_trace.append(logits)
         next_token = _greedy_token(logits, vocab_size)
 
@@ -688,14 +686,12 @@ def run_stage3_tiny_e2e(payload: Dict[str, object], *,
                         prompt_ids: Sequence[int] = (0,),
                         max_new_tokens: int = 32,
                         ptq_preset: str | Stage5PTQPreset | None = None) -> TinyE2EResult:
-    """Run the Stage 3 32-step gate comparing the golden model against a
-    PyTorch fake-quant numpy reference that shares calibration scales.
+    """Compare the FP16-storage bundle with the independent W8A16 reference.
 
-    Both paths use the same per-node INT8 scales derived from calibration on
-    the fixture's embedded Shakespeare text, so differences reflect arithmetic
-    correctness rather than calibration drift. When ptq_preset is the W8A16
-    weight-only variant, the bundle uses FP16 activation storage; otherwise
-    INT8 throughout (W8A8 reference).
+    The compiler always emits W8A16. The old W8A8 fake-quant reference used
+    INT8 activation storage and could diverge on trained fixtures despite
+    identical calibration inputs. Both rails now use the active arithmetic
+    contract; the reference remains a separate NumPy implementation.
     """
     # Single calibration pass — shared by compiler and reference
     resolved_preset = resolve_stage5_ptq_preset(ptq_preset)
@@ -719,15 +715,7 @@ def run_stage3_tiny_e2e(payload: Dict[str, object], *,
     )
     actual = run_tiny_decode_trace(tiny, prompt_ids, max_new_tokens=max_new_tokens)
 
-    ref = NanoGPTFQReference(
-        state_dict=payload["state_dict"],
-        model_args=payload["model_args"],
-        scales=calibration_scales,
-        requant_pc_weight_names=stage5_requant_pc_weight_names(payload["model_args"], resolved_preset),
-        raw_residual1_blocks=stage5_raw_residual1_blocks(resolved_preset),
-        raw_residual2_blocks=stage5_raw_residual2_blocks(resolved_preset),
-        gelu_from_accum_blocks=stage5_gelu_from_accum_blocks(resolved_preset),
-    )
+    ref = NanoGPTW8A16SimulatorReference(payload, calibration_scales=calibration_scales)
     reference = _run_reference_trace(
         ref, prompt_ids, max_new_tokens=max_new_tokens, vocab_size=tiny.config.vocab_size
     )

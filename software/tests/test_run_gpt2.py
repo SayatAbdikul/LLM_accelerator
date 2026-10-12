@@ -2,6 +2,7 @@
 import importlib.util
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -12,15 +13,9 @@ RUNNER = Path(__file__).resolve().parents[1] / "run_gpt2.py"
 GPT2_FIXTURE = Path("software/tests/fixtures/generated/gpt2_converted_nanogpt.pt")
 TOKENIZER_DIR = Path("software/tests/fixtures/generated/hf_gpt2")
 
-# The runner is invoked via a separate venv to avoid OMP-fork issues that
-# show up when subprocess'ing back into the parent's Python environment.
-# Tests that exercise the full CLI need this venv pre-built locally.
-_RUNNER_PYTHON = Path("/tmp/llm_accelerator_stage3_venv/bin/python")
-_NEEDS_RUNNER_VENV = pytest.mark.skipif(
-    not _RUNNER_PYTHON.exists(),
-    reason=f"runner venv {_RUNNER_PYTHON} not present (build via "
-           "tools/train_tiny_fixture.py setup, or set up locally)",
-)
+# Reuse the tested environment. A separate interpreter remains an explicit
+# escape hatch for platforms requiring isolated OpenMP/runtime dependencies.
+_RUNNER_PYTHON = os.environ.get("TACCEL_TEST_RUNNER_PYTHON", sys.executable)
 
 
 def _fixture_tool():
@@ -45,7 +40,7 @@ def _runner_env():
 
 def _run_runner(args):
     result = subprocess.run(
-        ["/tmp/llm_accelerator_stage3_venv/bin/python", str(RUNNER), *args],
+        [_RUNNER_PYTHON, str(RUNNER), *args],
         cwd=Path(__file__).resolve().parents[2],
         env=_runner_env(),
         text=True,
@@ -57,7 +52,6 @@ def _run_runner(args):
     return result
 
 
-@_NEEDS_RUNNER_VENV
 def test_run_gpt2_accepts_nanogpt_payload_smoke(tmp_path):
     tool = _fixture_tool()
     checkpoint = tmp_path / "stage5_smoke_nanogpt.pt"
@@ -67,6 +61,8 @@ def test_run_gpt2_accepts_nanogpt_payload_smoke(tmp_path):
     result = _run_runner(
         [
             str(checkpoint),
+            "--ptq-preset",
+            "control",
             "--prompt-ids",
             "0",
             "--max-new-tokens",
@@ -78,7 +74,6 @@ def test_run_gpt2_accepts_nanogpt_payload_smoke(tmp_path):
     assert "min_cosine" in result.stdout
 
 
-@_NEEDS_RUNNER_VENV
 def test_run_gpt2_perplexity_json_smoke(tmp_path):
     if not GPT2_FIXTURE.exists() or not TOKENIZER_DIR.exists():
         pytest.skip(

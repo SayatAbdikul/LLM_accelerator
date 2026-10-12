@@ -48,10 +48,12 @@ module taccel_top
   // Phase-2 blocking_helper toggle. 0 = DPI (default), 1 = synthesizable
   // dequant_add_pack via 16-lane parallel Phase-1 primitive chain.
   parameter int HELPER_SYNTH_MODE = 0,
-  // Allow DMA || Systolic concurrency (the weight-prefetch lever). See the long
-  // note in control_unit.sv: as built this is UNSAFE — the two engines share one
-  // Port-A bus with no backpressure, so the systolic's ACCUM drain writes are
-  // silently dropped when the DMA wins. Set 0 for a correct, serialized machine.
+  // Opt-in until the corrected unbuffered baseline and buffered candidate
+  // have been measured with identical datapath/memory settings.
+  parameter bit FETCH_BUFFER_ENABLE = 1'b0,
+  // Allow DMA || Systolic concurrency (the weight-prefetch lever). Separate
+  // A/S channels permit accesses to different physical buffers; simultaneous
+  // same-buffer requests fault. Set 0 for the serialized measurement control.
   parameter bit SYS_DMA_OVERLAP = 1'b1
 )
 (
@@ -109,6 +111,38 @@ module taccel_top
   logic                   fetch_ar_ready;
   logic                   fetch_r_valid;
   logic                   fetch_r_ready;
+  logic                   fetch_invalidate_w;
+  logic                   fetch_store_active_q;
+
+  // Report actual elaborated settings, independent of harness build flags.
+  logic [1:0] obs_sfu_synth_mode_w /* verilator public_flat_rd */;
+  logic [1:0] obs_helper_synth_mode_w /* verilator public_flat_rd */;
+  logic       obs_fetch_buffer_enable_w /* verilator public_flat_rd */;
+  logic [63:0] obs_fetch_read_count_q /* verilator public_flat_rd */;
+  assign obs_sfu_synth_mode_w = 2'(SFU_SYNTH_MODE);
+  assign obs_helper_synth_mode_w = 2'(HELPER_SYNTH_MODE);
+  assign obs_fetch_buffer_enable_w = FETCH_BUFFER_ENABLE;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      fetch_store_active_q <= 1'b0;
+      obs_fetch_read_count_q <= 64'h0;
+    end else begin
+      // Invalidate from dispatch through completion of every STORE, including
+      // all its bursts. The ISA permits writes to instruction memory; no cache
+      // hit or delayed refill may survive such a write. Loads do not invalidate.
+      if (dma_dispatch)
+        fetch_store_active_q <= dma_is_store;
+      else if (!dma_busy)
+        fetch_store_active_q <= 1'b0;
+      if (start && !obs_run_active_q && !done && !fault)
+        obs_fetch_read_count_q <= 64'h0;
+      else if (fetch_ar_valid && fetch_ar_ready)
+        obs_fetch_read_count_q <= obs_fetch_read_count_q + 64'd1;
+    end
+  end
+  assign fetch_invalidate_w = start | fetch_store_active_q |
+                              (dma_dispatch && dma_is_store);
 
   // --- DMA engine AXI connections ---
   logic [AXI_ADDR_W-1:0] dma_ar_addr;
@@ -122,6 +156,8 @@ module taccel_top
   logic                   prefer_fetch_after_dma_q;
   logic                   select_dma_ar_w;
   logic                   select_fetch_ar_w;
+  logic                   ar_grant_held_q;
+  logic                   ar_grant_dma_q;
 
   // AR arbitration: only one read request may be in flight at a time. DMA gets
   // default priority, but after each completed DMA burst we allow one pending
@@ -133,7 +169,13 @@ module taccel_top
     select_fetch_ar_w = 1'b0;
 
     if (!rd_inflight_q) begin
-      if (dma_ar_valid && fetch_ar_valid) begin
+      // AXI VALID and its payload must remain stable until READY. A newly
+      // pending fetch cannot steal a DMA grant already offered to the slave
+      // (or vice versa), even if the burst-boundary preference favors it.
+      if (ar_grant_held_q) begin
+        select_dma_ar_w = ar_grant_dma_q;
+        select_fetch_ar_w = !ar_grant_dma_q;
+      end else if (dma_ar_valid && fetch_ar_valid) begin
         if (prefer_fetch_after_dma_q)
           select_fetch_ar_w = 1'b1;
         else
@@ -151,8 +193,15 @@ module taccel_top
       dma_r_owner_q            <= 1'b0;
       rd_inflight_q            <= 1'b0;
       prefer_fetch_after_dma_q <= 1'b0;
+      ar_grant_held_q          <= 1'b0;
+      ar_grant_dma_q           <= 1'b0;
     end else begin
+      if (m_axi_ar_valid && !m_axi_ar_ready) begin
+        ar_grant_held_q <= 1'b1;
+        ar_grant_dma_q <= select_dma_ar_w;
+      end
       if (m_axi_ar_valid && m_axi_ar_ready) begin
+        ar_grant_held_q <= 1'b0;
         dma_r_owner_q <= select_dma_ar_w;
         rd_inflight_q <= 1'b1;
         if (select_fetch_ar_w)
@@ -173,10 +222,8 @@ module taccel_top
   assign m_axi_ar_burst = 2'b01;    // INCR
   assign m_axi_ar_valid = select_dma_ar_w | select_fetch_ar_w;
 
-  assign dma_ar_ready   = m_axi_ar_ready & ~rd_inflight_q &
-                          (~fetch_ar_valid | ~prefer_fetch_after_dma_q);
-  assign fetch_ar_ready = m_axi_ar_ready & ~rd_inflight_q &
-                          (~dma_ar_valid | prefer_fetch_after_dma_q);
+  assign dma_ar_ready   = m_axi_ar_ready & select_dma_ar_w;
+  assign fetch_ar_ready = m_axi_ar_ready & select_fetch_ar_w;
 
   // R channel routing follows the owner captured when the winning AR request is
   // accepted, which keeps fetch and DMA from inferring ownership heuristically.
@@ -289,6 +336,19 @@ module taccel_top
   logic [63:0]  obs_helper_busy_cycles_q /* verilator public_flat_rd */;
   logic [63:0]  obs_sfu_busy_cycles_q /* verilator public_flat_rd */;
   logic [63:0]  obs_sys_busy_cycles_q /* verilator public_flat_rd */;
+  logic [2:0]   sys_obs_phase_w;
+  logic         sys_obs_step_enable_w;
+  logic [63:0]  obs_sys_load_cycles_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_sys_data_cycles_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_sys_k_boundary_cycles_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_sys_flush_cycles_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_sys_drain_cycles_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_sys_other_cycles_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_sys_compute_steps_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_dma_read_burst_count_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_dma_write_burst_count_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_dma_read_beat_count_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_dma_write_beat_count_q /* verilator public_flat_rd */;
   logic         obs_fault_valid_q /* verilator public_flat_rd */;
   logic [55:0]  obs_fault_pc_q /* verilator public_flat_rd */;
   logic [4:0]   obs_fault_opcode_q /* verilator public_flat_rd */;
@@ -354,6 +414,62 @@ module taccel_top
   logic [63:0]  obs_sys_porta_lost_drain_q /* verilator public_flat_rd */;
   logic         obs_sys_porta_lost_w;
   logic         sys_a_preclear_w;
+
+  // Phase buckets partition systolic busy time. Enabled steps are a separate
+  // overlapping count (data + flush), not a count of useful/padded MACs.
+  // DMA counts sample accepted AXI transfers, including error responses;
+  // bytes = 16 * beats under this core's fixed full-beat transfer contract.
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      obs_sys_load_cycles_q <= 0;
+      obs_sys_data_cycles_q <= 0;
+      obs_sys_k_boundary_cycles_q <= 0;
+      obs_sys_flush_cycles_q <= 0;
+      obs_sys_drain_cycles_q <= 0;
+      obs_sys_other_cycles_q <= 0;
+      obs_sys_compute_steps_q <= 0;
+      obs_dma_read_burst_count_q <= 0;
+      obs_dma_write_burst_count_q <= 0;
+      obs_dma_read_beat_count_q <= 0;
+      obs_dma_write_beat_count_q <= 0;
+    end else if (start && !obs_run_active_q && !done && !fault) begin
+      obs_sys_load_cycles_q <= 0;
+      obs_sys_data_cycles_q <= 0;
+      obs_sys_k_boundary_cycles_q <= 0;
+      obs_sys_flush_cycles_q <= 0;
+      obs_sys_drain_cycles_q <= 0;
+      obs_sys_other_cycles_q <= 0;
+      obs_sys_compute_steps_q <= 0;
+      obs_dma_read_burst_count_q <= 0;
+      obs_dma_write_burst_count_q <= 0;
+      obs_dma_read_beat_count_q <= 0;
+      obs_dma_write_beat_count_q <= 0;
+    end else begin
+      if (obs_run_active_q) begin
+        case (sys_obs_phase_w)
+          3'd1: obs_sys_load_cycles_q <= obs_sys_load_cycles_q + 64'd1;
+          3'd2: obs_sys_data_cycles_q <= obs_sys_data_cycles_q + 64'd1;
+          3'd3: obs_sys_k_boundary_cycles_q <= obs_sys_k_boundary_cycles_q + 64'd1;
+          3'd4: obs_sys_flush_cycles_q <= obs_sys_flush_cycles_q + 64'd1;
+          3'd5: obs_sys_drain_cycles_q <= obs_sys_drain_cycles_q + 64'd1;
+          3'd6: obs_sys_other_cycles_q <= obs_sys_other_cycles_q + 64'd1;
+          default: ;
+        endcase
+        if (sys_obs_step_enable_w)
+          obs_sys_compute_steps_q <= obs_sys_compute_steps_q + 64'd1;
+      end
+      // Match the existing aggregate DMA counters' acceptance window even
+      // when a transfer was still in flight at an architectural fault.
+      if (dma_ar_valid && dma_ar_ready)
+        obs_dma_read_burst_count_q <= obs_dma_read_burst_count_q + 64'd1;
+      if (m_axi_aw_valid && m_axi_aw_ready)
+        obs_dma_write_burst_count_q <= obs_dma_write_burst_count_q + 64'd1;
+      if (dma_r_valid && dma_r_ready)
+        obs_dma_read_beat_count_q <= obs_dma_read_beat_count_q + 64'd1;
+      if (m_axi_w_valid && m_axi_w_ready)
+        obs_dma_write_beat_count_q <= obs_dma_write_beat_count_q + 64'd1;
+    end
+  end
 
   // THE BUS-SPLIT AUDIT. Decompose DMA-vs-systolic Port-A CO-ACCESS (both engines
   // want the bus in the same cycle) by whether they want the SAME SRAM. This is
@@ -828,11 +944,12 @@ module taccel_top
   // Submodule instantiation
   // =========================================================================
 
-  fetch_unit u_fetch (
+  fetch_unit #(.FETCH_BUFFER_ENABLE(FETCH_BUFFER_ENABLE)) u_fetch (
     .clk            (clk),
     .rst_n          (rst_n),
     .pc             (pc),
     .fetch_req      (fetch_req),
+    .invalidate     (fetch_invalidate_w),
     .insn_valid     (insn_valid_w),
     .insn_data      (insn_data_w),
     .fetch_fault    (fetch_fault_w),
@@ -1126,7 +1243,9 @@ module taccel_top
     .sram_w_en       (sys_sram_w_en),
     .sram_w_row      (sys_sram_w_row),
     .sram_w_rdata    (sys_sram_w_rdata),
-    .obs_a_preclear  (sys_a_preclear_w)
+    .obs_a_preclear  (sys_a_preclear_w),
+    .obs_phase       (sys_obs_phase_w),
+    .obs_step_enable (sys_obs_step_enable_w)
   );
 
   sram_subsystem u_sram (

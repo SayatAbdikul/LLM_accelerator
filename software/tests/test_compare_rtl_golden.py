@@ -136,6 +136,12 @@ def test_frozen_golden_sha_pin():
     )
 
 
+def test_frozen_golden_dependencies_and_fixtures():
+    from tools.check_reference_manifest import verify_reference_manifest
+    manifest = verify_reference_manifest()
+    assert manifest["golden_simulator_blob_sha1"] == FROZEN_GOLDEN_BLOB_SHA
+
+
 # --------------------------------------------------------------------------
 # Leg 2 — golden-side gen-2 conformance precursor (real gate)
 # --------------------------------------------------------------------------
@@ -150,6 +156,7 @@ def test_frozen_bundle_runs_gen2_clean_and_deterministic():
             "PYTHONPATH=software python software/tools/train_tiny_fixture.py"
         )
     torch = pytest.importorskip("torch")
+    tool.validate_fixture_metadata(tool.DEFAULT_FIXTURE, tool.DEFAULT_METADATA)
     payload = torch.load(tool.DEFAULT_FIXTURE, map_location="cpu")
 
     MAX_NEW_TOKENS = 4
@@ -254,8 +261,8 @@ def test_rtl_cosim_gen2_byte_match(token_id):
     cosim = _load_rtl_cosim()
     if not cosim.RTL_BINARY.exists():
         pytest.skip(
-            f"run_program not built ({cosim.RTL_BINARY}); "
-            "build: make -C rtl/verilator run_program"
+            f"hardware runner not built ({cosim.RTL_BINARY}); "
+            "build: make -C rtl/verilator run_program_synth"
         )
     tool = _load_tool()
     if not tool.DEFAULT_FIXTURE.exists():
@@ -309,8 +316,8 @@ def test_rtl_cosim_gen2_multistep_tiny():
     cosim = _load_rtl_cosim()
     if not cosim.RTL_BINARY.exists():
         pytest.skip(
-            f"run_program not built ({cosim.RTL_BINARY}); "
-            "build: make -C rtl/verilator run_program"
+            f"hardware runner not built ({cosim.RTL_BINARY}); "
+            "build: make -C rtl/verilator run_program_synth"
         )
     tool = _load_tool()
     if not tool.DEFAULT_FIXTURE.exists():
@@ -386,8 +393,8 @@ def test_rtl_cosim_gen2_logits_metric_tiny():
     cosim = _load_rtl_cosim()
     if not cosim.RTL_BINARY.exists():
         pytest.skip(
-            f"run_program not built ({cosim.RTL_BINARY}); "
-            "build: make -C rtl/verilator run_program"
+            f"hardware runner not built ({cosim.RTL_BINARY}); "
+            "build: make -C rtl/verilator run_program_synth"
         )
     tool = _load_tool()
     if not tool.DEFAULT_FIXTURE.exists():
@@ -448,32 +455,28 @@ GPT2_124M_FIXTURE = (
 def test_rtl_cosim_gpt2_124m_logits_metric():
     """#109 first measurement on the REAL GPT-2 124M weight_only_int8_quarot
     bundle. OPT-IN / MANUAL (PYTEST_124M=1): ~5 min per RTL run; requires
-    run_program rebuilt with DRAM_SIZE>=1<<30 (the 16 MB default FAULT_DRAM_OOBs
+    run_program_synth rebuilt with DRAM_SIZE>=1<<30 (a 16 MB runner FAULT_DRAM_OOBs
     on the ~392 MB 124M image).
 
     Discipline (freeze §5/§7): this test DOES NOT assert a guessed perplexity
-    threshold. Per-tensor compare() is well-posed only PRE-overflow; past
-    block0_out_proj the golden itself saturates fp16. The job here is to
-    *measure* the logits-level conformance (argmax / cosine / ppl) and emit it
-    so the user can fill + commit the §6/§7 revision stub
-    (docs/isa_freeze_revision_109_stub.md). The hard assertions are only that
-    the 124M RTL run is clean and non-vacuous and the metric is computable.
+    threshold. It records the first tensor divergence plus logits metrics.
+    Both rails must produce finite logits; matching nonfinite outputs is not
+    evidence of a valid language model, regardless of clean hardware status.
     """
     if os.environ.get("PYTEST_124M") != "1":
-        pytest.skip("opt-in: set PYTEST_124M=1 (rebuild run_program "
+        pytest.skip("opt-in: set PYTEST_124M=1 (rebuild run_program_synth "
                     "DRAM_SIZE=1073741824 first; ~5 min/RTL run)")
     if not GPT2_124M_FIXTURE.exists():
         pytest.skip(f"GPT-2 124M checkpoint missing: {GPT2_124M_FIXTURE}")
     cosim = _load_rtl_cosim()
     if not cosim.RTL_BINARY.exists():
-        pytest.skip(f"run_program not built ({cosim.RTL_BINARY})")
+        pytest.skip(f"hardware runner not built ({cosim.RTL_BINARY})")
     torch = pytest.importorskip("torch")
     payload = torch.load(GPT2_124M_FIXTURE, map_location="cpu")
 
     # Minimal feasible teacher-forced sequence: 3 tokens -> 1 prefill + 1
     # decode (~10 min total). Tokens are arbitrary valid ids — the metric is
-    # RTL-vs-golden agreement, and the fp16 overflow at block0_out_proj is
-    # input-independent (it is the W8A16 124M MLP dynamic range).
+    # RTL-vs-golden agreement, not a representative language-quality corpus.
     token_ids = [464, 3290, 318]
     res = cosim.run_cosim_sequence_logits(
         token_ids=token_ids, payload=payload, exclude_nodes={"lm_head"},
@@ -492,8 +495,7 @@ def test_rtl_cosim_gpt2_124m_logits_metric():
     # Emit the FIRST MEASUREMENT (recorded for the freeze stub; NOT thresholded).
     boundary = res["divergence"]
     print("\n==== #109 GPT-2 124M FIRST MEASUREMENT ====")
-    print("first per-tensor divergence (the fp16-overflow boundary; "
-          "expected at/after block0_out_proj — ill-posed past it, NOT a bug):")
+    print("first per-tensor divergence (requires diagnosis, including numerical range):")
     print(json.dumps(boundary, indent=2, default=str))
     print("logits-level conformance metric:")
     print(json.dumps({k: v for k, v in m.items() if k != "per_step"},
@@ -501,3 +503,4 @@ def test_rtl_cosim_gpt2_124m_logits_metric():
     print("per-step:")
     print(json.dumps(m["per_step"], indent=2, default=str))
     print("==== paste into docs/isa_freeze_revision_109_stub.md §Measurement ====")
+    assert m["quality_eligible"], f"non-finite full-model logits cannot pass a quality gate: {m}"

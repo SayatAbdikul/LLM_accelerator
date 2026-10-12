@@ -37,9 +37,8 @@ FPGA_SV       := $(FPGA_DIR)/pll_stub.sv \
 #                          for the `ifndef SFU_SYNTH_NO_DPI \`error`
 #                          guard in the wrapper)
 #   SFU_SYNTH_NO_DPI     — elides DPI-C imports; required for synth
-#   SFU_SYNTH_MODE=1     — selects synthesizable fp32 SFU paths
-#   HELPER_SYNTH_MODE=1  — selects synthesizable helper-engine chain
-TARGET_DEFS  := -DTARGET_FPGA -DSFU_SYNTH_NO_DPI -DSFU_SYNTH_MODE=1 -DHELPER_SYNTH_MODE=1
+# Compute modes are RTL parameters passed explicitly by taccel_top_fpga.
+TARGET_DEFS  := -DTARGET_FPGA -DSFU_SYNTH_NO_DPI
 
 SYNTH_BUILD  := $(BUILD_DIR)/synth
 SV2V_OUT     := $(SYNTH_BUILD)/design_fpga.v
@@ -49,7 +48,7 @@ SV2V_OUT     := $(SYNTH_BUILD)/design_fpga.v
 # sv2v: adapt SystemVerilog (packages, enums, ANSI ports) to Verilog-2005
 # for yosys consumption. Includes paths are critical — package + sibling
 # .svh files live in include/, systolic/, and the src/ root.
-$(SV2V_OUT): $(CORE_SV) $(FPGA_SV)
+$(SV2V_OUT): $(CORE_SV) $(wildcard $(SRC_DIR)/*.svh) $(FPGA_SV) $(CORE_F) Makefile
 	mkdir -p $(SYNTH_BUILD)
 	sv2v $(TARGET_DEFS) -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) -I$(SRC_DIR) \
 	     $(CORE_SV) $(FPGA_SV) -w $(SV2V_OUT)
@@ -58,6 +57,7 @@ $(SV2V_OUT): $(CORE_SV) $(FPGA_SV)
 # taccel_top_fpga hierarchy with zero unresolved modules. Aggressive
 # synthesis (synth_xilinx etc.) is NOT run here — that closure happens
 # in Vivado/nextpnr once a part is picked.
+# Raw-process check is diagnostic, not a fatal post-lowering structural proof.
 yosys-fpga: $(SV2V_OUT)
 	@echo "--- yosys FPGA elaboration smoke gate (taccel_top_fpga) ---"
 	yosys -p "read_verilog $(SV2V_OUT); hierarchy -check -top taccel_top_fpga; check; stat"

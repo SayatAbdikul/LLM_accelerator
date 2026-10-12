@@ -557,6 +557,13 @@ def _emit_batched_attention_block(graph: IRGraph, prev: str, block_idx: int,
                                   block_idx=block_idx, head_idx=h, query_len=1, key_len=key_len,
                                   v_int8_from_cache=True, av_accum_off=av_accum_units,
                                   stream=s,
+                                  # Every stream/head output survives until
+                                  # the delayed per-head gather below. The
+                                  # emitter must admit this whole cohort, not
+                                  # just the next output tile, into ABUF.
+                                  av_cohort_tiles=n_streams * shape.n_head,
+                                  av_cohort_streams=n_streams,
+                                  av_cohort_pack_bytes=pad_dim(group) * group * shape.d_head,
                                   v_prefetch_next_head=nh,
                                   v_prefetch_next_name=(
                                       f"block{block_idx}_head{nh}_s{s}_vload"

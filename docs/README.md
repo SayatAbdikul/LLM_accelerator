@@ -1,7 +1,7 @@
 # TACCEL documentation index
 
-This index was audited against the code after commit `3486c01` on
-2026-09-03. Documents are classified by authority so a dated experiment is
+This index was reconciled with the October 11 implementation based on
+`978f126`. Documents are classified by authority so a dated experiment is
 not mistaken for the current architecture.
 
 ## Current operational documentation
@@ -10,6 +10,10 @@ not mistaken for the current architecture.
 |---|---|
 | [Top-level README](../README.md) | Setup, architecture summary, supported commands, and known gaps |
 | [Current project status](project_status.md) | Latest verified state, measurements, limitations, and recent cleanup |
+| [Code exploration roadmap](code_exploration_roadmap.md) | Ordered ISA, RTL, software-reference, verification, and performance architecture tour |
+| [Accelerator optimization roadmap](optimization_roadmap.md) | Proposed milestones, dependencies, measurement gates, and laptop-aware compiler/RTL/physical optimization plan |
+| [Optimization implementation and results](optimization_results.md) | Implemented candidates, attributable measurements, verification scope, and unmet acceptance gates |
+| [SFU storage inventory](sfu_storage_inventory.md) | Opcode port/lifetime requirements and risks before scratch-bank changes |
 | [Software codebase](../software/CODEBASE.md) | Current Python package map and data flow |
 | [ISA specification](../software/docs/isa_spec.md) | Current software/RTL encoding and implementation matrix |
 | [ISA freeze record](../software/docs/isa_generation_freeze.md) | Frozen generation decision and dated amendments |

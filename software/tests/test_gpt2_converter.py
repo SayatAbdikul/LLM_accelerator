@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from software.tools.convert_hf_gpt2_to_nanogpt import convert_hf_state_dict_to_nanogpt
+from software.tools.convert_hf_gpt2_to_nanogpt import load_local_safetensors, write_payload
 
 
 def _hf_state(n_layer=1, n_head=2, d_model=8, vocab=13, block=16):
@@ -94,3 +95,20 @@ def test_local_converted_gpt2_metadata_when_present():
     assert args["split_qkv_bias"] is True
     assert "checkpoint_sha256" in metadata
     assert "lm_head.weight aliases transformer.wte.weight" in metadata["weight_tying"]
+
+
+def test_offline_safetensors_conversion_preserves_values_and_provenance(tmp_path):
+    from safetensors.torch import save_file
+    state, config = _hf_state()
+    tensors = tmp_path / "model.safetensors"
+    save_file({key.removeprefix("transformer."): value for key, value in state.items()}, str(tensors))
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(vars(config)))
+    payload, provenance = load_local_safetensors(tensors, config_path)
+    expected = convert_hf_state_dict_to_nanogpt(state, config)
+    for name, value in expected["state_dict"].items():
+        assert torch.equal(payload["state_dict"][name], value)
+    metadata = write_payload(payload, tmp_path / "converted.pt", source=str(tensors), provenance=provenance)
+    assert metadata["provenance"]["conversion_kind"] == "offline_safetensors"
+    assert len(metadata["provenance"]["source_sha256"]) == 64
+    assert len(metadata["checkpoint_sha256"]) == 64

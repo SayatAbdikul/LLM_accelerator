@@ -1,5 +1,6 @@
 """IR → ISA instruction sequence code generator."""
 import re
+from dataclasses import replace
 import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
 from ..assembler.assembler import RelocationSite, RuntimeConfigAttnSite, RuntimePatchSite
@@ -17,10 +18,17 @@ from .tiler import pad_dim, TILE
 from .memory_alloc import MemoryAllocator, Allocation
 from .model_config import ModelConfig
 from .kv_cache import KVCacheLayout
+from .options import CompilerOptions, COMPILER_TARGETS
+from .validation import validate_graph, validate_instruction
 
 UNIT = 16
 STAGE4_M_TILE = TILE
 STAGE4_MAX_N_TILE = 512
+
+
+def matmul_wbuf_bytes(weight_elements: int, output_columns: int) -> int:
+    """Concurrent INT8 weight and FP16 scale+bias footprint of simple lowering."""
+    return int(weight_elements) + 4 * pad_dim(int(output_columns))
 
 
 def stage4_forced_weights(graph, elem_bytes: int) -> set:
@@ -31,7 +39,7 @@ def stage4_forced_weights(graph, elem_bytes: int) -> set:
 
         output_bytes = M_pad*N_pad*elem_bytes  > ABUF_SIZE
         accum_bytes  = M_pad*N_pad*4           > ACCUM_SIZE
-        weight_bytes                           > WBUF_SIZE   (weight-size test)
+        weight_bytes + 4*N_pad                  > WBUF_SIZE   (weight + epilogue)
 
     The first two scale with **M_pad**, which is a property of the CONSUMER node,
     not of the weight. So a wide-M graph tiles weights a 1-row graph never does —
@@ -40,7 +48,7 @@ def stage4_forced_weights(graph, elem_bytes: int) -> set:
     leaves it untiled. Staging keyed only on the weight's own size misses that and
     the emitter then KeyErrors on the missing tile symbol.
 
-    `_layout_weights` also stages any weight with `data.size > WBUF_SIZE`, so this
+    `_layout_weights` also stages weights whose weight+epilogue exceeds WBUF, so this
     only has to cover the M_pad-driven cases.
 
     NOTE the two streams of a bundle must stage the SAME set, or their data blobs
@@ -108,18 +116,20 @@ class CodeGenerator:
                  model_config: Optional[ModelConfig] = None,
                  stream_name: str = "prefill",
                  kv_layout: Optional[KVCacheLayout] = None,
-                 use_fp16_activations: bool = True,  # DEPRECATED: always True now; kept for back-compat
+                 use_fp16_activations: bool = True,
                  biases: Optional[Dict[str, np.ndarray]] = None,
                  weight_dtypes: Optional[Dict[str, str]] = None,
                  extra_stage4_weights: Optional[set] = None,
-                 stage4_m_pad: int = STAGE4_M_TILE):
+                 stage4_m_pad: int = STAGE4_M_TILE,
+                 target: str = "research-golden",
+                 options: Optional[CompilerOptions] = None,
+                 external_inputs: Optional[set[str]] = None):
         """
         Args:
             weight_data: name → (quantized_data, per_channel_scales)
             calibration_scales: tensor_name → per-tensor activation scale
             prescaled_biases: name → INT32 pre-scaled bias array
-            use_fp16_activations: DEPRECATED — kept for signature back-compat.
-                Always treated as True. W8A16 is the only maintained compiler
+            use_fp16_activations: Must be True. W8A16 is the only maintained compiler
                 lowering. The old W8A8 compiler fallbacks and gen-1 SFU path
                 were removed; retained integer helper opcodes such as
                 DEQUANT_ADD and REQUANT_PC remain legal in RTL for compatibility
@@ -128,6 +138,10 @@ class CodeGenerator:
                 stages each FP32 bias folded into the
                 `__w8a16_pc_scale_and_bias` combined 2N FP16 blob
                 consumed by DEQUANT_ACCUM_FP32_SCALED.
+            external_inputs: Explicit externally initialized activation names.
+                Hardware graphs default to closed inputs. Research graphs keep
+                the legacy implicit-input API when this is None. Declaring a
+                name does not initialize SRAM; that is the caller's obligation.
             weight_dtypes: Optional sidecar map `name → "int8" | "int4"`
                 (default missing entries treated as "int8"). When a weight's
                 dtype is "int4", `_layout_weights` packs the np.int8 storage
@@ -141,8 +155,42 @@ class CodeGenerator:
         datapath; `self.elem_bytes = 2` and `self.fp_precision_flag = 1`
         are hardcoded.
         """
+        # Keep immutable input references, not copies of large model arrays, so
+        # cache-pressure fallback can discard the entire partial schedule and
+        # retry from a genuinely fresh allocator/register state.
+        self._constructor_kwargs = {key: value for key, value in locals().items() if key != "self"}
+        if target not in COMPILER_TARGETS:
+            raise ValueError(f"Unknown compiler target {target!r}")
+        self.target = target
+        if external_inputs is not None and (
+            not isinstance(external_inputs, (set, frozenset))
+            or any(not isinstance(name, str) or not name for name in external_inputs)
+        ):
+            raise ValueError("external_inputs must be a set of nonempty activation names")
+        self.external_inputs = (None if external_inputs is None and target == "research-golden"
+                                else frozenset(external_inputs or ()))
+        self.options = options or CompilerOptions()
+        if not use_fp16_activations:
+            raise ValueError("Only FP16 activation storage is supported by the compiler")
+        obsolete = {
+            "gelu_from_accum": gelu_from_accum,
+            "gelu_from_accum_blocks": gelu_from_accum_blocks,
+            "dequant_add_residual1_blocks": dequant_add_residual1_blocks,
+            "dequant_add_residual2_blocks": dequant_add_residual2_blocks,
+            "fused_softmax_attnv_blocks": fused_softmax_attnv_blocks,
+            "fused_softmax_attnv_accum_out_proj_blocks": fused_softmax_attnv_accum_out_proj_blocks,
+            "requant_pc_weight_names": requant_pc_weight_names,
+            "requant_pc_scale_tables": requant_pc_scale_tables,
+        }
+        for name, value in obsolete.items():
+            if value:
+                raise ValueError(f"{name} is unsupported by the maintained W8A16 compiler")
         self.weight_data = weight_data
         self.weight_dtypes = dict(weight_dtypes or {})
+        if any(dtype not in {"int8", "int4"} for dtype in self.weight_dtypes.values()):
+            raise ValueError("weight_dtypes entries must be int8 or int4")
+        if target == "rtl-gen2" and "int4" in self.weight_dtypes.values():
+            raise ValueError("INT4 weights are unsupported by rtl-gen2; use research-golden")
         # `model_config` is REQUIRED. It used to fall back to
         # `deit_tiny_config()`, which silently returns a VISION ENCODER geometry
         # (deit_tiny_patch16_224: d_model=192, n_layer=12, model_kind="encoder",
@@ -254,6 +302,11 @@ class CodeGenerator:
         self.relocation_sites: List[RelocationSite] = []
         self.runtime_patch_sites: List[RuntimePatchSite] = []
         self.runtime_config_attn_sites: List[RuntimeConfigAttnSite] = []
+        self.quantization_cache = {}
+        self.quantization_last_uses = {}
+        self.reserved_sregs = set()
+        self.optimization_events = []
+        self.batched_av_residency = {}
 
     def _dram_offset_required(self, name: str, context: str) -> int:
         """Return DRAM offset for a symbol or raise a clear error."""
@@ -261,11 +314,67 @@ class CodeGenerator:
             raise KeyError(f"Missing DRAM symbol '{name}' while {context}")
         return self.dram_layout[name]
 
-    def generate(self, graph: IRGraph) -> Tuple[List[Instruction], bytes]:
+    def compilation_metrics(self) -> Dict[str, Any]:
+        """Static schedule/storage counts; these are not cycle estimates."""
+        from collections import Counter
+        from ..isa.opcodes import Opcode
+        histogram = Counter(insn.opcode.name for insn in self.instructions)
+        config, accum_high_water = None, 0
+        for insn in self.instructions:
+            if insn.opcode == Opcode.CONFIG_TILE:
+                config = insn
+            elif insn.opcode == Opcode.MATMUL and config is not None:
+                accum_high_water = max(accum_high_water,
+                    insn.dst_off * UNIT + (config.M + 1) * TILE * (config.N + 1) * TILE * 4)
+        return {
+            "target": self.target,
+            "instructions": len(self.instructions),
+            "opcodes": dict(sorted(histogram.items())),
+            "dma_load_bytes": sum(i.xfer_len * UNIT for i in self.instructions if i.opcode == Opcode.LOAD),
+            "dma_store_bytes": sum(i.xfer_len * UNIT for i in self.instructions if i.opcode == Opcode.STORE),
+            "data_bytes": len(self.dram_blob),
+            "abuf_high_water_bytes": self.mem.abuf.high_water_units * UNIT,
+            "wbuf_high_water_bytes": self.mem.wbuf.high_water_units * UNIT,
+            "accum_addressed_high_water_bytes": accum_high_water,
+            "optimization_events": list(self.optimization_events),
+        }
+
+    def generate(self, graph: IRGraph, *, shared_layout=None) -> Tuple[List[Instruction], bytes]:
+        """Generate a schedule, failing closed to uncached lowering on pressure.
+
+        A cache can introduce fragmentation even when aggregate byte bounds
+        pass. Never move live allocations mid-emitter or retain a partially
+        emitted schedule: retry once from fresh state with reuse disabled.
+        Other optimizations and target checks remain enabled. A baseline
+        allocation failure still propagates to the caller.
+        """
+        try:
+            return self._generate_once(graph, shared_layout=shared_layout)
+        except MemoryError as pressure:
+            if not (self.options.reuse_qkv_quantization or self.options.reuse_fc2_quantization):
+                raise
+            kwargs = dict(self._constructor_kwargs)
+            kwargs["options"] = replace(self.options, reuse_qkv_quantization=False,
+                                        reuse_fc2_quantization=False)
+            retry = type(self)(**kwargs)
+            if hasattr(self, "layout_graphs"):
+                retry.layout_graphs = self.layout_graphs
+            result = retry.generate(graph, shared_layout=shared_layout)
+            retry.optimization_events.append({"kind": "quantization_reuse_fallback",
+                                              "reason": "SRAM allocation pressure",
+                                              "detail": str(pressure)})
+            self.__dict__.update(retry.__dict__)
+            return result
+
+    def _generate_once(self, graph: IRGraph, *, shared_layout=None) -> Tuple[List[Instruction], bytes]:
         """Generate instructions for the entire IR graph.
 
         Returns (instructions, dram_data_blob).
         """
+        # Residency decisions describe one graph's delayed-gather cohorts,
+        # never a previous generate() call (including whole-graph retries).
+        self.batched_av_residency = {}
+        validate_graph(self, graph)
         # Phase 3 (c.1) M3-B: all W8A32 matmul ops are now lowered.
         # - `matmul`         → emit_matmul_w8a16       (M2.5-B)
         # - `matmul_qkt`     → emit_matmul_qkt_w8a16   (M3-A)
@@ -277,7 +386,18 @@ class CodeGenerator:
         # ConfigError("CONFIG_ATTN not set") at simulator-execution time
         # until M3-C extends emit_softmax_fp32.
         # First pass: lay out weights in DRAM
-        self._layout_weights(graph)
+        if shared_layout is None:
+            self._layout_weights(graph)
+            self.data_layout_signature = self._data_layout_signature(graph)
+        else:
+            if self._data_layout_signature(graph) != shared_layout.data_layout_signature:
+                raise ValueError("prefill and decode require different shared data layouts")
+            self.dram_layout = dict(shared_layout.dram_layout)
+            # Freeze once: bytes(bytes_object) does not copy the image.
+            shared_layout.dram_blob = bytes(shared_layout.dram_blob)
+            self.dram_blob = shared_layout.dram_blob
+            self.dram_temp_start = shared_layout.dram_temp_start
+            self.data_layout_signature = shared_layout.data_layout_signature
 
         # Compute last-use index for each node output so we can free ABUF
         last_uses = graph.compute_last_uses()
@@ -286,6 +406,13 @@ class CodeGenerator:
         # reloads them from `dram_temp_outputs` and aliases the output
         # in-place into the sublayer input — both rely on this state).
         self.last_uses = last_uses
+        final_use_index = {}
+        for name, idx in last_uses.items():
+            final_use_index.setdefault(idx, []).append(name)
+        if self.options.reuse_qkv_quantization:
+            for idx, node in enumerate(graph.nodes):
+                if node.op == "matmul" and node.attrs.get("projection") in {"query", "key", "value"}:
+                    self.quantization_last_uses[node.inputs[0]] = idx
 
         # Second pass: emit instructions
         for idx, node in enumerate(graph.nodes):
@@ -297,7 +424,11 @@ class CodeGenerator:
                 self._compact_abuf()
             self._emit_node(node)
             # Free ABUF allocations whose last use was this node
-            for inp_name, last_idx in last_uses.items():
+            final_uses = (
+                ((name, idx) for name in final_use_index.get(idx, ()))
+                if self.options.indexed_liveness else last_uses.items()
+            )
+            for inp_name, last_idx in final_uses:
                 if last_idx == idx:
                     alloc = self.mem.abuf.get(inp_name)
                     if alloc is not None:
@@ -311,9 +442,44 @@ class CodeGenerator:
                     if inp_name in self.dram_temp_fp32_outputs:
                         del self.dram_temp_fp32_outputs[inp_name]
                         self.dram_temp_outputs.pop(inp_name, None)
+            for name, cached in list(self.quantization_cache.items()):
+                if cached["last_use"] == idx:
+                    self.mem.abuf.free(cached["allocation"].name)
+                    self.reserved_sregs.difference_update({cached["sreg"], cached["sreg"] + 1})
+                    del self.quantization_cache[name]
 
         self.instructions.append(HaltInsn())
         return self.instructions, bytes(self.dram_blob)
+
+    def _data_layout_signature(self, graph):
+        """Graph-dependent staged constants; shape/operation execution is separate."""
+        result = {}
+        default = 6.0 / 127.0
+        for node in graph.nodes:
+            if node.op == "matmul":
+                key = ("matmul", node.inputs[1])
+                value = node.attrs.get("bias")
+            elif node.op == "matmul_qkt":
+                key = ("qkt", node.name)
+                value = np.float16(np.float32(self.calibration_scales.get(node.inputs[0], default))
+                                  * np.float32(self.calibration_scales.get(node.inputs[1], default))
+                                  * np.float32(node.attrs.get("scale", self.config.d_head ** -0.5))).tobytes()
+            elif node.op == "qkt_dequant":
+                key = ("qkt", node.name)
+                value = np.float16(np.float32(self.calibration_scales.get(node.attrs["q_scale_key"], default))
+                                  * np.float32(self.calibration_scales.get(node.attrs["k_scale_key"], default))
+                                  * np.float32(node.attrs.get("scale", int(node.attrs["d_head"]) ** -0.5))).tobytes()
+            elif node.op == "matmul_attn_v":
+                key = ("attn_v", node.name)
+                value = (node.output_shape[1], np.float16(
+                    np.float32(self.calibration_scales.get(node.inputs[0], default))
+                    * np.float32(self.calibration_scales.get(node.inputs[1], default))).tobytes())
+            else:
+                continue
+            if key in result and result[key] != value:
+                raise ValueError(f"Incompatible shared data bindings for {key}")
+            result[key] = value
+        return result
 
     def _layout_weights(self, graph: IRGraph):
         """Pack all weights into DRAM data blob.
@@ -333,8 +499,30 @@ class CodeGenerator:
         # `stage4_forced_weights` for why a per-graph set is not enough.
         forced_stage4_weights = stage4_forced_weights(graph, self.elem_bytes)
         forced_stage4_weights |= set(self.extra_stage4_weights or ())
+        tile_only = set()
+        if self.options.deduplicate_data:
+            # Use BOTH stream graphs: one stream may need the canonical image
+            # while the other uses tiles because its M dimension is larger.
+            consumers = {}
+            for layout_graph in getattr(self, "layout_graphs", (graph,)):
+                for node in layout_graph.nodes:
+                    for name in node.inputs:
+                        consumers.setdefault(name, []).append(node)
+            for name, uses in consumers.items():
+                if name not in self.weight_data:
+                    continue
+                data = self.weight_data[name][0]
+                if uses and all(node.op == "matmul" and node.inputs[1] == name and (
+                    matmul_wbuf_bytes(data.size, node.output_shape[1]) > WBUF_SIZE
+                    or node.attrs.get("stage4_weight_tiled")
+                    or pad_dim(node.output_shape[0]) * pad_dim(node.output_shape[1]) * 4 > ACCUM_SIZE
+                    or pad_dim(node.output_shape[0]) * pad_dim(node.output_shape[1]) * self.elem_bytes > ABUF_SIZE
+                ) for node in uses):
+                    tile_only.add(name)
         offset = 0
         for name, (data, scales) in self.weight_data.items():
+            if name in tile_only:
+                continue
             if self.weight_dtypes.get(name) == "int4":
                 if not (isinstance(data, np.ndarray) and data.dtype == np.int8
                         and data.ndim >= 1 and data.shape[-1] % 2 == 0):
@@ -351,7 +539,7 @@ class CodeGenerator:
             self.dram_blob.extend(blob)
             offset += len(blob)
             # Also store scales if present
-            if scales is not None:
+            if scales is not None and not self.options.deduplicate_data:
                 scale_name = f"{name}__scales"
                 self.dram_layout[scale_name] = offset
                 scale_blob = scales.tobytes()
@@ -372,7 +560,8 @@ class CodeGenerator:
             if not (
                 isinstance(data, np.ndarray)
                 and data.ndim == 2
-                and (data.size > WBUF_SIZE or name in forced_stage4_weights)
+                and (matmul_wbuf_bytes(data.size, data.shape[1]) > WBUF_SIZE
+                     or name in forced_stage4_weights)
             ):
                 continue
             K_pad, N_pad = int(data.shape[0]), int(data.shape[1])
@@ -398,7 +587,7 @@ class CodeGenerator:
                 offset += len(blob)
 
         # Pre-scaled biases
-        for name, bias_i32 in self.prescaled_biases.items():
+        for name, bias_i32 in ({} if self.options.deduplicate_data else self.prescaled_biases).items():
             self.dram_layout[name] = offset
             blob = bias_i32.tobytes()
             self.dram_blob.extend(blob)
@@ -409,7 +598,7 @@ class CodeGenerator:
         # VADD_FP32s them onto the post-DEQUANT FP32 matmul output. The
         # INT32 prescaled version above is unusable in W8A32 because the
         # dynamic activation scale (max_abs/127) is only known at runtime.
-        for name, bias_fp32 in self.biases.items():
+        for name, bias_fp32 in ({} if self.options.deduplicate_data else self.biases).items():
             sym = f"{name}__fp32"
             self.dram_layout[sym] = offset
             blob = np.asarray(bias_fp32, dtype=np.float32).tobytes()
@@ -632,7 +821,9 @@ class CodeGenerator:
         Singles and pairs use separate pools so they never overwrite each other.
         Scale registers are set immediately before use so wrapping is safe.
         """
-        ODD_POOL = [1, 3, 5, 7, 9, 11, 13]
+        ODD_POOL = [r for r in [1, 3, 5, 7, 9, 11, 13] if r not in self.reserved_sregs]
+        if not ODD_POOL:
+            raise ValueError("No free scale register for scalar operation")
         reg = ODD_POOL[self.next_sreg_single % len(ODD_POOL)]
         self.next_sreg_single = (self.next_sreg_single + 1) % len(ODD_POOL)
         return reg
@@ -643,19 +834,26 @@ class CodeGenerator:
         Returns the lower (even) register; caller uses (reg, reg+1).
         Pairs and singles use separate pools so they never overwrite each other.
         """
-        PAIR_POOL = [0, 2, 4, 6, 8, 10, 12]
+        PAIR_POOL = [r for r in [0, 2, 4, 6, 8, 10, 12]
+                     if not ({r, r + 1} & self.reserved_sregs)]
+        if not PAIR_POOL:
+            raise ValueError("No free scale register pair")
         reg = PAIR_POOL[self.next_sreg_pair % len(PAIR_POOL)]
         self.next_sreg_pair = (self.next_sreg_pair + 1) % len(PAIR_POOL)
         return reg
 
     def _alloc_sreg_quad(self) -> int:
         """Allocate four consecutive scale registers."""
-        QUAD_POOL = [0, 4, 8, 12]
+        QUAD_POOL = [r for r in [0, 4, 8, 12]
+                     if not (set(range(r, r + 4)) & self.reserved_sregs)]
+        if not QUAD_POOL:
+            raise ValueError("No free scale register quadruplet")
         reg = QUAD_POOL[self.next_sreg_quad % len(QUAD_POOL)]
         self.next_sreg_quad = (self.next_sreg_quad + 1) % len(QUAD_POOL)
         return reg
 
     def _emit(self, insn: Instruction):
+        validate_instruction(self.target, insn)
         self.instructions.append(insn)
 
     def _record_addr_site(self, lo_pc: int, hi_pc: int, addr_reg: int, *,
@@ -974,6 +1172,8 @@ class CodeGenerator:
             self._emit_row_copy(node)
         elif op == "gather_rows":
             self._emit_gather_rows(node)
+        else:
+            raise ValueError(f"Unsupported IR operation {op!r} at {node.name!r}")
 
     def _emit_qkt(self, node: IRNode):
         from .emit.matmul import emit_qkt

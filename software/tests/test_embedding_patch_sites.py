@@ -24,8 +24,8 @@ def _config():
 
 
 def _weights():
-    token = np.arange(8 * 16, dtype=np.int8).reshape(8, 16)
-    pos = (np.arange(16 * 16, dtype=np.int16).reshape(16, 16) - 64).astype(np.int8)
+    token = np.arange(8 * 16, dtype=np.float16).reshape(8, 16)
+    pos = (np.arange(16 * 16, dtype=np.float16).reshape(16, 16) - 64).astype(np.float16)
     return {
         "transformer.wte.weight": (token, None),
         "transformer.wpe.weight": (pos, None),
@@ -63,15 +63,16 @@ def test_dynamic_embedding_patch_sites_load_selected_rows():
     sim = Simulator()
     sim.load_bundle(bundle)
 
-    bundle.patch_runtime_site("token_embed", 3 * config.d_model, stream="decode")
-    bundle.patch_runtime_site("pos_embed", 5 * config.d_model, stream="decode")
+    assert bundle.embedding_row_bytes == 2 * config.d_model
+    bundle.patch_runtime_site("token_embed", 3 * bundle.embedding_row_bytes, stream="decode")
+    bundle.patch_runtime_site("pos_embed", 5 * bundle.embedding_row_bytes, stream="decode")
     sim.run_program(bundle, "decode")
 
     token_table = _weights()["transformer.wte.weight"][0]
     pos_table = _weights()["transformer.wpe.weight"][0]
     pos_off = build.decode_codegen.mem.abuf.get("pos_embed").offset_units * 16
-    assert bytes(sim.state.abuf[:16]) == token_table[3].tobytes()
-    assert bytes(sim.state.abuf[pos_off:pos_off + 16]) == pos_table[5].tobytes()
+    assert bytes(sim.state.abuf[:32]) == token_table[3].tobytes()
+    assert bytes(sim.state.abuf[pos_off:pos_off + 32]) == pos_table[5].tobytes()
 
 
 def test_fixed_embedding_lookup_does_not_record_runtime_patch_sites():
@@ -111,7 +112,7 @@ def test_fixed_embedding_lookup_preserves_row_addend_in_program_bundle():
     sim.run_program(build.bundle, "prefill")
 
     token_table = _weights()["transformer.wte.weight"][0]
-    assert bytes(sim.state.abuf[:16]) == token_table[2].tobytes()
+    assert bytes(sim.state.abuf[:32]) == token_table[2].tobytes()
 
 
 def test_runtime_embedding_lookup_records_one_site_per_row():

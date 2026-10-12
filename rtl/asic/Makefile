@@ -49,17 +49,31 @@ ASIC_SV := $(PDK_SRAM_FILE) \
 #   TARGET_ASIC          — selects sram_dp_macro binding in the common
 #                          SRAM dispatch wrapper
 #   SFU_SYNTH_NO_DPI     — elides DPI-C imports; required for synth
-#   SFU_SYNTH_MODE=1     — selects synthesizable fp32 SFU paths
-#   HELPER_SYNTH_MODE=1  — selects synthesizable helper-engine chain
-TARGET_DEFS := -DTARGET_ASIC -DSFU_SYNTH_NO_DPI -DSFU_SYNTH_MODE=1 -DHELPER_SYNTH_MODE=1
+# Compute modes are RTL parameters passed explicitly by taccel_top_asic.
+TARGET_DEFS := -DTARGET_ASIC -DSFU_SYNTH_NO_DPI
 
 SYNTH_BUILD := $(BUILD_DIR)/synth
 SV2V_OUT    := $(SYNTH_BUILD)/design_asic.v
 
-.PHONY: yosys-asic openlane clean
+.PHONY: yosys-asic openlane test-sram-bank clean
+
+# Experimental macro adapter is not wired into the production SRAM contract.
+# Fetch the pinned vendor simulation view into this ignored cache first.
+SRAM_MODEL ?= cache/sky130_sram/sky130_sram_2kbyte_1rw1r_32x512_8.v
+IVERILOG ?= iverilog
+VVP ?= vvp
+$(BUILD_DIR)/test-sram-bank.vvp: src/sram_dp_sky130_banked.sv tests/test_sram_dp_sky130_banked.sv ../common/src/memory/sram_dp_inferred.sv $(SRAM_MODEL) Makefile
+	mkdir -p $(BUILD_DIR)
+	$(IVERILOG) -g2012 -s test_sram_dp_sky130_banked -o $@ \
+	  src/sram_dp_sky130_banked.sv tests/test_sram_dp_sky130_banked.sv \
+	  ../common/src/memory/sram_dp_inferred.sv $(SRAM_MODEL)
+
+test-sram-bank: $(BUILD_DIR)/test-sram-bank.vvp
+	python3 tools/fetch_macro_views.py --verify-only
+	$(VVP) $<
 
 # sv2v: adapt SystemVerilog to Verilog-2005 with TARGET_ASIC defines.
-$(SV2V_OUT): $(CORE_SV) $(ASIC_SV)
+$(SV2V_OUT): $(CORE_SV) $(wildcard $(SRC_DIR)/*.svh) $(ASIC_SV) $(CORE_F) Makefile
 	mkdir -p $(SYNTH_BUILD)
 	sv2v $(TARGET_DEFS) -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) -I$(SRC_DIR) \
 	     $(CORE_SV) $(ASIC_SV) -w $(SV2V_OUT)
@@ -67,6 +81,7 @@ $(SV2V_OUT): $(CORE_SV) $(ASIC_SV)
 # Elaboration smoke gate. Yosys must resolve the full taccel_top_asic
 # hierarchy with zero unresolved modules. ABC/synth passes are NOT run
 # — full physical closure requires a separately integrated physical flow.
+# Raw-process check is diagnostic, not a fatal post-lowering structural proof.
 yosys-asic: $(SV2V_OUT)
 	@echo "--- yosys ASIC elaboration smoke gate (taccel_top_asic; PDK=$(PDK)) ---"
 	yosys -p "read_verilog $(SV2V_OUT); hierarchy -check -top taccel_top_asic; check; stat"

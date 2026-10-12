@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/VLSIDA/sky130_sram_macros",
+  "revision": "965df150c754fe2b3f93a0bd1f9883eb114279b2",
+  "macro": "sky130_sram_2kbyte_1rw1r_32x512_8",
+  "status": "experimental; not bound into the production SRAM contract",
+  "capacity_bytes": 2048,
+  "logical_rows": 512,
+  "word_bits": 32,
+  "views": {
+    "sky130_sram_2kbyte_1rw1r_32x512_8.v": "2712357fbc3d1ee3343c4bcb7d630de92ca87d869fb5d50d1d3cea967f288208",
+    "sky130_sram_2kbyte_1rw1r_32x512_8.lef": "e35072ac14a991285619477f13c80fd3837e76ef7ed354ae6ab80d9232ce7a2e",
+    "sky130_sram_2kbyte_1rw1r_32x512_8.gds": "d32efcfe8079379f94070bcbcedad7f1239e27f8996eb184141840e31c9302b2",
+    "sky130_sram_2kbyte_1rw1r_32x512_8_TT_1p8V_25C.lib": "8656384775f5e10b44bed97b7193dd3188ce8cd60b7c8e02a5a4ad9e35ed03ba"
+  },
+  "limitations": [
+    "same-address Port-A write and Port-B read is not specified by the macro",
+    "functional-model delay is arbitrary, not characterized timing",
+    "Liberty input max_transition requires investigation before physical closure",
+    "no full-chip placement, routing, DRC, LVS or extracted power result"
+  ]
+}

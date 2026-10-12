@@ -4,7 +4,7 @@ The batched decode stream carries 16 query rows through the shared
 non-attention path (embeddings/LN/FFN/quant/logits are all M-shaped and batch
 for free); attention is per-stream block-diagonal (each stream runs the
 single-token query_len=1 QK^T/softmax/AV against its own KV cache). The final
-test is the bit-exact contract: the mode-1 synth RTL and the mode-0 golden
+test is the bit-exact contract: the mode-1 synth RTL and the Python golden
 model produce byte-identical logits for the batched decode program.
 """
 import importlib.util
@@ -18,7 +18,7 @@ import pytest
 
 from taccel.assembler.assembler import ProgramBinary
 from taccel.compiler.frontend import load_frontend
-from taccel.runtime.host_runner import HostRunner
+from taccel.runtime.host_runner import BundlePatcher, HostRunner
 from taccel.runtime.tiny_fixture import build_stage3_tiny_decoder_bundle
 
 RTL_SYNTH_BINARY = (
@@ -29,12 +29,10 @@ RTL_SYNTH_BINARY = (
 
 TOOL_PATH = Path(__file__).resolve().parents[1] / "tools" / "train_tiny_fixture.py"
 
-# Batched tests run at the PRODUCTION attention depth: key_len = 1 + 63 = 64, so
-# Kseq_pad = 64 and the per-head attn_v tiles spill to DRAM-temp exactly as they
-# do on GPT-2 124M. That spill is what bounds ABUF — without it the
-# n_head x n_streams live attn_v tiles are 4 x 32 x 1 KB = the whole 128 KB ABUF,
-# and B=32 cannot even build. (A shallow Kseq_pad < 64 is a toy regime that never
-# occurs in a real decode.)
+# This suite retains the established 64-key spill-path coverage. Initial
+# decodes also have real short windows; their delayed-gather AV cohorts need
+# capacity-aware spilling independently of key length (covered separately in
+# test_batched_av_capacity.py).
 BATCHED_SMOKE = 63
 
 
@@ -153,7 +151,7 @@ def test_batched_decode_runs_clean_in_golden(tmp_path, batch):
     payload = _build_payload(tmp_path)
     tiny = build_stage3_tiny_decoder_bundle(payload, smoke_decode_steps=BATCHED_SMOKE, batch=batch)
 
-    runner = HostRunner(tiny.build.bundle, logits_dtype=np.int8)
+    runner = HostRunner(tiny.build.bundle, logits_dtype=np.float16)
     # Batched bundle's prefill slot is the lockstep batched graph (N rows).
     vocab = _tiny_nanogpt_config()["vocab_size"]
     runner.run_prefill([(3 + s) % vocab for s in range(batch)])
@@ -161,11 +159,12 @@ def test_batched_decode_runs_clean_in_golden(tmp_path, batch):
     out = runner.run_decode_step_batch(tokens, position=1)
 
     # Lever I-a (logits×N): the region spans all N per-stream logits rows, not
-    # just row 0. `out` is the flat int8 view of the whole logits_size region;
+    # just row 0. `out` is the flat FP16 view of the whole logits_size region;
     # reshape to per-stream rows and confirm every stream is populated.
-    assert out.shape == (tiny.logits_size,)
+    assert out.shape == (tiny.logits_size // 2,)
     per_stream = out.reshape(batch, -1)
-    assert per_stream.shape[1] == tiny.logits_size // batch
+    assert per_stream.shape[1] == tiny.logits_size // (2 * batch)
+    assert np.isfinite(per_stream[:, :vocab]).all()
     assert np.all(per_stream.any(axis=1)), "a per-stream logits row is empty (store_rows<N?)"
     # The N streams decode distinct tokens, so their logits rows must differ —
     # proves the store captured per-stream data, not row 0 replicated N×.
@@ -174,31 +173,33 @@ def test_batched_decode_runs_clean_in_golden(tmp_path, batch):
 
 @pytest.mark.parametrize("batch", [16, 32])
 def test_batched_decode_rtl_matches_golden_bytes(tmp_path, batch):
-    """Bit-exact contract: mode-1 synth RTL == mode-0 golden on the batched
+    """Bit-exact contract: mode-1 synth RTL == Python golden on the batched
     decode program (byte-identical logits), for every batched stream's row.
 
-    NOTE this is the TINY model on purpose: RTL-vs-golden *byte*-match is only
-    well-posed below GPT-2 124M's first fp16 overflow (block0_out_proj →
-    ±65504/NaN), past which the golden itself saturates and conformance becomes
-    logits-level (argmax/cosine/perplexity) — see rtl_cosim.py #109.
+    This tiny fixture is a conformance workload, not evidence of GPT-2 quality.
+    Full-model nonfinite outputs cannot pass a numerical-quality gate.
     """
     if not RTL_SYNTH_BINARY.exists():
         pytest.skip(f"synth RTL binary not built: {RTL_SYNTH_BINARY}")
+    from tools.benchmark_support import check_runner_freshness, validate_runner_summary
+    check_runner_freshness(Path(__file__).resolve().parents[2], RTL_SYNTH_BINARY)
     payload = _build_payload(tmp_path)
     tiny = build_stage3_tiny_decoder_bundle(payload, smoke_decode_steps=BATCHED_SMOKE, batch=batch)
     bundle = tiny.build.bundle
     pos = 1
     tokens16 = [(3 + s) % 64 for s in range(batch)]
 
-    # Golden (mode-0 DPI). Decode-ONLY, to mirror the RTL side below, which runs
+    # Python golden. Decode-ONLY, to mirror the RTL side below, which runs
     # the extracted decode program on a fresh image. Running a prefill here (and
     # not on the RTL) would compare two different machine states.
-    runner = HostRunner(bundle, logits_dtype=np.int8)
-    golden = runner.run_decode_step_batch(tokens16, pos)
+    runner = HostRunner(bundle, logits_dtype=np.float16)
+    golden_fp16 = runner.run_decode_step_batch(tokens16, pos)
+    assert np.isfinite(golden_fp16.reshape(batch, -1)[:, :tiny.config.vocab_size]).all()
+    golden = golden_fp16.view(np.uint8)
 
     # Extract the standalone decode program and run it on the synth RTL,
     # dumping the logits region for a byte compare.
-    patcher = HostRunner(bundle, simulator=None)
+    patcher = BundlePatcher(bundle)
     patcher._patch_embeddings("decode", tokens16, [pos] * batch)
     patcher._patch_kv_bases(pos)
     patcher._patch_decode_attention_context(pos)
@@ -219,10 +220,13 @@ def test_batched_decode_rtl_matches_golden_bytes(tmp_path, batch):
             "--dram-dump-offset", str(logits_off), "--dram-dump-size", str(logits_size),
             "--dram-dump-out", str(td / "dram.bin")]
     cp = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
+    assert cp.returncode == 0, cp.stderr[-800:]
     assert (td / "s.json").exists(), f"RTL run failed: {cp.stderr[-800:]}"
     summ = json.loads((td / "s.json").read_text())
-    assert summ.get("status") == "halted" and not summ.get("fault"), summ
-    rtl = np.frombuffer((td / "dram.bin").read_bytes(), dtype=np.int8)[:golden.shape[0]]
+    validate_runner_summary(summ)
+    raw = (td / "dram.bin").read_bytes()
+    assert len(raw) == golden.size
+    rtl = np.frombuffer(raw, dtype=np.uint8)
 
     assert np.array_equal(golden, rtl), (
         f"RTL != golden: {int(np.sum(golden != rtl))}/{golden.shape[0]} bytes differ"

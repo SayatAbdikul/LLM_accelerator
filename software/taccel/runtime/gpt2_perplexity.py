@@ -133,6 +133,11 @@ def run_golden_teacher_forced_logits(
     *,
     ptq_preset: str | Stage5PTQPreset | None = None,
 ) -> List[np.ndarray]:
+    """Return active W8A16 bundle logits widened to FP32, already dequantized.
+
+    Despite the legacy function name, these are not INT8 code values and
+    must not be multiplied by an lm_head activation scale a second time.
+    """
     inputs, _ = teacher_forced_inputs_and_targets(context_tokens)
     tiny = build_stage3_tiny_decoder_bundle(
         payload,
@@ -140,10 +145,10 @@ def run_golden_teacher_forced_logits(
         calibration_scales=calibration_scales,
         ptq_preset=ptq_preset,
     )
-    runner = HostRunner(tiny.build.bundle, logits_dtype=np.int8)
-    logits: List[np.ndarray] = [runner.run_prefill([inputs[0]])]
+    runner = HostRunner(tiny.build.bundle, logits_dtype=np.float16)
+    logits: List[np.ndarray] = [runner.run_prefill([inputs[0]]).astype(np.float32)]
     for position, token in enumerate(inputs[1:], start=1):
-        logits.append(runner.run_decode_step(int(token), position))
+        logits.append(runner.run_decode_step(int(token), position).astype(np.float32))
     return logits
 
 
@@ -643,8 +648,12 @@ def evaluate_gpt2_perplexity(
     if len(golden_logits) != len(targets) or len(fake_logits) != len(targets):
         raise RuntimeError("teacher-forced logits/targets length mismatch")
 
+    # The compiled golden rail is W8A16; only the retained W8A8 research
+    # reference below returns integer logit codes requiring lm_head scaling.
+    # This legacy preset branch is a cross-arithmetic comparison, not the
+    # matched W8A16 simulator_backed conformance path above.
     golden_nlls = [
-        stable_cross_entropy(np.asarray(row, dtype=np.float32) * np.float32(lm_head_scale), target, vocab_size=vocab_size)
+        stable_cross_entropy(np.asarray(row, dtype=np.float32), target, vocab_size=vocab_size)
         for row, target in zip(golden_logits, targets)
     ]
     fake_nlls = [

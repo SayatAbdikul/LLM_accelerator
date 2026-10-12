@@ -277,13 +277,13 @@ class NanoGPTW8A16SimulatorReference:
                     sd[f"{head_prefix}.weight_h{head_idx}_value"], dtype=np.float32
                 )
                 q_b = np.asarray(
-                    sd[f"{head_prefix}.bias_h{head_idx}_query"], dtype=np.float32
+                    sd.get(f"{head_prefix}.bias_h{head_idx}_query", np.zeros(self.d_head)), dtype=np.float32
                 )
                 k_b = np.asarray(
-                    sd[f"{head_prefix}.bias_h{head_idx}_key"], dtype=np.float32
+                    sd.get(f"{head_prefix}.bias_h{head_idx}_key", np.zeros(self.d_head)), dtype=np.float32
                 )
                 v_b = np.asarray(
-                    sd[f"{head_prefix}.bias_h{head_idx}_value"], dtype=np.float32
+                    sd.get(f"{head_prefix}.bias_h{head_idx}_value", np.zeros(self.d_head)), dtype=np.float32
                 )
                 # Store INT8 + FP16 scales (transposed to [K, N] = [d_model, d_head]).
                 q_int8, q_scales = self._qpc_for(

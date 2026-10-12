@@ -35,7 +35,7 @@ def emit_embedding_lookup(cg: "CodeGenerator", node: IRNode, *,
     """
     table_name = node.attrs.get("table", default_table)
     if table_name not in cg.dram_layout:
-        return
+        raise KeyError(f"{node.name}: missing staged embedding table {table_name!r}")
     seq_len, d_model = node.output_shape
     d_model_pad = pad_dim(d_model)
     if d_model_pad != d_model:

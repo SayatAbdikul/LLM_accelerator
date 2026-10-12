@@ -36,6 +36,32 @@ def test_fixture_metadata_roundtrip_and_checksum(tmp_path):
     assert loaded["stage3e_logits_smoke_ready"] is True
     assert loaded["stage3f_full_graph_smoke_ready"] is True
     assert loaded["stage3c_e2e_ready"] is True
+    assert loaded["provenance"]["payload_sha256"]
+    assert loaded["provenance"]["generator_sha256"]
+
+
+def test_payload_identity_survives_serialization_but_detects_tensor_changes(tmp_path):
+    torch = pytest.importorskip("torch")
+    tool = _load_tool()
+    payload = tool._make_checkpoint_payload()
+    identity = tool.payload_sha256(payload)
+    for name in ("a.pt", "different_filename.pt"):
+        checkpoint = tmp_path / name
+        torch.save(payload, checkpoint)
+        assert tool.payload_sha256(torch.load(checkpoint, map_location="cpu")) == identity
+    tensor = next(iter(payload["state_dict"].values()))
+    tensor.view(-1)[0] += 1
+    assert tool.payload_sha256(payload) != identity
+
+
+def test_fixture_byte_checksum_remains_strict(tmp_path):
+    tool = _load_tool()
+    checkpoint = tmp_path / "fixture.pt"
+    metadata = checkpoint.with_suffix(".pt.json")
+    tool.write_fixture(checkpoint, metadata)
+    checkpoint.write_bytes(checkpoint.read_bytes() + b"corruption")
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        tool.validate_fixture_metadata(checkpoint, metadata)
 
 
 def test_default_fixture_skip_message_when_absent():

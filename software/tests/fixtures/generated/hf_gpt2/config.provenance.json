@@ -1,0 +1,13 @@
+{
+  "source_repository": "https://huggingface.co/openai-community/gpt2",
+  "revision": "607a30d783dfa663caf39e06633721c8d4cfcd7e",
+  "config_url": "https://huggingface.co/openai-community/gpt2/resolve/607a30d783dfa663caf39e06633721c8d4cfcd7e/config.json",
+  "tree_metadata_url": "https://huggingface.co/api/models/openai-community/gpt2/tree/607a30d783dfa663caf39e06633721c8d4cfcd7e?recursive=false&expand=false",
+  "config_git_blob_sha1": "10c66461e4c109db5a2196bff4bb59be30396ed8",
+  "config_sha256": "0daed7749b4f02b8f76240d5444551d7b08712dab4d0adb8239c56ba823bb7b4",
+  "config_size_bytes": 665,
+  "weights_file": "model.safetensors",
+  "weights_sha256": "248dfc3911869ec493c76e65bf2fcf7f615828b0254c12b473182f0f81d3a707",
+  "weights_size_bytes": 548105171,
+  "verification": "Local weights SHA-256 and byte size match the pinned repository's published LFS object; only its small config was retrieved, no weights downloaded."
+}

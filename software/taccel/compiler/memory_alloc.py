@@ -117,6 +117,10 @@ class BufferAllocator:
     def free_bytes(self) -> int:
         return self.capacity - self.used_bytes
 
+    @property
+    def largest_free_bytes(self) -> int:
+        return max((size for _, size in self._free), default=0) * UNIT
+
     def get(self, name: str) -> Optional[Allocation]:
         return self.allocations.get(name)
 

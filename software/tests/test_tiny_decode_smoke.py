@@ -21,19 +21,21 @@ def _load_tool():
 
 def _run_full_graph_smoke(payload):
     tiny = build_stage3_tiny_decoder_bundle(payload, smoke_decode_steps=2)
-    runner = HostRunner(tiny.build.bundle, logits_dtype=np.int8)
+    runner = HostRunner(tiny.build.bundle, logits_dtype=np.float16)
 
     prefill_a = runner.run_prefill([0])
     decode_a = runner.run_decode_step(1, 1)
     decode_repeat = runner.run_decode_step(1, 1)
 
-    runner_b = HostRunner(tiny.build.bundle, logits_dtype=np.int8)
+    runner_b = HostRunner(tiny.build.bundle, logits_dtype=np.float16)
     runner_b.run_prefill([0])
     decode_b = runner_b.run_decode_step(2, 1)
 
-    assert prefill_a.shape == (tiny.logits_size,)
-    assert decode_a.shape == (tiny.logits_size,)
-    assert decode_b.shape == (tiny.logits_size,)
+    assert prefill_a.shape == (tiny.logits_size // 2,)
+    assert decode_a.shape == (tiny.logits_size // 2,)
+    assert decode_b.shape == (tiny.logits_size // 2,)
+    assert all(np.isfinite(row[:tiny.config.vocab_size]).all()
+               for row in (prefill_a, decode_a, decode_b))
     assert np.any(prefill_a)
     assert np.any(decode_a)
     assert np.any(decode_b)

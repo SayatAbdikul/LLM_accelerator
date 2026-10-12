@@ -2,6 +2,11 @@
 # EDA / experiment artifacts (never commit)
 .gptq_runs/
 rtl/asic/openlane/
+rtl/asic/cache/
+rtl/asic/results/
+rtl/asic/build/*.vvp
+rtl/asic/build/test-sram-*.log
+build/optimization-*/
 
 # rtl/asic/build/synth_blocks/ holds BOTH the hand-written sky130 synth/STA flow
 # (*.sh / *.tcl — ~17 KB, the scripts that produce every fmax number this project

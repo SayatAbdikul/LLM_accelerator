@@ -16,6 +16,18 @@ using namespace systolic_test;
 static void expect_clean_halt(const char* name, Vtaccel_top* dut) {
   if (!dut->done || dut->fault)
     TEST_FAIL(name, "did not halt cleanly");
+  const auto* r = dut->rootp;
+  const uint64_t phases = r->taccel_top__DOT__obs_sys_load_cycles_q +
+      r->taccel_top__DOT__obs_sys_data_cycles_q +
+      r->taccel_top__DOT__obs_sys_k_boundary_cycles_q +
+      r->taccel_top__DOT__obs_sys_flush_cycles_q +
+      r->taccel_top__DOT__obs_sys_drain_cycles_q +
+      r->taccel_top__DOT__obs_sys_other_cycles_q;
+  if (phases != r->taccel_top__DOT__obs_sys_busy_cycles_q)
+    TEST_FAIL(name, "systolic phase counters do not partition busy time");
+  if (r->taccel_top__DOT__obs_sys_compute_steps_q !=
+      r->taccel_top__DOT__obs_sys_data_cycles_q + r->taccel_top__DOT__obs_sys_flush_cycles_q)
+    TEST_FAIL(name, "enabled steps must include data and final flush");
 }
 
 static void test_matmul_identity() {
@@ -45,6 +57,10 @@ static void test_matmul_identity() {
   s.load_program(prog);
   s.run(500000);
   expect_clean_halt(name, s.dut.get());
+  if (s.dut->rootp->taccel_top__DOT__obs_sys_data_cycles_q != 16 ||
+      s.dut->rootp->taccel_top__DOT__obs_sys_flush_cycles_q != 30 ||
+      s.dut->rootp->taccel_top__DOT__obs_sys_k_boundary_cycles_q != 0)
+    TEST_FAIL(name, "single chained tile phase counts are incorrect");
   if (!check_accum_16x16(s.dut.get(), 0, exp, "identity"))
     TEST_FAIL(name, "ACCUM mismatch");
   TEST_PASS(name);

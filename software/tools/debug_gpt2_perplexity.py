@@ -546,7 +546,7 @@ def _per_step_rows(
 ) -> List[Dict[str, object]]:
     rows = []
     for step, (input_id, target, golden, fake, fp32, direct_q) in enumerate(zip(tokens[:-1], targets, golden_i8, fake_i8, fp32_logits, direct_quant_i8)):
-        golden_deq = np.asarray(golden, dtype=np.float32)[:vocab_size] * np.float32(lm_head_scale)
+        golden_deq = np.asarray(golden, dtype=np.float32)[:vocab_size]
         fake_deq = np.asarray(fake, dtype=np.float32)[:vocab_size] * np.float32(lm_head_scale)
         direct_deq = np.asarray(direct_q, dtype=np.float32)[:vocab_size] * np.float32(lm_head_scale)
         fp32_active = np.asarray(fp32, dtype=np.float32)[:vocab_size]
@@ -574,15 +574,17 @@ def _per_step_rows(
                 "direct_quant_vs_fp32": len(set(_topk_ids(direct_deq, k=10, vocab_size=vocab_size)) & set(_topk_ids(fp32_active, k=10, vocab_size=vocab_size))),
             },
             "cosine": {
-                "golden_vs_fake": cosine_similarity(np.asarray(golden, dtype=np.float32)[:vocab_size], np.asarray(fake, dtype=np.float32)[:vocab_size]),
+                "golden_vs_fake": cosine_similarity(golden_deq, fake_deq),
                 "fake_vs_fp32": cosine_similarity(fake_deq, fp32_active),
                 "direct_quant_vs_fp32": cosine_similarity(direct_deq, fp32_active),
             },
             "int8": {
-                "golden": _int8_stats(np.asarray(golden)[:vocab_size]),
                 "fake_quant": _int8_stats(np.asarray(fake)[:vocab_size]),
                 "direct_quant_fp32": _int8_stats(np.asarray(direct_q)[:vocab_size]),
             },
+            "golden_storage": {"dtype": "float16", "widened_to": "float32",
+                               "finite_count": int(np.isfinite(golden_deq).sum()),
+                               "element_count": int(golden_deq.size)},
             "top10_tokens": {
                 "fp32": _topk_ids(fp32_active, k=10, vocab_size=vocab_size),
                 "direct_quant_fp32": _topk_ids(direct_deq, k=10, vocab_size=vocab_size),
@@ -801,7 +803,7 @@ def _compare_search_windows(
             scales,
             ptq_preset=preset,
         )
-        golden_deq = [np.asarray(row, dtype=np.float32)[:vocab_size] * np.float32(lm_scale) for row in golden_i8]
+        golden_deq = [np.asarray(row, dtype=np.float32)[:vocab_size] for row in golden_i8]
         fake_deq = [np.asarray(row, dtype=np.float32)[:vocab_size] * np.float32(lm_scale) for row in fake_i8]
         golden_ppl = _ppl_from_logits(golden_deq, targets, vocab_size=vocab_size)
         fake_ppl = _ppl_from_logits(fake_deq, targets, vocab_size=vocab_size)
@@ -899,7 +901,7 @@ def _ablation_sweep(
     baseline_ppl = _ppl_from_logits(baseline_fake_deq, targets, vocab_size=vocab_size)
     baseline_summary = _logit_pair_summary(
         [np.asarray(row, dtype=np.float32)[:vocab_size] for row in golden_i8],
-        [np.asarray(row, dtype=np.float32)[:vocab_size] for row in fake_i8],
+        baseline_fake_deq,
         vocab_size=vocab_size,
     )
     rows = []
@@ -1285,12 +1287,12 @@ def _preset_sweep(
             scales,
             ptq_preset=preset,
         )
-        golden_deq = [np.asarray(row, dtype=np.float32)[:vocab_size] * np.float32(lm_scale) for row in golden_i8]
+        golden_deq = [np.asarray(row, dtype=np.float32)[:vocab_size] for row in golden_i8]
         fake_deq = [np.asarray(row, dtype=np.float32)[:vocab_size] * np.float32(lm_scale) for row in fake_i8]
         golden_ppl = _ppl_from_logits(golden_deq, targets, vocab_size=vocab_size)
         fake_ppl = _ppl_from_logits(fake_deq, targets, vocab_size=vocab_size)
         pair_fake_fp32 = _logit_pair_summary(fake_deq, fp32_logits, vocab_size=vocab_size)
-        pair_golden_fake = _logit_pair_summary(golden_i8, fake_i8, vocab_size=vocab_size)
+        pair_golden_fake = _logit_pair_summary(golden_deq, fake_deq, vocab_size=vocab_size)
         expected_top10 = min(10, int(vocab_size))
         row = {
             "name": preset.name,
@@ -1473,11 +1475,13 @@ def _calibration_sweep(
         lm_scale = float(scales.get("lm_head", 1.0))
         golden = run_golden_teacher_forced_logits(payload, eval_tokens, scales, ptq_preset=preset)
         fake = run_fake_quant_teacher_forced_logits(payload, eval_tokens, scales, ptq_preset=preset)
-        golden_deq = [np.asarray(row, dtype=np.float32)[:vocab_size] * np.float32(lm_scale) for row in golden]
+        golden_deq = [np.asarray(row, dtype=np.float32)[:vocab_size] for row in golden]
         fake_deq = [np.asarray(row, dtype=np.float32)[:vocab_size] * np.float32(lm_scale) for row in fake]
         golden_ppl = _ppl_from_logits(golden_deq, targets, vocab_size=vocab_size)
         fake_ppl = _ppl_from_logits(fake_deq, targets, vocab_size=vocab_size)
-        stats = [_int8_stats(np.asarray(row)[:vocab_size]) for row in golden]
+        # The active compiler stores real FP16 golden logits, not INT8 codes.
+        # Keep integer saturation diagnostics on the separate W8A8 reference.
+        fake_stats = [_int8_stats(np.asarray(row)[:vocab_size]) for row in fake]
         rows.append({
             "n_seqs": int(n_seqs),
             "seq_len": int(seq_len),
@@ -1487,9 +1491,17 @@ def _calibration_sweep(
             "golden_perplexity": golden_ppl["perplexity"],
             "fake_quant_perplexity": fake_ppl["perplexity"],
             "relative_delta": abs(golden_ppl["perplexity"] - fake_ppl["perplexity"]) / max(abs(fake_ppl["perplexity"]), 1e-12),
-            "min_golden_vs_fake_cosine": _logit_pair_summary(golden, fake, vocab_size=vocab_size)["min_cosine"],
-            "mean_saturation_rate": float(np.mean([s["saturation_rate"] for s in stats])),
-            "min_unique_count": int(min(s["unique_count"] for s in stats)),
+            "min_golden_vs_fake_cosine": _logit_pair_summary(golden_deq, fake_deq, vocab_size=vocab_size)["min_cosine"],
+            "golden_storage": {
+                "dtype": "float16", "widened_to": "float32",
+                "finite_count": int(sum(np.isfinite(row).sum() for row in golden_deq)),
+                "element_count": int(sum(row.size for row in golden_deq)),
+                "min_unique_count": int(min(np.unique(row).size for row in golden_deq)),
+            },
+            "fake_quant_int8": {
+                "mean_saturation_rate": float(np.mean([s["saturation_rate"] for s in fake_stats])),
+                "min_unique_count": int(min(s["unique_count"] for s in fake_stats)),
+            },
             "tokenizer_dir": str(tokenizer_dir),
         })
     return rows
@@ -1592,7 +1604,7 @@ def run_report(args) -> Dict[str, object]:
     direct_deq = [row.astype(np.float32) * np.float32(lm_scale) for row in direct_q]
     direct_ppl = _ppl_from_logits(direct_deq, targets, vocab_size=vocab_size)
     fake_deq = [row.astype(np.float32)[:vocab_size] * np.float32(lm_scale) for row in fake_incr]
-    golden_deq = [row.astype(np.float32)[:vocab_size] * np.float32(lm_scale) for row in golden_i8]
+    golden_deq = [row.astype(np.float32)[:vocab_size] for row in golden_i8]
     fake_ppl = _ppl_from_logits(fake_deq, targets, vocab_size=vocab_size)
     golden_ppl = _ppl_from_logits(golden_deq, targets, vocab_size=vocab_size)
 

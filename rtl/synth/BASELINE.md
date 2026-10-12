@@ -1,6 +1,10 @@
 # Generic RTL synthesizability gate
 
-**Current result:** green on 2026-09-02/03 after `3486c01`
+**Latest result:** mode-1 hierarchy checks pass on 2026-10-11 for the shared
+core (fetch off/on), ASIC wrapper and FPGA wrapper. The shared fetch-off gate
+takes 85.55 s and samples 2,923,626,496 bytes process-group peak RSS. Its
+27,891 raw-process diagnostics are not an asserted structural proof. See
+[the milestone report](../../docs/optimization_results.md) for logs and scope.
 **Command:** `make -C rtl/verilator synth-check`
 **Top:** `taccel_top`
 
@@ -9,7 +13,7 @@ the complete target-neutral RTL hierarchy parses without DPI/`real`
 dependencies and has no unresolved modules. It is deliberately not a mapped
 area/timing flow.
 
-## Latest observed result
+## Historical observed result
 
 | Metric | Value |
 |---|---:|
@@ -24,10 +28,15 @@ area/timing flow.
 | Memory bits | 3,670,016 |
 | Logfile hash | `c7b93d94cb` |
 
-The run emits many known messages from generated casts, FP constant
-conversion, and memory lowering. Exit status, hierarchy resolution, and the
-structural check are the gate. Do not treat warning count as a stable metric
-across Yosys versions.
+That older script did not override either compute parameter; both defaulted
+to zero. It is not evidence for the intended mode-1 hardware configuration.
+
+The run emits messages from generated casts, FP constant conversion, and
+memory lowering. Exit status and fatal hierarchy resolution are the gate.
+The raw-process `check` output is diagnostic: unused inlined-function
+temporaries can appear undriven before process lowering. It is not an
+asserted whole-design structural proof. Mapped leaf/bank flows lower
+processes and run `check -assert` with the actual cell interfaces loaded.
 
 ## What runs
 
@@ -56,6 +65,7 @@ yosys -p "read_verilog rtl/verilator/build/synth/design_full.v; \
 The Yosys script currently performs:
 
 ```text
+chparam -set SFU_SYNTH_MODE 1 -set HELPER_SYNTH_MODE 1 taccel_top
 hierarchy -check -top taccel_top
 check
 stat
@@ -72,11 +82,15 @@ The target is green when:
 - every source in `core.f` converts through `sv2v`;
 - Yosys resolves the entire `taccel_top` hierarchy;
 - the synth configuration contains no reachable DPI imports or `real` state;
-- `check` completes without a fatal structural error;
+- diagnostic `check` and `stat` complete (their warnings remain in the log);
 - the command exits zero.
 
 `SFU_SYNTH_NO_DPI` removes reference-only DPI code. The top-level synthesis
-configuration selects the synthesizable SFU and helper datapaths.
+configuration explicitly selects the synthesizable SFU and helper datapaths
+through actual module parameters, not ineffective parameter-name defines.
+The shared top's instruction buffer remains default-off; candidate buffered
+mapping is tested separately. A green mode-0 hierarchy must not be relabeled
+as mode1.
 
 ## Source-of-truth rule
 

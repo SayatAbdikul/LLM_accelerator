@@ -41,6 +41,50 @@ if TYPE_CHECKING:
     from ..ir import IRNode
 
 
+def _spill_batched_av_cohort(cg: "CodeGenerator", node: "IRNode",
+                            m_pad: int, n_pad: int, key_pad: int) -> bool:
+    """Admit an entire delayed-gather cohort before retaining its first tile.
+
+    Short attention windows are real decode workloads too. Retaining one
+    padded AV tile per head/stream can exhaust ABUF at the *next* packed QKT,
+    before another AV emitter gets a chance to react. Keep the established
+    large-window schedule unchanged; for annotated packed-batched graphs,
+    require conservative cohort plus workspace headroom in one free span.
+    Otherwise use the existing, arithmetic-neutral DRAM spill/reload path.
+    """
+    if cg.current_node_idx < 0:
+        return False
+    if key_pad >= 64:
+        return True
+    if "av_cohort_tiles" not in node.attrs:
+        return False
+    block = int(node.attrs["block_idx"])
+    if block not in cg.batched_av_residency:
+        tiles = int(node.attrs["av_cohort_tiles"])
+        streams = int(node.attrs.get("av_cohort_streams", 0))
+        pack_bytes = int(node.attrs.get("av_cohort_pack_bytes", 0))
+        cohort_bytes = tiles * m_pad * n_pad * cg.elem_bytes
+        # Sum (rather than max) overlapping/transient phases deliberately:
+        # packed Q, three FP score tiles, quantized softmax, a streamed INT8
+        # K tile and a gather destination. Already-live Q/residual/input
+        # allocations are excluded from the allocator's free-span bound.
+        workspace_bytes = (pack_bytes + 3 * m_pad * key_pad * cg.elem_bytes
+                           + m_pad * key_pad + key_pad * n_pad
+                           + pad_dim(max(streams, 1)) * n_pad * cg.elem_bytes)
+        largest_free = cg.mem.abuf.largest_free_bytes
+        valid = tiles > 0 and streams > 0 and pack_bytes > 0
+        retain = (valid and cohort_bytes <= cg.mem.abuf.capacity // 2
+                  and cohort_bytes + workspace_bytes <= largest_free)
+        cg.batched_av_residency[block] = not retain
+        cg.optimization_events.append({
+            "kind": "batched_av_residency", "block": block, "spill": not retain,
+            "cohort_bytes": cohort_bytes, "workspace_bound_bytes": workspace_bytes,
+            "largest_free_bytes": largest_free,
+            "reason": "bounded resident cohort" if retain else "cohort capacity not proven",
+        })
+    return cg.batched_av_residency[block]
+
+
 # ---------------------------------------------------------------------------
 # M3-A: matmul_qkt W8A32 lowering — Q @ K^T with static composite dequant
 # ---------------------------------------------------------------------------
@@ -654,6 +698,9 @@ def emit_matmul_attn_v_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
             relocation_symbol=_pf_entry.base_symbol,
         )
 
+    # Decide before retaining the first AV output; waiting until a later
+    # allocation fails cannot rescue the following packed QKT's scratch.
+    spill_output = _spill_batched_av_cohort(cg, node, M_pad, N_pad, Kseq_pad)
     # ----- Stage 5: FP32 output tile (M_pad × N_pad × 4 bytes) -----
     out_alloc = _abuf_alloc_fp32(cg, node.name, M_pad, N_pad)
 
@@ -703,14 +750,10 @@ def emit_matmul_attn_v_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
         cg.mem.wbuf.free(f"v_head{head_idx}_{node.name}")
     cg.mem.wbuf.free(f"_attn_v_pc_{node.name}")
 
-    # M4-debug: at production decode scale (Kseq_pad >= 64), spill the
-    # per-head attn_v output to DRAM-temp. Otherwise 12 heads × 4 KB
-    # per-head output accumulate in ABUF, leaving no room for head 11's
-    # QKT k_int8 alloc (115 KB live + 16 KB request > 128 KB).
-    # concat_heads reloads each spilled tile when assembling the concat
-    # tensor.
-    if Kseq_pad >= 64 and cg.current_node_idx >= 0:
-        out_bytes = M_pad * N_pad * cg.elem_bytes
+    # Both the established large-window path and short-window cohorts that
+    # cannot be admitted spill only after the dequantization has completed.
+    # concat_heads/gather_rows reload each tile without changing arithmetic.
+    if spill_output:
         cg._spill_fp32_tile_to_dram(node.name, out_alloc, M_pad, N_pad)
         # _spill freed the ABUF; concat_heads detects this via
         # dram_temp_fp32_outputs[node.name] and reloads on demand.

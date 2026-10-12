@@ -141,7 +141,7 @@ def emit_matmul_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     weight_name = node.inputs[1]
     weight_data = cg.weight_data.get(weight_name)
     if weight_data is None:
-        return
+        raise KeyError(f"{node.name}: missing matmul weight {weight_name!r}")
 
     w_q, w_scales = weight_data
     if w_q.ndim != 2:
@@ -160,7 +160,8 @@ def emit_matmul_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     # defer to a follow-up milestone).
     output_bytes = M_pad * N_pad * cg.elem_bytes
     accum_bytes = M_pad * N_pad * 4  # INT32
-    weight_bytes = int(w_q.size)
+    from ..codegen import matmul_wbuf_bytes
+    weight_bytes = matmul_wbuf_bytes(w_q.size, N_pad)
     input_bytes = M_pad * K_pad * cg.elem_bytes
     if input_bytes > ABUF_SIZE and node.inputs[0] not in cg.dram_temp_fp32_outputs:
         raise NotImplementedError(
@@ -185,76 +186,13 @@ def emit_matmul_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     bias_name = node.attrs.get("bias")
     pc_scale_sym = f"{weight_name}__w8a16_pc_scale_and_bias"
 
-    # ----- ABUF allocations -----
-    # FP32 input tile (M_pad × K_pad × 4 bytes). The prior op's output
-    # FP32 alloc is reused here under the input's name.
-    #
-    # M4-debug: if the input was spilled to DRAM-temp by an earlier
-    # emit_matmul_w8a16 (post-QUANT spill, see below), reload it now.
+    from .quantization import prepare_matmul_activation
     input_name = node.inputs[0]
-    if (
-        input_name in cg.dram_temp_fp32_outputs
-        and cg.mem.abuf.get(input_name) is None
-    ):
-        in_alloc = cg._load_dram_to_abuf_fp(input_name, M_pad, K_pad)
-    else:
-        in_alloc = _abuf_alloc_fp32(cg, input_name, M_pad, K_pad)
-    # FP32 output tile (M_pad × N_pad × 4 bytes).
-    out_alloc = _abuf_alloc_fp32(cg, node.name, M_pad, N_pad)
-    # INT8 scratch tile (M_pad × K_pad × 1 byte) for the QUANT output.
-    # Lives in ABUF, freed immediately after the MATMUL consumes it.
-    int8_scratch = cg.mem.abuf.alloc(f"{node.name}__quant_int8", M_pad * K_pad)
-
-    # M4-debug: zero-fill FP32 padding rows before MAX_ABS_REDUCE so the
-    # dynamic activation scale is computed against only the valid query
-    # rows. Otherwise LN-beta / matmul-bias leakage into padding rows
-    # inflates the scale → INT8 precision loss → catastrophic PPL.
-    _zero_fill_fp32_padding_rows(cg, in_alloc, M, M_pad, K_pad)
-
-    # Allocate an sreg pair: S[sreg] holds 127/max_abs for QUANT,
-    # S[sreg+1] holds max_abs/127 for the DEQUANT epilogue.
-    sreg = cg._alloc_sreg_pair()
-
-    # ----- Stage 1: MAX_ABS_REDUCE_FP32 -----
-    # CONFIG_TILE for the activation tile: M_pad rows × K_pad cols,
-    # row-split via _act_quant_tiles when K_pad exceeds the SFU row cap
-    # (byte-identical reshape; f=1 for K_pad <= 1024).
+    in_alloc, out_alloc, int8_scratch, sreg, retain_quant = prepare_matmul_activation(
+        cg, node, M, M_pad, N_pad, K_pad,
+    )
     m_tiles = M_pad // TILE
     k_tiles = K_pad // TILE
-    aq_m_tiles, aq_k_tiles = _act_quant_tiles(M_pad, K_pad)
-    # Lever C: MAX_ABS + QUANT walk exactly the real activation rows. The
-    # act-quant view reshapes M_pad logical rows into aq_m_tiles*TILE rows
-    # (f=aq_m_tiles*TILE/M_pad per logical row), so the real-row count is
-    # M*f. The pad rows are zero-filled just above (max over real+zero ==
-    # max over real → byte-identical scale) and the QUANT'd pad rows feed
-    # only the systolic MATMUL's junk output (dropped by the m_exact DEQUANT).
-    _aq_full_rows = aq_m_tiles * TILE
-    cg._emit(ConfigTileInsn(
-        M=aq_m_tiles - 1, N=aq_k_tiles - 1, K=0,
-        m_exact=_m_exact_rows(M * _aq_full_rows // M_pad, _aq_full_rows),
-    ))
-    cg._emit(
-        MaxAbsReduceFp32Insn(
-            src1_buf=BUF_ABUF, src1_off=in_alloc.offset_units,
-            src2_buf=BUF_ABUF, src2_off=0,
-            dst_buf=BUF_ABUF, dst_off=0,
-            sreg=sreg,
-            flags=cg.fp_precision_flag,
-        )
-    )
-    cg._emit(SyncInsn(resource_mask=0b100))  # wait SFU
-
-    # ----- Stage 2: QUANT_FP32_INT8 (FP{32,16} ABUF → INT8 ABUF) -----
-    cg._emit(
-        QuantFp32Int8Insn(
-            src1_buf=BUF_ABUF, src1_off=in_alloc.offset_units,
-            src2_buf=BUF_ABUF, src2_off=0,
-            dst_buf=BUF_ABUF, dst_off=int8_scratch.offset_units,
-            sreg=sreg,
-            flags=cg.fp_precision_flag,
-        )
-    )
-    cg._emit(SyncInsn(resource_mask=0b100))
 
     # M4-debug: free the FP32 input ABUF region now — the INT8 scratch
     # contains the quantized version and the rest of this matmul
@@ -275,7 +213,7 @@ def emit_matmul_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
         # Case 1: last use here. Free ABUF immediately.
         if cg.mem.abuf.get(input_name) is not None:
             cg.mem.abuf.free(input_name)
-    elif has_future_use and input_bytes >= cg.fp_spill_threshold_bytes:
+    elif in_alloc is not None and has_future_use and input_bytes >= cg.fp_spill_threshold_bytes:
         if input_name not in cg.dram_temp_fp32_outputs:
             # Case 2: first spill.
             cg._spill_fp32_tile_to_dram(input_name, in_alloc, M_pad, K_pad)
@@ -322,7 +260,8 @@ def emit_matmul_w8a16(cg: "CodeGenerator", node: "IRNode") -> None:
     cg._emit(SyncInsn(resource_mask=0b010))  # wait systolic
 
     # INT8 scratch and weight blob are no longer needed.
-    cg.mem.abuf.free(f"{node.name}__quant_int8")
+    if not retain_quant:
+        cg.mem.abuf.free(int8_scratch.name)
     cg.mem.wbuf.free(f"_w_{weight_name}")
 
     # ----- Stage 5: DEQUANT_ACCUM_FP32_SCALED → FP32 output -----
@@ -412,7 +351,7 @@ def emit_matmul_w8a16_large_weight_tiled(
     weight_name = node.inputs[1]
     weight_data = cg.weight_data.get(weight_name)
     if weight_data is None:
-        return
+        raise KeyError(f"{node.name}: missing matmul weight {weight_name!r}")
     w_q, w_scales = weight_data
     if w_q.ndim != 2:
         raise NotImplementedError(
@@ -866,6 +805,39 @@ def _emit_matmul_w8a16_large_input_streaming(
             n_tile_groups.append(((n_start, n_len), []))
         n_tile_groups[-1][1].append((k_start, k_len))
 
+    # Retain the largest bounded prefix that fits with worst live work. No
+    # spill traffic is introduced; if even one partition fails, use baseline.
+    unique_k_tiles = set((ks, kl) for _, tiles in n_tile_groups for ks, kl in tiles)
+    # Keep a free pair for uncached tiles. Partial reuse still helps FC2 with
+    # twelve K partitions, whose twelve scales cannot all stay in registers.
+    worst_input = M_pad * max(kl for _, kl in unique_k_tiles) * cg.elem_bytes
+    worst_output = M_pad * max(nl for (_, nl), _ in n_tile_groups) * cg.elem_bytes
+    cached_k_tiles = set()
+    cache_bytes = working_bytes = 0
+    if cg.options.reuse_fc2_quantization and len(n_tile_groups) > 1:
+        ordered_k_tiles = sorted(unique_k_tiles)
+        for count in range(min(6, len(ordered_k_tiles)), 0, -1):
+            candidate = set(ordered_k_tiles[:count])
+            candidate_bytes = M_pad * sum(kl for _, kl in candidate)
+            # An uncached INT8 scratch overlaps its FP16 input and is not
+            # included in the retained cache. Count it explicitly.
+            uncached = unique_k_tiles - candidate
+            uncached_bytes = M_pad * max(kl for _, kl in uncached) if uncached else 0
+            required = candidate_bytes + worst_input + uncached_bytes + 2 * worst_output
+            if candidate_bytes <= ABUF_SIZE // 2 and required <= cg.mem.abuf.largest_free_bytes:
+                cached_k_tiles, cache_bytes, working_bytes = candidate, candidate_bytes, required
+                break
+    cache_allowed = bool(cached_k_tiles)
+    activation_cache = {} if cache_allowed else None
+    if cache_allowed:
+        cg.optimization_events.append({"kind": "fc2_cache_admission", "node": node.name,
+                                       "cached_partitions": len(cached_k_tiles),
+                                       "total_partitions": len(unique_k_tiles),
+                                       "cache_bytes": cache_bytes, "working_bound_bytes": working_bytes,
+                                       "largest_free_bytes": cg.mem.abuf.largest_free_bytes})
+    if cg.options.reuse_fc2_quantization and not cache_allowed:
+        cg.optimization_events.append({"kind": "fc2_reuse_fallback", "node": node.name,
+                                       "reason": "SRAM/register bound or no N reuse"})
     for (n_start, n_len), k_tile_list in n_tile_groups:
         n_tile_units = n_len // TILE
 
@@ -903,62 +875,13 @@ def _emit_matmul_w8a16_large_input_streaming(
         cg._emit(SyncInsn(resource_mask=0b001))          # ensure it landed
 
         for k_idx, (k_start, k_len) in enumerate(k_tile_list):
-            # Stage 1: load FP-precision input K-tile from DRAM into ABUF.
-            input_tile_bytes = M_pad * k_len * cg.elem_bytes
-            in_tile_alloc = cg.mem.abuf.alloc(
-                f"{node.name}__in_fp32_k{k_start}_n{n_start}", input_tile_bytes
+            from .quantization import prepare_streamed_activation
+            retain_activation = activation_cache is not None and (k_start, k_len) in cached_k_tiles
+            int8_tile_alloc, sreg = prepare_streamed_activation(
+                cg, node, M_logical, M_pad, K_pad, k_start, k_len,
+                n_start, input_dram_off, activation_cache if retain_activation else None,
             )
-            tile_row_bytes = k_len * cg.elem_bytes
-            tile_row_units = tile_row_bytes // UNIT
-            for r in range(M_pad):
-                cg._emit_dma_load(
-                    BUF_ABUF,
-                    in_tile_alloc.offset_units + r * tile_row_units,
-                    tile_row_bytes, 0,
-                    input_dram_off + r * full_input_row_bytes + k_start * cg.elem_bytes,
-                )
-            cg._emit(SyncInsn(resource_mask=0b001))
-
-            # M4-debug: zero-fill padding rows of this K-tile before
-            # MAX_ABS_REDUCE. Without this, the per-K-tile dynamic
-            # scale is inflated by upstream padding garbage.
-            _zero_fill_fp32_padding_rows(cg, in_tile_alloc, M_logical, M_pad, k_len)
-
-            # Stage 2: MAX_ABS_REDUCE on this K-tile. Row-split via
-            # _act_quant_tiles when k_len exceeds the SFU row cap
-            # (byte-identical reshape; f=1 for k_len <= 1024).
-            sreg = cg._alloc_sreg_pair()
             k_tiles_units = k_len // TILE
-            aq_m_tiles, aq_k_tiles = _act_quant_tiles(M_pad, k_len)
-            # Lever C: real-row truncation on the per-K-tile MAX_ABS + QUANT
-            # (M_logical*f reshaped rows; pad rows zero-filled above).
-            _aq_full_rows = aq_m_tiles * TILE
-            cg._emit(ConfigTileInsn(
-                M=aq_m_tiles - 1, N=aq_k_tiles - 1, K=0,
-                m_exact=_m_exact_rows(M_logical * _aq_full_rows // M_pad, _aq_full_rows),
-            ))
-            cg._emit(MaxAbsReduceFp32Insn(
-                src1_buf=BUF_ABUF, src1_off=in_tile_alloc.offset_units,
-                src2_buf=BUF_ABUF, src2_off=0,
-                dst_buf=BUF_ABUF, dst_off=0,
-                sreg=sreg,
-                flags=cg.fp_precision_flag,
-            ))
-            cg._emit(SyncInsn(resource_mask=0b100))
-
-            # Stage 3: QUANT this K-tile → INT8.
-            int8_tile_alloc = cg.mem.abuf.alloc(
-                f"{node.name}__quant_int8_k{k_start}_n{n_start}", M_pad * k_len
-            )
-            cg._emit(QuantFp32Int8Insn(
-                src1_buf=BUF_ABUF, src1_off=in_tile_alloc.offset_units,
-                src2_buf=BUF_ABUF, src2_off=0,
-                dst_buf=BUF_ABUF, dst_off=int8_tile_alloc.offset_units,
-                sreg=sreg,
-                flags=cg.fp_precision_flag,
-            ))
-            cg._emit(SyncInsn(resource_mask=0b100))
-            cg.mem.abuf.free(in_tile_alloc.name)
 
             # Stage 4: PREFETCH the next k-tile's weight (deferred, no sync) so
             # its DMA overlaps this tile's MATMUL below. `cur_w` (this tile's
@@ -985,7 +908,8 @@ def _emit_matmul_w8a16_large_input_streaming(
                 flags=0,
             ))
             cg._emit(SyncInsn(resource_mask=0b010))
-            cg.mem.abuf.free(int8_tile_alloc.name)
+            if not retain_activation:
+                cg.mem.abuf.free(int8_tile_alloc.name)
             cg.mem.wbuf.free(cur_w.name)
             cur_w = nxt_w
 
@@ -1091,11 +1015,12 @@ def _emit_matmul_w8a16_large_input_streaming(
         cg._emit(SyncInsn(resource_mask=0b010))
         cg.mem.abuf.free(tile_accum_alloc.name)
 
+    for allocation, sreg in (activation_cache or {}).values():
+        cg.mem.abuf.free(allocation.name)
+        cg.reserved_sregs.difference_update({sreg, sreg + 1})
     cg.dram_temp_outputs[node.name] = dram_temp_off
     cg.dram_temp_fp32_outputs[node.name] = output_bytes
     out_scale = cg.calibration_scales.get(node.name, 1.0 / 127.0)
     cg._record_trace_event(
         node.name, BUF_ABUF, 0, M_pad, N_pad, M, N, "fp32", out_scale,
     )
-
-

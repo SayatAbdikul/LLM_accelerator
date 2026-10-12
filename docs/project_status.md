@@ -1,11 +1,87 @@
 # TACCEL current project status
 
-**Audited:** 2026-09-03
-**Code basis:** `3486c01` plus the documentation refresh following it
+**Audited:** 2026-10-11–12
+**Code basis:** `978f126` plus the optimization implementation working tree
 **Primary target:** GPT-2 124M W8A16 causal-decoder inference
 
 This file is the current state-of-truth for project capability and measured
 status. Dated roadmaps under `docs/` remain experiment records.
+
+## October implementation
+
+See [the optimization results](optimization_results.md) for commands, current
+test counts, corrected mode-1 cycle measurements, candidate acceptance, and
+remaining gates. The September tables below are historical snapshots, not
+fresh verification of the October changes.
+
+Implemented candidates include real-row FC2 loading, exact QKV/FC2
+quantization reuse with bounded lifetimes/fallback, indexed liveness, shared
+prefill/decode data layout, data deduplication, and a one-beat instruction
+buffer. They remain individually selectable through explicit compiler
+options and separate buffered/unbuffered hardware runners. Hardware-target
+IR validation rejects W4 and noncausal softmax before emission; the research
+golden target preserves those software experiments.
+
+Corrected DMA handling splits at 4 KiB and detects address overflow. A
+directed concurrent SRAM/STORE regression additionally guards stalled AXI
+write-data stability. Actual execution parameters and directional DMA,
+instruction-fetch, and systolic-phase counters are recorded in JSON.
+
+Obsolete Stage-5/embedding/KV tests and checkpoint metadata provenance were
+repaired without relaxing numeric tolerances. The selected like-for-like
+regression reference now models W8A16; legacy PPL comparisons still use W8A8
+and remain failed. A 73-file executable-reference manifest and required
+no-skip test profile now distinguish mandatory conformance from optional
+large-model quality.
+
+The final required profile passes 395 tests, plus eight affected prefill tests,
+without failures or mandatory skips after short-context AV capacity and host
+batch-priming corrections. Collection contains 639 nodes, with 244 optional
+cases excluded from the required profile; this is not a final-source full-suite
+pass. Reconciled evidence covers 637 distinct passing tests (395 required and
+242 optional). All 54 formerly pending nodes execute without skips/timeouts;
+their original 177-file epoch passes 51 and fails three. A test-only compatible
+preset repair then passes all three affected checks, combining dependency-
+unchanged evidence with fresh reruns rather than claiming one-source-hash
+execution of all 639. Both legacy PPL failures remain unresolved.
+The 124M finite-output metric records a
+one-ULP first snapshot difference and 0/2 argmax agreement; its pass is not
+a full-model accuracy or numerical-equivalence gate.
+The optional default-preset 257-token comparison also fails its original
+2% limit (95.699% difference); production calibration also fails (62.563%).
+These compare compiled W8A16 with a retained
+legacy W8A8 fake-quant policy, not matched RTL or the optimization preset;
+these failed research gates and poor PPL results remain explicit.
+Fresh native runners
+pass the 128-check affected campaign. Four mode-1 core/wrapper hierarchy gates
+resolve successfully, while their 27,891 raw-process diagnostics are not an
+asserted structural proof. See the results report for identities and resources.
+
+The final full GPT-2 campaign passes 14 shape executions/seven exact pairs
+and 12 contiguous-sequence executions/six exact pairs. Stored FP16 logits
+are finite and full KV matches. The sequence inputs demonstrably carry the
+preceding RTL KV, rather than resetting history. The combined opt-in profile
+reduces fixed-mix shape cycles by 7.264%, and three-step B1/B16 sequence cycles
+by 12.181%/10.284%. These are matched cycle measurements, not trained-quality,
+achieved-frequency or hardware-throughput claims.
+
+Clean-source/fresh-build reproduction closes integration of those opt-in
+changes: 395 required tests, eight affected prefill tests, 39 portable ASIC
+static/mocked tests, eight tiny-model golden comparisons and four exact A/B
+pairs pass. Both mode-1 runners are freshly compiled and match the performance
+runner hashes; all 428 exported source hashes stay unchanged during the run.
+Existing installed dependencies are reused, not freshly installed. This is
+not an additional distinct-test count, full-model accuracy or physical signoff.
+Source, binaries, logs and payload evidence are retained under
+`build/optimization-20261011/clean-source-final/`. Compiler defaults and wrapper
+fetch defaults remain unchanged.
+
+The SKY130 macro-bank prototype is deliberately isolated: a delayed-write
+overlay passes 96,804 equivalence cycles, including the inferred old-data
+Port B collision contract. Macro timing is not yet validated. Real-memory
+chip binding, IO, full-chip PNR, DRC/LVS and
+power remain unresolved. SKY130/ICSprout55 leaf reports must not be scaled
+into full-chip area, achieved frequency or energy/token.
 
 ## What works
 
@@ -56,7 +132,7 @@ The instruction word is 64-bit big-endian with a 5-bit opcode.
 See [the ISA specification](../software/docs/isa_spec.md) for the complete
 opcode and field matrix.
 
-## Verification snapshot
+## Historical September verification snapshot
 
 The September cleanup established this post-refactor baseline:
 
@@ -75,7 +151,7 @@ The September cleanup established this post-refactor baseline:
 
 The last broad Python execution before cleanup collected 493 tests and exposed
 pre-existing fixture, embedding, and W4 failures plus one very long test. The
-cleanup removed retired tests, producing the current 462-test collection; all
+cleanup removed retired tests, producing the then-current 462-test collection; all
 surfaces changed by the cleanup were rerun and passed. A new broad execution
 should be compared with that baseline rather than assumed to be zero-failure.
 
@@ -85,14 +161,15 @@ ISA/assembler/pin tests passed. A combined run that also included the Stage-5
 preset module produced 80 passes and four existing failures. Those tests
 monkeypatch the old `taccel.runtime.calibration` symbol after the implementation moved to
 `calibration.output_aware`, so the real evaluator sees intentionally incomplete
-fixtures and raises `KeyError: n_embd`. This is an active test-maintenance issue,
-not a documentation regression.
+fixtures and raises `KeyError: n_embd`. This was a test-maintenance issue,
+not a documentation regression; the October contract repairs address it.
 
-## Current performance evidence
+## Historical performance evidence
 
-Latest direct mode-1 measurements after the July pipeline campaign:
+Direct measurements after the July pipeline campaign (not the corrected
+October both-datapaths-mode-1 baseline):
 
-| Shape | Context position | Step cycles | Cycles/token | Logits SHA-1 prefix |
+| Shape | Context position | Step cycles | Cycles/token | ACCUM diagnostic SHA-1 prefix |
 |---|---:|---:|---:|---|
 | B=1 | 511 | 18,318,261 | 18,318,261 | `eeab004014642d14` |
 | B=16 | 510 | 49,998,042 | 3,124,878 | `205682b6515f7e85` |
@@ -100,7 +177,8 @@ Latest direct mode-1 measurements after the July pipeline campaign:
 Conditions:
 
 - GPT-2 124M frozen performance bundle.
-- `run_program_synth` with synthesizable SFU/helper datapaths.
+- Historical `run_program_synth` selected the synthesizable SFU; helper-mode
+  build provenance was not verified. The old target omitted that override.
 - `--fast-beats`, one 128-bit DRAM beat per core cycle.
 - Measurements include pipeline changes through `451e7df`.
 
@@ -110,7 +188,7 @@ conversion point. Applying it illustratively gives about 1.879 tok/s for B=1
 and 11.012 aggregate tok/s for B=16, but those are not current full-chip
 sign-off numbers.
 
-Current timing evidence is a set of standalone or partial-lane measurements:
+Historical timing evidence is a set of standalone or partial-lane measurements:
 known long combinational paths were reduced to roughly one FP primitive per
 stage, generally in the 27–32 ns range depending on mapping context. The final
 whole-lane post-`451e7df` placement rerun exceeded the available 15 GB memory.
@@ -152,10 +230,11 @@ diagnostic rather than changing the numeric allocation.
 1. Run full-SFU/full-chip physical timing on a machine with sufficient memory.
 2. Select and integrate ASIC SRAM macros and IO cells, or select an FPGA board
    and replace the platform stubs.
-3. Resolve `SOFTMAX_FP32` `0x1C`: implement in RTL or reject/remove it from
-   compiler-facing Python APIs.
-4. Resolve W4 hardware scope: implement `CONFIG_TILE.weight_int4` in RTL or
-   make hardware-target compilation reject W4 bundles.
-5. Re-establish a fully characterized broad Python regression baseline with
-   all optional fixtures and slow gates available.
+3. Decide whether to add noncausal softmax hardware; current hardware-target
+   compilation already rejects it, while research-golden remains explicit.
+4. Decide whether to add W4 hardware; hardware-target compilation already
+   rejects it, while research-golden retains INT4 experiments.
+5. Resolve the two retained legacy PPL failures and the characterized 124M
+   RTL/golden numerical gap before promoting trained-model quality; all 639
+   collected Python nodes already have an explicit disposition.
 6. Re-measure end-to-end fmax and throughput before publishing a new headline.

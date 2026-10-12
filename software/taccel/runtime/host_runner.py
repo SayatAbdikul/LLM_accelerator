@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Iterable, List, Optional, Sequence
+from numbers import Integral
 
 import numpy as np
 
@@ -9,15 +10,11 @@ from ..assembler.assembler import ProgramBundle, RuntimePatchSite
 from ..golden_model.simulator import Simulator
 
 
-class HostRunner:
-    """Drive prefill/decode ProgramBundle streams with runtime patch sites."""
+class BundlePatcher:
+    """Patch runtime addresses without allocating or loading a simulator."""
 
-    def __init__(self, bundle: ProgramBundle, simulator: Optional[Simulator] = None,
-                 *, logits_dtype=np.int32):
+    def __init__(self, bundle: ProgramBundle):
         self.bundle = bundle
-        self.simulator = simulator or Simulator()
-        self.logits_dtype = np.dtype(logits_dtype)
-        self.simulator.load_bundle(bundle)
 
     def _sites(self, kind: str, stream: str) -> List[RuntimePatchSite]:
         return [
@@ -74,6 +71,20 @@ class HostRunner:
         # One query row at `position`: it sees keys 0..position.
         self._patch_attention_context("decode", position, int(position) + 1)
 
+
+class HostRunner(BundlePatcher):
+    """Drive prefill/decode ProgramBundle streams with runtime patch sites."""
+
+    def __init__(self, bundle: ProgramBundle, simulator: Optional[Simulator] = None,
+                 *, logits_dtype=np.int32, vocab_size: Optional[int] = None):
+        super().__init__(bundle)
+        if vocab_size is not None:
+            self._validate_vocab_size(vocab_size)
+        self.vocab_size = int(vocab_size) if vocab_size is not None else None
+        self.simulator = simulator or Simulator()
+        self.logits_dtype = np.dtype(logits_dtype)
+        self.simulator.load_bundle(bundle)
+
     def _read_logits(self, offset: int, rows: int = 0) -> np.ndarray:
         """Read `rows` logits rows from `offset` (0 = the whole region).
 
@@ -104,10 +115,17 @@ class HostRunner:
 
     def run_prefill(self, token_ids: Iterable[int], *,
                     max_instructions: int = 10_000_000) -> np.ndarray:
+        """Prime sequential prompt rows or independent lockstep streams.
+
+        Multiple decode token-embedding sites identify lockstep batching;
+        multiple prefill sites alone can instead describe a sequential chunk.
+        """
         tokens = [int(tok) for tok in token_ids]
         if not tokens:
             raise ValueError("run_prefill requires at least one token")
-        self._patch_embeddings("prefill", tokens, list(range(len(tokens))))
+        lockstep = self._is_lockstep_batch()
+        positions = [0] * len(tokens) if lockstep else list(range(len(tokens)))
+        self._patch_embeddings("prefill", tokens, positions)
         # The batched bundle reuses the batched DECODE graph for its prefill slot
         # (tiny_fixture), so the prefill stream carries runtime `kv_base` sites.
         # Left unpatched they read 0, and the KV row stores then address
@@ -116,9 +134,13 @@ class HostRunner:
         # (The single-token prefill graph has no kv_base sites, so this is a
         # no-op there and the b1 path stays byte-identical.)
         self._patch_kv_bases(0, stream="prefill")
+        self._patch_attention_context("prefill", 0, 1 if lockstep else len(tokens))
         self.simulator.run_program(self.bundle, "prefill", max_instructions=max_instructions)
         return self._read_logits(self.bundle.prefill_logits_offset,
                                  rows=int(self.bundle.prefill_store_rows))
+
+    def _is_lockstep_batch(self) -> bool:
+        return len(self._sites("token_embed", "decode")) > 1
 
     def run_prefill_chunk(self, token_ids: Sequence[int], base_position: int, *,
                           max_instructions: int = 10_000_000) -> np.ndarray:
@@ -149,6 +171,9 @@ class HostRunner:
         On a ``prefill_store_rows == 1`` bundle this is the single last-row
         store exactly as before.
         """
+        if self._is_lockstep_batch():
+            raise ValueError("run_prefill_chunk requires a single-stream bundle; "
+                             "lockstep batches use run_prefill and run_decode_step_batch")
         tokens = [int(tok) for tok in token_ids]
         if not tokens:
             raise ValueError("run_prefill_chunk requires at least one token")
@@ -216,29 +241,69 @@ class HostRunner:
         return self._read_logits(self.bundle.decode_logits_offset, rows=len(tokens))
 
     @staticmethod
-    def _greedy_token(logits: np.ndarray) -> int:
-        if logits.size == 0:
-            return 0
-        return int(np.argmax(logits))
+    def _validate_vocab_size(vocab_size: int) -> None:
+        if isinstance(vocab_size, bool) or not isinstance(vocab_size, Integral) or vocab_size <= 0:
+            raise ValueError("vocab_size must be an explicit positive integer")
+
+    @staticmethod
+    def _greedy_token(logits: np.ndarray, *, vocab_size: int) -> int:
+        HostRunner._validate_vocab_size(vocab_size)
+        row = np.asarray(logits)
+        if row.ndim != 1 or row.size < vocab_size:
+            raise ValueError("sampling requires one logits row covering the live vocabulary")
+        active = row[:int(vocab_size)]
+        if not np.isfinite(active).all():
+            raise ValueError("cannot sample non-finite live logits")
+        return int(np.argmax(active))
 
     def generate(self, prompt_ids: Sequence[int], max_new_tokens: int,
-                 *, sampler: str = "greedy", eos_token_id: Optional[int] = None) -> List[int]:
+                 *, sampler: str = "greedy", eos_token_id: Optional[int] = None,
+                 final_token_commit: bool = False,
+                 vocab_size: Optional[int] = None) -> List[int]:
+        """Return prompt plus sampled tokens, avoiding an unused final decode.
+
+        When at least one new token is returned, by default the final token
+        has not been executed: its KV row is not committed. To continue,
+        call ``run_decode_step(tokens[-1],
+        len(tokens) - 1)`` and sample its returned logits. Set
+        ``final_token_commit=True`` to execute that final token as well
+        (including EOS), leaving its KV row and next-token logits committed.
+        The latter preserves the previous non-EOS cache state contract.
+        Prefill still runs when ``max_new_tokens=0``.
+        Sampling requires an explicit live ``vocab_size`` here or in the
+        constructor; padded row bytes cannot establish the vocabulary bound.
+        This convenience method supports one-row, single-stream bundles only.
+        Chunked/batched callers must select their own row before sampling.
+        """
         if sampler != "greedy":
             raise ValueError("Stage 3 HostRunner only supports greedy sampling")
         if max_new_tokens < 0:
             raise ValueError("max_new_tokens must be non-negative")
         if not prompt_ids:
             raise ValueError("generate requires at least one prompt token")
+        if self.bundle.logits_rows != 1 or self.bundle.prefill_store_rows != 1:
+            raise ValueError("generate requires a one-row, single-stream logits bundle")
+        live_vocab = self.vocab_size if vocab_size is None else vocab_size
+        if live_vocab is not None:
+            self._validate_vocab_size(live_vocab)
+        elif max_new_tokens:
+            raise ValueError("generate requires explicit vocab_size; padded row bytes are not a vocabulary")
 
         generated = [int(tok) for tok in prompt_ids]
         logits = self.run_prefill(generated)
-        next_token = self._greedy_token(logits)
+        if max_new_tokens == 0:
+            return generated
+        next_token = self._greedy_token(logits, vocab_size=live_vocab)
 
-        for _ in range(max_new_tokens):
+        for step in range(max_new_tokens):
             generated.append(next_token)
-            if eos_token_id is not None and next_token == eos_token_id:
+            finished = (step + 1 == max_new_tokens or
+                        eos_token_id is not None and next_token == eos_token_id)
+            if finished and not final_token_commit:
                 break
             position = len(generated) - 1
             logits = self.run_decode_step(next_token, position)
-            next_token = self._greedy_token(logits)
+            if finished:
+                break
+            next_token = self._greedy_token(logits, vocab_size=live_vocab)
         return generated

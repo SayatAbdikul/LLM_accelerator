@@ -25,8 +25,8 @@ def _config():
 
 def _weight_data():
     return {
-        "transformer.wte.weight": (np.zeros((32, 16), dtype=np.int8), None),
-        "transformer.wpe.weight": (np.zeros((16, 16), dtype=np.int8), None),
+        "transformer.wte.weight": (np.zeros((32, 16), dtype=np.float16), None),
+        "transformer.wpe.weight": (np.zeros((16, 16), dtype=np.float16), None),
         "transformer.h.0.ln_1.weight": (np.ones(16, dtype=np.float16), None),
         "transformer.h.0.ln_1.bias": (np.zeros(16, dtype=np.float16), None),
         "transformer.h.0.ln_2.weight": (np.ones(16, dtype=np.float16), None),
@@ -105,6 +105,7 @@ def test_decoder_bundle_appends_logits_store_for_lm_head_graphs():
         weight_data=_weight_data(),
         calibration_scales={},
         prescaled_biases=_prescaled_biases(),
+        biases={name: value.astype(np.float32) for name, value in _prescaled_biases().items()},
         model_config=result.config,
     )
 
@@ -125,6 +126,7 @@ def test_full_decoder_bundle_records_kv_runtime_config_and_logits_sites():
         weight_data=_weight_data(),
         calibration_scales={},
         prescaled_biases=_prescaled_biases(),
+        biases={name: value.astype(np.float32) for name, value in _prescaled_biases().items()},
         model_config=result.config,
     )
 
@@ -181,6 +183,7 @@ def test_decode_kv_load_allocates_padded_tensor_footprint():
             weight_data=_weight_data(),
             calibration_scales={},
             prescaled_biases=_prescaled_biases(),
+            biases={name: value.astype(np.float32) for name, value in _prescaled_biases().items()},
             model_config=result.config,
         )
     finally:
@@ -214,6 +217,7 @@ def test_decode_kv_load_allocates_padded_tensor_footprint():
 
 def test_decoder_bundle_reserves_codegen_temp_before_logits_and_kv_cache():
     graph = IRGraph()
+    graph.add_node(IRNode("embed_lookup", "act", [], (1, 384)))
     graph.add_node(IRNode(
         op="matmul",
         name="large_fc1",
@@ -237,6 +241,7 @@ def test_decoder_bundle_reserves_codegen_temp_before_logits_and_kv_cache():
         prefill_graph=graph,
         decode_graph=graph,
         weight_data={
+            "transformer.wte.weight": (np.zeros((32, 384), dtype=np.float16), None),
             "large.weight": (
                 np.zeros((384, 1536), dtype=np.int8),
                 np.ones(1536, dtype=np.float16),

@@ -5,12 +5,13 @@
 # generated Verilog to Yosys before running this script.
 #
 # Definition of green: the full taccel_top hierarchy resolves, contains no
-# reachable DPI/real dependency in the synthesis configuration, passes the
-# structural check, and reports statistics. This is an elaboration/
+# reachable DPI/real dependency in the synthesis configuration, and reports
+# diagnostic checks/statistics. This is an elaboration/
 # synthesizability gate, not technology mapping or timing analysis.
 
 # Resolve the module hierarchy from the real top; loud early error on any
 # missing/unresolved module.
+chparam -set SFU_SYNTH_MODE 1 -set HELPER_SYNTH_MODE 1 taccel_top
 hierarchy -check -top taccel_top
 
 # Whole-design gate. It intentionally skips proc/flatten —
@@ -18,7 +19,9 @@ hierarchy -check -top taccel_top
 # `integer'(...)` widening in the 1024-element loops) that make proc
 # multi-minute. Technology-mapped synthesis and timing live under rtl/asic/.
 
-# Structural check.
+# Diagnostic only: check before proc can report unused inlined function
+# temporaries as undriven. Do not call its completion a structural proof.
+# Mapped leaf/bank flows lower processes and run fatal check -assert instead.
 check
 
 # Elaboration-level statistics; not a physical area estimate.

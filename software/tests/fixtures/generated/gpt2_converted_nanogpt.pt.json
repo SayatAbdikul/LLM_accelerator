@@ -1,8 +1,9 @@
 {
   "checkpoint": "software/tests/fixtures/generated/gpt2_converted_nanogpt.pt",
-  "checkpoint_sha256": "f0ac7200c680cba02d5ff8c5a9fb9151152485295b2da2fc3323665efd10bf9d",
+  "checkpoint_sha256": "e30b0d787e3fa85669b8594801f61a03291455cade9899aa89131c24e6fc5fb8",
   "format": "nanogpt_split_qkv",
   "model_args": {
+    "activation_function": "gelu_new",
     "bias": true,
     "block_size": 1024,
     "layer_norm_epsilon": 1e-05,
@@ -12,7 +13,27 @@
     "split_qkv_bias": true,
     "vocab_size": 50257
   },
-  "source": "software/tests/fixtures/generated/hf_gpt2",
+  "provenance": {
+    "configuration": {
+      "activation_function": "gelu_new",
+      "bias": true,
+      "block_size": 1024,
+      "layer_norm_epsilon": 1e-05,
+      "n_embd": 768,
+      "n_head": 12,
+      "n_layer": 12,
+      "n_positions": 1024,
+      "split_qkv_bias": true,
+      "vocab_size": 50257
+    },
+    "configuration_sha256": "3c9e75a36b82d120ec68c865592d2319546e05d910674fe2e76e48f11df38dfb",
+    "configuration_source": "software/tests/fixtures/generated/gpt2_converted_nanogpt.pt.json",
+    "conversion_kind": "offline_safetensors",
+    "converter_sha256": "12211ef542965caddb32d4026146a38260821827559753be172bcfc9015c421c",
+    "source_sha256": "248dfc3911869ec493c76e65bf2fcf7f615828b0254c12b473182f0f81d3a707",
+    "torch_version": "2.11.0"
+  },
+  "source": "software/tests/fixtures/generated/hf_gpt2/model.safetensors",
   "stage5_gpt2_converted": true,
   "weight_tying": "lm_head.weight aliases transformer.wte.weight in payload"
 }

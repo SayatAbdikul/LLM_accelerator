@@ -10,14 +10,21 @@ shift
 EXTRA_SV="$@"
 
 OUTDIR=rtl/asic/build/synth_blocks
-LIB=/home/user/.ciel/ciel/sky130/versions/61a056e180dac7dcc6d4eb7529e2231f95105746/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib
+LIB=${LIB:?Set LIB to the selected characterized Liberty file}
+mkdir -p "$OUTDIR"
+PARAMS=""
+case "$BLOCK" in
+  sfu_engine) PARAMS="chparam -set SFU_SYNTH_MODE 1 sfu_engine;" ;;
+  blocking_helper_engine) PARAMS="chparam -set HELPER_SYNTH_MODE 1 blocking_helper_engine;" ;;
+  taccel_top) PARAMS="chparam -set SFU_SYNTH_MODE 1 -set HELPER_SYNTH_MODE 1 taccel_top;" ;;
+esac
 
 # Pick the .sv file for the module (search common/src and asic/src).
 SRC=$(find rtl/common/src rtl/asic/src -name "${BLOCK}.sv" | head -1)
 [ -z "$SRC" ] && { echo "no source found for $BLOCK"; exit 1; }
 
 # Pre-process with sv2v (always include the package and any extras).
-sv2v -DTARGET_ASIC -DSFU_SYNTH_NO_DPI -DSFU_SYNTH_MODE=1 -DHELPER_SYNTH_MODE=1 \
+sv2v -DTARGET_ASIC -DSFU_SYNTH_NO_DPI \
      -I rtl/common/src/include -I rtl/common/src/systolic -I rtl/common/src \
      rtl/common/src/include/taccel_pkg.sv $EXTRA_SV "$SRC" \
      -w "$OUTDIR/${BLOCK}.v"
@@ -27,6 +34,7 @@ PREV_AREA=""
 for D in 10000 5000 2000 1000 500 300 200 150 100; do
   yosys -p "
     read_verilog $OUTDIR/${BLOCK}.v;
+    $PARAMS
     hierarchy -check -top $BLOCK;
     synth -top $BLOCK -flatten;
     dfflibmap -liberty $LIB;
@@ -36,5 +44,6 @@ for D in 10000 5000 2000 1000 500 300 200 150 100; do
   " > "$OUTDIR/${BLOCK}.D${D}.log" 2>&1 || { echo "  yosys failed; see ${BLOCK}.D${D}.log"; break; }
   AREA=$(grep "Chip area" "$OUTDIR/${BLOCK}.D${D}.log" | tail -1 | awk '{print $NF}')
   CELLS=$(grep "Number of cells:" "$OUTDIR/${BLOCK}.D${D}.log" | tail -1 | awk '{print $NF}')
-  echo "$BLOCK  D=${D}ps  cells=$CELLS  area=${AREA} um^2"
+  # Physical um^2 requires matching LEF verification in tools/block_flow.py.
+  echo "$BLOCK  D=${D}ps  cells=$CELLS  area=${AREA} unverified_Liberty_units"
 done

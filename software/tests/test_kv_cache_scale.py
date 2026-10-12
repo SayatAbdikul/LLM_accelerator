@@ -47,6 +47,7 @@ def _decode_graph(kind: str):
     graph.add_node(IRNode(
         op="kv_load",
         name=f"load_{kind}",
+        output_shape=(1, 16),
         attrs={
             "layer": 0,
             "kind": kind,

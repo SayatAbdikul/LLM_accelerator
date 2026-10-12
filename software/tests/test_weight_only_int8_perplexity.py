@@ -3,7 +3,7 @@
 Covers:
 
 1. `weight_only_int8` preset construction rejects every W8A8 transform
-   (rotation, AWQ, BC, output-aware searches, per-channel requant) at
+   (AWQ, BC, output-aware searches, per-channel requant) at
    `_preset(...)` time. No silent compositions.
 2. `evaluate_gpt2_perplexity(..., ptq_preset="weight_only_int8")` returns
    a `GPT2PerplexityResult` with `golden_perplexity` / `relative_delta`
@@ -85,7 +85,6 @@ def test_weight_only_int8_preset_registered():
         ("hessian_gelu_blocks", (0,)),
         ("fc2_aware_gelu_blocks", (0,)),
         ("gelu_from_accum_blocks", (0,)),
-        ("quarot_enabled", True),
         ("awq_enabled", True),
         ("activation_percentile_nodes", {"ln_f": 99.8}),
     ],
@@ -98,6 +97,12 @@ def test_weight_only_int8_rejects_w8a8_field(kwarg, value):
     """
     with pytest.raises(ValueError, match="weight_only_int8=True is incompatible"):
         _preset("bad_combo", weight_only_int8=True, **{kwarg: value})
+
+
+def test_weight_only_int8_accepts_supported_quarot_rotation():
+    preset = _preset("rotated", weight_only_int8=True, quarot_enabled=True)
+    assert preset.weight_only_int8 and preset.quarot_enabled
+    assert resolve_stage5_ptq_preset("weight_only_int8_quarot").quarot_enabled
 
 
 # ---------------------------------------------------------------------------

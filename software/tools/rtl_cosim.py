@@ -115,6 +115,7 @@ def _load_tiny_payload():
             f"tiny nanoGPT fixture missing: {module.DEFAULT_FIXTURE}\n"
             "run: PYTHONPATH=software python software/tools/train_tiny_fixture.py"
         )
+    module.validate_fixture_metadata(module.DEFAULT_FIXTURE, module.DEFAULT_METADATA)
     return torch.load(module.DEFAULT_FIXTURE, map_location="cpu")
 
 
@@ -131,7 +132,7 @@ def serialize_prefill_bundle(
     """
     from taccel.assembler.assembler import ProgramBinary
     from taccel.runtime.calibration import build_calibration_scales
-    from taccel.runtime.host_runner import HostRunner
+    from taccel.runtime.host_runner import BundlePatcher
     from taccel.runtime.tiny_fixture import build_stage3_tiny_decoder_bundle
 
     if payload is None:
@@ -154,7 +155,7 @@ def serialize_prefill_bundle(
     # Patch only the prefill embedding sites for one fixed token @ pos 0.
     # This is exactly what HostRunner.run_prefill does before executing
     # golden; reusing its (tested) patch logic keeps RTL == golden inputs.
-    runner = HostRunner(bundle)
+    runner = BundlePatcher(bundle)
     runner._patch_embeddings("prefill", [int(token_id)], [0])
 
     # Runtime-patched flat DRAM image; split at data_base.
@@ -196,7 +197,8 @@ def serialize_prefill_bundle(
 # ---------------------------------------------------------------------------
 # RTL-vs-golden e2e byte-match (freeze §4.5 / §7)
 # ---------------------------------------------------------------------------
-RTL_BINARY = REPO_ROOT.parent / "rtl" / "verilator" / "build" / "run_program" / "Vtaccel_top"
+RTL_BINARY = REPO_ROOT.parent / "rtl" / "verilator" / "build" / "run_program_synth" / "Vtaccel_top"
+RTL_REFERENCE_BINARY = REPO_ROOT.parent / "rtl" / "verilator" / "build" / "run_program" / "Vtaccel_top"
 
 # freeze §7 per-op-class fp16-ULP conformance bands. Default for any opcode
 # not listed (incl. non-gen-2 producers and int8/int32 storage) is 0 ULP
@@ -295,7 +297,8 @@ def capture_golden(*, token_id: int = 0, smoke_decode_steps: int = 1,
 
 
 def run_rtl(program_bytes: bytes, csv_text: str, *, max_cycles: int = 5_000_000,
-            timeout_s: int = 1800, dram_dump: tuple | None = None):
+            timeout_s: int = 1800, dram_dump: tuple | None = None,
+            rtl_binary: Path | None = None):
     """Run the patched prefill on Verilator run_program with snapshot capture;
     return (summary, rtl_entries, rtl_data_bytes[, dram_dump_bytes]).
     timeout_s default 30min (124M 1-tok prefill ~292s clean).
@@ -306,16 +309,19 @@ def run_rtl(program_bytes: bytes, csv_text: str, *, max_cycles: int = 5_000_000,
     import subprocess
     import tempfile
 
-    if not RTL_BINARY.exists():
+    binary = Path(rtl_binary) if rtl_binary is not None else RTL_BINARY
+    if not binary.exists():
         raise FileNotFoundError(
-            f"run_program not built: {RTL_BINARY}\n"
-            "build: make -C rtl/verilator run_program"
+            f"selected RTL runner not built: {binary}\n"
+            "build: make -C rtl/verilator run_program_synth"
         )
+    from tools.benchmark_support import check_runner_freshness
+    check_runner_freshness(REPO_ROOT.parent, binary)
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         (td / "p.bin").write_bytes(program_bytes)
         (td / "snap.csv").write_text(csv_text)
-        argv = [str(RTL_BINARY),
+        argv = [str(binary.resolve()),
                 "--program", str(td / "p.bin"),
                 "--json-out", str(td / "sum.json"),
                 "--snapshot-request", str(td / "snap.csv"),
@@ -334,6 +340,8 @@ def run_rtl(program_bytes: bytes, csv_text: str, *, max_cycles: int = 5_000_000,
                 f"run_program exited {cp.returncode}\n{cp.stderr[-2000:]}"
             )
         summary = json.loads((td / "sum.json").read_text())
+        from tools.benchmark_support import validate_runner_summary
+        validate_runner_summary(summary, require_hardware=(binary.resolve() != RTL_REFERENCE_BINARY.resolve()))
         manifest = json.loads((td / "man.json").read_text())
         data = (td / "data.bin").read_bytes()
         if dram_dump is not None:
@@ -370,23 +378,18 @@ def _dequant_fragment(dtype: str, scale: float, raw: bytes,
 
 
 def _fp16_ulp(a_bits, b_bits):
-    """Ordered-int fp16 ULP distance (matches test_sfu expect_fp16_ulp). NaN
-    vs NaN -> 0; exactly one NaN / inf-sign mismatch -> huge (forces fail)."""
+    """Match test_sfu's ordered finite ULP and exact NaN/Inf bit contract."""
     import numpy as np
 
     def ordered(u):
         u = u.astype(np.int32)
-        return np.where(u & 0x8000, 0x8000 - (u & 0x7FFF), u | 0x0000)
+        return np.where(u & 0x8000, -(u & 0x7FFF), u & 0x7FFF)
 
     a = a_bits.astype(np.uint16)
     b = b_bits.astype(np.uint16)
-    a_nan = ((a & 0x7C00) == 0x7C00) & ((a & 0x03FF) != 0)
-    b_nan = ((b & 0x7C00) == 0x7C00) & ((b & 0x03FF) != 0)
+    special = ((a & 0x7C00) == 0x7C00) | ((b & 0x7C00) == 0x7C00)
     ulp = np.abs(ordered(a) - ordered(b)).astype(np.int64)
-    both_nan = a_nan & b_nan
-    one_nan = a_nan ^ b_nan
-    ulp = np.where(both_nan, 0, ulp)
-    ulp = np.where(one_nan, np.int64(1 << 40), ulp)
+    ulp = np.where(special & (a != b), np.int64(1 << 40), ulp)
     return ulp
 
 
@@ -471,7 +474,8 @@ def compare(golden_tensors, rtl_entries, rtl_data, instr_image,
 def run_cosim(*, token_id: int = 0, smoke_decode_steps: int = 1,
               payload: Optional[Dict[str, Any]] = None,
               max_cycles: Optional[int] = None,
-              exclude_nodes: Optional[set] = None):
+              exclude_nodes: Optional[set] = None,
+              rtl_binary: Path | None = None):
     """Full freeze §4.5 RTL-vs-golden prefill gate. Returns a result dict;
     'divergence' is None on byte-match.
 
@@ -487,7 +491,7 @@ def run_cosim(*, token_id: int = 0, smoke_decode_steps: int = 1,
         max_cycles = max(5_000_000, sp.insn_count * 3000)
     csv = emit_snapshot_csv(sp.trace_manifest)
     summary, rtl_entries, rtl_data = run_rtl(
-        sp.program_bytes, csv, max_cycles=max_cycles)
+        sp.program_bytes, csv, max_cycles=max_cycles, rtl_binary=rtl_binary)
     divergence = compare(golden, rtl_entries, rtl_data, instr_image,
                          sp.trace_manifest)
     return {
@@ -550,7 +554,11 @@ def logits_metric(golden_logits, rtl_logits, targets, vocab_size: int) -> dict:
         stable_cross_entropy,
     )
 
-    n = min(len(golden_logits), len(rtl_logits), len(targets))
+    if not (len(golden_logits) == len(rtl_logits) == len(targets)):
+        raise ValueError("golden, RTL, and target step counts must match")
+    n = len(targets)
+    if n == 0 or vocab_size <= 0:
+        raise ValueError("logits metrics require non-empty steps and vocabulary")
     per_step = []
     n_argmax_agree = 0
     g_nlls_fin, r_nlls_fin = [], []
@@ -560,6 +568,8 @@ def logits_metric(golden_logits, rtl_logits, targets, vocab_size: int) -> dict:
     for i in range(n):
         g = np.asarray(golden_logits[i], dtype=np.float32)[: int(vocab_size)]
         r = np.asarray(rtl_logits[i], dtype=np.float32)[: int(vocab_size)]
+        if g.size != vocab_size or r.size != vocab_size:
+            raise ValueError("logits row is shorter than the declared vocabulary")
         g_am, r_am = int(np.argmax(g)), int(np.argmax(r))
         agree = g_am == r_am
         n_argmax_agree += int(agree)
@@ -608,6 +618,9 @@ def logits_metric(golden_logits, rtl_logits, targets, vocab_size: int) -> dict:
         "max_abs_nll_delta": max_abs_nll_delta,
         "n_nonfinite_golden": n_nonfinite_g,
         "n_nonfinite_rtl": n_nonfinite_r,
+        "quality_eligible": n_nonfinite_g == 0 and n_nonfinite_r == 0,
+        "finite_step_count_golden": len(g_nlls_fin),
+        "finite_step_count_rtl": len(r_nlls_fin),
         "per_step": per_step,
     }
 
@@ -770,7 +783,7 @@ def capture_golden_sequence(*, token_ids=(0, 0, 0), payload=None,
 
 
 def run_cosim_sequence(*, token_ids=(0, 0, 0), payload=None,
-                       max_cycles=None, exclude_nodes=None):
+                       max_cycles=None, exclude_nodes=None, rtl_binary=None):
     """Multi-step RTL-vs-golden gate: prefill + len(token_ids)-1 decode steps.
 
     KV state is threaded between RTL runs via --dram-dump-* (the KV cache
@@ -802,6 +815,7 @@ def run_cosim_sequence(*, token_ids=(0, 0, 0), payload=None,
     # RTL prefill — dump KV region for threading into decode step 0.
     summary_p, rtl_entries_p, rtl_data_p, kv_dump = run_rtl(
         seq.prefill_program_bytes, csv_prefill, max_cycles=max_cycles,
+        rtl_binary=rtl_binary,
         dram_dump=(seq.bundle_kv_cache_base, seq.bundle_kv_cache_size),
     )
     divergence = compare(
@@ -843,6 +857,7 @@ def run_cosim_sequence(*, token_ids=(0, 0, 0), payload=None,
         decode_max_cycles = max(5_000_000, decode_insn_count * 3000)
         summary_d, rtl_entries_d, rtl_data_d, kv_dump = run_rtl(
             pb.to_bytes(), csv_decode, max_cycles=decode_max_cycles,
+            rtl_binary=rtl_binary,
             dram_dump=(seq.bundle_kv_cache_base, seq.bundle_kv_cache_size),
         )
         # compare() uses local decode PCs to look up RTL entries and node names
@@ -869,7 +884,7 @@ def run_cosim_sequence(*, token_ids=(0, 0, 0), payload=None,
 
 
 def run_cosim_sequence_logits(*, token_ids, payload=None,
-                              max_cycles=None, exclude_nodes=None):
+                              max_cycles=None, exclude_nodes=None, rtl_binary=None):
     """#109: teacher-forced RTL↔golden gate that ALSO emits a logits-level
     conformance metric (the past-fp16-overflow signal).
 
@@ -906,6 +921,7 @@ def run_cosim_sequence_logits(*, token_ids, payload=None,
     # RTL prefill — one combined dump: logits (head) + KV cache (tail).
     summary_p, rtl_entries_p, rtl_data_p, dump_p = run_rtl(
         seq.prefill_program_bytes, csv_prefill, max_cycles=max_cycles,
+        rtl_binary=rtl_binary,
         dram_dump=(dump_off_p, kv_end - dump_off_p),
     )
     divergence = compare(
@@ -945,6 +961,7 @@ def run_cosim_sequence_logits(*, token_ids, payload=None,
         )
         summary_d, rtl_entries_d, rtl_data_d, dump_d = run_rtl(
             pb.to_bytes(), csv_decode,
+            rtl_binary=rtl_binary,
             max_cycles=max(5_000_000, decode_insn_count * 3000),
             dram_dump=(dump_off_d, kv_end - dump_off_d),
         )
@@ -967,6 +984,8 @@ def run_cosim_sequence_logits(*, token_ids, payload=None,
     result["logits"] = logits_metric(
         seq.golden_logits, rtl_logits, targets, seq.vocab_size,
     )
+    from tools.benchmark_support import bundle_ptq_transform_manifest
+    result["ptq_transforms"] = bundle_ptq_transform_manifest(FREEZE_PTQ_PRESET)
     return result
 
 
@@ -979,10 +998,14 @@ if __name__ == "__main__":
     ap.add_argument("--token", type=int, default=0)
     ap.add_argument("--cosim", action="store_true",
                     help="run full RTL-vs-golden compare")
+    ap.add_argument("--runner", choices=("synth", "reference"), default="synth",
+                    help="synth selects both hardware datapaths; reference selects DPI")
+    ap.add_argument("--rtl", type=Path, help="explicit custom runner executable")
     args = ap.parse_args()
 
     if args.cosim:
-        res = run_cosim(token_id=args.token)
+        binary = args.rtl or (RTL_BINARY if args.runner == "synth" else RTL_REFERENCE_BINARY)
+        res = run_cosim(token_id=args.token, rtl_binary=binary)
         s = res["summary"]
         print(f"insn_count={res['insn_count']} events={res['n_events']} "
               f"rtl_captures={res['n_rtl_captures']}")
@@ -994,6 +1017,7 @@ if __name__ == "__main__":
         else:
             print("RESULT: FIRST DIVERGENCE:")
             print(_json.dumps(res["divergence"], indent=2, default=str))
+            raise SystemExit(1)
     else:
         sp = serialize_prefill_bundle(token_id=args.token)
         Path(args.out).write_bytes(sp.program_bytes)
