@@ -18,6 +18,7 @@ from .calibration import (
     apply_output_aware_lm_head_scale_search_from_token_ids,
     apply_output_aware_mlp_scale_search_from_token_ids,
     apply_quarot_rotation_from_token_ids,
+    build_calibration_scales,
     build_calibration_scales_from_token_ids,
 )
 
@@ -257,8 +258,14 @@ def run_weight_only_int8_simulator_reference_teacher_forced_logits(
     from .w8a16_simulator_reference import NanoGPTW8A16SimulatorReference
 
     inputs, _ = teacher_forced_inputs_and_targets(context_tokens)
+    # None means implicit fixture calibration in the bundle builder, not the
+    # independent reference's missing-key defaults. Resolve the same policy
+    # here for direct callers as well as the shared evaluator below.
+    if calibration_scales is None:
+        calibration_scales = build_calibration_scales(payload)
     ref = NanoGPTW8A16SimulatorReference(
-        payload, calibration_scales=calibration_scales, kv_quant=kv_quant
+        payload, calibration_scales=calibration_scales, kv_quant=kv_quant,
+        attention_window=len(inputs),
     )
     return ref.run_teacher_forced(inputs)
 
@@ -421,6 +428,13 @@ def evaluate_gpt2_perplexity(
         # relative_delta then measures codegen correctness (within
         # FP16 ULP) rather than the QDQ-vs-host-runner identity.
         if simulator_backed:
+            # The bundle builder calibrates when passed None. Previously the
+            # independent rail interpreted that same None as defaults, making
+            # this comparison cross-policy despite its like-for-like label.
+            # Resolve once and share exact scales without changing the compiled
+            # baseline's implicit calibration policy.
+            if wo_calibration_scales is None:
+                wo_calibration_scales = build_calibration_scales(payload)
             fake_logits = (
                 run_weight_only_int8_simulator_reference_teacher_forced_logits(
                     payload, eval_tokens,

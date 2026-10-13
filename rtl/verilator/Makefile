@@ -21,6 +21,9 @@ VFLAGS        := --cc --exe --build --timing \
                                   --x-assign fast --x-initial fast
 SYSTOLIC_ARCH_MODE ?= 1
 DRAM_SIZE ?= 16777216
+PYTHON ?= ../../.venv/bin/python
+# Optional real-row evidence; the generator validates its four retained hashes.
+LN_CAPTURED_PREFIX ?=
 
 SRC_DIR       := ../common/src
 INCLUDE_DIR   := $(SRC_DIR)/include
@@ -74,7 +77,7 @@ CONTROL_DEPS  := $(CONTROL_SV) $(SVH_SRCS) $(CORE_F) Makefile
         test_accum_snapshot_readback test_fp32_add test_fp32_div test_fp32_div_p3 test_fp32_div_p4 test_fp32_div_p5 test_fp32_div_p6 test_fp32_sqrt test_fp32_sqrt_p3 test_fp32_sqrt_p4 test_fp32_sqrt_p6 test_fp32_exp_p18 test_fp32_gelu_p33 \
         test_sfu_synth test_helpers_synth \
         test_sfu_helper_synth test_fetch_buffer test_fetch_no_buffer \
-        run_program_synth_nofetch test_dma_buffer synth-check clean
+        run_program_synth_nofetch test_dma_buffer test_ln_quality synth-check clean
 # R7 (2026-05-23): test_fp32_*_pipe targets removed. The 12 fp32_*_pipe.sv
 # wrappers and their 12 _pipe.cpp standalone gates were dead code from the
 # abandoned "pipelined-first" direction. The combinational cores (fp32_add.sv,
@@ -312,6 +315,13 @@ $(BUILD_DIR)/test_sfu_synth/Vtaccel_top: $(CONTROL_DEPS) test_sfu.cpp $(TB_HEADE
 test_sfu_synth: $(BUILD_DIR)/test_sfu_synth/Vtaccel_top
 	@echo "--- Running SFU tests with SFU_SYNTH_MODE=1 (current mode-1 path) ---"
 	$(BUILD_DIR)/test_sfu_synth/Vtaccel_top
+
+# New generated quality vectors are separate from the immutable gen2 fixtures.
+# Run both behavioral and actual synthesizable SFU paths against NumPy outputs.
+test_ln_quality: $(BUILD_DIR)/test_sfu/Vtaccel_top $(BUILD_DIR)/test_sfu_synth/Vtaccel_top gen_ln_vectors.py
+	$(PYTHON) gen_ln_vectors.py --out $(BUILD_DIR)/ln_quality.bin $(if $(LN_CAPTURED_PREFIX),--captured-prefix "$(LN_CAPTURED_PREFIX)")
+	$(BUILD_DIR)/test_sfu/Vtaccel_top --ln-vectors $(BUILD_DIR)/ln_quality.bin
+	$(BUILD_DIR)/test_sfu_synth/Vtaccel_top --ln-vectors $(BUILD_DIR)/ln_quality.bin
 
 # -----------------------------------------------------------------------
 # test_helpers_synth: helper regressions with HELPER_SYNTH_MODE=1. This selects

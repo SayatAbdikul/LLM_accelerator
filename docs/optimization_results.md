@@ -2,7 +2,16 @@
 
 **Verification dates:** 2026-10-11–12  
 **Base commit:** `978f126` plus the working-tree changes  
-**Status:** opt-in integration validated; numerical-quality and physical gates remain open
+**Status:** opt-in integration validated; agreed bounded numerical gate passes October 13; physical/default promotion remain separate
+
+The [October 13 numerical-quality results](numerical_quality_results.md) add
+a passing 5%-FP32-relative software W8A16 gate on the pinned 256-target window
+and repair real LayerNorm reduction-order and GELU overflow defects. The
+accepted three-target RTL replay also passes with exact logits/whole KV;
+full-window RTL quality and physical/default promotion are not claimed.
+This October 11–12 report retains
+its original runner/source identities and is not relabeled as performance
+validation of the corrected numerical RTL.
 
 This report implements the [optimization roadmap](optimization_roadmap.md).
 It distinguishes implemented candidates, accepted behavior, measured benefits,

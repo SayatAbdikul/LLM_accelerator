@@ -10,8 +10,9 @@ engine, synthesizable SFU, three on-chip SRAMs, and an in-order issue unit. The
 software provides the ISA, assembler, model frontends, quantization, compiler,
 golden simulator, host runtime, fixtures, and RTL co-simulation tools.
 
-> **Documentation state:** October 11 implementation based on `978f126`;
-> validation is tracked in [the milestone report](docs/optimization_results.md).
+> **Documentation state:** October 13 numerical changes against `ffd71e8`;
+> current validation is tracked in [the numerical report](docs/numerical_quality_results.md).
+> October 11–12 performance evidence remains in [the milestone report](docs/optimization_results.md).
 > Start with [the current project status](docs/project_status.md) and
 > [documentation index](docs/README.md). Dated plans and measurement reports
 > are retained as historical evidence and are labeled accordingly.
@@ -22,9 +23,10 @@ golden simulator, host runtime, fixtures, and RTL co-simulation tools.
 |---|---|
 | Primary workload | GPT-2 124M / nanoGPT-format causal decoder; the older DeiT frontend remains available but is not the active optimization target. |
 | Numeric path | W8A16: INT8 weights, FP16 activation storage, INT32 accumulators, FP32 SFU internals. The KV cache is stored as INT8. |
-| RTL | The full shared-core hierarchy passes the `sv2v + yosys` hierarchy/check/stat gate. FPGA and ASIC wrapper elaboration targets are also provided. These are not mapped synthesis or physical sign-off. |
+| RTL | The full mode-1 shared-core hierarchy resolves through `sv2v + yosys`; pre-process checks are diagnostic, not structural sign-off. FPGA and ASIC wrapper elaboration targets are also provided. These are not mapped synthesis or physical sign-off. |
 | ISA | Fixed 64-bit, big-endian instructions. Six generation-1 SFU opcodes are retired. The RTL implements the causal generation-2 path; `SOFTMAX_FP32` (`0x1C`) remains software/golden-only and is illegal in RTL. |
-| Verification | A mandatory no-skip profile, pinned executable reference dependencies, native protocol/primitive tests, and opt-in large-model tests distinguish conformance from numerical quality. Latest counts and scope are in the milestone report. |
+| Verification | All 537 mandatory tests pass with no skips; 244 optional cases are deselected. Pinned references, native protocol/primitive tests, and opt-in large-model tests distinguish conformance from numerical quality. |
+| Numerical quality | The selected QuaRot W8A16 preset passes the 5% FP32-relative limit on 256 software targets (+2.494%). The agreed three-step RTL continuation produces exact logits/whole KV. This is not corpus-wide or full-window RTL quality proof. |
 | Performance | Corrected mode-1 baselines and opt-in compiler/fetch A/B reports replace ambiguous historical runner provenance. No current full-chip post-layout fmax, power, or achieved tokens/second is established. |
 | Physical target | SKY130 is the measured ASIC research path. The FPGA directory is an elaboration-ready wrapper skeleton; no board or vendor flow is selected. |
 
@@ -277,6 +279,7 @@ fixed-total GB/s memory controller.
 - [Documentation index](docs/README.md)
 - [Current project status](docs/project_status.md)
 - [Optimization implementation and results](docs/optimization_results.md)
+- [Current W8A16 numerical quality evidence](docs/numerical_quality_results.md)
 - [Code exploration roadmap](docs/code_exploration_roadmap.md)
 - [ISA specification](software/docs/isa_spec.md)
 - [ISA freeze and amendment record](software/docs/isa_generation_freeze.md)

@@ -391,10 +391,9 @@
   //   row_bits = real_to_fp32_bits(row_data_q[iter]) = synth_a_bits (reused)
   //   neg_mean = ln_mean_q ^ sign-bit  (fp32 negate via XOR)
   // Reduction primitives:
-  //   ln_sum_add = fp32_add(ln_sum_acc_q, synth_a_bits)
-  //   ln_diff    = fp32_add(synth_a_bits, neg_mean)        // row - mean
-  //   ln_diff_sq = fp32_mul(ln_diff, ln_diff)
-  //   ln_var_add = fp32_add(ln_var_acc_q, ln_diff_sq)
+  //   ln_reduce_add = shared FP32 add for eight lanes / ordered tree merges
+  //   ln_diff    = fp32_add(ln_row_q, neg_mean)           // row - mean
+  //   ln_diff_sq = fp32_mul(ln_diff_q, ln_diff_q)
   //   ln_n_fp32  = real_to_fp32_bits(real'(n_elems_q))
   //   ln_var_norm= fp32_div(ln_var_acc_q, ln_n_fp32)
   //   ln_var_eps = fp32_add(ln_var_norm, C_LN_FP32_EPS)
@@ -407,11 +406,10 @@
   localparam logic [31:0] C_LN_EPS_G1   = 32'h358D_3F3F;  // 1.0e-6 fp32 (gen-1)
   logic [31:0] ln_neg_mean;
   logic [31:0] ln_n_fp32;
-  logic [31:0] ln_sum_add_w;
+  logic [31:0] ln_reduce_a_w, ln_reduce_b_w, ln_reduce_add_w;
   logic [31:0] ln_mean_div_w;
   logic [31:0] ln_diff_w;
   logic [31:0] ln_diff_sq_w;
-  logic [31:0] ln_var_add_w;
   logic [31:0] ln_var_norm_w;
   logic [31:0] ln_var_eps_w;
   logic [31:0] ln_eps_sel_w;
@@ -436,8 +434,28 @@
   // of the combinational synth_a_bits — the iter_idx_q pointer fanout + the
   // 1024-entry row_data_q read mux no longer chain into any LN fp op. This was
   // the post-repair_design lane binder on BOTH hd and hs (mux -> sub -> square
-  // -> ln_dsq_q, single-cycle). Costs 1 extra fill cycle per pass, per row.
-  fp32_add  u_ln_sum_add (.a(ln_sum_acc_q), .b(ln_row_q),     .y(ln_sum_add_w));
+  // -> ln_dsq_q, single-cycle). The pairwise sequencer drains at leaf bounds.
+  // One shared adder implements the leaf lanes and ordered subtree merges.
+  // Array reads feeding subtraction/squaring remain separately registered.
+  always_comb begin
+    ln_reduce_a_w = ln_partial_q[ln_count_q[2:0]];
+    ln_reduce_b_w = ln_variance_q ? ln_dsq_q : ln_row_q;
+    if (state == F_G2_LN_MERGE) begin
+      case (ln_merge_q)
+        3'd0: begin ln_reduce_a_w = ln_partial_q[0]; ln_reduce_b_w = ln_partial_q[1]; end
+        3'd1: begin ln_reduce_a_w = ln_partial_q[2]; ln_reduce_b_w = ln_partial_q[3]; end
+        3'd2: begin ln_reduce_a_w = ln_partial_q[0]; ln_reduce_b_w = ln_partial_q[2]; end
+        3'd3: begin ln_reduce_a_w = ln_partial_q[4]; ln_reduce_b_w = ln_partial_q[5]; end
+        3'd4: begin ln_reduce_a_w = ln_partial_q[6]; ln_reduce_b_w = ln_partial_q[7]; end
+        3'd5: begin ln_reduce_a_w = ln_partial_q[4]; ln_reduce_b_w = ln_partial_q[6]; end
+        default: begin ln_reduce_a_w = ln_partial_q[0]; ln_reduce_b_w = ln_partial_q[4]; end
+      endcase
+    end else if (state == F_G2_LN_RETURN) begin
+      ln_reduce_a_w = (ln_depth_q != 0) ? ln_left_q[ln_parent_w] : 32'b0;
+      ln_reduce_b_w = ln_result_q;
+    end
+  end
+  fp32_add u_ln_reduce_add (.a(ln_reduce_a_w), .b(ln_reduce_b_w), .y(ln_reduce_add_w));
   // 2026-07-12 (lever E): 6-stage pipelined divider (LATENCY=6, fp32_div_p6). FSM
   // presents the registered ln_sum_acc_q and samples ln_mean_div_w 6 cycles later
   // (F_G2_LN_MEAN -> _W -> _W2 -> _W3 -> _W4 -> _W5 -> _S). valid_in tied high.
@@ -448,11 +466,9 @@
   // 2026-07-25 (fmax 0g): the square reads the REGISTERED difference ln_diff_q
   // (latched from ln_diff_w each F_G2_LN_VAR cycle) so sub and square sit in
   // separate stages. VAR is now a 3-deep feed pipe (ln_row_q -> ln_diff_q ->
-  // ln_dsq_q), each stage one primitive; the loop-carried accumulate below
-  // stays a lone reg -> add -> reg. Bit-exact: identical ops, operands and
-  // accumulation order — the registers only delay them.
+  // ln_dsq_q), each stage one primitive; the shared pairwise adder consumes
+  // the registered square without chaining a subtract/multiply into it.
   fp32_mul  u_ln_diff_sq (.a(ln_diff_q),    .b(ln_diff_q),    .y(ln_diff_sq_w));
-  fp32_add  u_ln_var_add (.a(ln_var_acc_q), .b(ln_dsq_q),     .y(ln_var_add_w));
   // 2026-07-12 (lever E): 6-stage divider (LATENCY=6, fp32_div_p6). var_acc/n
   // sampled 6 cycles after the registered ln_var_acc_q is presented
   // (F_G2_LN_DENOM_PRE -> _W -> _W2 -> _W3 -> _W4 -> _W5 -> _S); the +eps add then

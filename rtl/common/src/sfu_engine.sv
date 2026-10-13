@@ -139,14 +139,9 @@ module sfu_engine
     //   0x19 OP_VADD_FP32, 0x17 OP_DEQUANT_ACCUM_FP32,
     //   0x18 OP_QUANT_FP32_INT8, 0x1E OP_DEQUANT_ACCUM_FP32_SCALED.
     F_G2_SYNTH_ITER = 7'd31,
-    // Phase-2 LAYERNORM_FP32 (0x1A) synth sub-FSM. 3 reduction passes over
-    // the row (sum -> mean; var -> denom; output) plus 2 single-cycle math
-    // steps. State sequence:
-    //   F_G2_LN_SUM      : iter; sum_acc_q += row_data_q[iter]
-    //   F_G2_LN_MEAN     : 1 cycle; mean_q = sum_acc_q / n_elems_fp32; reset var_acc
-    //   F_G2_LN_VAR      : iter; var_acc_q += (row[iter] - mean)^2
-    //   F_G2_LN_DENOM    : 1 cycle; denom_q = sqrt(var_acc/n + LN_FP32_EPS)
-    //   F_G2_LN_OUT      : iter; out_h_q[iter] = f2h((row-mean)/denom*gamma + beta)
+    // LAYERNORM_FP32: two NumPy-order pairwise reductions and an output pass.
+    // DESCEND/SUM/MERGE/RETURN -> pipelined MEAN -> DESCEND/VAR/MERGE/RETURN
+    // -> pipelined DENOM -> OUT_DIFF (divide, gamma, beta and FP16 writeback).
     F_G2_LN_SUM     = 7'd32,
     F_G2_LN_MEAN    = 7'd33,
     F_G2_LN_VAR     = 7'd34,
@@ -244,7 +239,10 @@ module sfu_engine
     // y 6 cycles after the operands are presented. (The streaming ln_norm/sm_div
     // drains re-tune via the collect threshold iter>=7, no new state.)
     F_G2_LN_MEAN_W5     = 7'd75,  // ln_mean div_p6 6th stage (LATENCY=6)
-    F_G2_LN_DENOM_PRE_W5= 7'd76   // ln_var_norm div_p6 6th stage (LATENCY=6)
+    F_G2_LN_DENOM_PRE_W5= 7'd76,  // ln_var_norm div_p6 6th stage (LATENCY=6)
+    F_G2_LN_DESCEND     = 7'd77,  // NumPy-order reduction: split at aligned half
+    F_G2_LN_MERGE       = 7'd78,  // merge the eight leaf accumulators
+    F_G2_LN_RETURN      = 7'd79   // return/merge a completed subtree
   } sfu_state_t;
 
   sfu_state_t state;
@@ -277,6 +275,23 @@ module sfu_engine
   // Stored as fp32 bit-patterns (the primitives' native I/O).
   logic [31:0]  ln_sum_acc_q;
   logic [31:0]  ln_var_acc_q;
+  // Frozen NumPy FP32 reduction order: eight accumulators per <=128-element
+  // leaf, recursively split larger rows at an eight-aligned half. At most
+  // three frames are needed for the legal 16..1024-element rows. Both passes
+  // reuse one adder; no full-row scratch copy or parallel FP adder tree.
+  logic [31:0]  ln_partial_q [0:7];
+  logic [31:0]  ln_left_q [0:2];
+  logic [10:0]  ln_right_start_q [0:2];
+  logic [10:0]  ln_right_len_q [0:2];
+  logic [2:0]   ln_right_phase_q;
+  logic [1:0]   ln_depth_q;
+  logic [10:0]  ln_start_q, ln_len_q;
+  logic [7:0]   ln_count_q;
+  logic [2:0]   ln_merge_q;
+  logic         ln_variance_q;
+  logic [31:0]  ln_result_q;
+  wire [10:0]   ln_split_w = {1'b0, ln_len_q[10:4], 3'b000};
+  wire [1:0]    ln_parent_w = ln_depth_q - 2'd1;
   logic [31:0]  ln_mean_q;
   logic [31:0]  ln_denom_q;
   // Phase-4 (2026-05-28): pipeline cut between (var_acc/n + eps) and sqrt.
@@ -307,16 +322,9 @@ module sfu_engine
   logic [10:0]  ln_wr_q;
   logic [1:0]   ln_fin_vld_q;
   logic         ln_coll_en_w;
-  // 2026-05-31: LN_VAR accumulator pipelining (fmax lever). The variance pass
-  // computed (row-mean)^2 AND accumulated it in ONE cycle: synth_a_bits ->
-  // fp32_add(sub) -> fp32_mul(square) -> fp32_add(accumulate) -> ln_var_acc_q,
-  // a ~42 ns chain = the post-div_p4 SFU PNR floor (= whole-chip clock). diff
-  // and square are NOT loop-carried (only the final accumulate is), so register
-  // the square here and accumulate it the next cycle: the binding path splits
-  // into sub+mul (~28 ns, fed) and add (~14 ns, loop-carried). Software-
-  // pipelined like F_G2_LN_OUT_DIFF — feed element i's square while accumulating
-  // element i-1's — so throughput stays ~1 elem/cycle (+1 drain/row). Bit-exact
-  // (same sub/mul/add, same operands, same accumulation order).
+  // Registered square keeps subtract, multiply and the shared reduction add
+  // in separate stages. The pairwise lane update consumes this registered
+  // value three cycles after the corresponding row read is issued.
   logic [31:0]  ln_dsq_q;
   // 2026-07-25 (fmax 0g): registered row_data_q read for the LN row walks.
   // Post-repair_design STA (both hd and hs) showed the lane binder was the
@@ -457,6 +465,7 @@ module sfu_engine
   logic [7:0] out_bytes_q [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
   // gen-2: FP16 result bit-patterns + FP16-rows-per-logical-row (=2*n_tiles).
   logic [15:0] out_h_q [0:SFU_MAX_ROW_ELEMS-1] /* verilator public_flat_rd */;
+`include "sfu_ln_pairwise.svh"
   logic [12:0] g2_rows_q;
   // 0x1F MAX_ABS_REDUCE_FP32: running global max|x| + 2-cycle write phase.
   logic [31:0] g2_maxabs_q;
@@ -930,6 +939,20 @@ module sfu_engine
       iter_idx_q     <= 11'h0;
       ln_sum_acc_q   <= 32'h0;
       ln_var_acc_q   <= 32'h0;
+      ln_right_phase_q <= 3'b0;
+      ln_depth_q    <= 2'b0;
+      ln_start_q    <= 11'b0;
+      ln_len_q      <= 11'b0;
+      ln_count_q    <= 8'b0;
+      ln_merge_q    <= 3'b0;
+      ln_variance_q <= 1'b0;
+      ln_result_q   <= 32'b0;
+      for (int i = 0; i < 8; i++) ln_partial_q[i] <= 32'b0;
+      for (int i = 0; i < 3; i++) begin
+        ln_left_q[i] <= 32'b0;
+        ln_right_start_q[i] <= 11'b0;
+        ln_right_len_q[i] <= 11'b0;
+      end
       ln_mean_q      <= 32'h0;
       ln_denom_q     <= 32'h0;
       ln_var_eps_q   <= 32'h0;

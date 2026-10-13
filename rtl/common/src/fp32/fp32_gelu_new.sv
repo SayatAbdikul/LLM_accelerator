@@ -72,8 +72,14 @@ module fp32_gelu_new (
   // Stable: ratio is in (0, 1) with no near-cancellation; for large negative
   // z the result is exp(2z)/(1 + tiny) ≈ exp(2z); for large positive z it's
   // big/(big + 1) ≈ 1. No 1 + tanh subtraction; ~9 bits of precision saved.
-  logic [31:0] ratio;
-  fp32_div d_r (.a(exp_2z), .b(denom), .y(ratio));
+  // When exp overflows on the positive tail, the exact ratio rounds to1,
+  // not Inf/Inf. Normalize this specific limit to1/1 BEFORE division. This
+  // does not replace arbitrary NaNs: a NaN exp still follows the normal path.
+  // Real GPT-2 FP16 input10.8671875 reaches this case (2z=108.91607).
+  logic [31:0] ratio, ratio_num, ratio_den;
+  assign ratio_num = (exp_2z == 32'h7F80_0000) ? C_ONE : exp_2z;
+  assign ratio_den = (exp_2z == 32'h7F80_0000) ? C_ONE : denom;
+  fp32_div d_r (.a(ratio_num), .b(ratio_den), .y(ratio));
 
   // x * ratio = x * 0.5 * (1 + tanh(z)) = gelu_new(x)
   fp32_mul m_out (.a(a), .b(ratio), .y(y));

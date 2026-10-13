@@ -748,7 +748,10 @@ class CodeGenerator:
                 if node.op != "matmul_attn_v":
                     continue
                 sm_input, v_input = node.inputs[0], node.inputs[1]
-                sm_scale = float(self.calibration_scales.get(sm_input, DEFAULT_ACT_SCALE))
+                # Match the probability quantizer's 1/127 fallback. Using the
+                # activation fallback here dequantized missing-key softmax
+                # values six times too large despite identical INT8 codes.
+                sm_scale = float(self.calibration_scales.get(sm_input, 1.0 / 127.0))
                 v_scale = float(self.calibration_scales.get(v_input, DEFAULT_ACT_SCALE))
                 # Cast order matches the test fixture: FP32 × FP32 → FP16.
                 composite_fp32 = np.float32(sm_scale) * np.float32(v_scale)

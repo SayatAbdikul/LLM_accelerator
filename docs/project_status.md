@@ -1,13 +1,36 @@
 # TACCEL current project status
 
-**Audited:** 2026-10-11–12
-**Code basis:** `978f126` plus the optimization implementation working tree
+**Audited:** 2026-10-13
+**Code basis:** `ffd71e8` plus the numerical-quality implementation working tree
 **Primary target:** GPT-2 124M W8A16 causal-decoder inference
 
 This file is the current state-of-truth for project capability and measured
 status. Dated roadmaps under `docs/` remain experiment records.
 
 ## October implementation
+
+The [numerical-quality results](numerical_quality_results.md) supersede the
+earlier finite-only quality characterization for the named active W8A16
+window: compiled PPL 55.032995 versus original FP32 53.693769, a 2.494193%
+increase within the user-selected 5% limit. All 256 live logit rows match the
+corrected independent reference. The real LayerNorm reduction-order defect
+is repaired and passes 1,026 exact native vectors across both modes; a fresh
+real-row replay matches golden at zero ULP. The real-data GELU exponential
+overflow is also repaired: both SFU modes pass 12 checks, and 8,526,144
+primitive comparisons pass independent saturation/finite-output checks. The
+fixed first-block prefix has finite captures and respects the existing GELU
+band. All 148 focused numerical/gate tests pass. The canonical software rerun
+records HALT for every compiled step. The agreed bounded three-step hardware
+gate passes, with exact logits/whole KV, two actual hardware-history links and
+−3.930333% FP32-relative PPL on its matched prefix. Full 256-target RTL and
+corpus-wide quality are not claimed.
+
+The current required profile passes 537 tests with zero failures or skips;
+244 optional cases are deselected from the 781-node collection. All 32 affected
+prefill/generator/prefix-helper tests also pass. The strengthened GELU gate
+passes 18,522,288 exact valid-timing checks and 11,527 NaN-input checks.
+The campaign below is the October 11–12 source epoch, not a blanket rerun of
+all optional tests or performance measurements on these numerical changes.
 
 See [the optimization results](optimization_results.md) for commands, current
 test counts, corrected mode-1 cycle measurements, candidate acceptance, and

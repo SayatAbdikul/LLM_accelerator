@@ -3,8 +3,9 @@
 // order, with the SAME operand port assignments; only pipeline registers are
 // inserted between them (and `fp32_exp` / `fp32_div` are swapped for their
 // already-proven bit-exact pipelined twins `fp32_exp_p18` / `fp32_div_p6`).
-// No arithmetic changes ⇒ the output is bit-IDENTICAL to fp32_gelu_new, not
-// merely within-band. test_fp32_gelu_p33.cpp is the zero-diff gate (drives the
+// Both implementations normalize a positive-infinite exp ratio to1/1, the
+// saturated positive GELU tail, before division. Their outputs are identical,
+// not merely within-band. test_fp32_gelu_p33.cpp is the zero-diff gate (drives the
 // combinational core and this module with the same stream and asserts equality
 // on the LATENCY=33 deque).
 //
@@ -34,6 +35,7 @@
 //        capture stage rather than being chained into the next fp32_add. This
 //        is the same call made in phase 0b for the softmax EXPSUM accumulate.)
 //   s25  denom  = exp_2z + 1.0                       [fp32_add]  (+ exp_2z copy)
+//        positive-infinite exp -> numerator=denominator=1 (saturated ratio)
 //   s26..s31   ratio = exp_2z / denom                [fp32_div_p6, 6 stages]
 //   s32  y      = x(-32) * ratio                     [fp32_mul]  -> output reg
 //   ⇒ LATENCY = 33.
@@ -151,8 +153,10 @@ module fp32_gelu_p33 (
   fp32_add a_dn (.a(r24_e2z), .b(C_ONE), .y(s25_denom_w));
   logic [31:0] r25_denom, r25_e2z;
   always_ff @(posedge clk) begin
-    r25_denom <= s25_denom_w;
-    r25_e2z   <= r24_e2z;      // dividend rides alongside its own +1
+    // Exact positive-tail limit, not a NaN-output mask. Normalize both operands
+    // together in the existing stage, preserving all33cycles and bubble timing.
+    r25_denom <= (r24_e2z == 32'h7F80_0000) ? C_ONE : s25_denom_w;
+    r25_e2z   <= (r24_e2z == 32'h7F80_0000) ? C_ONE : r24_e2z;
   end
 
   // ======== STAGES 26..31: ratio = exp_2z / denom [fp32_div_p6] ===========

@@ -196,11 +196,13 @@
           end else begin
             // LAYERNORM_FP32: mean / var (population) / eps=1e-5 / gamma,beta.
             if (SFU_SYNTH_MODE == 1 && opcode_q == OP_LAYERNORM_FP32) begin
-              // Synth path: 3-pass sub-FSM through F_G2_LN_{SUM,MEAN,VAR,
-              // DENOM,OUT}. Init iter + sum accumulator (+0 == 32'h0).
-              iter_idx_q   <= 11'h0;
-              ln_sum_acc_q <= 32'h0;
-              state        <= F_G2_LN_SUM;
+              // Traverse the same eight-lane pairwise reduction tree as the
+              // frozen NumPy FP32 mean/variance, not a serial running sum.
+              ln_start_q    <= 11'b0;
+              ln_len_q      <= n_elems_q[10:0];
+              ln_depth_q    <= 2'b0;
+              ln_variance_q <= 1'b0;
+              state         <= F_G2_LN_DESCEND;
             end else begin
 `ifndef SFU_SYNTH_NO_DPI
               // DPI path (default; cosim-pinned).
@@ -208,20 +210,9 @@
               real mean_r;
               real var_r;
               real denom_r;
-              sum_r = 0.0;
-              for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
-                if (i < integer'(n_elems_q))
-                  sum_r = sfu_fp32_add(sum_r, fp32_bits_to_real(row_data_q[i]));
-              end
+              sum_r = ln_pairwise_reduce(1'b0, 0.0);
               mean_r = sfu_fp32_div(sum_r, real'(n_elems_q));
-              var_r = 0.0;
-              for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
-                if (i < integer'(n_elems_q)) begin
-                  real diff_r;
-                  diff_r = sfu_fp32_sub(fp32_bits_to_real(row_data_q[i]), mean_r);
-                  var_r = sfu_fp32_add(var_r, sfu_fp32_mul(diff_r, diff_r));
-                end
-              end
+              var_r = ln_pairwise_reduce(1'b1, mean_r);
               var_r = sfu_fp32_div(var_r, real'(n_elems_q));
               denom_r = sfu_fp32_sqrt(sfu_fp32_add(var_r, LN_FP32_EPS));
               for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
@@ -343,33 +334,82 @@
           end
         end
 
-        // 0x1A LAYERNORM_FP32 synth sub-FSM (Phase-2):
-        //   1) Sum reduction: sum_acc += row[iter]
-        //   2) Mean: mean = sum_acc / n; reset var_acc
-        //   3) Variance: var_acc += (row[iter] - mean)^2
-        //   4) Denom: denom = sqrt(var_acc / n + LN_EPS)
-        //   5) Output: out[iter] = f2h((row[iter] - mean) / denom * gamma + beta)
-        // 2026-07-25 (fmax 0g): software-pipelined one deep — the accumulate
-        // reads the REGISTERED ln_row_q (element iter-1) so the row_data_q
-        // read mux never chains into the fp32_add. Same accumulation order
-        // (((0+e0)+e1)+...) => bit-exact; +1 fill cycle per row. The final
-        // accumulate (element n-1) fires on the same cycle as the exit, so
-        // ln_sum_acc_q is stable on entry to F_G2_LN_MEAN exactly as before.
-        F_G2_LN_SUM: begin
-          if (iter_idx_q >= 11'd1)
-            ln_sum_acc_q <= ln_sum_add_w;
-          if ({5'h0, iter_idx_q} < n_elems_q) begin
-            ln_row_q   <= synth_a_bits;
-            iter_idx_q <= iter_idx_q + 11'd1;
+        // Legal LN widths are multiples of 16. Recursive eight-aligned splits
+        // therefore produce leaves of 8..128 elements, with no scalar tail.
+        // Push the right range, compute the left, then return to the right.
+        F_G2_LN_DESCEND: begin
+          if (ln_len_q > 11'd128) begin
+            ln_right_start_q[ln_depth_q] <= ln_start_q + ln_split_w;
+            ln_right_len_q[ln_depth_q]   <= ln_len_q - ln_split_w;
+            ln_right_phase_q[ln_depth_q] <= 1'b0;
+            ln_depth_q <= ln_depth_q + 2'd1;
+            ln_len_q   <= ln_split_w;
           end else begin
-            iter_idx_q <= 11'h0;
-            state      <= F_G2_LN_MEAN;
+            iter_idx_q <= ln_start_q;
+            ln_count_q <= 8'b0;
+            ln_merge_q <= 3'b0;
+            state <= ln_variance_q ? F_G2_LN_VAR : F_G2_LN_SUM;
           end
         end
 
-        // mean = sum_acc / n_elems_fp32 via the pipelined fp32_div_p2 u_ln_mean
-        // (LATENCY=2). ln_sum_acc_q is registered & stable on entry; sample its
-        // quotient 2 cycles later. Once-per-row so the +2 cycles are negligible.
+        // First eight elements seed the lanes without adding +0 (important
+        // for signed zeros); subsequent elements update the same lane modulo8.
+        // The row read remains a separate pipeline stage before the adder.
+        F_G2_LN_SUM: begin
+          if (iter_idx_q > ln_start_q) begin
+            ln_partial_q[ln_count_q[2:0]] <= (ln_count_q < 8'd8)
+                ? ln_row_q : ln_reduce_add_w;
+            ln_count_q <= ln_count_q + 8'd1;
+          end
+          if (iter_idx_q < ln_start_q + ln_len_q) begin
+            ln_row_q   <= synth_a_bits;
+            iter_idx_q <= iter_idx_q + 11'd1;
+          end else begin
+            state <= F_G2_LN_MERGE;
+          end
+        end
+
+        // ((r0+r1)+(r2+r3)) + ((r4+r5)+(r6+r7)), one shared add per cycle.
+        F_G2_LN_MERGE: begin
+          case (ln_merge_q)
+            3'd0, 3'd2: ln_partial_q[0] <= ln_reduce_add_w;
+            3'd1: ln_partial_q[2] <= ln_reduce_add_w;
+            3'd3, 3'd5: ln_partial_q[4] <= ln_reduce_add_w;
+            3'd4: ln_partial_q[6] <= ln_reduce_add_w;
+            default: begin
+              ln_result_q <= ln_reduce_add_w;
+              state <= F_G2_LN_RETURN;
+            end
+          endcase
+          ln_merge_q <= ln_merge_q + 3'd1;
+        end
+
+        F_G2_LN_RETURN: begin
+          if (ln_depth_q == 0) begin
+            // NumPy's outer ufunc reduction starts at +0. Use the same add,
+            // including its +0 result for an all-negative-zero input row.
+            iter_idx_q <= 11'b0;
+            if (ln_variance_q) begin
+              ln_var_acc_q <= ln_reduce_add_w;
+              state <= F_G2_LN_DENOM_PRE;
+            end else begin
+              ln_sum_acc_q <= ln_reduce_add_w;
+              state <= F_G2_LN_MEAN;
+            end
+          end else if (!ln_right_phase_q[ln_parent_w]) begin
+            ln_left_q[ln_parent_w] <= ln_result_q;
+            ln_right_phase_q[ln_parent_w] <= 1'b1;
+            ln_start_q <= ln_right_start_q[ln_parent_w];
+            ln_len_q <= ln_right_len_q[ln_parent_w];
+            state <= F_G2_LN_DESCEND;
+          end else begin
+            ln_result_q <= ln_reduce_add_w;
+            ln_depth_q <= ln_depth_q - 2'd1;
+          end
+        end
+
+        // mean = sum_acc / n_elems_fp32 via fp32_div_p6. The completed
+        // pairwise sum is registered and held through all six pipeline stages.
         F_G2_LN_MEAN: begin
           state <= F_G2_LN_MEAN_W;
         end
@@ -390,8 +430,11 @@
         end
         F_G2_LN_MEAN_S: begin
           ln_mean_q    <= ln_mean_div_w;   // divider y now valid
-          ln_var_acc_q <= 32'h0;
-          state        <= F_G2_LN_VAR;
+          ln_start_q    <= 11'b0;
+          ln_len_q      <= n_elems_q[10:0];
+          ln_depth_q    <= 2'b0;
+          ln_variance_q <= 1'b1;
+          state         <= F_G2_LN_DESCEND;
         end
 
         // 2026-05-31 (pipelined) / 2026-07-25 (fmax 0g, deepened to 3): the
@@ -401,28 +444,26 @@
         //   iter    : ln_row_q  <= row_data_q[iter]        (read mux only)
         //   iter+1  : ln_diff_q <= ln_row_q - mean         (one fp32_add)
         //   iter+2  : ln_dsq_q  <= ln_diff_q^2             (one fp32_mul)
-        //   iter+3  : ln_var_acc_q += ln_dsq_q             (lone add, carried)
+        //   iter+3  : one of eight partial sums += ln_dsq_q (lone add)
         // mean needs no side-operand delay: ln_mean_q is latched once per row
-        // in F_G2_LN_MEAN_S and constant through VAR. Same accumulation order
-        // (((0+dsq0)+dsq1)+...), so bit-exact; +2 drain cycles/row vs the
-        // 1-deep version. Squares latched past the bound expire uncollected
-        // (the exit at iter==n+2 accumulates exactly through element n-1).
+        // in F_G2_LN_MEAN_S and constant through VAR. The feed is drained at
+        // every leaf boundary before merging. No stale pipeline entries seed
+        // the next leaf; it starts collecting only after three new feeds.
         F_G2_LN_VAR: begin
-          // ACCUMULATE element (iter-3)'s square, once the pipe has filled.
-          if (iter_idx_q >= 11'd3)
-            ln_var_acc_q <= ln_var_add_w;
+          if (iter_idx_q >= ln_start_q + 11'd3) begin
+            ln_partial_q[ln_count_q[2:0]] <= (ln_count_q < 8'd8)
+                ? ln_dsq_q : ln_reduce_add_w;
+            ln_count_q <= ln_count_q + 8'd1;
+          end
           // Pipe stages advance every cycle in-state.
           ln_diff_q <= ln_diff_w;
           ln_dsq_q  <= ln_diff_sq_w;
-          if ({5'h0, iter_idx_q} < (n_elems_q + 16'd2)) begin
-            if ({5'h0, iter_idx_q} < n_elems_q)
+          if (iter_idx_q < ln_start_q + ln_len_q + 11'd2) begin
+            if (iter_idx_q < ln_start_q + ln_len_q)
               ln_row_q <= synth_a_bits;   // FEED: register the array read
             iter_idx_q <= iter_idx_q + 11'd1;
           end else begin
-            // iter==n_elems+2: the final square (element n-1) was just
-            // accumulated by the branch above. Variance sum complete.
-            iter_idx_q <= 11'h0;
-            state       <= F_G2_LN_DENOM_PRE;
+            state <= F_G2_LN_MERGE;
           end
         end
 

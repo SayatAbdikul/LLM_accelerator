@@ -6,7 +6,8 @@
 // combinational core over directed edge cases + millions of randomized inputs.
 // The harness (fp32_gelu_p33_tb.sv) drives one `a` per cycle into both; y_pipe
 // (valid LATENCY=33 later) is compared to the y_comb that was captured when
-// that `a` was presented (an in-flight deque handles the latency).
+// that `a` was presented. Timestamped expectations check valid_out every cycle,
+// including bubbles and a bounded empty-pipeline drain, not merely FIFO order.
 //
 // BUBBLE COVERAGE is not optional here. fp32_gelu_p33 carries a 32-deep `x`
 // delay line whose taps (1, 3, 32) must stay aligned with the arithmetic under
@@ -33,24 +34,46 @@
 
 static int  g_fail = 0;
 static long g_checked = 0;
+static long g_tail_checked = 0;
+static long g_finite_checked = 0;
+static long g_nan_checked = 0;
+static long g_inputs = 0;
+static long g_valid_checked = 0;
+static constexpr uint64_t LATENCY = 33;
+static uint64_t g_cycle = 0;  // Number of completed rising edges, including reset.
 
 static inline float    bits2f(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
 static inline uint32_t f2bits(float f)    { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 
 static Vfp32_gelu_p33_tb* g_dut = nullptr;
 
-struct Exp { uint32_t a; uint32_t y_comb; const char* tag; };
+struct Exp { uint32_t a; uint32_t y_comb; const char* tag; uint64_t due_cycle; };
 static std::deque<Exp> g_inflight;
 
 static void tick() {
   g_dut->clk = 0; g_dut->eval();
   g_dut->clk = 1; g_dut->eval();
+  ++g_cycle;
 }
 
 static void collect(const char* where) {
-  if (!g_dut->valid_out) return;
+  const bool expected_valid = !g_inflight.empty() &&
+                              g_inflight.front().due_cycle == g_cycle;
+  const bool actual_valid = g_dut->valid_out != 0;
+  ++g_valid_checked;
+  if (actual_valid != expected_valid) {
+    if (g_fail < 40)
+      std::printf("VALID MISMATCH%s cycle=%llu expected=%d actual=%d\n",
+                  where, static_cast<unsigned long long>(g_cycle),
+                  int(expected_valid), int(actual_valid));
+    ++g_fail;
+  }
+  // Retire by the specified cycle even when the DUT misses its valid pulse.
+  // An extra pulse must not consume a future expectation or read an empty FIFO.
+  if (!expected_valid) return;
   Exp e = g_inflight.front();
   g_inflight.pop_front();
+  if (!actual_valid) return;
   uint32_t got = g_dut->y_pipe;
   g_checked++;
   if (got != e.y_comb) {
@@ -61,6 +84,43 @@ static void collect(const char* where) {
     }
     g_fail++;
   }
+  // Independent mathematical oracle, not RTL-vs-RTL agreement: for x>=10,
+  // tanh's positive tail rounds to1 in FP32, so GELU(x) is exactly x. This
+  // catches the prior exp-overflow Inf/Inf bug even if BOTH RTL variants agree.
+  if (e.a >= 0x41200000u && e.a <= 0x7f800000u) {
+    ++g_tail_checked;
+    if (got != e.a || e.y_comb != e.a) {
+      if (g_fail < 40)
+        std::printf("TAIL MISMATCH [%s] a=%08x pipe=%08x comb=%08x expected=x\n",
+                    e.tag, e.a, got, e.y_comb);
+      ++g_fail;
+    }
+  }
+  if ((e.a & 0x7f800000u) != 0x7f800000u) {
+    ++g_finite_checked;
+    if ((got & 0x7f800000u) == 0x7f800000u ||
+        (e.y_comb & 0x7f800000u) == 0x7f800000u) {
+      if (g_fail < 40)
+        std::printf("FINITE MISMATCH [%s] a=%08x pipe=%08x comb=%08x\n",
+                    e.tag, e.a, got, e.y_comb);
+      ++g_fail;
+    }
+  }
+  // Independent special-value oracle: neither implementation may silently
+  // turn a NaN input into a finite value or infinity. Bit parity above still
+  // checks their existing payload/sign behavior without inventing a new policy.
+  const auto is_nan = [](uint32_t u) {
+    return (u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu) != 0;
+  };
+  if (is_nan(e.a)) {
+    ++g_nan_checked;
+    if (!is_nan(got) || !is_nan(e.y_comb)) {
+      if (g_fail < 40)
+        std::printf("NAN MISMATCH [%s] a=%08x pipe=%08x comb=%08x\n",
+                    e.tag, e.a, got, e.y_comb);
+      ++g_fail;
+    }
+  }
 }
 
 // Drive one input, then advance one cycle; check any output that becomes valid.
@@ -68,13 +128,16 @@ static void step(uint32_t a, const char* tag) {
   g_dut->valid_in = 1;
   g_dut->a = a;
   g_dut->eval();  // settle combinational y_comb for THIS a
-  g_inflight.push_back({a, g_dut->y_comb, tag});
+  // With C edges already completed, this input enters stage0 on edge C+1
+  // and exits stage32 on edge C+33: 33 captures, not 33 *additional* edges.
+  g_inflight.push_back({a, g_dut->y_comb, tag, g_cycle + LATENCY});
+  ++g_inputs;
   tick();
   collect("");
 }
 
-// Drive a cycle that must NOT produce a result: valid_in low, `a` carrying
-// unrelated garbage that the free-running datapath will happily shift.
+// Drive invalid input with unrelated garbage. Older valid inputs can still
+// produce outputs now; this bubble must appear at the output 33 captures later.
 static void bubble(uint32_t garbage) {
   g_dut->valid_in = 0;
   g_dut->a = garbage;
@@ -83,13 +146,17 @@ static void bubble(uint32_t garbage) {
   collect("(bubble)");
 }
 
-// Drain the remaining in-flight results after the input stream ends.
+// A bounded drain catches missing outputs without hanging and checks an extra
+// full latency of invalid output after all pending results must have emerged.
 static void drain() {
-  while (!g_inflight.empty()) {
-    g_dut->valid_in = 0;
-    g_dut->eval();
-    tick();
-    collect("(drain)");
+  for (uint64_t i = 0; i < 2 * LATENCY; ++i) bubble(0x7fc00000u);
+  if (!g_inflight.empty()) {
+    std::printf("DRAIN MISMATCH: %zu expected results remain\n", g_inflight.size());
+    ++g_fail;
+  }
+  if (g_checked != g_inputs) {
+    std::printf("COUNT MISMATCH: presented=%ld checked=%ld\n", g_inputs, g_checked);
+    ++g_fail;
   }
 }
 
@@ -109,12 +176,9 @@ int main(int argc, char** argv) {
   g_dut->rst_n = 1; g_dut->eval();
 
   // --- Directed edge cases -------------------------------------------------
-  // Note the large-|x| entries: for x ≳ 10.6 the inner exp(2z) overflows to
-  // +inf, so denom is +inf and ratio = inf/inf = qNaN — i.e. fp32_gelu_new
-  // itself returns NaN out there. That is PRE-EXISTING combinational behavior
-  // (this op's live inputs are fp16 activations well inside the band); the
-  // point of listing it is that the retimed pipe must reproduce it exactly,
-  // NaN payload included, rather than quietly differing in the saturation tail.
+  // Include the retained GPT-2 failure and neighbors. Large positive finite
+  // activations are legal and occur in the trained model; they must saturate
+  // the ratio to1, never generate NaN from an overflowing exponential.
   std::vector<uint32_t> directed = {
     0x00000000u,                 // +0
     0x80000000u,                 // -0
@@ -126,7 +190,8 @@ int main(int argc, char** argv) {
     0xC0A00000u,                 // -5.0
     0x41200000u,                 // 10.0  (just under the exp-overflow knee)
     0xC1200000u,                 // -10.0
-    0x412AAAABu,                 // ~10.67 (astride the knee)
+    0x412AAAABu,                 // ~10.67 (past the exp-overflow knee)
+    0x412DE000u,                 // 10.8671875, captured PC3994/column588
     0x41400000u,                 // 12.0  (past it: exp->inf)
     0xC1400000u,                 // -12.0
     0x42000000u,                 // 32.0
@@ -149,6 +214,15 @@ int main(int argc, char** argv) {
     0xC0490FDBu,                 // -pi
   };
   for (uint32_t a : directed) step(a, "directed");
+
+  // Exhaust every FP16 value in the positive saturation tail (and its negative
+  // partner), including bubble transitions across the former overflow knee.
+  for (uint32_t h = 0x4900u; h <= 0x7bffu; ++h) {
+    const uint32_t a = (((h >> 10) + 112u) << 23) | ((h & 0x3ffu) << 13);
+    step(a, "fp16-tail+");
+    if ((h & 31u) == 0) bubble(0x7fc00000u);
+    step(a | 0x80000000u, "fp16-tail-");
+  }
 
   std::mt19937 rng(0x6E1Bu);
 
@@ -191,6 +265,10 @@ int main(int argc, char** argv) {
 
   std::printf("fp32_gelu_p33 bit-exact gate: checked=%ld  fails=%d\n",
               g_checked, g_fail);
+  std::printf("independent positive-tail checks=%ld; finite-input checks=%ld\n",
+              g_tail_checked, g_finite_checked);
+  std::printf("exact 33-stage valid checks=%ld; independent NaN-input checks=%ld\n",
+              g_valid_checked, g_nan_checked);
   delete g_dut;
   if (g_fail) { std::printf("FAIL\n"); return 1; }
   std::printf("PASS (byte-identical to combinational fp32_gelu_new)\n");

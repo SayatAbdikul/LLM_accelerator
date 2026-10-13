@@ -13,6 +13,7 @@ not mistaken for the current architecture.
 | [Code exploration roadmap](code_exploration_roadmap.md) | Ordered ISA, RTL, software-reference, verification, and performance architecture tour |
 | [Accelerator optimization roadmap](optimization_roadmap.md) | Proposed milestones, dependencies, measurement gates, and laptop-aware compiler/RTL/physical optimization plan |
 | [Optimization implementation and results](optimization_results.md) | Implemented candidates, attributable measurements, verification scope, and unmet acceptance gates |
+| [W8A16 numerical quality results](numerical_quality_results.md) | Current numerical evidence, shared-input software evaluation, hardware replay status, and unchanged acceptance criteria |
 | [SFU storage inventory](sfu_storage_inventory.md) | Opcode port/lifetime requirements and risks before scratch-bank changes |
 | [Software codebase](../software/CODEBASE.md) | Current Python package map and data flow |
 | [ISA specification](../software/docs/isa_spec.md) | Current software/RTL encoding and implementation matrix |

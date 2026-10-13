@@ -1,10 +1,19 @@
 # Accelerator optimization roadmap
 
 **Created:** 2026-10-11  
-**Updated:** 2026-10-12  
+**Updated:** 2026-10-13
 **Code basis:** `978f126` and the October code audit  
-**Status:** Accepted opt-in integration validated; numerical quality and physical integration remain gated  
+**Status:** Accepted opt-in integration and agreed bounded numerical gate validated; physical/default promotion remain gated
 **Primary workload:** GPT-2 124M causal inference with W8A16 and INT8 KV cache
+
+The [October 13 numerical-quality campaign](numerical_quality_results.md)
+passes the newly explicit 5% FP32-relative PPL limit for the named 256-target
+software window and repairs real-data RTL LayerNorm reduction order and
+GELU exponential overflow. The accepted three-target hardware continuation
+gate passes with exact logits and whole KV. This does not claim full-window
+RTL or corpus-wide quality. Default promotion and physical signoff remain
+distinct gates; the milestone table below records the prior optimization
+source epoch.
 
 Optimize useful work per cycle and memory traffic first, then establish physical
 area and timing with real memories. Keep SKY130 as the reference backend and

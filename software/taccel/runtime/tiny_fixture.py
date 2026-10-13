@@ -715,7 +715,10 @@ def run_stage3_tiny_e2e(payload: Dict[str, object], *,
     )
     actual = run_tiny_decode_trace(tiny, prompt_ids, max_new_tokens=max_new_tokens)
 
-    ref = NanoGPTW8A16SimulatorReference(payload, calibration_scales=calibration_scales)
+    ref = NanoGPTW8A16SimulatorReference(
+        payload, calibration_scales=calibration_scales,
+        attention_window=1 + max_new_tokens,
+    )
     reference = _run_reference_trace(
         ref, prompt_ids, max_new_tokens=max_new_tokens, vocab_size=tiny.config.vocab_size
     )

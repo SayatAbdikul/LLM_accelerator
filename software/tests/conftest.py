@@ -18,6 +18,8 @@ REQUIRED_MODULES = {
     "test_tiny_decode_determinism", "test_verification_contracts",
     "test_compiler_optimizations", "test_optimization_matrix", "test_chat_gpt2",
     "test_batched_av_capacity",
+    "test_numerical_quality_gate", "test_w8a16_numerical_reference",
+    "test_w8a16_quality_cli", "test_w8a16_rtl_quality_cli",
 }
 
 

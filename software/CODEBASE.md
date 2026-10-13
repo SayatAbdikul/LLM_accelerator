@@ -1,6 +1,6 @@
 # TACCEL software codebase
 
-**Updated:** 2026-10-12 against the current working tree.
+**Updated:** 2026-10-13 against the current working tree.
 
 This guide describes the current Python toolchain. The top-level
 [README](../README.md) covers repository-wide setup and RTL commands; the
@@ -33,6 +33,7 @@ software/
 │   │   ├── host_runner.py      # Runtime patching and serving loop
 │   │   ├── stage5_ptq.py       # GPT-2 PTQ preset registry
 │   │   ├── tiny_fixture.py     # Tiny and GPT-2 bundle/test helpers
+│   │   ├── numerical_quality.py # Fail-closed teacher-forced quality metrics
 │   │   ├── speculative.py      # Prompt-lookup speculative decoding
 │   │   └── *_reference.py      # FP32, fake-quant, W8A16/W8A8 references
 │   └── utils/                  # Integer and tensor helpers
@@ -345,6 +346,21 @@ reference; its compiled rail now decodes FP16 logits without applying an INT8
 output scale again. That cross-arithmetic comparison is distinct from the
 matched W8A16 `simulator_backed` conformance path.
 
+`runtime/w8a16_simulator_reference.py` independently models the active W8A16
+storage, rounding, streamed matmul and INT8 KV-cache arithmetic. Its explicit
+`attention_window` matches the compiled decode reduction width. Shared
+calibration maps must include identical prefill/decode KV aliases; an implicit
+map is resolved once before constructing either execution path.
+
+`runtime/numerical_quality.py` scores identical teacher-forced prefixes across
+compiled W8A16, independent W8A16 and original FP32 logits. It rejects missing
+rows, invalid targets and nonfinite live logits/NLL/PPL. Reference acceptance
+retains the 2% PPL, 0.995 cosine and four-of-five ranking limits; the permitted
+FP32-relative PPL increase is an explicit caller decision, with no default.
+See [current numerical evidence](../docs/numerical_quality_results.md) for
+separate software and hardware results, rather than treating either as proof
+of the other.
+
 `runtime/speculative.py` adds opt-in prompt-lookup speculative decoding. It is
 not enabled by default and is guarded by byte-inertness tests.
 
@@ -356,6 +372,8 @@ not enabled by default and is guarded by byte-inertness tests.
 | `run_golden.py` | Execute a ProgramBinary in the golden model |
 | `convert_hf_gpt2_to_nanogpt.py` | Convert supported Hugging Face GPT-2 weights |
 | `evaluate_gpt2_perplexity.py` | PTQ/fake-quant/golden perplexity evaluation |
+| `w8a16_quality_gate.py` | Offline teacher-forced W8A16/FP32 quality gate with pinned inputs, raw logits and optional same-model RTL replay export |
+| `w8a16_rtl_quality_gate.py` | Three-target hardware quality replay using the canonical export, actual RTL KV continuation and fail-closed evidence checks |
 | `rtl_cosim.py` | Serialize a decoder stream and compare RTL with golden |
 | `bench_decode_cycles.py` | Direct decode cycle measurement by position/batch |
 | `fast_gate_b16.py` | Compare actual FP16 logits and cycles with a matched baseline report |
@@ -367,6 +385,55 @@ not enabled by default and is guarded by byte-inertness tests.
 | `audit_porta_argmax.py` | Port-A overlap/correctness audit |
 | `bench_specdec_*.py` | Speculative-decoding measurements |
 | `debug_*.py` | Focused quality and lowering diagnostics |
+
+`w8a16_quality_gate.py` accepts only the three active weight-only INT8 presets
+and requires `--max-fp32-ppl-increase-percent`. It captures the original FP32
+trace before any rotation, records actual PTQ transforms and uses one shared
+calibration map. The canonical window is 257 tokens; other explicitly selected
+lengths are labeled debug/noncanonical. Output directories are exclusive, and
+failed runs retain their captured logits and provenance. `--rtl-export-steps 3`
+exports the first three inputs without shortening the compiled attention
+window: one static data image, instruction-only ProgramBinary envelopes, and
+comparison-only golden logits/whole KV. A separate hardware replay must attach
+the static data and carry its own previous RTL KV dump; exporting does not run
+RTL or establish hardware quality.
+
+`w8a16_rtl_quality_gate.py` consumes a passed canonical software report with
+all 256 ordered compiled steps explicitly halted, a completed three-step
+export, unchanged source/export hashes, and actual QuaRot preprocessing. Its
+runner must be freshly built with SFU/helper modes 1/1. Run it under an external
+RSS/free-disk/time supervisor; the CLI does not build tools or download inputs.
+For example, with an existing canonical export and a new output directory:
+
+```sh
+PYTHONPATH=software .venv/bin/python software/tools/w8a16_rtl_quality_gate.py \
+  --quality build/numerical-quality/quality \
+  --runner rtl/verilator/build/run_program_synth/Vtaccel_top \
+  --out build/numerical-quality/rtl-replay
+```
+
+The first hardware step starts with zero KV; the next two consume the preceding
+hardware dump, never golden KV. The gate checks complete instruction retirement,
+immutable model data, permitted STORE ranges, finite live FP16 logits and
+unchanged identities. It scores exactly three teacher-forced targets against
+the same reference/FP32 prefixes, retaining the 2% reference PPL, 0.995 cosine,
+four-of-five ranking and selected 5% FP32-relative limits. Exact golden logits
+and whole-KV equality are separate diagnostics. This bounded check is not
+256-target RTL or corpus-wide quality proof. Metric failures and execution or
+validation errors return nonzero and retain a terminal report plus completed
+and partial artifacts; existing output directories are never overwritten.
+
+On 2026-10-13, the accepted bounded hardware replay passed for the first three
+teacher-forced targets of the pinned 257-token window, retaining the compiled
+attention window of 256. All three live-logit rows and whole-KV outputs were
+bit-exact against golden, with two actual hardware KV continuation links.
+RTL/reference PPL was 1317.182714 versus original FP32 1371.070346
+(-3.930333%); cosine was 1 and every top-five overlap was 5/5. Source and output
+hash checks closed successfully. Evidence is retained at
+`build/optimization-numerical-20261013/quality-rtl-replay-v2/report.json`;
+see [the numerical report](../docs/numerical_quality_results.md) for the pinned
+inputs, reproduction details and preserved earlier failures. This accepted
+scope does not promote a default preset or extend to all 256 hardware targets.
 
 ## Tests
 
@@ -392,9 +459,42 @@ PYTHONPATH=software .venv/bin/python -m pytest -q software/tests --verification-
 ```
 
 `conftest.py` explicitly selects core modules, excludes optional 124M cases,
-and turns a skipped mandatory test into a failure. On 2026-10-11 this profile
-passed 395 tests with zero skips or failures; 244 optional cases were
-deselected from a 639-test collection. All eight affected multi-token prefill
+and turns a skipped mandatory test into a failure. On 2026-10-13, the current
+required profile passed **537 tests**, with zero failures or skips and 244
+optional cases deselected from a 781-test collection. The supervised run took
+93.831 s and peaked at 689.094 MiB sampled test-process-group RSS. Its log and
+resource record are under
+`build/optimization-numerical-20261013/supervision-required-final-v1/`;
+the exact test outcomes are in
+`build/optimization-numerical-20261013/required-final.xml`.
+
+The separate affected run passed 32 tests (eight prefill, six LayerNorm-vector
+generator and 18 diagnostic-helper tests) plus five subtests in 13.381 s
+supervised wall time, peaking at 300.969 MiB sampled process-group RSS. Its
+log/resource record and JUnit outcomes are retained in
+`build/optimization-numerical-20261013/supervision-affected-final-v1/` and
+`build/optimization-numerical-20261013/affected-final.xml`. These results are
+reported separately, not added to the 781-test software collection.
+
+The native regressions separately passed 12/12 checks in each SFU mode and
+513/513 LayerNorm vectors per mode. The strengthened GELU gate passed
+8,526,144 bit-exact comparisons, 18,522,288 exact 33-stage valid checks and
+11,527 independent NaN-input checks, with zero failures. These are overlapping
+primitive checks, not additional Python tests. See
+[the RTL guide](../rtl/TESTBENCHES.md#fp32-primitives) for coverage and retained
+native logs. All 12 standalone FP32 primitive suites also passed in a serial
+85.363 s supervised run, peaking at 19.438 MiB sampled process-group RSS;
+its log and resource record are under
+`build/optimization-numerical-20261013/supervision-all-primitives-final-v1/`.
+
+### Historical October 11 and 12 validation
+
+The following suite and clean-source counts predate the October 13 numerical
+repairs. They are retained historical evidence, not a fresh full-suite run of
+the current RTL and software.
+
+On 2026-10-11 this profile passed 395 tests with zero skips or failures; 244
+optional cases were deselected from a 639-test collection. All eight affected multi-token prefill
 tests and both offline Hugging Face converter-parity tests also passed after
 the AV-residency, stored-row mapping and host lockstep-priming fixes.
 

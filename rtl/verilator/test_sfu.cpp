@@ -148,6 +148,59 @@ static void test_g2_layernorm_fp32() {
     TEST_PASS(name);
 }
 
+// Dedicated quality gate: independent NumPy-generated vectors at every legal
+// width, with raw byte equality (including signed zero), not a widened band.
+static void test_layernorm_vectors(const std::string& path) {
+    const char* name = "layernorm_vectors";
+    auto data = read_binary_file(name, path);
+    size_t pos = 0;
+    auto take = [&](size_t n) {
+        if (pos + n > data.size()) TEST_FAIL(name, "truncated LN vectors");
+        std::vector<uint8_t> bytes(data.begin() + pos, data.begin() + pos + n);
+        pos += n;
+        return bytes;
+    };
+    auto u32 = [&]() {
+        auto b = take(4);
+        return uint32_t(b[0]) | uint32_t(b[1]) << 8 |
+               uint32_t(b[2]) << 16 | uint32_t(b[3]) << 24;
+    };
+    auto magic = take(8);
+    if (std::string(magic.begin(), magic.end()) != "LNPAIR01")
+        TEST_FAIL(name, "bad LN vector magic");
+    uint32_t count = u32();
+    if (count < 512 || count > 513) TEST_FAIL(name, "incomplete LN width coverage");
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t n = u32(), name_bytes = u32();
+        if (n < 16 || n > 1024 || n % 16 || name_bytes > 128)
+            TEST_FAIL(name, "invalid LN vector geometry");
+        auto text = take(name_bytes);
+        std::string label(text.begin(), text.end());
+        if ((i < 512 && n != 16 * (i / 8 + 1)) ||
+            (i == 512 && (n != 768 || label != "captured_gpt2_block0_ln1_768")))
+            TEST_FAIL(name, "missing legal LN width or invalid captured case");
+        auto input = take(n * 2), gamma = take(n * 2), beta = take(n * 2);
+        auto expected = take(n * 2);
+        gamma.insert(gamma.end(), beta.begin(), beta.end());
+        SimHarness s;
+        sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, input);
+        sram_write_bytes(s.dut.get(), BUF_WBUF_ID, 0, gamma);
+        s.load({
+            // Exact one logical row, independently of the 16-row tile padding.
+            insn::CONFIG_TILE(1, int(n / 16), 1) | (uint64_t(1) << 16),
+            insn::R_TYPE(0x1A, BUF_ABUF_ID, 0, BUF_WBUF_ID, 0,
+                         BUF_ABUF_ID, 4096, 0, 1),
+            insn::SYNC(0b100), insn::HALT(),
+        });
+        s.run(100000);
+        if (s.dut->fault) TEST_FAIL(label.c_str(), "unexpected LN fault");
+        auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, 4096 * 16, n * 2);
+        expect_equal_bytes(label.c_str(), got, expected);
+        TEST_PASS(label.c_str());
+    }
+    if (pos != data.size()) TEST_FAIL(name, "trailing LN vector bytes");
+}
+
 static void test_g2_gelu_fp32() {
     const char* name = "g2_gelu_fp32";
     const std::string d = "fixtures/gen2/gelu_fp32/std";
@@ -168,6 +221,31 @@ static void test_g2_gelu_fp32() {
     auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID,
                                size_t(G2_DST) * 16, G2_OUT_BYTES);
     expect_fp16_ulp(name, got, expected, band);   // freeze §7 per-op band
+    TEST_PASS(name);
+}
+
+static void test_g2_gelu_saturated_tail() {
+    const char* name = "g2_gelu_saturated_tail";
+    // Frozen tanh-GELU is exactly x for these positive FP16 inputs, and -0
+    // at FP16 storage precision for their negative partners. 0x496f is the
+    // real trained-model input that previously produced an Inf/Inf NaN.
+    const std::vector<uint16_t> positive = {
+        0x4800, 0x48ff, 0x4900, 0x4901, 0x496e, 0x496f, 0x4970, 0x4a00,
+        0x5000, 0x5400, 0x5800, 0x6000, 0x6800, 0x7000, 0x7800, 0x7bff};
+    auto input = positive;
+    auto expected = positive;
+    for (auto x : positive) { input.push_back(x | 0x8000); expected.push_back(0x8000); }
+    SimHarness s;
+    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, pack_u16_le(input));
+    s.load({
+        insn::CONFIG_TILE(1, 2, 1) | (uint64_t(1) << 16),
+        insn::R_TYPE(0x1B, BUF_ABUF_ID, 0, BUF_ABUF_ID, 0, BUF_ABUF_ID, 1024, 0, 1),
+        insn::SYNC(0b100), insn::HALT(),
+    });
+    s.run(100000);
+    if (s.dut->fault) TEST_FAIL(name, "unexpected fault");
+    auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, 1024 * 16, 64);
+    expect_equal_bytes(name, got, pack_u16_le(expected));
     TEST_PASS(name);
 }
 
@@ -575,6 +653,12 @@ static void test_bug1_full_chain_diagnostic() {
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
 
+    if (argc == 3 && std::string(argv[1]) == "--ln-vectors") {
+        test_layernorm_vectors(argv[2]);
+        std::printf("\n%d / %d LN quality vectors passed\n", tests_pass, tests_run);
+        return tests_pass == tests_run ? 0 : 1;
+    }
+
     test_bug1_scale_visibility_diagnostic();
     test_bug1_full_chain_diagnostic();
     // 2026-05-23 Phase B/C: gen-1 SFU test functions stripped (the 9 tests
@@ -583,6 +667,7 @@ int main(int argc, char** argv) {
     test_g2_vadd_fp32();
     test_g2_layernorm_fp32();
     test_g2_gelu_fp32();
+    test_g2_gelu_saturated_tail();
     test_g2_dequant_accum_fp32();
     test_g2_quant_fp32_int8();
     test_g2_masked_softmax_fp32();
